@@ -5,7 +5,7 @@
      Triangle (BACK) puts the values the page opened with back and closes, as AUDIO / OTHER does.
    Every change is saved to dhd.ini at once (host_setting_save keeps the other lines). Display,
    window size, picture shape, scaling, skip movies (the startup movies) and vibration apply at
-   once; resolution, widescreen and the texture pack at
+   once; resolution, widescreen, the texture pack and the font at
    the next start ("*" and the footer say so). A setting the environment
    sets (DHD_*) is shown but can't be changed here. Nothing here writes game state: the page
    lives in host memory and the settings in dhd.ini, never in the memory card's save. */
@@ -20,7 +20,7 @@ void gs_window_apply(void);           /* port/gs/present.c */
 void gs_present_options_apply(void);
 int texpack_available(void);          /* port/gs/texpack.c */
 
-enum { ROWS = 9 };
+enum { ROWS = 10 };
 
 typedef struct { const char *text, *value; } Choice;
 typedef struct {
@@ -40,9 +40,10 @@ static const Choice shapes[] = {{"4:3", "4:3"}, {"Wide", "wide"}, {"16:9", "16:9
 static const Choice filters[] = {{"Smooth", "linear"}, {"Sharp", "point"}};
 static const Choice switches[] = {{"OFF", "0"}, {"ON", "1"}};
 static const Choice toggles[] = {{"OFF", "off"}, {"ON", "on"}};
+static const Choice fonts[] = {{"Original", "original"}, {"Sharp", "sharp"}};
 
 #define CHOICES(c) c, (int)(sizeof c / sizeof *c)
-enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES };
+enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT };
 static Row rows[ROWS] = {
     {"Resolution:", "scale", "DHD_SCALE", "2", CHOICES(scales), 0},
     {"Display:", "window", "DHD_WINDOW", "windowed", CHOICES(displays), 1},
@@ -53,6 +54,7 @@ static Row rows[ROWS] = {
     {"Skip Movies:", "skip_movies", "DHD_SKIP_MOVIES", "0", CHOICES(switches), 1},  /* the startup movies */
     {"Vibration:", "vibration", "DHD_VIBRATION", "1", CHOICES(switches), 1},
     {"Texture Pack:", "textures", "DHD_TEXTURES", "on", CHOICES(toggles), 0},  /* port/gs/texpack.c */
+    {"Font:", "font", "DHD_FONT", "sharp", CHOICES(fonts), 0},  /* port/gs/font_sharp.c */
 };
 
 static MenuPage page;
@@ -74,6 +76,8 @@ static void current(const Row *r, char *out, size_t size)
     if (r == &rows[TEXTURES])
         snprintf(out, size, "%s", v && (!_stricmp(v, "off") || !strcmp(v, "0") || !_stricmp(v, "false") || !_stricmp(v, "no"))
                  ? "off" : "on");
+    if (r == &rows[FONT])  /* as font_sharp_on reads it */
+        snprintf(out, size, "%s", v && (!_stricmp(v, "original") || !_stricmp(v, "off") || !strcmp(v, "0")) ? "original" : "sharp");
 }
 
 static int find(const Row *r, const char *value)

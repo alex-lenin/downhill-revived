@@ -78,6 +78,10 @@ def prepare_tree(rev):
         sys.exit('missing %s (see docs/STATE.md, Environment)' % (ROOT / ELF))
     (TREE / ELF).parent.mkdir(exist_ok=True)
     shutil.copyfile(ROOT / ELF, TREE / ELF)
+    # pinned third-party downloads (SDL3's source, port/tools/sdl3.py checks its hash): no second
+    # download when this checkout has them
+    if (ROOT / 'build' / 'downloads').is_dir():
+        shutil.copytree(ROOT / 'build' / 'downloads', TREE / 'build' / 'downloads', dirs_exist_ok=True)
     return commit
 
 

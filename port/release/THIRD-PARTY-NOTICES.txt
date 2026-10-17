@@ -68,14 +68,37 @@ xxHash (https://github.com/Cyan4973/xxHash), BSD-2-Clause
   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+SDL 3.4.18 (https://libsdl.org), zlib License
+  Controllers (port/hle/gamepad.c) go through SDL3, linked into dhd.exe unchanged (joystick,
+  gamepad and HID parts only), with its built-in controller mapping database. SDL includes HIDAPI
+  (Copyright 2009 Alan Ott, Signal 11 Software), used here under its GPL-3.0 option.
+
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
 LLVM / clang (https://llvm.org), Apache-2.0 WITH LLVM-exception
   dhd.exe is compiled with clang and may contain the compiler's runtime support code, which is
   covered by the LLVM exception (no notice required in binaries).
 
 Microsoft C runtime and Windows SDK import libraries
   dhd.exe links the static Microsoft C runtime and uses Windows system libraries (Direct3D 11,
-  DXGI, the D3D compiler, WinHTTP, the Windows Imaging Component for PNG files), all part of
-  Windows.
+  DXGI, the D3D compiler, WinHTTP, the Windows Imaging Component for PNG files, and for the
+  controllers XInput, DirectInput, Windows.Gaming.Input, SetupAPI and HID), all part of Windows.
 
 The game itself
   Downhill Domination and its code, data, names and trademarks belong to their owners. They are

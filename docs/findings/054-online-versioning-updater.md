@@ -228,3 +228,33 @@ Native renderer gate (`gate_native_renderer.py`, ebf21db1, reference r39-plain):
    text; 0.1.0 has no updater, so they download 0.2.0 by hand.
 4. For later releases: bump `port/include/version.h` only, repeat 1-2, and raise `MIN_VERSION`
    when old releases should stop racing.
+
+## 7. After the race the controller did nothing (0.2.0 bug)
+
+Reported on 0.2.0: after an online race the game was back at the title and X did nothing.
+
+Cause (`port/hle/online.c`): online mode never ended.
+- `online` stayed 1, so `pads_read` kept using the race's menu script (`DHD_NAV`, set at the
+  barrier) everywhere but the race itself. That script had run out, so it answered "nothing
+  pressed" for the controller.
+- The results' menu (TRY AGAIN ... QUIT, race phase 0) and the title were therefore deaf.
+- The room, the puppets and the shared frame pacing also stayed on.
+
+Fix:
+- From the countdown on, the race screen reads the player's own controller, results and their
+  menu included.
+- `race_over` ends online mode when the game leaves the race screen. It also ends it when, after
+  the results, TRY AGAIN or NEW LEVEL starts another race on the same screen (race phase back
+  to the flight or the countdown).
+- `race_over` leaves the room, turns the puppets off (`hle_puppet_offline`), ends the shared
+  pacing, puts `DHD_NAV` and `DHD_RACE_SEED` back as they were and resets its state. The ONLINE
+  menu can start another online race.
+- Tests: `DHD_NET_AFTER_RACE` (with `DHD_NET_SCRIPTED`) is the menu script once the results are
+  in.
+
+Test:
+- Two instances on a local server: race to the end (`DHD_NET_TEST_FINISH=10`), results, NEW
+  LEVEL. Both log `the race is over; back to offline play` and `puppet: offline`, and the
+  restored offline script starts the next race (Mt. Midoule) on both.
+- QUIT on the results' menu did not respond to the scripted Cross in this harness (the cursor
+  moves; the menu stays). Not resolved here; leaving the race screen by any way ends online mode.

@@ -32,6 +32,7 @@
 #include <limits.h>
 #include <intrin.h>
 #include "texpack.h"
+#include "font_sharp.h"
 
 double host_wall_seconds(void); /* port/hle/host.c */
 
@@ -59,6 +60,7 @@ typedef struct {
     uint64_t used;        /* last field that drew with it */
     TexPackEntry *pack;   /* its replacement (texpack.c), once looked up (pack_checked) */
     int pack_checked;
+    ID3D11ShaderResourceView *sharp;  /* the game's font made sharp (font_sharp.c), or NULL */
 } NativeTexture;
 
 /* A render target or depth buffer: GS memory from page `page`, `bw` pages wide. */
@@ -455,6 +457,7 @@ static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w,
         ID3D11ShaderResourceView_Release(victim->view); ID3D11Texture2D_Release(victim->texture);
         victim->texture = NULL; victim->view = NULL;
     }
+    if (victim->sharp) { ID3D11ShaderResourceView_Release(victim->sharp); victim->sharp = NULL; }
     unsigned psm = (unsigned)(tex0 >> 20) & 63, tbp = (unsigned)tex0 & 0x3FFF, tbw = (unsigned)(tex0 >> 14) & 63;
     uint32_t *pixels = malloc((size_t)w * h * 4), palette[256];
     if (!pixels) return NULL;
@@ -471,9 +474,13 @@ static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w,
     d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     D3D11_SUBRESOURCE_DATA data = {pixels, w * 4, 0};
     HRESULT hr = ID3D11Device_CreateTexture2D(n->device, &d, &data, &victim->texture);
+    /* The text engine's font, made sharp for high resolutions (dhd.ini font, finding 058). */
+    if (SUCCEEDED(hr) && indexed && n->replace_samplers[7] && font_sharp_on() && font_sharp_match(tex0))
+        victim->sharp = font_sharp_view(n->device, pixels, w, h, key);
     free(pixels);
     if (FAILED(hr)) { victim->texture = NULL; return NULL; }
     if (FAILED(ID3D11Device_CreateShaderResourceView(n->device, (ID3D11Resource *)victim->texture, NULL, &victim->view))) {
+        if (victim->sharp) { ID3D11ShaderResourceView_Release(victim->sharp); victim->sharp = NULL; }
         ID3D11Texture2D_Release(victim->texture); victim->texture = NULL; return NULL;
     }
     victim->key = key; victim->used = n->field;
@@ -557,13 +564,14 @@ static int native_convert_texture(Native *n, Gs *g, uint64_t tex0, unsigned w, u
 }
 
 /* A texture pack's replacement for a decoded texture (texpack.c): looked up once per decode,
-   drawn once its loader has it. Region repeat (an address mask) stays the original's. */
+   drawn once its loader has it. Else the sharp font (font_sharp.c), so a pack's own font wins.
+   Region repeat (an address mask) stays the original's. */
 static void native_replace(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
 {
     NativeTexture *t = c->texture;
-    if (!t->pack_checked) { t->pack = texpack_find(g, ctxt); t->pack_checked = 1; }
-    if (!t->pack || c->constants.wrap[0] == 3 || c->constants.wrap[1] == 3) return;
-    ID3D11ShaderResourceView *view = texpack_view(t->pack, n->field);
+    if (!t->pack_checked) { t->pack = n->texpack ? texpack_find(g, ctxt) : NULL; t->pack_checked = 1; }
+    if ((!t->pack && !t->sharp) || c->constants.wrap[0] == 3 || c->constants.wrap[1] == 3) return;
+    ID3D11ShaderResourceView *view = t->pack ? texpack_view(t->pack, n->field) : t->sharp;
     if (!view) return;
     c->replacement = view;
     c->constants.flags |= 2048;
@@ -615,6 +623,14 @@ static void native_texture(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
         for (unsigned i = 0; i < entries; i++) key = native_mix(key, gs_palette(g, tex0, i));
     }
     if (gpu_pages) {
+        /* The menus' font lives in a depth buffer's top bytes; the sharp one is drawn from the
+           CPU copy, which holds the font as the game uploaded it. */
+        if (n->replace_samplers[7] && font_sharp_on() && font_sharp_match(tex0)) {
+            c->texture = native_decode(n, g, tex0, w, h, key);
+            if (c->texture && c->texture->sharp) native_replace(n, g, ctxt, c);
+            if (c->replacement) return;
+            c->texture = NULL;
+        }
         if (native_convert_texture(n, g, tex0, w, h, pages, key, c)) return;
         /* Drawn over, but the CPU copy holds it (a Z24 buffer's top byte), or out of reach. */
         if (owner >= 0) {
@@ -633,7 +649,7 @@ static void native_texture(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
                     tbw, w, h, gpu_page);
     }
     c->texture = native_decode(n, g, tex0, w, h, key);
-    if (c->texture && n->texpack) native_replace(n, g, ctxt, c);
+    if (c->texture && (n->texpack || c->texture->sharp)) native_replace(n, g, ctxt, c);
     if (!c->texture) {
         k->flags &= ~1u;
         if (n->texlog)
@@ -2738,7 +2754,8 @@ static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceCont
     /* A texture pack (dhd.ini texture_pack, textures): replacements are sampled with mipmaps,
        anisotropic when the GS filters (trilinear alone blurs ground seen at a low angle), point
        magnification when it doesn't, with clamped or repeating coordinates as the GS has them. */
-    if (texpack_open(device)) {
+    int pack = texpack_open(device);
+    if (pack || font_sharp_on()) {
         for (unsigned i = 0; i < 8 && SUCCEEDED(hr); i++) {
             D3D11_SAMPLER_DESC sd = {0};
             sd.Filter = i & 1 ? D3D11_FILTER_ANISOTROPIC : D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR;
@@ -2749,7 +2766,8 @@ static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceCont
             sd.MaxLOD = D3D11_FLOAT32_MAX;
             hr = ID3D11Device_CreateSamplerState(device, &sd, &n->replace_samplers[i]);
         }
-        n->texpack = SUCCEEDED(hr);
+        n->texpack = pack && SUCCEEDED(hr);
+        if (FAILED(hr)) memset(n->replace_samplers, 0, sizeof n->replace_samplers);
         hr = S_OK;
     }
     ID3D11Device_AddRef(device); ID3D11DeviceContext_AddRef(context);

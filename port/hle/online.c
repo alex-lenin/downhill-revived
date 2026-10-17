@@ -218,6 +218,7 @@ static void log_hash(uint64_t field)
 /* ---- online ---- */
 
 void hle_puppet_online(int local, int nslots, int host);
+void hle_puppet_offline(void);
 void hle_puppet_drop(int lobby, int host);
 int hle_puppet_pack(int slot, uint8_t *out, int max);
 void hle_puppet_receive(int sender, const uint8_t *in, int n);
@@ -305,7 +306,7 @@ static void fail(const char *why)
     char text[400];
     snprintf(text, sizeof text, "Online play stopped: %s", why);
     fprintf(stderr, "online: %s\n", text);
-    MessageBoxA(NULL, text, "Downhill Domination online", MB_OK | MB_ICONERROR);
+    MessageBoxA(NULL, text, "Downhill Revived online", MB_OK | MB_ICONERROR);
     exit(1);
 }
 
@@ -351,6 +352,14 @@ static void set_env(const char *name, const char *value)
    doesn't matter: the countdown waits for everyone and starts on the host's moment. */
 static const char race_script[] = "0:triangle|cross,15:cross,3:cross,16:cross,1:cross,11:cross,"
                                   "18@4C7F38=0:start,18@4C7F38=1:cross,9/5:start";
+
+/* What the race's script and seed replaced, put back when the race is over ("" when unset). */
+static char saved_nav[1200], saved_seed[32];
+static void save_env(const char *name, char *out, size_t size)
+{
+    const char *v = getenv(name);
+    snprintf(out, size, "%s", v ? v : "");
+}
 
 static void connect_lobby(void)
 {
@@ -440,7 +449,7 @@ static void barrier(void)
         int all_ready = lobby.nmembers >= 2 && ready == lobby.nmembers;
         if (lobby.state == NET_RACING || lobby.started) {
             double left = lobby.start_at - net_seconds();
-            title("Downhill Domination online - room %s - starting in %.1f s", lobby.code, left > 0 ? left : 0);
+            title("Downhill Revived online - room %s - starting in %.1f s", lobby.code, left > 0 ? left : 0);
             if (left <= 0) break;
         } else if (lobby.state == NET_LOBBY) {
             if (lobby.is_host && all_ready && !start_sent &&
@@ -452,14 +461,14 @@ static void barrier(void)
                     start_sent = 1;
                 }
             }
-            title("Downhill Domination online - room %s - %d player%s, %d ready - %s", lobby.code, lobby.nmembers,
+            title("Downhill Revived online - room %s - %d player%s, %d ready - %s", lobby.code, lobby.nmembers,
                   lobby.nmembers == 1 ? "" : "s", ready,
                   !lobby.is_host ? "waiting for the host to start"
                   : lobby.nmembers < 2 ? "waiting for players to join"
                   : !all_ready ? "waiting for everyone to be ready"
                                : "press START (or Enter) to begin");
         } else
-            title("Downhill Domination online - connecting...");
+            title("Downhill Revived online - connecting...");
         if (lobby.state == NET_LOBBY && lobby.is_host) pressed_start();
         gs_pump_messages();
         Sleep(10);
@@ -477,6 +486,7 @@ static void barrier(void)
     for (int i = 1; i < 4; i++) on.setup.rider[i] = -1;
     for (int i = 0; i < NRIDERS; i++) on.finish[i] = -1;
     char seed[16];
+    save_env("DHD_NAV", saved_nav, sizeof saved_nav), save_env("DHD_RACE_SEED", saved_seed, sizeof saved_seed);
     set_env("DHD_NAV", race_script);
     snprintf(seed, sizeof seed, "%u", lobby.race_seed ? lobby.race_seed : 1u);
     set_env("DHD_RACE_SEED", seed);  /* hle_race_seed: never 0, which falls back to the RTC */
@@ -588,7 +598,7 @@ static void exchange_rides(void)
         for (int i = 0; i < on.nslots; i++)
             if (!lobby.racer[i].left && !on.ride[i].have) missing++;
         if (!missing || !net_racing() || host_wall_seconds() - entered > 30) break;
-        title("Downhill Domination online - room %s - waiting for %d player%s' riders", on.code, missing,
+        title("Downhill Revived online - room %s - waiting for %d player%s' riders", on.code, missing,
               missing == 1 ? "" : "s");
         gs_pump_messages();
         Sleep(5);
@@ -665,9 +675,9 @@ static void start_together(void)
             announced = 1;
         }
         if (on.go_at && net_server_ms() >= on.go_at) break;
-        if (missing) title("Downhill Domination online - room %s - waiting for %d player%s to load", on.code, missing,
+        if (missing) title("Downhill Revived online - room %s - waiting for %d player%s to load", on.code, missing,
                            missing == 1 ? "" : "s");
-        else title("Downhill Domination online - room %s - get ready", on.code);
+        else title("Downhill Revived online - room %s - get ready", on.code);
         gs_pump_messages();
         Sleep(on.go_at && on.go_at - net_server_ms() < 20 ? 0 : 2);
     }
@@ -712,7 +722,7 @@ static void read_results(const uint8_t *in, int n)
     }
     on.nresults = count, on.have_results = 1;
     char text[300];
-    int len = snprintf(text, sizeof text, "Downhill Domination online - results:");
+    int len = snprintf(text, sizeof text, "Downhill Revived online - results:");
     for (int i = 0; i < count; i++) {
         int global = on.results[i], time = on.finish[global];
         rider_label(global, name, sizeof name);
@@ -834,6 +844,14 @@ static void state_sync(void)
         (on.have_results || host_wall_seconds() - on.end_held_at > 120)) {
         func_001B45F8(EE_PTR(0x4B1F40), 1, 4 * 60);  /* the results screen in 4 s */
         on.end_done = 1;
+        /* tests (DHD_NET_SCRIPTED): DHD_NET_AFTER_RACE is the menu script from here, e.g. through
+           the results and their menu to QUIT */
+        const char *after = getenv("DHD_NET_AFTER_RACE");
+        if (after && *after && getenv("DHD_NET_SCRIPTED")) {
+            char script[1200];
+            snprintf(script, sizeof script, "%s", after);
+            set_env("DHD_NAV", script);
+        }
     }
     if (EE32(PHASE) < 2 || clock < on.last_sent + SNAPSHOT_TICKS && clock >= on.last_sent) return;
     on.last_sent = clock - clock % SNAPSHOT_TICKS;
@@ -851,7 +869,7 @@ static void state_sync(void)
         last_title = host_wall_seconds();
         hle_puppet_lag(lag, sizeof lag);
         if (!on.have_results)
-            title("Downhill Domination online - room %s - player %d of %d - ping %d ms%s%s", on.code, on.local_slot + 1,
+            title("Downhill Revived online - room %s - player %d of %d - ping %d ms%s%s", on.code, on.local_slot + 1,
                   on.nslots, lobby.ping_ms, lobby.offline ? " - offline" : "",
                   on.end_held ? " - finished, waiting for the others" : "");
         extern unsigned kernel_pace_extra_fields, kernel_pace_late_ms;
@@ -871,6 +889,26 @@ static void choose_view(void)
     gs_native_view = racing && EE32(SETUP + 0x288) >= 3 ? want : 0;
 }
 
+/* The online race is over: the game left the race screen (QUIT to the title, or a quit from the
+   pause menu), or after the results the player chose TRY AGAIN or NEW LEVEL, which start another
+   race on the same screen (race phase back to the flight or the countdown). This PC leaves the
+   room and plays offline again. Before, online mode and the race's spent menu script (DHD_NAV)
+   stayed on, so the game ignored the player's controller (the title's X). The ONLINE menu starts
+   the next online race as the first did. */
+static int connected;
+static void race_over(void)
+{
+    fprintf(stderr, "online: the race is over; back to offline play\n");
+    net_leave();
+    hle_puppet_offline();
+    kernel_pace_shared(0);
+    set_env("DHD_NAV", saved_nav);  /* "" unsets it */
+    set_env("DHD_RACE_SEED", saved_seed);
+    memset(&on, 0, sizeof on);
+    online = 0, from_menu = 0, connected = 0;
+    gs_window_title("Downhill Revived");
+}
+
 void pads_begin_field(void)
 {
     choose_view();
@@ -886,7 +924,6 @@ void pads_begin_field(void)
         log_hash(kernel_vsync_count);
         return;
     }
-    static int connected;
     if (!connected++ && !from_menu) connect_lobby();
     if (!on.released) {
         barrier();
@@ -902,7 +939,9 @@ void pads_begin_field(void)
         on.started = 1;
     }
     if (on.started) state_sync();
-    if (on.started && EE32(MENU) != LOAD_MENU) kernel_pace_shared(0);  /* the race is over */
+    if (on.started && (EE32(MENU) != LOAD_MENU ||
+                       (on.end_done && (EE32(PHASE) < 2 || EE32(PHASE) == FLYBY_PHASE))))
+        race_over();
 }
 
 /* Online: the menu script, then in the race this PC's controller (DHD_NET_SCRIPTED=1, tests:
@@ -910,7 +949,8 @@ void pads_begin_field(void)
 void pads_read(int player, HostPad *out)
 {
     if (online_mode()) {
-        int race = EE32(MENU) == LOAD_MENU && EE32(PHASE) >= 1 && EE32(PHASE) != FLYBY_PHASE;
+        /* the race, and after it the results and their menu (Try Again ... Quit, race phase 0) */
+        int race = EE32(MENU) == LOAD_MENU && (on.started || (EE32(PHASE) >= 1 && EE32(PHASE) != FLYBY_PHASE));
         if (player == 0 && race && !getenv("DHD_NET_SCRIPTED")) host_pad_device(0, out);
         else if (!on.released || !host_pad_script(player, out)) neutral(out);
         for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;

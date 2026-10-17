@@ -37,8 +37,10 @@ What works today:
 - **The movies play**: the intro, the attract loop and OPTIONS > VIDEO CLIPS, decoded with
   libmpeg2 from your disc. Skip Movies in PC SETTINGS turns them off.
 - **PC SETTINGS in the game's own OPTIONS menu**: resolution, display mode, window size, picture
-  shape, scaling, widescreen, skip movies, vibration and texture pack, drawn with the game's own
-  menus and font. Changes are saved to `dhd.ini`.
+  shape, scaling, widescreen, skip movies, vibration, texture pack and font, drawn with the
+  game's own menus and font. Changes are saved to `dhd.ini`.
+- **A sharp font**: the game's text is drawn with clean edges at any resolution, made in memory
+  from the font on your disc (PC SETTINGS > Font: Sharp or Original).
 - **Texture packs**: replacement packs made for PCSX2 (PNG files named by PCSX2's texture hash)
   work unchanged with the native renderer (see [Texture packs](#texture-packs)).
 - **Automatic updates**: at start the game looks for a newer release and offers to install it;
@@ -46,10 +48,15 @@ What works today:
 - **EXIT GAME** in the main menu.
 - **Online races** for 2 to 4 players (experimental): an ONLINE entry in the main menu, a list of
   public races, private races joined with a 6-character code, and a race room where the host
-  picks the track, on the project's official server (see [Online](#online)).
+  picks the track, on the project's official server (see [Online](#online)). After the
+  results the game goes back to offline play with your own controller (TRY AGAIN, NEW LEVEL or
+  QUIT).
 - **Memory card saves**, stored as plain files beside the game.
-- **Controllers**: XInput pads (Xbox style) with vibration; DualSense and DualShock 4 over USB/Bluetooth
-  (no vibration yet); keyboard.
+- **Controllers**: Xbox pads, DualSense, DualShock 4, Switch Pro, 8BitDo and most other USB or
+  Bluetooth pads (through SDL3 and its controller database), with vibration where the pad has
+  motors. Buttons go by position, as on a PlayStation pad.
+- **Keyboard play**: a whole race on the keyboard, with gradual steering; letters go by their
+  place on the keyboard, so AZERTY and QWERTZ work too (see [Controls](#controls)).
 - **Sound**: the game's sound driver is replaced by a native mixer, with music, effects and reverb.
 
 Known gaps:
@@ -90,9 +97,30 @@ need the newest version; an older one is offered Update Now in the ONLINE menu.
 
 ### Controls
 
-A controller works out of the box. On the keyboard: arrow keys, Enter = START,
-Backspace = SELECT, X = Cross, C = Circle, Z = Square, S = Triangle, Q/W = L1/R1,
-1/2 = L2/R2.
+A controller works out of the box. The buttons go by position, as on a PlayStation pad:
+bottom = Cross, right = Circle, left = Square, top = Triangle. A pad SDL doesn't know can be added
+with a line in SDL's format in `gamecontrollerdb.txt` beside `dhd.exe`.
+
+No controller? The keyboard plays a whole race (only while the game's window is in front; it
+works together with a controller):
+
+| Key | Button | What |
+|---|---|---|
+| Arrow keys | d-pad / left stick | move in menus; steer and lean while riding (gradually: a tap steers a little, holding steers fully) |
+| Space or X | Cross | confirm; pedal (press twice: sprint) |
+| Esc, Backspace | Triangle | back in menus; while riding Esc pauses, Backspace brakes |
+| S | Triangle | brake (in the air: tweak a trick) |
+| Enter | START | start the race on the race setup screen, pause |
+| Tab | SELECT | hold + up/down changes the camera, with Q looks back; press twice to bail out |
+| Z / C | Square / Circle | punch / kick |
+| A / D | L1 / R1 | tricks (both together: Superman) |
+| Q / E | L2 / R2 | tricks; E (R2) is also bunny hop |
+| W | R3 | sprint |
+| F | L3 | powerslide |
+
+Letters are places on the keyboard as on a US one: on AZERTY or QWERTZ use the keys in the same
+places. The game's own controls screen (OPTIONS > CONTROLS) names the PlayStation buttons; the
+keys above stand for them.
 
 ### Online
 
@@ -137,6 +165,7 @@ first start. The PC SETTINGS page writes most of them for you.
 | `auto_update` | `ask` | `ask`, `on` (update without asking) or `off` (never look) |
 | `update_url` | (empty) | where to look for updates; empty: this project's GitHub releases |
 | `server` | (empty) | the online server; empty: the official one |
+| `font` | `sharp` | `original` draws the game's font as the PS2 does |
 
 Each key has a `DHD_*` environment variable (`scale` is `DHD_SCALE`, `server` is
 `DHD_NET_SERVER`; see [docs/BUILDING.md](docs/BUILDING.md)), which wins over the file.
@@ -228,6 +257,8 @@ This project builds on the work of others:
   included). The reverb presets are read from the player's own disc (Sony's libsd module).
 - [OpenGOAL](https://github.com/open-goal/jak-project) (ISC): the SPU2 Gaussian interpolation
   table in `port/hle/sound_gaussian.h`.
+- [SDL](https://libsdl.org) 3.4.18 (zlib): controllers, built from its pinned release source by
+  `port/tools/sdl3.py` and linked in statically.
 - [libmpeg2](https://libmpeg2.sourceforge.io) 0.5.1 (GPL-2.0-or-later): the movie decoder,
   `port/third_party/libmpeg2`, unchanged.
 - [xxHash](https://github.com/Cyan4973/xxHash) (BSD-2-Clause): the XXH64 specification, from

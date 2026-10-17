@@ -417,17 +417,21 @@ static XInputGetStateFn xinput(void)
 }
 
 /* The DualShock 2's motors (pad.c, scePadSetActDirect): the small one on or off, the large one
-   0-255. An XInput pad gets them as its high- and low-frequency motors, unless DHD_VIBRATION=0
-   (dhd.ini "vibration", the PC settings page). Output only: nothing comes back into the game.
-   Sony pads over raw HID don't rumble yet. */
+   0-255. A pad gets them as its high- and low-frequency motors (SDL: every pad with motors,
+   gamepad.c; without SDL, XInput pads only), unless DHD_VIBRATION=0 (dhd.ini "vibration", the
+   PC settings page). Output only: nothing comes back into the game. */
 void host_pad_vibrate(int port, int light, int heavy)
 {
-    static int last[2] = {-1, -1};
+    static int last[4] = {-1, -1, -1, -1};
     const char *setting = getenv("DHD_VIBRATION");
     if (setting && !atoi(setting)) light = heavy = 0;
     int key = (light ? 256 : 0) | (heavy & 255);
-    if (port < 0 || port > 1 || key == last[port]) return;
+    if (port < 0 || port > 3 || key == last[port]) return;
     last[port] = key;
+    if (gamepad_start()) {
+        gamepad_vibrate(port, light, heavy);
+        return;
+    }
     xinput();
     if (!xinput_set) return;
     XVibration v = {(WORD)((heavy & 255) * 257), (WORD)(light ? 0xFFFF : 0)};
@@ -604,13 +608,66 @@ static uint8_t stick(SHORT v, int flip)
     return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
 }
 
-/* Keyboard (when the game's console has focus): arrows, Enter START, Backspace SELECT,
-   X CROSS, C CIRCLE, Z SQUARE, S TRIANGLE, Q/W L1/R1, 1/2 L2/R2. */
-static const struct { int key; uint16_t button; } keys[] = {
-    {VK_UP, PAD_UP}, {VK_DOWN, PAD_DOWN}, {VK_LEFT, PAD_LEFT}, {VK_RIGHT, PAD_RIGHT},
-    {VK_RETURN, PAD_START}, {VK_BACK, PAD_SELECT}, {'X', PAD_CROSS}, {'C', PAD_CIRCLE}, {'Z', PAD_SQUARE},
-    {'S', PAD_TRIANGLE}, {'Q', PAD_L1}, {'W', PAD_R1}, {'1', PAD_L2}, {'2', PAD_R2},
-};
+/* The game's controls are in riding mode (D_0029E290, func_00220550): keyboard.c moves the left
+   stick with the arrows then, and the d-pad in menus. */
+static int riding_controls(void) { return *(volatile int32_t *)0x0829E290 != 0; }
+
+/* The keyboard (layout: keyboard.c), only while a window of this process (the game's) is in
+   front, and not while Alt, Ctrl or a Windows key is held, so Alt+Tab, Alt+Enter, Ctrl+Esc and
+   the like stay the system's. A key let go elsewhere is let go here too. */
+static void keyboard_merge(HostPad *out)
+{
+    uint8_t down[256] = {0};
+    DWORD pid = 0;
+    HWND front = GetForegroundWindow();
+    if (front) GetWindowThreadProcessId(front, &pid);
+    if (front && pid == GetCurrentProcessId() && !(GetAsyncKeyState(VK_MENU) & 0x8000) &&
+        !(GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_LWIN) & 0x8000) &&
+        !(GetAsyncKeyState(VK_RWIN) & 0x8000)) {
+        /* Letters are places on the keyboard, named as on a US one: the key where a US keyboard
+           has Z is Square on an AZERTY (W) or QWERTZ (Y) one too. Their scan codes, A to Z: */
+        static const uint8_t us_scan[26] = {0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32,
+                                            0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
+        HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(front, NULL));
+        int count;
+        const uint8_t *keys = keyboard_keys(&count);
+        for (int i = 0; i < count; i++) {
+            UINT vk = keys[i];
+            if (vk >= 'A' && vk <= 'Z') {
+                UINT here = MapVirtualKeyExA(us_scan[vk - 'A'], MAPVK_VSC_TO_VK, layout);
+                if (here) vk = here;
+            }
+            if (GetAsyncKeyState((int)vk) & 0x8000) down[keys[i]] = 1;
+        }
+    }
+    keyboard_pad(down, riding_controls(), host_seconds(), out);
+}
+
+/* DHD_KEYS (tests, finding 059): fake keys from the race's GO on, as DHD_RACE_PAD, through the
+   keyboard's mapping; each change is logged with the steering the rider got from it. */
+static void keys_script(HostPad *out)
+{
+    const char *script = getenv("DHD_KEYS");
+    double seconds = race_sync_seconds();
+    uint8_t down[256];
+    if (!script || seconds < 0) return;
+    if (!keyboard_script(script, seconds, down)) {
+        fprintf(stderr, "Invalid DHD_KEYS: expected start:duration:key[+key],...\n");
+        exit(1);
+    }
+    keyboard_pad(down, riding_controls(), host_seconds(), out);
+    /* the human rider (D_002AF2C0 + 0x50130) and its steering input, right +0x1190, left +0x1194 */
+    uintptr_t rider = *(volatile uint32_t *)0x082FF3F0;
+    int right = 0, left = 0;
+    if (rider >= 0x400000 && rider < 0x0A000000) right = *(volatile int32_t *)(rider + 0x1190), left = *(volatile int32_t *)(rider + 0x1194);
+    static int last[5] = {-1};
+    int now[5] = {out->buttons, out->left_x, out->left_y, right, left};
+    if (memcmp(now, last, sizeof now)) {
+        hle_log("keys race=%.3f riding=%d buttons=%04X lx=%d ly=%d steer right=%d left=%d\n", seconds,
+                riding_controls(), out->buttons, out->left_x, out->left_y, right, left);
+        memcpy(last, now, sizeof now);
+    }
+}
 
 /* DHD_NAV, DHD_AUTOPAD or DHD_AUTOPAD_FRAMES: every player gets the script's buttons (the same
    chord on every pad, so the menus accept any of them); from the race countdown DHD_RACE_PAD
@@ -639,6 +696,7 @@ int host_pad_script(int player, HostPad *out)
     }
     race_sync_vsync(kernel_vsync_count);
     race_sync_pad(player, &out->buttons);
+    if (player == 0) keys_script(out);
     static uint16_t previous;
     if (player == 0 && previous != out->buttons) {
         if (frame_script || nav)
@@ -657,15 +715,13 @@ void host_pad_read(int port, HostPad *out)
         host_pad_device(port, out);
 }
 
-/* The controller itself: XInput pad `port`, else (port 0) a DualSense or DualShock 4, else
-   (port 0) the keyboard while the game has focus. */
-void host_pad_device(int port, HostPad *out)
+/* Without SDL (DHD_SDL=0, or it didn't start): XInput pad `port`, else (port 0) a DualSense or
+   DualShock 4 over raw HID. */
+static void direct_pad(int port, HostPad *out)
 {
     XInputGetStateFn get = xinput();
     XState x;
     size_t i;
-    memset(out, 0, sizeof *out);
-    out->right_x = out->right_y = out->left_x = out->left_y = 128;
     if (get && get((DWORD)port, &x) == ERROR_SUCCESS) {
         static const struct { WORD x; uint16_t button; } map[] = {
             {0x0001, PAD_UP}, {0x0002, PAD_DOWN}, {0x0004, PAD_LEFT}, {0x0008, PAD_RIGHT}, {0x0010, PAD_START},
@@ -713,18 +769,18 @@ void host_pad_device(int port, HostPad *out)
             out->pressure[i] = pressure_order[i] == PAD_L2 ? sony.l2
                              : pressure_order[i] == PAD_R2 ? sony.r2
                              : out->buttons & pressure_order[i] ? 255 : 0;
-        return;
     }
-    DWORD foreground_pid = 0;
-    HWND foreground = GetForegroundWindow();
-    GetWindowThreadProcessId(foreground, &foreground_pid);
-    if (port != 0 || (foreground != GetConsoleWindow() && foreground_pid != GetCurrentProcessId()))
-        return;
-    for (i = 0; i < sizeof keys / sizeof *keys; i++)
-        if (GetAsyncKeyState(keys[i].key) & 0x8000)
-            out->buttons |= keys[i].button;
-    for (i = 0; i < 12; i++)
-        out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;
+}
+
+/* Player `port`'s controller (SDL, gamepad.c, else XInput and the Sony pads directly: one of the
+   two, never both, so a pad isn't read twice), and for player 1 the keyboard as well, merged. */
+void host_pad_device(int port, HostPad *out)
+{
+    memset(out, 0, sizeof *out);
+    out->right_x = out->right_y = out->left_x = out->left_y = 128;
+    if (gamepad_start()) gamepad_read(port, out);
+    else direct_pad(port, out);
+    if (port == 0) keyboard_merge(out);
 }
 
 void *host_fiber_main(void) { return ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH); }
@@ -855,6 +911,7 @@ static void apply_setting(const char *key, const char *value)
         {"update_url", "DHD_UPDATE_URL"}, {"auto_update", "DHD_AUTO_UPDATE"},  /* the updater (update.c) */
         {"texture_pack", "DHD_TEXTURE_PACK"}, {"textures", "DHD_TEXTURES"},  /* texture packs (port/gs/texpack.c) */
         {"texture_cache_mb", "DHD_TEXTURE_CACHE_MB"},
+        {"font", "DHD_FONT"},  /* the sharp font (port/gs/font_sharp.c) */
     };
     if (!_strnicmp(key, "DHD_", 4)) { setting(key, value); return; }
     if (!_stricmp(key, "renderer")) { setting("DHD_RENDER", _stricmp(value, "native") ? "exact" : "native"); return; }
@@ -906,7 +963,7 @@ static void note_overrides(void)
 {
     static const char *const names[] = {"DHD_SCALE", "DHD_WINDOW", "DHD_WINDOW_WIDTH", "DHD_WINDOW_HEIGHT",
                                         "DHD_ASPECT", "DHD_PRESENT_FILTER", "DHD_WIDESCREEN", "DHD_SKIP_MOVIES",
-                                        "DHD_VIBRATION", "DHD_RENDER", "DHD_TEXTURES"};
+                                        "DHD_VIBRATION", "DHD_RENDER", "DHD_TEXTURES", "DHD_FONT"};
     char list[256] = ",";
     if (getenv("DHD_RELAUNCHED")) return;
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
@@ -1017,7 +1074,11 @@ static const char settings_template[] =
     "; used if there is one. textures = off draws the game's own textures (PC SETTINGS > Texture\n"
     "; Pack).\n"
     "texture_pack =\n"
-    "textures = on\n";
+    "textures = on\n"
+    "\n"
+    "; font: sharp draws the game's font with clean edges at any resolution (made in memory from\n"
+    "; the font on your disc each time the game starts); original draws it as the PS2 does.\n"
+    "font = sharp\n";
 
 /* Writes key = value into dhd.ini: replaces the key's first line, else adds one at the end; every
    other line (comments, sections, unknown keys) stays as it was. A missing dhd.ini starts as
@@ -1148,7 +1209,7 @@ static int choose_disc(char *path, size_t size)
    never questioned (the tools set it). Returns 0 to go on, 1 if the player cancelled. */
 int host_disc_ready(void)
 {
-    static const char title[] = "Downhill Domination";
+    static const char title[] = "Downhill Revived";
     static char why[256], chosen[MAX_PATH], message[1024];
     if (iso_from_environment || getenv("DHD_HEADLESS")) return 0;
     const char *iso = getenv("DHD_ISO");

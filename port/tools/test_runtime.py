@@ -180,6 +180,20 @@ with open(cmd, 'w') as f:
             % (rt, hle, hle, autopad_exe))
     f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % autopad_exe)
 
+    keyboard_exe = os.path.join(OUT, 'test_keyboard.exe')  # keyboard layout and steering ramp (finding 059)
+    f.write('@if errorlevel 1 exit /b 1\n')
+    f.write('clang-cl -m32 /nologo /O2 /I"%s" "%s\\keyboard.c" "%s\\test_keyboard.c" /Fe:"%s"\n'
+            % (hle, hle, hle, keyboard_exe))
+    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % keyboard_exe)
+
+    # SDL3 starts and enumerates the controllers (none needed); gamepad.c's smoke test
+    import sdl3
+    sdl_lib, sdl_include = sdl3.build()
+    gamepad_exe = os.path.join(OUT, 'test_gamepad.exe')
+    f.write('clang-cl -m32 /nologo /O2 -w /I"%s" /I"%s" "%s\\gamepad.c" "%s\\test_gamepad.c" "%s" %s /Fe:"%s"\n'
+            % (hle, sdl_include, hle, hle, sdl_lib, ' '.join(sdl3.SYSTEM_LIBS), gamepad_exe))
+    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % gamepad_exe)
+
     sif_exe = os.path.join(OUT, 'test_sif.exe')
     f.write('@if errorlevel 1 exit /b 1\n')
     f.write('clang-cl -m32 /nologo /O2 /I"%s" "%s\\sif.c" "%s\\test_sif.c" /Fe:"%s"\n'

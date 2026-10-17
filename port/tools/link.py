@@ -20,7 +20,7 @@ import collections, glob, json, os, re, shutil, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import data, recomp  # noqa: E402
+import data, recomp, sdl3  # noqa: E402
 from pctarget import HOST_TARGET, IMAGE_BASE, LABEL_PREFIX as P, TARGET  # noqa: E402
 
 ROOT = data.ROOT
@@ -163,16 +163,20 @@ def runtime():
         f.write('static const char gs_shader_path[] = ' + json.dumps('port/gs/raster.hlsl') + ';\n')
     for name in ('runtime/ps2asm.c', 'runtime/vu0_micro.c', 'runtime/vu0_interp.c', 'runtime/recomp.c', 'runtime/fp_trap.c', 'runtime/libc_shims.c',
                  'runtime/memory.c', 'hle/host.c', 'hle/autopad.c', 'hle/timer.c', 'hle/kernel.c', 'hle/boot.c', 'hle/sif.c', 'hle/cdvd.c', 'hle/game_data.c',
-                 'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/vif.c', 'hle/graphics.c', 'hle/graphics_queue.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/online_menu.c', 'hle/online.c', 'hle/puppet.c', 'hle/sound.c', 'gs/memory.c', 'gs/gs.c', 'gs/display.c', 'gs/present.c', 'gs/gpu.c', 'gs/texpack.c', 'gs/capture.c',
+                 'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/vif.c', 'hle/graphics.c', 'hle/graphics_queue.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/online_menu.c', 'hle/online.c', 'hle/puppet.c', 'hle/sound.c', 'gs/memory.c', 'gs/gs.c', 'gs/display.c', 'gs/present.c', 'gs/gpu.c', 'gs/texpack.c', 'gs/font_sharp.c', 'gs/capture.c',
                  # the auto-updater (finding 054)
                  'hle/update.c',
                  # the game's movies (finding 055)
                  'hle/movie.c',
                  # online races (port/net, finding 042)
-                 'net/lockstep.c', 'net/hash.c', 'net/json.c', 'net/client.c', 'net/ws_winhttp.c', 'net/net.c'):
+                 'net/lockstep.c', 'net/hash.c', 'net/json.c', 'net/client.c', 'net/ws_winhttp.c', 'net/net.c',
+                 # the keyboard and the controllers through SDL3 (finding 059)
+                 'hle/keyboard.c', 'hle/gamepad.c'):
         o = os.path.join(OUT, name + '.o')
         os.makedirs(os.path.dirname(o), exist_ok=True)
         extra = ['-DPS2_VU_AOT'] if aot and name == 'runtime/vu0_interp.c' else []
+        if name == 'hle/gamepad.c':
+            extra = ['-I', str(sdl3.build()[1])]
         p = run(['clang', '--target=' + HOST_TARGET, '-c', '-O2', '-msse2', '-mfpmath=sse',
                  '-ffp-contract=off', '-w', '-I', OUT, '-I', os.path.join(ROOT, 'port', 'runtime'),
                  os.path.join(ROOT, 'port', name), '-o', o] + extra)
@@ -273,9 +277,12 @@ def main():
     if p.returncode:
         sys.exit(p.stderr)
     dobjs = [symbols_obj, assemble(fixups_s), res]
+    # SDL3, static (port/tools/sdl3.py), and the Windows libraries it needs: in the object list,
+    # so build_clean.py's relink gets them too
+    libs = [str(sdl3.build()[0])] + ['-Wl,' + name for name in sdl3.SYSTEM_LIBS]
     rsp = os.path.join(OUT, 'objs.rsp')
     with open(rsp, 'w', newline='\n') as f:
-        f.write(''.join(o.replace(os.sep, '/') + '\n' for o in objs + dobjs))
+        f.write(''.join(o.replace(os.sep, '/') + '\n' for o in objs + dobjs + libs))
     def link(extra=()):
         return run(['clang', '--target=' + HOST_TARGET, '-fuse-ld=lld', '-o', os.path.join(OUT, 'dhd.exe'),
                     '@' + rsp, '-Wl,d3dcompiler.lib', '-Wl,d3d11.lib', '-Wl,dxgi.lib', '-Wl,user32.lib', '-Wl,gdi32.lib', '-Wl,winhttp.lib', '-Wl,ole32.lib', *extra, '-Wl,/map:' + os.path.join(OUT, 'dhd.map'), '-Wl,/subsystem:windows', '-Wl,/entry:mainCRTStartup', '-Wl,/safeseh:no', '-Wl,/demangle:no',

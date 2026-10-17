@@ -1,0 +1,194 @@
+/* The keyboard as player 1's DualShock 2 (finding 059). host.c reads which keys are down (only
+   while the game's window has focus) and this file turns them into pad state, merged with the
+   controller's, so both work at once.
+
+   The game reads its controls two ways (src: func_00220550 sets D_0029E290):
+   - in menus (D_0029E290 = 0) only buttons count, each press once: the d-pad moves, Cross
+     accepts, Triangle goes back, START starts a race or pauses;
+   - while riding (D_0029E290 = 1) buttons are held and the left stick steers (X) and leans (Y)
+     in proportion (func_0017E1C0, func_0017E300). The d-pad steers too, but always at full lock
+     (func_0012DEB0 reads a digital press as 1.0).
+   So while riding the arrow keys move the left stick instead of the d-pad, ramped: full tilt
+   ~100 ms after the press, back to centre at once on release. The ramp is linear in what the
+   game makes of the stick: func_00220AE0 has a dead zone (raw 92-162) and two slopes, and the
+   steering squares the result (v * v / 127), so each step of the ramp picks the raw value whose
+   steering is the wanted fraction of full lock. Esc pauses while riding (START) and goes back
+   in menus (Triangle).
+
+   A key keeps the meaning it had when it went down until it is let go: Esc pressed while riding
+   stays START while the pause menu opens, so the menu doesn't see a Triangle and close again.
+
+   Layout (keys are Windows virtual-key codes):
+     arrows     d-pad in menus; steer / lean while riding (left stick, ramped)
+     Space, X   Cross     confirm; pedal (twice: sprint)
+     S          Triangle  back; brake (tweak a trick in the air)
+     Backspace  Triangle  back; brake
+     Esc        Triangle in menus (back), START while riding (pause)
+     Enter      START     start the race, pause
+     Tab        SELECT    hold + up/down: camera; with Q: look back; twice: bail out
+     Z          Square    punch
+     C          Circle    kick
+     A, D       L1, R1    tricks (both: Superman)
+     Q, E       L2, R2    tricks; R2 bunny hop
+     W          R3        sprint
+     F          L3        powerslide */
+#include "hle.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum { VK_BACK_ = 0x08, VK_TAB_ = 0x09, VK_RETURN_ = 0x0D, VK_ESCAPE_ = 0x1B, VK_SPACE_ = 0x20,
+       VK_LEFT_ = 0x25, VK_UP_ = 0x26, VK_RIGHT_ = 0x27, VK_DOWN_ = 0x28 };
+enum { NO_AXIS, LEFT_X, LEFT_Y };
+
+typedef struct {
+    uint8_t key;
+    uint16_t menu, riding;  /* the button in menus and while riding */
+    uint8_t axis;           /* while riding: the left stick axis it moves instead, */
+    int8_t dir;             /* -1 left/up, 1 right/down */
+} Key;
+
+static const Key keys[] = {
+    {VK_LEFT_, PAD_LEFT, 0, LEFT_X, -1},   {VK_RIGHT_, PAD_RIGHT, 0, LEFT_X, 1},
+    {VK_UP_, PAD_UP, 0, LEFT_Y, -1},       {VK_DOWN_, PAD_DOWN, 0, LEFT_Y, 1},
+    {VK_SPACE_, PAD_CROSS, PAD_CROSS},     {'X', PAD_CROSS, PAD_CROSS},
+    {'S', PAD_TRIANGLE, PAD_TRIANGLE},     {VK_BACK_, PAD_TRIANGLE, PAD_TRIANGLE},
+    {VK_ESCAPE_, PAD_TRIANGLE, PAD_START}, {VK_RETURN_, PAD_START, PAD_START},
+    {VK_TAB_, PAD_SELECT, PAD_SELECT},     {'Z', PAD_SQUARE, PAD_SQUARE},
+    {'C', PAD_CIRCLE, PAD_CIRCLE},         {'A', PAD_L1, PAD_L1},
+    {'D', PAD_R1, PAD_R1},                 {'Q', PAD_L2, PAD_L2},
+    {'E', PAD_R2, PAD_R2},                 {'W', PAD_R3, PAD_R3},
+    {'F', PAD_L3, PAD_L3},
+};
+enum { KEYS = sizeof keys / sizeof *keys };
+
+#define RAMP_SECONDS 0.1
+#define FIELD_SECONDS (1.0 / 60)
+
+static struct {
+    int8_t held[KEYS];      /* 0 up, 1 down as in menus, 2 down as while riding */
+    int8_t dir[3];          /* each stick axis: the direction the arrows last gave it, */
+    double since[3];        /* from when (its ramp starts there) */
+} state;
+
+const uint8_t *keyboard_keys(int *count)
+{
+    static uint8_t list[KEYS];
+    for (int i = 0; i < KEYS; i++) list[i] = keys[i].key;
+    *count = KEYS;
+    return list;
+}
+
+void keyboard_reset(void) { memset(&state, 0, sizeof state); }
+
+/* What the game makes of a raw stick byte: func_00220AE0 (riding, D_0029E290 = 1). */
+int keyboard_game_axis(int raw)
+{
+    int value;
+    if (raw >= 226) {
+        value = (int)(((float)raw - 225.0f) * 2.133333444595337f + 64.0f);
+        if (value >= 128) value = 127;
+    } else if (raw >= 163) {
+        value = raw - 162;
+        if (value >= 65) value = 64;
+    } else if (raw < 30) {
+        value = (int)((float)raw * 2.133333444595337f + -127.0f);
+        if (value <= -128) value = -127;
+    } else if (raw < 92) {
+        value = (int)((92.0f - (float)raw) * -1.0322580337524414f);
+        if (value <= -65) value = -64;
+    } else
+        value = 0;
+    if (value >= 128) value = 127;
+    else if (value <= -128) value = -127;
+    return abs(value) <= 1 ? 0 : value;
+}
+
+/* The raw byte for a fraction (0..1] of full steering in direction dir: the first one out from
+   the centre whose steering (value squared / 127, func_0017E1C0) reaches it. */
+static uint8_t ramp_raw(double fraction, int dir)
+{
+    int want = (int)ceil(fraction * 127.0 - 1e-9), raw = 128;
+    if (want < 1) want = 1;
+    for (int step = 1; step <= 128; step++) {
+        raw = dir > 0 ? 127 + step : 128 - step;
+        if (raw > 255) raw = 255;
+        if (raw < 0) raw = 0;
+        int v = abs(keyboard_game_axis(raw));
+        if (v * v / 127 >= want || (v >= 127)) break;
+    }
+    return (uint8_t)raw;
+}
+
+/* Merges the keys that are down into `out` (a controller's state, or a neutral pad): buttons and
+   pressures add, the left stick follows the arrows while riding. */
+void keyboard_pad(const uint8_t down[256], int riding, double now, HostPad *out)
+{
+    static const uint16_t pressure_order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
+                                                PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
+    uint16_t buttons = 0;
+    int dir[3] = {0};
+    for (int i = 0; i < KEYS; i++) {
+        const Key *k = &keys[i];
+        if (!down[k->key]) {
+            state.held[i] = 0;
+            continue;
+        }
+        if (!state.held[i]) state.held[i] = riding ? 2 : 1;
+        if (state.held[i] == 2 && k->axis) dir[k->axis] += k->dir;
+        else buttons |= state.held[i] == 2 ? k->riding : k->menu;
+    }
+    for (int axis = LEFT_X; axis <= LEFT_Y; axis++) {
+        if (dir[axis] != state.dir[axis]) {  /* pressed, let go or turned: the ramp starts again */
+            state.dir[axis] = (int8_t)dir[axis];
+            state.since[axis] = now;
+        }
+        if (!dir[axis]) continue;  /* none, or both directions: the centre */
+        double fraction = (now - state.since[axis] + FIELD_SECONDS) / RAMP_SECONDS;
+        if (fraction > 1) fraction = 1;
+        uint8_t raw = ramp_raw(fraction, dir[axis]);
+        if (axis == LEFT_X) out->left_x = raw;
+        else out->left_y = raw;
+    }
+    out->buttons |= buttons;
+    for (int i = 0; i < 12; i++)
+        if (buttons & pressure_order[i]) out->pressure[i] = 255;
+}
+
+/* DHD_KEYS (tests): "start:duration:key[+key],..." as DHD_RACE_PAD, seconds on the race clock
+   after GO; keys: up down left right space enter esc tab backspace, or a letter. Sets down[]
+   for the given time; 0 if the script is invalid. */
+int keyboard_script(const char *script, double seconds, uint8_t down[256])
+{
+    static const struct { const char *name; uint8_t key; } names[] = {
+        {"up", VK_UP_}, {"down", VK_DOWN_}, {"left", VK_LEFT_}, {"right", VK_RIGHT_}, {"space", VK_SPACE_},
+        {"enter", VK_RETURN_}, {"esc", VK_ESCAPE_}, {"tab", VK_TAB_}, {"backspace", VK_BACK_},
+    };
+    memset(down, 0, 256);
+    while (script && *script) {
+        double start, duration;
+        char chord[128];
+        int consumed = 0;
+        if (sscanf(script, "%lf:%lf:%127[a-z+]%n", &start, &duration, chord, &consumed) != 3 || start < 0 ||
+            duration <= 0)
+            return 0;
+        int active = seconds >= start && seconds < start + duration;
+        for (char *name = chord; *name;) {
+            char *end = strchr(name, '+');
+            size_t n = end ? (size_t)(end - name) : strlen(name);
+            int key = -1;
+            if (n == 1) key = name[0] - 'a' + 'A';
+            for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+                if (strlen(names[i].name) == n && !strncmp(names[i].name, name, n)) key = names[i].key;
+            if (key < 0) return 0;
+            if (active) down[key] = 1;
+            name += n + (end != NULL);
+        }
+        script += consumed;
+        if (*script == ',') script++;
+        else if (*script) return 0;
+    }
+    return 1;
+}

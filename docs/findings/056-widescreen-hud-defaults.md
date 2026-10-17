@@ -166,7 +166,7 @@ EE dump at the main menu (DHD_NAV_DUMP, widescreen off, as in the gate) already 
 bb898f87 vs this build, among 53 differing words of that buffer. With widescreen off every 2D
 helper is the identity. So in the front end the only change is the fifth row's text, which
 leaves more glyphs in the buffer, and these leftovers carry into the race. This is by reasoning
-and the dump, not an A/B build of c61937ef. Per the coordinator, the reference is re-recorded
+and the dump, not an A/B build of c61937ef. The reference is re-recorded
 once at integration; until then "arms match, only these words differ" is the pass.
 
 The later commits of this round were not run through the gate; the user asked for short checks:

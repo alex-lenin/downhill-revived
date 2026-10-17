@@ -138,9 +138,9 @@ int game_data_load(void)
     if (!getenv("DHD_HEADLESS")) {
         char message[1024];
         snprintf(message, sizeof message, "The game's data can't be read from the disc image\n%s\n\n%s\n\n"
-                 "Downhill Domination plays from your own copy of the disc: an unchanged .iso file of "
+                 "Downhill Revived plays from your own copy of the disc: an unchanged .iso file of "
                  "Downhill Domination (USA), SCUS-97177.", path ? path : "(none chosen)", problem);
-        MessageBoxA(NULL, message, "Downhill Domination", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        MessageBoxA(NULL, message, "Downhill Revived", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     }
     return 0;
 }

@@ -19,7 +19,8 @@ dhd.exe needs only Windows' own DLLs (the C runtime is linked in), so nothing el
 The zip is refused if dhd.exe:
   - isn't what build_clean.py wrote (manifest.json beside it: same hash, VU1 AOT, no --recomp-basis);
   - holds an absolute path (a builder's folder, C:\\Users\\..., the repository's own path), in
-    ASCII or UTF-16;
+    ASCII or UTF-16 (a drive path "X:\\..." in ASCII: in the data sections, where strings are; in
+    machine code such bytes are an instruction's operand);
   - holds a server address other than the official one (dhd-online.downhill-revived.workers.dev,
     the built-in default): another workers.dev host, DHD_NET_SERVER when set, or the server line of a
     dhd.ini named by --settings;
@@ -33,6 +34,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
 import zipfile
 from pathlib import Path
@@ -95,11 +97,28 @@ def other_hosts(text):
     return sorted({m.group(0).lower() for m in WORKERS_HOST.finditer(text)} - {OFFICIAL_HOST})
 
 
+def without_code(data):
+    """data with the bytes of the PE's executable sections zeroed. The compiler puts every string in a
+    data section, never in code; in code a 4-byte immediate after an opcode can spell a drive path by
+    chance (push 0x407c2f3a is 'h:/|@'), depending only on where the linker placed things."""
+    out = bytearray(data)
+    pe = struct.unpack_from('<I', data, 0x3C)[0]
+    assert data[:2] == b'MZ' and data[pe:pe + 4] == b'PE\0\0', 'dhd.exe is not a PE file'
+    count, optional = struct.unpack_from('<H', data, pe + 6)[0], struct.unpack_from('<H', data, pe + 20)[0]
+    for k in range(count):
+        header = pe + 24 + optional + 40 * k
+        size, offset = struct.unpack_from('<II', data, header + 16)
+        if struct.unpack_from('<I', data, header + 36)[0] & 0x20000000:  # IMAGE_SCN_MEM_EXECUTE
+            out[offset:offset + size] = bytes(size)
+    return bytes(out)
+
+
 def exe_problems(exe, servers):
     data = exe.read_bytes()
     problems = []
     for text, kind in ((data, 'ASCII'), (utf16_strings(data), 'UTF-16')):
-        for m in ABSOLUTE.finditer(text):
+        # drive paths: in the data sections only (see without_code); every other check reads it all
+        for m in ABSOLUTE.finditer(without_code(text) if kind == 'ASCII' else text):
             problems.append('%s absolute path %r' % (kind, m.group(0)[:120].decode('ascii', 'replace')))
         for host in other_hosts(text):
             problems.append('%s server host %r' % (kind, host.decode('ascii', 'replace')))

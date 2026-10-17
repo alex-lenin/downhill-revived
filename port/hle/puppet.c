@@ -353,6 +353,18 @@ void hle_puppet_online(int local, int nslots, int host)
     fprintf(stderr, "\n");
 }
 
+/* The online race is over (online.c, back at the menus): no puppets, the next race is the game's own. */
+void hle_puppet_offline(void)
+{
+    if (!pp.online) return;
+    pp.online = 0;
+    for (int i = 1; i < NRIDERS; i++)
+        if (i != pp.play_slot) memset(&pp.p[i], 0, sizeof pp.p[i]);
+    memset(pp.gone, 0, sizeof pp.gone);
+    pp.hits_taken = 0, pp.nevents = 0;
+    fprintf(stderr, "puppet: offline\n");
+}
+
 /* A player left (lobby slot); host: who runs the AI now (the lowest still connected). The riders
    this PC now owns stop being puppets: their own AI and physics take over where they are, and
    from here on this PC sends their snapshots. */

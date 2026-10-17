@@ -18,13 +18,41 @@ How to play
    remembered in dhd.ini (the game writes this file then); you are only asked again if the file
    moves or changes.
 
-Controls: a controller works out of the box (Xbox-style XInput pads with vibration, DualSense and
-DualShock 4 over USB or Bluetooth). Keyboard: arrow keys, Enter = START, Backspace = SELECT,
-X = Cross, C = Circle, Z = Square, S = Triangle, Q/W = L1/R1, 1/2 = L2/R2.
+Controls
+A controller works out of the box: Xbox pads, DualSense, DualShock 4, Switch Pro, 8BitDo and most
+other USB or Bluetooth pads (through SDL3 and its controller database), with vibration where the
+pad has motors. The buttons go by position, as on a PlayStation pad: bottom = Cross, right =
+Circle, left = Square, top = Triangle. A pad SDL doesn't know can be added with a line in SDL's
+format in gamecontrollerdb.txt beside dhd.exe.
+
+No controller? The keyboard plays a whole race (only while the game's window is in front; it
+works together with a controller):
+    Arrow keys       move in menus; steer and lean while riding (they tilt the stick
+                     gradually, so a short tap steers a little and holding steers fully)
+    Space or X       Cross: confirm; pedal (press twice: sprint)
+    Esc, Backspace   Triangle: back in menus. While riding Esc pauses, Backspace brakes
+    S                Triangle: brake (in the air: tweak a trick)
+    Enter            START: start the race on the race setup screen, pause
+    Tab              SELECT: hold + up/down changes the camera, with Q looks back,
+                     press twice to bail out
+    Z / C            Square / Circle: punch / kick
+    A / D            L1 / R1: tricks (both together: Superman)
+    Q / E            L2 / R2: tricks; E (R2) is also bunny hop
+    W                R3: sprint
+    F                L3: powerslide
+Letters are places on the keyboard as on a US one: on AZERTY or QWERTZ use the keys in the same
+places (e.g. Square is the key left of X, wherever its label says Z, W or Y).
+The game's own controls screen (OPTIONS > CONTROLS) and its trick lists name the PlayStation
+buttons; the keys above stand for them.
 
 Settings: OPTIONS > PC SETTINGS in the game's menu (resolution, display mode, window size,
-picture shape, scaling, widescreen, skip movies, vibration, texture pack). Changes are saved to
-dhd.ini at once.
+picture shape, scaling, widescreen, skip movies, vibration, texture pack, font). Changes are
+saved to dhd.ini at once.
+
+Font: the game's text is drawn with sharp edges at any resolution ("font = sharp", the
+default). The sharp font is made in memory from the font on your disc each time the game
+starts; nothing is saved. "font = original" (PC SETTINGS > Font, at the next start) draws it as
+the PS2 does. A texture pack that replaces the font wins over both.
 
 Texture packs (upscale mods)
 Texture replacement packs made for PCSX2 work unchanged (PNG files named by PCSX2's texture

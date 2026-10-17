@@ -249,6 +249,62 @@ deleted dhd.exe.old and found "0.2.0 is the newest". After it: dhd.exe is the re
 2253ddf9...), README.txt replaced, LICENSE and notices added, dhd.ini and the save byte for byte
 the same, no dhd-update folder. The folder was deleted.
 
+## 7. Release 0.2.1 (round 42): the windows say Downhill Revived
+
+c6a4cc4f: the game window (`present.c`), the disc and game-data message boxes (`host.c`,
+`game_data.c`) and the online window titles and error box (`online.c`) say "Downhill Revived"
+(the updater already did). The disc is still named "Downhill Domination (USA)" where the text
+means the disc. `version.h` 0.2.1. The old developer launchers (`port/launcher`, `port/online`)
+and the PCSX2 movie header in `compare_pcsx2.py` keep the game's name.
+
+- Build: `build_clean.py` on c6a4cc4f, dhd.exe sha256
+  3f7756f34a9498b8959dd0f094f42bb685f069bed57f1f21218742a6eec666b5.
+- Gate against r40-plain: NATIVE RENDERER GAME-STATE GATE MATCH, 1,151 readbacks.
+- `DownhillRevived-0.2.1-win.zip`, sha256
+  c6840bba532f3bec69df87c8746b6fd7630b944e91bbb6c6cb1834c36e44d753 (2,186,596 bytes), and
+  `latest.json` for v0.2.1.
+- Smoke test (the zip unzipped, `DHD_WINDOW=windowed`, menus by `DHD_NAV`): the disc prompt and the
+  game window are titled "Downhill Revived"; a race started (Alpine, clock running).
+- Updater, for real: the 0.2.0 release (from its zip, dhd.exe 2253ddf9...) in a new folder with
+  `auto_update = ask` and `update_url` = the 0.2.1 latest.json on a local `http.server` (its url
+  pointed at the same server). The box "Downhill Revived 0.2.1 is available (this is 0.2.0)",
+  Update now (BM_CLICK): downloaded 2,186,596 bytes with the right sha256, "installed over
+  0.2.0; starting it", the new process deleted dhd.exe.old and found 0.2.1 newest. dhd.exe is
+  then 0.2.1's (3f7756f3...); dhd.ini and the save are unchanged. The folder was deleted.
+
+## 8. Release 0.2.2 (round 43): after-race fix, sharp font, keyboard and SDL3 pads
+
+c4e2c707 (version.h 0.2.2) on top of finding 054 section 7, 058 and 059.
+
+- Build: `build_clean.py` on c4e2c707, compile 77 s, link 365 s. The worktree had no SDL build;
+  `link.py` ran `sdl3.py`, which unpacked the pinned SDL3 3.4.18 tarball (copied from
+  build/downloads) and built `build/port/sdl3/3.4.18/build/SDL3-static.lib` inside the worktree
+  with CMake. dhd.exe sha256 805d4e0913a56d0d995495bf75ffd1973b9a14611c69e652fdfcf9da8c22d781.
+- Gate against r40-plain: NATIVE RENDERER GAME-STATE GATE MATCH, 1,156 readbacks.
+- `DownhillRevived-0.2.2-win.zip` (2,808 KB, sha256
+  4d400a85f3a8796f9a012f186203808c3036bfafe1dacd688c9d76b6c760178c) and `latest.json` for v0.2.2.
+  `scan_retail.py`: the same 14 runs from the decompiled source, none other. Icon resource present.
+- Smoke test (zip unzipped; dhd.ini with only the iso and `window = windowed`, so the player
+  defaults applied; `DHD_NAV`): title to the main menu (five rows, EXIT GAME last); OPTIONS >
+  PC SETTINGS shows the Font row, "Sharp" by default; a race started (Alpine).
+- Updater: the 0.2.0 release with `auto_update = on` and a local latest.json for 0.2.2:
+  "0.2.2 is available (this is 0.2.0)", 2,875,947 bytes downloaded and checked, installed,
+  started; the new process deleted dhd.exe.old and found 0.2.2 newest; dhd.exe is 0.2.2's,
+  README and notices replaced, dhd.ini and the save unchanged. The folder was deleted.
+
+Online between 0.2.0 and 0.2.2: they can't share a room, so they can't desync. The lobby
+version is `dhd-port <version> <first 8 bytes of the exe's SHA-256>` (`online.c`
+`build_version`) and the server refuses a joiner whose string differs from the room's
+(`room.ts`, `version_mismatch`); the public list marks such rooms "(other version)" and won't
+join them. Apart from that, what goes over the wire is unchanged: `port/net` and the puppet
+snapshot format (`hle_puppet_pack` / `hle_puppet_receive`) have no diff since 0.2.0, and no
+`src/`, patch or data change touches the game's simulation. The 0.2.2 online changes are local:
+after the results the PC leaves the room and plays offline (`race_over`), and the player's own
+controller drives the results menu. Keyboard and SDL3 pads only feed the local pad. The sharp
+font reads EE memory and writes only the native renderer's textures. Raising MIN_VERSION to
+0.2.2 is still worth doing: 0.2.0 players would otherwise see 0.2.2 rooms as "other version"
+with no hint, and 0.2.0 keeps the dead controller after an online race.
+
 ## Open
 
 - A save writes `saves\card1` on demand; the first run above made none.

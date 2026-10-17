@@ -22,11 +22,14 @@ For both builds:
 For the PC port, also:
 
 - [LLVM](https://github.com/llvm/llvm-project/releases) for Windows: `clang`, `clang-cl`,
-  `lld-link`, `llvm-nm`, `llvm-objcopy` and `llvm-cxxfilt` on PATH. The project is built with
+  `lld-link`, `llvm-rc`, `llvm-nm`, `llvm-objcopy` and `llvm-cxxfilt` on PATH. The project is built with
   LLVM 23. `build_clean.py` also finds a [scoop](https://scoop.sh) install (`scoop install llvm`)
   that is not on PATH.
 - Visual Studio 2022 Build Tools (or Visual Studio) with the "Desktop development with C++"
   workload: the MSVC **x86** libraries and a Windows SDK. clang finds them by itself.
+- [CMake](https://cmake.org) 3.16 or newer, on PATH or in `C:\Program Files\CMake`, for SDL3
+  (controllers). `requirements.txt` brings the `ninja` package it builds with.
+- A network connection once, for SDL3's source (see [SDL3](#sdl3-controllers)).
 
 For the matching build, also:
 
@@ -83,6 +86,22 @@ full-speed executable. `--install` also copies it to `build/port/fast-preview/na
 with the settings launcher. (`--recomp-basis` exists only to compare with old local builds; never
 use it for a release.)
 
+### SDL3 (controllers)
+
+`port/tools/sdl3.py`, which `link.py` runs, provides SDL3 as a static library, so `dhd.exe`
+stays one file:
+
+- it downloads `SDL3-3.4.18.tar.gz` from SDL's GitHub release into `build/downloads/` and checks
+  its SHA-256 (pinned in the script; any other file is refused). `build_clean.py` copies
+  `build/downloads/` into its worktree, so later builds need no network;
+- it builds with CMake + Ninja + clang for `i686-pc-windows-msvc`, the static C runtime, only the
+  joystick, gamepad, HIDAPI and event parts (DirectInput, XInput, RawInput, Windows.Gaming.Input
+  and HID drivers), into `build/port/sdl3/3.4.18/` (about 2 minutes, once per worktree);
+- `link.py` links `SDL3-static.lib` and the Windows libraries it needs.
+
+To change the version, update `VERSION` and `SHA256` in `sdl3.py` together (the hash of the
+release's `.tar.gz` as GitHub lists it). `python port/tools/sdl3.py` builds it alone.
+
 ### Package a release
 
     python port/tools/package_release.py --exe build/port/clean/<revision>/dhd.exe --version <version>
@@ -114,6 +133,9 @@ first time. `DHD_ISO=<path to iso>` in the environment skips the question.
 Tests of the port runtime (after `port/tools/build.py`):
 
     python port/tools/test_runtime.py
+
+They include `test_keyboard` (keyboard layout and steering ramp) and `test_gamepad` (SDL starts
+and lists the controllers; none needed).
 
 ### The game-state gate
 
@@ -198,6 +220,8 @@ the file. A few useful ones:
 | `update_url` / `DHD_UPDATE_URL` | a `latest.json` or GitHub releases API address (empty: the official releases) |
 | `server` / `DHD_NET_SERVER` | the online server address (empty: the official server) |
 | `renderer` / `DHD_RENDER` | `native` (default for players) or `exact` (the reference) |
+| `font` / `DHD_FONT` | `sharp` (the default) or `original`, the game's font as the PS2 draws it |
+| `DHD_SDL` | `0` reads controllers without SDL (XInput and Sony pads only) |
 
 A dhd.ini without a key gets the player defaults (`port/hle/host.c`, `player_defaults`):
 native renderer, scale 2, borderless, widescreen 1, movies on. With no dhd.ini at all (the test

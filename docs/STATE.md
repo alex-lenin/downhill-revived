@@ -122,7 +122,7 @@ Boot, disc and input (plan step 6, in progress, finding 020).
 - PS2 RAM is also mapped at its own addresses from 0x400000 (the data files hold PS2 pointers).
 - Calls that pass arguments only in registers are written out in `src` (58 more sites, still
   MATCH).
-- Controllers work: `pad.c`, XInput or the keyboard.
+- Controllers work: `pad.c`; SDL3 or XInput/Sony HID, and the keyboard (finding 059).
 - The game boots, loads and relocates its first resources, runs VU0 scene setup, and keeps
   running its first screen without crashing.
 - Open: memory card (`mcserv`), multitap (replies "none"), sound.
@@ -1330,6 +1330,49 @@ retail scan clean, icon resource present. The unzipped release: defaults written
 start, movies play, EXIT GAME exits with 0, a race starts. Updater dry run (a 0.1.9-marked
 copy, a local latest.json): the real 0.2.0 zip downloaded, checked, installed and started,
 dhd.ini and saves untouched.
+
+Round 42, release 0.2.1 (finding 053, section 7): window and message box titles say "Downhill
+Revived"; version 0.2.1. Clean build c6a4cc4f, gate passes against r40-plain, zip (sha256
+c6840bba...d753) and latest.json made. The 0.2.0 release updated itself to 0.2.1 from a local
+latest.json (Update now).
+
+Round 43, release 0.2.2 (finding 053, section 8): version 0.2.2 (c4e2c707) with the online
+after-race fix, the sharp font and keyboard / SDL3 pads. Clean build (SDL3 built by sdl3.py in
+the fresh worktree), gate passes against r40-plain, zip (sha256 4d400a85...178c) and
+latest.json made, retail scan clean. Smoke: menus, PC SETTINGS with the Font row, a race. The
+0.2.0 release updated itself to 0.2.2. Online: 0.2.0 and 0.2.2 can't share a room (the lobby
+version carries the exe hash), and nothing on the wire or in the simulation changed.
+
+Round 42, sharp font (finding 058): the game's text is readable at 2x-4x.
+- `port/gs/font_sharp.c` takes the text engine's font texture (the TEX0 in `D_004F35B0`'s
+  commands), as the game uploaded it from the disc. In memory it makes a magnified copy:
+  cubic B-spline magnification, then the edges cut as a distance field's are when drawn.
+- The native renderer draws the copy as a texture pack replacement, with mipmaps. A pack's own
+  font wins.
+- The menus' 512x512 font lives in a depth buffer's top bytes. It is now drawn from the CPU copy
+  rather than rebuilt on the GPU.
+- Nothing is written to disk. No third-party code (xBRZ was considered, not used).
+- dhd.ini `font = sharp|original` (default sharp); PC SETTINGS > Font, at the next start.
+- With `font = original`, the menu screenshots are byte-identical to before, apart from the new
+  row.
+- Before/after crops: `build/port/r41font/shots/`.
+- Gate on the clean build of 29f9d938: match against r40-plain, with the sharp font on (the
+  default). scan_retail.py and package_release.py pass.
+
+Round 42, keyboard and generic controllers (finding 059): a whole race plays on the keyboard,
+and non-XInput pads work through SDL3.
+- Keyboard (`port/hle/keyboard.c`): arrows are the d-pad in menus and, while the game's riding
+  controls are on (`D_0029E290`), tilt the left stick, ramped to full in 100 ms (linear in the
+  game's own steering, after its dead zone and squaring); Space/X Cross, S/Backspace Triangle,
+  Esc back or pause, Enter START, Tab SELECT, Z/C Square/Circle, A/D L1/R1, Q/E L2/R2, W/F R3/L3,
+  letters by place (AZERTY/QWERTZ). Read only while the game's window is in front and no
+  Alt/Ctrl/Win is held; merged with player 1's controller.
+- Controllers (`port/hle/gamepad.c`): SDL 3.4.18, static, built by `port/tools/sdl3.py` from the
+  pinned, hash-checked source (CMake; `docs/BUILDING.md`). It replaces the direct XInput and Sony
+  HID paths, which remain the fallback (`DHD_SDL=0`); vibration on every pad with motors.
+- Checked: test_keyboard; SDL enumerates this PC's DualSense; a DHD_KEYS race (fake keys) gives
+  the rider steering 22, 43, 65, 85, 107, 127 over 100 ms; the gate passes. Real key presses,
+  generic/Switch/8BitDo pads and actual vibration need someone at the PC.
 
 ## Online play (plan: docs/ONLINE-PLAN.md)
 2026-10-16 step 1, server (finding 039): `online/server/` is the Cloudflare Workers + Durable

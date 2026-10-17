@@ -51,7 +51,7 @@ static DWORD WINAPI window_thread(void *arg)
 {
     WindowSpec *s = arg;
     MSG msg;
-    window = CreateWindowA(s->class_name, "Downhill Domination", s->style, s->x, s->y, s->w, s->h, NULL, NULL,
+    window = CreateWindowA(s->class_name, "Downhill Revived", s->style, s->x, s->y, s->w, s->h, NULL, NULL,
                            GetModuleHandleA(NULL), NULL);
     SetEvent(s->ready);  /* s is gone after this */
     if (!window) return 0;

@@ -222,6 +222,8 @@ int race_sync_pad(int player, uint16_t *buttons)
     return 1;
 }
 
+double race_sync_seconds(void) { return race_in(1) ? race_clock / 60.0 : -1; }
+
 /* A race seeds its RNGs (start grid, AI) from the EE time since a timer reset (0016B8C8:
    func_00238F10), which follows load timing. DHD_RACE_SEED pins it, so the port starts the race
    PCSX2 compared against (the seed is stored at 0x0043FA10). */

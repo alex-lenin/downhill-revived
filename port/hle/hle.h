@@ -68,6 +68,7 @@ int autopad_read(const char *script, double seconds, uint16_t *buttons);
 int autopad_nav(const char *script, unsigned long long field, uint16_t *buttons);  /* DHD_NAV */
 void race_sync_vsync(unsigned long long field);  /* DHD_RACE_SYNC, see autopad.c */
 int race_sync_pad(int player, uint16_t *buttons);
+double race_sync_seconds(void);  /* race clock seconds after GO (DHD_RACE_SYNC), -1 before */
 int race_sync_capture(const char *prefix, char *name, size_t size);
 
 /* One controller's state, as a DualShock 2 reports it: buttons as libpad's bits (1 = pressed,
@@ -81,7 +82,21 @@ typedef struct {
 } HostPad;
 void host_pad_read(int port, HostPad *out);  /* a script if one is set, else the controller */
 int host_pad_script(int player, HostPad *out);  /* DHD_NAV / DHD_AUTOPAD / DHD_RACE_PAD; 0 if none */
-void host_pad_device(int port, HostPad *out);   /* XInput pad, else DualSense/DS4, else the keyboard */
+void host_pad_device(int port, HostPad *out);   /* the controller, and for port 0 the keyboard too */
+
+/* keyboard.c: keys (Windows virtual-key codes, down[key] != 0) as a pad, merged into `out`;
+   `riding`: the game's riding controls are on (D_0029E290), the arrows move the left stick. */
+void keyboard_pad(const uint8_t down[256], int riding, double now, HostPad *out);
+const uint8_t *keyboard_keys(int *count);  /* the keys it reads */
+void keyboard_reset(void);
+int keyboard_game_axis(int raw);           /* the game's reading of a stick byte (-127..127) */
+int keyboard_script(const char *script, double seconds, uint8_t down[256]);  /* DHD_KEYS */
+
+/* gamepad.c: controllers through SDL3 (XInput, DirectInput, HID: DualSense, DualShock 4, Switch
+   Pro and the generic pads in SDL's mapping database). gamepad_start: 1 if SDL is running. */
+int gamepad_start(void);
+int gamepad_read(int player, HostPad *out);  /* 0: no controller for that player */
+void gamepad_vibrate(int player, int light, int heavy);
 
 /* ---- kernel.c ---- */
 enum { INTC_GS = 0, INTC_VBLANK_START = 2, INTC_VBLANK_END = 3, INTC_TIMER0 = 9 };
