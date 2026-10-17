@@ -833,12 +833,29 @@ static void mix_sample(int32_t mix[2])
     snd_debug_gain_frame(grain_samples, components, nvoices, nstreams, voice_gain);
 }
 
+#ifndef SND_NO_HOST
+int movie_playing(void);                     /* port/hle/movie.c */
+void movie_audio(int32_t *mix, int frames);  /* adds the movie's sound, moves its clock on */
+#endif
+
 static void render(int16_t *stereo, int samples)
 {
     int i;
+#ifndef SND_NO_HOST
+    /* A movie's PCM (finding 055), added like a voice; its clock is these rendered samples. */
+    int32_t movie[1024 * 2];
+    int with_movie = samples <= 1024 && movie_playing();
+    if (with_movie) {
+        memset(movie, 0, (size_t)samples * sizeof movie[0] * 2);
+        movie_audio(movie, samples);
+    }
+#endif
     for (i = 0; i < samples; i++) {
         int32_t mix[2];
         mix_sample(mix);
+#ifndef SND_NO_HOST
+        if (with_movie) { mix[0] += movie[i * 2]; mix[1] += movie[i * 2 + 1]; }
+#endif
         if (mix[0] > 32767) { mix[0] = 32767; snd_mix_clipped[0]++; }
         if (mix[0] < -32768) { mix[0] = -32768; snd_mix_clipped[0]++; }
         if (mix[1] > 32767) { mix[1] = 32767; snd_mix_clipped[1]++; }

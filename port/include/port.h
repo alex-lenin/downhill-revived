@@ -28,6 +28,8 @@ typedef struct {
 /* Runs a MIPS/VU0 instruction sequence (an inline asm template) on the emulated register file.
    constraints: the operands' constraint strings joined by '|', outputs first. */
 int host_skip_movies(void);
+void host_movie_start(const char *name, int audio);  /* port/hle/movie.c (finding 055) */
+int host_movie_update(int keep);                     /* nonzero: the movie is over */
 
 void ps2_store32(unsigned int address, unsigned int value);
 void ps2_store64(unsigned int address, unsigned long long value);

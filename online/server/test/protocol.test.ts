@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { DesyncTracker } from "../src/desync";
 import {
   CODE_ALPHABET,
+  clientVersionOf,
+  DEFAULT_MIN_VERSION,
   inputFrameLastField,
+  isOutdated,
+  minVersionOf,
+  parseVersion,
   isValidCode,
   measuredRtt,
   randomCode,
@@ -88,5 +93,36 @@ describe("DesyncTracker", () => {
     t.remove(1);
     expect(t.add(1, 59, "b")).toBeNull();
     expect(t.add(0, 59, "a")).toBeNull();
+  });
+});
+
+describe("version gate", () => {
+  it("reads X.Y.Z, with an optional v, patch and suffix", () => {
+    expect(parseVersion("0.2.0")).toEqual([0, 2, 0]);
+    expect(parseVersion("v1.10.3")).toEqual([1, 10, 3]);
+    expect(parseVersion("1.2")).toEqual([1, 2, 0]);
+    expect(parseVersion("0.3.0-rc1")).toEqual([0, 3, 0]);
+    for (const bad of ["", "dhd-port 274f8c46", "1", "a.b.c", 2, null, undefined]) expect(parseVersion(bad)).toBeNull();
+  });
+
+  it("takes a hello without clientVersion as 0.1.0", () => {
+    expect(clientVersionOf({ version: "dhd-port 274f8c46f1af52d6" })).toBe("0.1.0");
+    expect(clientVersionOf({ clientVersion: "0.2.0" })).toBe("0.2.0");
+  });
+
+  it("refuses releases older than the minimum and unreadable ones", () => {
+    expect(isOutdated("0.1.0", "0.1.0")).toBe(false);
+    expect(isOutdated("0.1.0", "0.2.0")).toBe(true);
+    expect(isOutdated("0.2.0", "0.2.0")).toBe(false);
+    expect(isOutdated("0.10.0", "0.9.0")).toBe(false); // numbers, not text
+    expect(isOutdated("1.0.0", "0.2.0")).toBe(false);
+    expect(isOutdated("0.1.9", "0.2.0")).toBe(true);
+    expect(isOutdated("junk", "0.1.0")).toBe(true);
+  });
+
+  it("falls back to the default minimum when MIN_VERSION isn't a version", () => {
+    expect(minVersionOf("0.2.0")).toBe("0.2.0");
+    expect(minVersionOf(undefined)).toBe(DEFAULT_MIN_VERSION);
+    expect(minVersionOf("latest")).toBe(DEFAULT_MIN_VERSION);
   });
 });

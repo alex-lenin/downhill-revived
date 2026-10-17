@@ -1227,6 +1227,110 @@ Round 39 (finding 053): the first public release, "Downhill Revived".
   allows that host only. From the 0.1.0 zip: a public race created, listed by a second instance,
   joined with its code by a third.
 
+Round 40, online track (finding 054): 0.2.0's start gates, version gate and updater.
+- Start gates: online, every rider starts on the start point of its global id, the same on every
+  PC. Cause: `func_0011AEC0` swaps each human with a random rider, a draw that differs per PC
+  while each PC's human is its own slot 0. Puppets stood on AI riders' gates and jumped at GO. The
+  swap is skipped online (`port/patches.py`, `hle_puppet_keep_grid`); the draw is kept.
+- One version: `port/include/version.h` (`DHD_VERSION "0.2.0"`), used by the hello
+  (`clientVersion`), the online version string, the updater and `package_release.py`.
+- Server: `MIN_VERSION` in `online/server/wrangler.jsonc` (0.1.0 for now); older hellos get
+  `client_outdated` (4009), "A new version is out. Update to play online." 0.1.0 shows that in
+  its online footer; 0.2.0 adds Update Now. 34 server tests. Deployed to the official server
+  with `MIN_VERSION` 0.1.0 (version d8f6e3c1).
+- Updater (`port/hle/update.c`): the first dhd.exe asks GitHub's latest release (or `update_url`)
+  at start, at most 6 s. If newer, it asks (`auto_update = ask | on | off`), downloads,
+  checks the sha256, swaps dhd.exe (old one as dhd.exe.old, deleted next start) and restarts.
+  It never touches dhd.ini or saves. `package_release.py` writes `latest.json` beside the zip.
+- Release steps: finding 054, section 6 (publish zip + latest.json as v0.2.0, then
+  `MIN_VERSION` 0.2.0 and deploy).
+
+Round 40, movies (finding 055): the startup movies and OPTIONS > VIDEO CLIPS play, with picture
+and sound in sync.
+- The PS2 player can't run on the PC: it needs libmpeg on the IPU, a toIPU DMA chain the game
+  builds itself, PATH3 uploads and 989snd's external stream.
+- Its entry points (func_00223BB0 start, func_00223C60 each frame, with keep 0 = skip) are patched
+  to `port/hle/movie.c`:
+  - a thread reads MOV/*.PSS from the disc image;
+  - libmpeg2 0.5.1 decodes the video (GPL-2+, `port/third_party/libmpeg2`, credited in
+    THIRD-PARTY-NOTICES);
+  - the PCM goes into the mixer;
+  - picture and sound follow the mixer's sample count;
+  - the presenter shows the picture centred at 4:3 (exact and native paths);
+  - the game gets the PS2 player's flags.
+- VIDEO CLIPS crashed on raw PS2 string addresses in its clip table; host_movie_start maps them.
+- A movie never ends in the frame it started (its callers would wait forever).
+- `skip_movies` (PC SETTINGS > Skip Movies, live) is the player's choice again, default 0. The
+  race, gate and bench tools still set DHD_SKIP_MOVIES=1; DHD_MOVIES is gone.
+- Tested on clean builds of a5c87e5c and 36d79fb1 (screenshots and WAVs in
+  build/port/r40movies/final):
+  - the four startup movies at real time;
+  - CREDITS and INTRO from VIDEO CLIPS, each skipped with Cross back to the list.
+- scan_retail and package_release pass. libmpeg2's default intra matrix is stored as uint16_t,
+  so the exe holds no copy of the ELF's copy of that MPEG-2 table.
+- Native renderer gate on 36d79fb1 (the gate tools force DHD_SKIP_MOVIES=1):
+  - the arms match each other at every moment, with 1,153 readbacks;
+  - against r39-plain only 2 words differ, 0x004F4324 (0x10 -> 0x24) and 0x004F4454 (0 -> 0x10);
+  - the widescreen and menu work's own gate run (build/port/r40ui/gate1) shows the same two
+    words, so they come from those changes, not from the movies;
+  - so the gate fails on main until those two words are traced and a reference recorded.
+
+Round 40, widescreen HUD, defaults, EXIT GAME (finding 056):
+- Widescreen (`port/hle/widescreen.c`) is Hor+ for any shape. `widescreen = 1` takes the
+  monitor's shape; `W:H` takes that shape. The process is DPI aware.
+- The game's 2D code maps X (`port/patches_widescreen.py`):
+  - menus, popups, the pause menu and results stay 4:3 in the middle, with the 3D background
+    widened around them;
+  - the race HUD's text and its 3D pieces (speedometer, track bar, place) are anchored to their
+    side of the screen, in shape.
+- Full-screen 2D pictures are shown 4:3 by the native renderer: the memory card warning, the
+  publisher cards, and the startup and race loading cards. The test is VU1 drawing nothing, or
+  a loading state (title before its 3D, race loading) with few VU1 primitives, 8 fields in a row.
+  It is never applied during a race.
+- `DHD_ASPECT=wide` is widescreen's shape. `DHD_SCREENSHOT_WINDOW=WxH` writes screenshots as a
+  window shows them.
+- Player defaults, where dhd.ini doesn't say (only with a dhd.ini; the first start writes one,
+  and its template lists them): native renderer, scale 2, borderless, widescreen 1, DHD_ASPECT
+  wide, skip_movies 0. Explicit lines and DHD_* variables win. The race, gate and bench tools set
+  `DHD_SETTINGS=none`, so they keep the old defaults.
+- EXIT GAME: a fifth main-menu row (`port/hle/exit_menu.c`, `port/patches_exit.py`) asks "Quit
+  Downhill Revived?" (No / Yes) in the game's popup. Yes closes the window: exit code 0, both
+  dhd.exe end.
+- Gate (30222647): the arms match each other. Against r39-plain the same 2 words differ,
+  0x4F4324 and 0x4F4454: text packet leftovers in `D_004F3AD0` from the fifth row's "EXIT GAME"
+  glyphs (finding 056, Gate). The reference is to be re-recorded once at integration.
+- `link.py` links gdi32 (the updater's dialog font); the clean build of ebde3667 had failed to
+  link.
+
+Round 40, texture packs (finding 057): the native renderer loads PCSX2 texture
+replacement packs unchanged (`port/gs/texpack.c`; PCSX2's names reimplemented, XXH3 from
+xxHash 0.8.3 vendored as `port/gs/xxhash.h`). Packs are the players' own; none is in the repo.
+- On the user's pack (6,181 PNGs, 4x upscales): every texture the renderer decodes in the scripted
+  run is in it, 161 in the menus and 110 in the race (271 of 271).
+- PNGs load on two loader threads (WIC) with mip chains; the original texture draws until the
+  replacement is ready. A budget (`texture_cache_mb`, default half the card's memory, 512-2048 MB)
+  releases the least recently drawn. The race peaked at 738 MB of graphics memory; process memory
+  grew by 10 MB.
+- dhd.ini `texture_pack =`, `textures = on|off` (PC SETTINGS > Texture Pack, at the next start),
+  `texture_cache_mb`; a `textures\SCUS-97177\replacements` folder beside dhd.exe is found alone.
+- No pack or `textures = off`: pictures byte-identical to 076de351; the gate passes on the build
+  from that base (also with the pack on: replacements change no game state).
+- Speed, on a busy PC (sanity checks, not benchmarks): paced, pack on, menus to race start
+  59.56 fields/s, worst 1% 30 ms, max 69 ms. The hitches fall on menu screen changes where
+  40-55 new textures appear at once. Not yet compared with the pack off on an idle PC. Unpaced
+  race with all replacements loaded: 116 vs 132 fields/s off.
+- Left: a pack-off/on paced comparison on an idle PC (are the screen-change hitches the pack's?);
+  texture dumping; region names and lod.x > 0 draws (finding 057).
+
+Round 41, release 0.2.0 (finding 053, section 6): built with `build_clean.py` on 22e70d54
+(dhd.exe 2253ddf9...). Gate reference re-recorded as `build/port/compare/r40-plain` from that
+build (it differs from r39-plain only in the 2 EXIT GAME words) and made the default; the gate
+passes on it. `DownhillRevived-0.2.0-win.zip` (sha256 a14684e0...6a0c) and `latest.json` made;
+retail scan clean, icon resource present. The unzipped release: defaults written on the first
+start, movies play, EXIT GAME exits with 0, a race starts. Updater dry run (a 0.1.9-marked
+copy, a local latest.json): the real 0.2.0 zip downloaded, checked, installed and started,
+dhd.ini and saves untouched.
+
 ## Online play (plan: docs/ONLINE-PLAN.md)
 2026-10-16 step 1, server (finding 039): `online/server/` is the Cloudflare Workers + Durable
 Objects server (lobbies, join codes, public list, lockstep input relay, desync detection);

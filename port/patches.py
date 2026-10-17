@@ -337,6 +337,12 @@ PATCHES = {
          '        hle_puppet_start_point(D_0043EEC0, p);\n        if (func_001A0498(D_0043EEC0, &start.pos, start.matrix)) {'),
         ('text', 'u128 *v = func_001177F8(D_0029EA20, I(0x7978));',
          'u128 *v = func_001177F8(D_0029EA20, hle_puppet_grid(p, I(0x7978)));')],
+    # Online: no random start swap of the human (port/hle/puppet.c hle_puppet_keep_grid), so every
+    # PC has the same grid and no two riders share a gate.
+    'unsorted/0011AEC0.c': [
+        ('text', 'extern void func_0011B030(World *world, Racer *a, Racer *b);',
+         'extern void func_0011B030(World *world, Racer *a, Racer *b);\nextern int hle_puppet_keep_grid(void);'),
+        ('text', '        if (i != r) {', '        if (i != r && !hle_puppet_keep_grid()) {')],
     'unsorted/001B7198.cpp': [
         ('text', 'extern void func_001B87F8(void *);', 'extern void func_001B87F8(void *);\nextern void hle_online_riders(void *);'),
         ('text', '    func_001B74E8(game);\n', '    func_001B74E8(game);\n    hle_online_riders(game);\n')],
@@ -494,15 +500,35 @@ for _unit in ('00201010', '00201080', '002010F0', '00201160'):
         ('text', 'extern void func_001FFD30(void);', 'extern void func_001FFD30(void *, int);'),
         ('text', 'void func_%s(void)\n{\n    func_001FFD30();' % _unit,
          'void func_%s(void *self, int flags)\n{\n    func_001FFD30(self, flags);' % _unit)]
-# OPTIONS > VIDEO CLIPS: no movie can play (host_skip_movies), so a chosen clip ends at once, as
-# a finished one does (D_0029D408 set, no next clip: func_001B57F8 closes the player).
-PATCHES['unsorted/001B53C0.c'] = [('text', '''    if (o->x4C != 0) {
-        Entry *e = &list[o->x50];
-        func_00223BB0(e->x0, e->x8);''', '''    if (o->x4C != 0 && host_skip_movies()) {
-        o->x4C = 0;
-        o->x50 = 0;
-        D_0029D408 = 1;
-    }
-    if (o->x4C != 0) {
-        Entry *e = &list[o->x50];
-        func_00223BB0(e->x0, e->x8);''')]
+# The movie player (finding 055): Sony's stream player sample on libmpeg/the IPU/PATH3/989snd's
+# external stream, none of which the PC has, is replaced at its entry points by port/hle/movie.c
+# (decoded with libmpeg2, shown by the presenter, its sound in the mixer). func_00223BB0 starts a
+# movie and func_00223C60, called once a game frame, keeps it going (arg0 0: the player skipped);
+# the flags the startup sequence and OPTIONS > VIDEO CLIPS wait on are set as the PS2's player sets
+# them (D_0029DB00 0 while one plays, D_0029DAFC 1; func_00224308 at the end), and the sound mask
+# of the start (func_00201D50) is still sent. The PS2 path below stays compiled, never reached.
+PATCHES['unsorted/00223BB0.c'] = [
+    ('text', 'int func_00223BB0(int arg0, int arg1)\n{\n',
+     'int func_00223BB0(int arg0, int arg1)\n{\n'
+     '    host_movie_start((const char *)arg0, arg1);\n'
+     '    func_00201D50(0xFFFFFDFF);\n'
+     '    D_0029DB20 = arg1;\n'
+     '    D_0029DC1C = 0;\n'
+     '    D_0029DB00 = 0;\n'
+     '    D_0029DAFC = 1;\n'
+     '    return 0;\n'),
+    ('text', 'void func_00223C60(int arg0)\n{\n',
+     'void func_00223C60(int arg0)\n{\n'
+     '    extern int D_0029D9F8;\n'
+     '    if (host_movie_update(arg0)) {\n'
+     '        D_0029D9F8 = 0;\n'
+     '        D_0029DB00 = 1;\n'
+     '        D_0029DAFC = 0;\n'
+     '    }\n'
+     '    return;\n')]
+
+# Widescreen 2D and HUD, and the main menu's EXIT GAME (finding 056): port/patches_widescreen.py,
+# port/patches_exit.py (after the ONLINE row above, whose text it patches).
+import patches_exit, patches_widescreen  # noqa: E402
+patches_widescreen.add(PATCHES)
+patches_exit.add(PATCHES)

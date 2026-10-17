@@ -6,7 +6,8 @@ Downhill Revived is a native Windows port of *Downhill Domination* (PlayStation 
 Entertainment / SCEA, 2003). It is built on a matching decompilation: C/C++ source that
 compiles back to the original game program byte for byte. The port takes that source, builds it
 for the PC and replaces the PS2 hardware with native code. It adds a modern renderer, PC display
-options, memory card saves and online races.
+options, the game's movies, memory card saves, texture packs, online races and automatic
+updates.
 
 ## Legal notice
 
@@ -29,12 +30,20 @@ What works today:
 - **60 fps with even frame pacing.** The game runs at its original 59.94 Hz, and each picture is
   shown on a fixed 59.94 Hz grid, so frames don't come out long-short-long. Pad input is read as
   late as possible before each frame.
-- **Higher resolution and widescreen.** Internal resolution 1x to 4x (or matched to the window),
-  and a 16:9 Hor+ mode (wider view, same vertical framing). Windowed, borderless and exclusive
-  fullscreen.
+- **Higher resolution and widescreen.** Internal resolution 1x to 4x (or matched to the window).
+  Widescreen at the monitor's shape (16:9, 21:9 or any other) is Hor+: a wider view with the same
+  vertical framing, and the HUD, menus and 2D screens keep their shape. Windowed, borderless and
+  exclusive fullscreen. A new install starts borderless at 2x in widescreen.
+- **The movies play**: the intro, the attract loop and OPTIONS > VIDEO CLIPS, decoded with
+  libmpeg2 from your disc. Skip Movies in PC SETTINGS turns them off.
 - **PC SETTINGS in the game's own OPTIONS menu**: resolution, display mode, window size, picture
-  shape, scaling, widescreen and vibration, drawn with the game's own menus and font. Changes are
-  saved to `dhd.ini`.
+  shape, scaling, widescreen, skip movies, vibration and texture pack, drawn with the game's own
+  menus and font. Changes are saved to `dhd.ini`.
+- **Texture packs**: replacement packs made for PCSX2 (PNG files named by PCSX2's texture hash)
+  work unchanged with the native renderer (see [Texture packs](#texture-packs)).
+- **Automatic updates**: at start the game looks for a newer release and offers to install it;
+  your settings and saves are never touched.
+- **EXIT GAME** in the main menu.
 - **Online races** for 2 to 4 players (experimental): an ONLINE entry in the main menu, a list of
   public races, private races joined with a 6-character code, and a race room where the host
   picks the track, on the project's official server (see [Online](#online)).
@@ -45,9 +54,8 @@ What works today:
 
 Known gaps:
 
-- **Movies are skipped.** The intro and the VIDEO CLIPS menu need an MPEG-2 decoder that isn't
-  written yet.
-- In 16:9 the HUD is stretched, as with PCSX2's widescreen patch.
+- Movies are shown 4:3 in widescreen, as on the PS2.
+- The 2-4 player split screens have not been checked in widescreen.
 - Online races have been tested with two games and two scripted players, not yet with four
   people on four PCs.
 - The game has only been tested on a few PCs. Please report problems.
@@ -69,9 +77,16 @@ Files the game keeps beside `dhd.exe`:
 | `dhd.ini` | Your settings, one `key = value` per line. The game adds your disc image; the PC SETTINGS page (OPTIONS) writes the rest. |
 | `saves\card1\` | Memory card 1, made at the first save. Copy this folder to back up your saves. |
 | `dhd.log` | Messages from the last run. Attach it when you report a problem. |
+| `dhd.exe.old` | The previous version, for a moment after an update; the next start deletes it. |
 
-To update, copy the files of a newer release over your folder. A release holds no `dhd.ini`
-and no saves, so yours are kept.
+### Updates
+
+At start the game looks for a newer release. If there is one it asks: **Update now** downloads
+it, checks its SHA-256, puts it in place and starts the game again; **Later** starts this
+version. Without a network the game just starts. An update replaces `dhd.exe` and the text files
+only, never `dhd.ini` or `saves\`. You can also update by hand: copy the files of a newer release
+over your folder (a release holds no `dhd.ini` and no saves, so yours are kept). Online races
+need the newest version; an older one is offered Update Now in the ONLINE menu.
 
 ### Controls
 
@@ -92,6 +107,39 @@ address on the `server =` line of `dhd.ini` (the game writes the file at the fir
     server = wss://YOUR-SERVER-ADDRESS
 
 An empty `server =` line means the official server.
+
+### Texture packs
+
+Texture replacement packs made for PCSX2 work unchanged. Packs are made by their authors and are
+not part of this project. Either put the pack's files in `textures\SCUS-97177\replacements`
+beside `dhd.exe`, or name the pack's folder on the `texture_pack =` line of `dhd.ini` (for
+example PCSX2's own `textures\SCUS-97177\replacements` folder in your Documents). PC SETTINGS >
+Texture Pack turns it off or on at the next start.
+
+### Settings
+
+`dhd.ini` beside `dhd.exe` holds `key = value` lines; the game writes it, with comments, at the
+first start. The PC SETTINGS page writes most of them for you.
+
+| Key | Default | What |
+|---|---|---|
+| `iso` | (asked at the first start) | your disc image |
+| `renderer` | `native` | `native`, or `exact` (the slow reference path) |
+| `scale` | `2` | the 3D picture's resolution, `1` to `4` times the PS2's, or `window` |
+| `window` | `borderless` | `windowed`, `borderless` or `fullscreen` |
+| `widescreen` | `1` | `1` the monitor's shape, `0` off, or a shape such as `21:9` |
+| `DHD_ASPECT` | `wide` | the picture's shape: `wide`, `4:3`, `16:9`, `stretch` or `pixels` |
+| `skip_movies` | `0` | `1` skips the movies |
+| `vibration` | on | `0` turns rumble off |
+| `texture_pack` | (empty) | a texture pack's folder; empty: `textures\SCUS-97177\replacements` beside `dhd.exe` |
+| `textures` | `on` | `off` draws the game's own textures |
+| `texture_cache_mb` | half the card's memory, at most 2048 | graphics memory for replacements |
+| `auto_update` | `ask` | `ask`, `on` (update without asking) or `off` (never look) |
+| `update_url` | (empty) | where to look for updates; empty: this project's GitHub releases |
+| `server` | (empty) | the online server; empty: the official one |
+
+Each key has a `DHD_*` environment variable (`scale` is `DHD_SCALE`, `server` is
+`DHD_NET_SERVER`; see [docs/BUILDING.md](docs/BUILDING.md)), which wins over the file.
 
 ### System requirements
 
@@ -158,7 +206,7 @@ the format [decomp.dev](https://decomp.dev) reads).
 ## Contributing
 
 Contributions are welcome: decompiling the last functions, naming and typing what is matched,
-port fixes, the movie decoder, testing on other PCs.
+port fixes, widescreen split screens, testing on other PCs.
 
 - Read `docs/STATE.md` and [AGENTS.md](AGENTS.md) (the project's rules) first.
 - To decompile a function, follow `docs/WORKER.md`. A function is accepted only when
@@ -180,8 +228,13 @@ This project builds on the work of others:
   included). The reverb presets are read from the player's own disc (Sony's libsd module).
 - [OpenGOAL](https://github.com/open-goal/jak-project) (ISC): the SPU2 Gaussian interpolation
   table in `port/hle/sound_gaussian.h`.
+- [libmpeg2](https://libmpeg2.sourceforge.io) 0.5.1 (GPL-2.0-or-later): the movie decoder,
+  `port/third_party/libmpeg2`, unchanged.
 - [xxHash](https://github.com/Cyan4973/xxHash) (BSD-2-Clause): the XXH64 specification, from
-  which `port/net/hash.c` is written.
+  which `port/net/hash.c` is written, and `port/gs/xxhash.h` (XXH3, unchanged) for texture pack
+  names.
+- PCSX2's texture replacement names (its GSTextureCache / GSTextureReplacements hash scheme),
+  reimplemented in `port/gs/texpack.c` so PCSX2 packs load unchanged.
 - [splat](https://github.com/ethteck/splat), [spimdisasm](https://github.com/Decompollaborate/spimdisasm)
   and [rabbitizer](https://github.com/Decompollaborate/rabbitizer) (MIT): splitting and
   disassembling the executable.

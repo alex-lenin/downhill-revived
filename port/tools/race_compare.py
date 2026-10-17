@@ -152,6 +152,7 @@ def launch_port(args, directory, race_events, moments):
     (directory / 'port').mkdir()
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DHD_', 'ROUND_'))}
     env.update(DHD_ISO=os.environ['DHD_ISO'], DHD_FRAME_CLOCK='1', DHD_LOG='1', DHD_SKIP_MOVIES='1', DHD_MEMCARD='0',
+               DHD_SETTINGS='none',  # no dhd.ini: the tools' settings, never a player's defaults (finding 056)
                DHD_SND_OFF='1', DHD_AUTOPAD_FRAMES=compare.frame_script(compare.parse_pad(NAVIGATION)),
                DHD_RACE_SYNC='1', DHD_RACE_PAD=args.race_pad,
                DHD_RACE_CAPTURE=spec(moments), DHD_RACE_CAPTURE_WINDOW=str(args.window),

@@ -9,6 +9,7 @@ extern volatile uint32_t gs_presented_frames;
    the other players keeps the window responsive. Both do nothing before the window exists. */
 void gs_window_title(const char *utf8);
 void gs_pump_messages(void);
+void gs_window_close(void);  /* as the window's close button: the game ends at the next field */
 /* The native renderer shows player gs_native_view's quarter of a 3-4 player split screen,
    scaled to the window (1-4; 0: the whole picture). online.c sets it during races. */
 extern volatile int gs_native_view;

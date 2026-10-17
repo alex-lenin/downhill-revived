@@ -7,7 +7,8 @@ any later version (LICENSE.txt). It contains or is derived from the following th
 PCSX2 (https://github.com/PCSX2/pcsx2), GPL-3.0-or-later, Copyright PCSX2 Dev Team
   The GS memory block and page layouts in port/gs/memory.c follow PCSX2's GSLocalMemory and
   GSTables. PCSX2 is also the behaviour reference for the GS, VU and SPU2 code (written
-  independently).
+  independently). Texture packs (port/gs/texpack.c) use PCSX2's texture replacement names: the
+  hash scheme of its GSTextureCache and GSTextureReplacements, reimplemented.
 
 OpenGOAL (https://github.com/open-goal/jak-project), ISC License
   The SPU2 Gaussian interpolation table in port/hle/sound_gaussian.h is adapted from OpenGOAL's
@@ -29,11 +30,43 @@ OpenGOAL (https://github.com/open-goal/jak-project), ISC License
   ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
   OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+libmpeg2 0.5.1 (https://libmpeg2.sourceforge.io), GPL-2.0-or-later
+  Copyright (C) 2000-2003 Michel Lespinasse, Copyright (C) 1999-2000 Aaron Holtzman, and the
+  contributors listed in its AUTHORS file. The game's movies are decoded with libmpeg2's portable
+  C core (port/third_party/libmpeg2, unchanged, with its COPYING and AUTHORS); this package is
+  distributed under the GPL version 3, which libmpeg2's "or any later version" allows.
+
 PCSX2 widescreen patch for this game, by Aced14 (https://github.com/PCSX2/pcsx2_patches)
   The 16:9 mode changes the values that patch lists; the changes are applied by our own code.
 
 xxHash (https://github.com/Cyan4973/xxHash), BSD-2-Clause
-  port/net/hash.c is written from the XXH64 specification; no xxHash code is included.
+  port/net/hash.c is written from the XXH64 specification. port/gs/xxhash.h is xxHash 0.8.3
+  itself (XXH3-64, the hash in texture pack names), unchanged:
+
+  Copyright (C) 2012-2023 Yann Collet
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are
+  met:
+
+     * Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+     * Redistributions in binary form must reproduce the above
+       copyright notice, this list of conditions and the following disclaimer
+       in the documentation and/or other materials provided with the
+       distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 LLVM / clang (https://llvm.org), Apache-2.0 WITH LLVM-exception
   dhd.exe is compiled with clang and may contain the compiler's runtime support code, which is
@@ -41,7 +74,8 @@ LLVM / clang (https://llvm.org), Apache-2.0 WITH LLVM-exception
 
 Microsoft C runtime and Windows SDK import libraries
   dhd.exe links the static Microsoft C runtime and uses Windows system libraries (Direct3D 11,
-  DXGI, the D3D compiler, WinHTTP), all part of Windows.
+  DXGI, the D3D compiler, WinHTTP, the Windows Imaging Component for PNG files), all part of
+  Windows.
 
 The game itself
   Downhill Domination and its code, data, names and trademarks belong to their owners. They are

@@ -16,7 +16,10 @@
    (host.c host_settings_load). The
    ISO must be the USA disc, as the online launcher checks (port/online/Online.ps1): its SHA-256
    is worked out in a thread when the page opens, remembered in iso-check.txt beside dhd.exe in
-   the launcher's format. The name and the rider are saved to dhd.ini (name, rider). */
+   the launcher's format. The name and the rider are saved to dhd.ini (name, rider).
+   A server that refuses this release as too old (client_outdated, finding 054) gets the
+   message "A new version is out. Update to play online." and HOME an Update Now row:
+   the game ends and the first dhd.exe updates it and starts it again (update.c). */
 #include "hle.h"
 #include "menu_page.h"
 #include "../net/net.h"
@@ -51,6 +54,9 @@ enum { HOME, LIST, NAME, CODE, ROOM };
 static MenuPage page;
 static int screen, race;
 static char text[MAX_ROWS][ROW_TEXT], status[128], footer[128];
+static int outdated;  /* the server refused this release: HOME offers Update Now (row 5) */
+/* 44 characters: the footer fits about 45 at 640 wide (0.1.0 shows the server's copy there too) */
+static const char outdated_text[] = "A new version is out. Update to play online.";
 
 static const char *server(void)
 {
@@ -251,6 +257,7 @@ static void page_build(MenuPage *p)
         menu_page_row(p, "Create A Public Race", 1);
         menu_page_row(p, "Create A Private Race", 1);
         menu_page_row(p, "Join With A Code", 1);
+        if (outdated) menu_page_row(p, "Update Now", 1);
         break;
     case LIST:
         p->title = "PUBLIC RACES";
@@ -300,10 +307,14 @@ static void entry_text(void)
 static void room_update(MenuPage *p, NetLobby *l)
 {
     if (l->state == NET_FAILED || l->state == NET_IDLE) {
-        snprintf(status, sizeof status, "%s", l->error[0] ? l->error : "The connection to the server failed");
+        int too_old = !strcmp(l->error_code, "client_outdated");
+        if (too_old) outdated = 1;
+        snprintf(status, sizeof status, "%s",
+                 too_old ? outdated_text : l->error[0] ? l->error : "The connection to the server failed");
+        hle_log("online menu: refused: %s (%s)\n", l->error, l->error_code);
         net_leave();
         screen = HOME;
-        menu_page_rebuild_at(p, home_row);
+        menu_page_rebuild_at(p, too_old ? 5 : home_row);
         return;
     }
     int in = l->state == NET_LOBBY || l->state == NET_RACING;
@@ -413,6 +424,9 @@ static void page_accept(MenuPage *p, int row)
             entry[0] = 0;
             entry_pick = 0;
             go(CODE);
+        } else if (row == 5 && outdated) {
+            hle_log("online menu: Update Now\n");
+            update_request();  /* ends the game; the first dhd.exe updates and starts it again */
         }
         break;
     case LIST:

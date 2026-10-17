@@ -14,7 +14,7 @@ and linked in, together with whatever further unfinished functions those call.
 The census lists undefined symbols by kind (asm-only functions, SDK/library, other) and
 duplicate definitions; build/port/link/census.json keeps the full lists. Unresolved symbols are
 forced through (/force), so dhd.exe is written but not runnable yet.
-usage: python port/tools/link.py   (needs LLVM's clang, lld-link, llvm-nm, llvm-objcopy,
+usage: python port/tools/link.py   (needs LLVM's clang, lld-link, llvm-nm, llvm-objcopy, llvm-rc,
 llvm-cxxfilt on PATH and Visual Studio's x86 libraries; run port/tools/build.py first)"""
 import collections, glob, json, os, re, shutil, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -163,7 +163,11 @@ def runtime():
         f.write('static const char gs_shader_path[] = ' + json.dumps('port/gs/raster.hlsl') + ';\n')
     for name in ('runtime/ps2asm.c', 'runtime/vu0_micro.c', 'runtime/vu0_interp.c', 'runtime/recomp.c', 'runtime/fp_trap.c', 'runtime/libc_shims.c',
                  'runtime/memory.c', 'hle/host.c', 'hle/autopad.c', 'hle/timer.c', 'hle/kernel.c', 'hle/boot.c', 'hle/sif.c', 'hle/cdvd.c', 'hle/game_data.c',
-                 'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/vif.c', 'hle/graphics.c', 'hle/graphics_queue.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/pc_settings.c', 'hle/online_menu.c', 'hle/online.c', 'hle/puppet.c', 'hle/sound.c', 'gs/memory.c', 'gs/gs.c', 'gs/display.c', 'gs/present.c', 'gs/gpu.c', 'gs/capture.c',
+                 'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/vif.c', 'hle/graphics.c', 'hle/graphics_queue.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/online_menu.c', 'hle/online.c', 'hle/puppet.c', 'hle/sound.c', 'gs/memory.c', 'gs/gs.c', 'gs/display.c', 'gs/present.c', 'gs/gpu.c', 'gs/texpack.c', 'gs/capture.c',
+                 # the auto-updater (finding 054)
+                 'hle/update.c',
+                 # the game's movies (finding 055)
+                 'hle/movie.c',
                  # online races (port/net, finding 042)
                  'net/lockstep.c', 'net/hash.c', 'net/json.c', 'net/client.c', 'net/ws_winhttp.c', 'net/net.c'):
         o = os.path.join(OUT, name + '.o')
@@ -172,6 +176,17 @@ def runtime():
         p = run(['clang', '--target=' + HOST_TARGET, '-c', '-O2', '-msse2', '-mfpmath=sse',
                  '-ffp-contract=off', '-w', '-I', OUT, '-I', os.path.join(ROOT, 'port', 'runtime'),
                  os.path.join(ROOT, 'port', name), '-o', o] + extra)
+        if p.returncode:
+            sys.exit(p.stderr)
+        out.append(o)
+    # The movies' MPEG-2 video decoder: libmpeg2's portable C core (port/third_party/libmpeg2,
+    # GPL-2-or-later, README.port there), with its own config.h.
+    lib = os.path.join(ROOT, 'port', 'third_party', 'libmpeg2')
+    for name in ('alloc', 'cpu_accel', 'cpu_state', 'decode', 'header', 'idct', 'motion_comp', 'slice'):
+        o = os.path.join(OUT, 'libmpeg2', name + '.c.o')
+        os.makedirs(os.path.dirname(o), exist_ok=True)
+        p = run(['clang', '--target=' + HOST_TARGET, '-c', '-O2', '-msse2', '-mfpmath=sse', '-w', '-I', lib,
+                 os.path.join(lib, name + '.c'), '-o', o])
         if p.returncode:
             sys.exit(p.stderr)
         out.append(o)
@@ -252,13 +267,18 @@ def main():
         fixups_s, nfix = data.write_fixups(image_obj, fixups, image_nm)
     except (OSError, ValueError) as e:
         sys.exit('PS2 data image: %s' % e)
-    dobjs = [symbols_obj, assemble(fixups_s)]
+    # the icon (port/res/dhd.rc), shown by Explorer, the taskbar and the game's windows
+    res = os.path.join(OUT, 'dhd.res')
+    p = run(['llvm-rc', '/fo', res, os.path.join(ROOT, 'port', 'res', 'dhd.rc')])
+    if p.returncode:
+        sys.exit(p.stderr)
+    dobjs = [symbols_obj, assemble(fixups_s), res]
     rsp = os.path.join(OUT, 'objs.rsp')
     with open(rsp, 'w', newline='\n') as f:
         f.write(''.join(o.replace(os.sep, '/') + '\n' for o in objs + dobjs))
     def link(extra=()):
         return run(['clang', '--target=' + HOST_TARGET, '-fuse-ld=lld', '-o', os.path.join(OUT, 'dhd.exe'),
-                    '@' + rsp, '-Wl,d3dcompiler.lib', '-Wl,d3d11.lib', '-Wl,dxgi.lib', '-Wl,user32.lib', '-Wl,winhttp.lib', '-Wl,ole32.lib', *extra, '-Wl,/map:' + os.path.join(OUT, 'dhd.map'), '-Wl,/subsystem:windows', '-Wl,/entry:mainCRTStartup', '-Wl,/safeseh:no', '-Wl,/demangle:no',
+                    '@' + rsp, '-Wl,d3dcompiler.lib', '-Wl,d3d11.lib', '-Wl,dxgi.lib', '-Wl,user32.lib', '-Wl,gdi32.lib', '-Wl,winhttp.lib', '-Wl,ole32.lib', *extra, '-Wl,/map:' + os.path.join(OUT, 'dhd.map'), '-Wl,/subsystem:windows', '-Wl,/entry:mainCRTStartup', '-Wl,/safeseh:no', '-Wl,/demangle:no',
                     '-Wl,/force', '-Wl,/errorlimit:0',
                     # above the emulated PS2 RAM and its mirrors (port/runtime/memory.c), never moved
                     '-Wl,/base:0x%X' % IMAGE_BASE, '-Wl,/fixed', '-Wl,/dynamicbase:no',

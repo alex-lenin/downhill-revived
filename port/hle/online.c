@@ -25,6 +25,7 @@
 #include "hle.h"
 #include "../gs/present.h"
 #include "../net/net.h"
+#include "../include/version.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -308,7 +309,9 @@ static void fail(const char *why)
     exit(1);
 }
 
-/* The build's identity for the lobby: players must run the same executable. */
+/* The build's identity for the lobby: players must run the same executable. The release
+   (version.h) is in it so the server's "the host runs ..." message names it; the hello also
+   sends the release alone (clientVersion) for the version gate. */
 static void build_version(char *out, size_t size)
 {
     char path[MAX_PATH];
@@ -316,7 +319,7 @@ static void build_version(char *out, size_t size)
     BCRYPT_HASH_HANDLE h;
     uint8_t digest[32], buf[65536];
     DWORD n;
-    snprintf(out, size, "dhd-port unknown");
+    snprintf(out, size, "dhd-port " DHD_VERSION " unknown");
     GetModuleFileNameA(NULL, path, sizeof path);
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -324,7 +327,7 @@ static void build_version(char *out, size_t size)
         if (BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) == 0) {
             while (ReadFile(f, buf, sizeof buf, &n, NULL) && n) BCryptHashData(h, buf, n, 0);
             if (BCryptFinishHash(h, digest, sizeof digest, 0) == 0)
-                snprintf(out, size, "dhd-port %02x%02x%02x%02x%02x%02x%02x%02x", digest[0], digest[1], digest[2],
+                snprintf(out, size, "dhd-port " DHD_VERSION " %02x%02x%02x%02x%02x%02x%02x%02x", digest[0], digest[1], digest[2],
                          digest[3], digest[4], digest[5], digest[6], digest[7]);
             BCryptDestroyHash(h);
         }

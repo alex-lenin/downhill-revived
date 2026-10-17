@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "json.h"
+#include "../include/version.h"
 
 enum { PING_LOBBY_MS = 1000, PING_RACE_MS = 500, RESEND_MS = 100, SILENT_MS = 10000 };
 
@@ -88,8 +89,9 @@ void client_connected(NetClient *c, const NetTransport *tr)
     c->connected = 1;
     c->last_rx = c->next_ping = net_now_ms();
     json_escape(name, sizeof name, c->name);
-    say(c, "{\"type\":\"hello\",\"protocol\":%d,\"version\":\"%s\",\"isoSha256\":\"%s\",\"name\":\"%s\"}",
-        NET_PROTOCOL, c->version, c->iso, name);
+    /* clientVersion: this release (port/include/version.h), for the server's version gate */
+    say(c, "{\"type\":\"hello\",\"protocol\":%d,\"version\":\"%s\",\"clientVersion\":\"%s\",\"isoSha256\":\"%s\","
+        "\"name\":\"%s\"}", NET_PROTOCOL, c->version, DHD_VERSION, c->iso, name);
     if (c->lobby.state != NET_RECONNECTING)
         c->lobby.state = NET_CONNECTING;
     changed(c);

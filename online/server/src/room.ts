@@ -14,6 +14,7 @@ import {
   FRAME_EVENT,
   HASH_FRAME_BYTES,
   HELLO_TIMEOUT_MS,
+  OUTDATED_MESSAGE,
   MAX_BINARY_BYTES,
   MAX_MEMBERS,
   MAX_TEXT_BYTES,
@@ -23,10 +24,13 @@ import {
   RTT_SAMPLES,
   START_LEAD_MS,
   type ErrorCode,
+  clientVersionOf,
   inputFrameLastField,
+  isOutdated,
   isByte,
   isU32,
   measuredRtt,
+  minVersionOf,
   randomSeed,
   readU32,
   readU64Hex,
@@ -363,6 +367,11 @@ export class Room extends DurableObject<Env> {
   private async onHello(ws: WebSocket, info: SocketInfo, m: Msg): Promise<void> {
     if (m.protocol !== PROTOCOL)
       return this.refuse(ws, "protocol_mismatch", `This server speaks protocol ${PROTOCOL}; update the game.`);
+    // The version gate: releases older than MIN_VERSION (wrangler.jsonc) may not play.
+    const minVersion = minVersionOf(this.env.MIN_VERSION);
+    const clientVersion = clientVersionOf(m);
+    if (isOutdated(clientVersion, minVersion))
+      return this.refuse(ws, "client_outdated", OUTDATED_MESSAGE, { minVersion, clientVersion });
     const version = m.version;
     const iso = m.isoSha256;
     const name = typeof m.name === "string" ? m.name.trim() : "";
@@ -636,16 +645,16 @@ export class Room extends DurableObject<Env> {
     this.send(ws, { type: "error", code, message });
   }
 
-  /** Fatal error: error frame, then close. */
-  private async refuse(ws: WebSocket, code: keyof typeof CLOSE_CODES, message: string): Promise<void> {
+  /** Fatal error: error frame (with any extra fields), then close. */
+  private async refuse(ws: WebSocket, code: keyof typeof CLOSE_CODES, message: string, extra: object = {}): Promise<void> {
     await this.dropSocket(ws);
-    this.close(ws, code, message);
+    this.close(ws, code, message, extra);
   }
 
-  private close(ws: WebSocket, code: keyof typeof CLOSE_CODES, message: string): void {
+  private close(ws: WebSocket, code: keyof typeof CLOSE_CODES, message: string, extra: object = {}): void {
     const info = ws.deserializeAttachment() as SocketInfo | null;
     if (info && !info.gone) ws.serializeAttachment({ ...info, gone: true });
-    this.send(ws, { type: "error", code, message });
+    this.send(ws, { type: "error", code, message, ...extra });
     try {
       ws.close(CLOSE_CODES[code], code);
     } catch {}

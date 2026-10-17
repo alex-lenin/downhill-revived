@@ -1,5 +1,5 @@
 // Worker entry: routes lobby-list requests to the LobbyIndex and WebSockets to a Room by code.
-import { PROTOCOL, randomCode } from "./protocol";
+import { PROTOCOL, minVersionOf, randomCode } from "./protocol";
 
 export { Room } from "./room";
 export { LobbyIndex } from "./lobbies";
@@ -14,12 +14,14 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname.replace(/\/+$/, "");
 
-    if (path === "/v1/health") return json({ ok: true, protocol: PROTOCOL });
+    // minVersion: the oldest client release the server lets play (MIN_VERSION, wrangler.jsonc).
+    const minVersion = minVersionOf(env.MIN_VERSION);
+    if (path === "/v1/health") return json({ ok: true, protocol: PROTOCOL, minVersion });
 
     if (path === "/v1/lobbies") {
       if (request.method !== "GET") return json({ error: "GET only" }, 405);
       const lobbies = await env.LOBBIES.get(env.LOBBIES.idFromName("global")).list();
-      return json({ protocol: PROTOCOL, lobbies });
+      return json({ protocol: PROTOCOL, minVersion, lobbies });
     }
 
     const m = path.match(/^\/v1\/rooms\/([^/]+)$/);

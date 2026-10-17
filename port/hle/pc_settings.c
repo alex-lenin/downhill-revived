@@ -4,7 +4,8 @@
    - left/right change the row under the cursor; Cross (SELECT) keeps the changes and closes,
      Triangle (BACK) puts the values the page opened with back and closes, as AUDIO / OTHER does.
    Every change is saved to dhd.ini at once (host_setting_save keeps the other lines). Display,
-   window size, picture shape, scaling and vibration apply at once; resolution and widescreen at
+   window size, picture shape, scaling, skip movies (the startup movies) and vibration apply at
+   once; resolution, widescreen and the texture pack at
    the next start ("*" and the footer say so). A setting the environment
    sets (DHD_*) is shown but can't be changed here. Nothing here writes game state: the page
    lives in host memory and the settings in dhd.ini, never in the memory card's save. */
@@ -17,8 +18,9 @@
 
 void gs_window_apply(void);           /* port/gs/present.c */
 void gs_present_options_apply(void);
+int texpack_available(void);          /* port/gs/texpack.c */
 
-enum { ROWS = 7 };
+enum { ROWS = 9 };
 
 typedef struct { const char *text, *value; } Choice;
 typedef struct {
@@ -33,12 +35,14 @@ static const Choice scales[] = {{"1x", "1"}, {"2x", "2"}, {"3x", "3"}, {"4x", "4
 static const Choice displays[] = {{"Window", "windowed"}, {"Borderless", "borderless"}, {"Fullscreen", "fullscreen"}};
 static const Choice sizes[] = {{"896x672", "896x672"}, {"1280x960", "1280x960"}, {"1440x1080", "1440x1080"},
                                {"1280x720", "1280x720"}, {"1920x1080", "1920x1080"}};
-static const Choice shapes[] = {{"4:3", "4:3"}, {"16:9", "16:9"}, {"Stretch", "stretch"}, {"Pixels", "pixels"}};
+/* Wide: widescreen's shape (the monitor's, port/hle/widescreen.c); 4:3 with widescreen off. */
+static const Choice shapes[] = {{"4:3", "4:3"}, {"Wide", "wide"}, {"16:9", "16:9"}, {"Stretch", "stretch"}, {"Pixels", "pixels"}};
 static const Choice filters[] = {{"Smooth", "linear"}, {"Sharp", "point"}};
 static const Choice switches[] = {{"OFF", "0"}, {"ON", "1"}};
+static const Choice toggles[] = {{"OFF", "off"}, {"ON", "on"}};
 
 #define CHOICES(c) c, (int)(sizeof c / sizeof *c)
-enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, VIBRATION };
+enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES };
 static Row rows[ROWS] = {
     {"Resolution:", "scale", "DHD_SCALE", "2", CHOICES(scales), 0},
     {"Display:", "window", "DHD_WINDOW", "windowed", CHOICES(displays), 1},
@@ -46,7 +50,9 @@ static Row rows[ROWS] = {
     {"Picture:", "DHD_ASPECT", "DHD_ASPECT", "4:3", CHOICES(shapes), 1},
     {"Scaling:", "DHD_PRESENT_FILTER", "DHD_PRESENT_FILTER", "linear", CHOICES(filters), 1},
     {"Widescreen:", "widescreen", "DHD_WIDESCREEN", "0", CHOICES(switches), 0},
+    {"Skip Movies:", "skip_movies", "DHD_SKIP_MOVIES", "0", CHOICES(switches), 1},  /* the startup movies */
     {"Vibration:", "vibration", "DHD_VIBRATION", "1", CHOICES(switches), 1},
+    {"Texture Pack:", "textures", "DHD_TEXTURES", "on", CHOICES(toggles), 0},  /* port/gs/texpack.c */
 };
 
 static MenuPage page;
@@ -63,8 +69,11 @@ static void current(const Row *r, char *out, size_t size)
     }
     const char *v = getenv(r->env);
     snprintf(out, size, "%s", v && *v ? v : r->fallback);
-    if (r == &rows[WIDESCREEN] || r == &rows[VIBRATION])
+    if (r == &rows[WIDESCREEN] || r == &rows[MOVIES] || r == &rows[VIBRATION])
         snprintf(out, size, "%d", atoi(out) != 0);
+    if (r == &rows[TEXTURES])
+        snprintf(out, size, "%s", v && (!_stricmp(v, "off") || !strcmp(v, "0") || !_stricmp(v, "false") || !_stricmp(v, "no"))
+                 ? "off" : "on");
 }
 
 static int find(const Row *r, const char *value)
@@ -117,10 +126,10 @@ static void change(int index, int step)
     r->selected = r->selected < 0 ? (step > 0 ? 0 : r->count - 1) : (r->selected + step + r->count) % r->count;
     menu_page_sound(step > 0);
     commit(r, r->live);
-    /* Widescreen brings its picture shape, as the launcher's checkbox did; saved for the next
-       start, when the wider view comes, not shown stretched now. */
+    /* Widescreen brings its picture shape (the monitor's, "wide"); saved for the next start,
+       when the wider view comes, not shown stretched now. */
     if (r == &rows[WIDESCREEN] && !locked(&rows[SHAPE])) {
-        rows[SHAPE].selected = find(&rows[SHAPE], r->selected ? "16:9" : "4:3");
+        rows[SHAPE].selected = find(&rows[SHAPE], r->selected ? "wide" : "4:3");
         commit(&rows[SHAPE], 0);
         format(&rows[SHAPE]);
     }
@@ -146,6 +155,7 @@ static void page_update(MenuPage *p, int cursor)  /* the footer for the row */
         snprintf(footer, sizeof footer, "Set by %s outside the game", r == &rows[SIZE] ? "DHD_WINDOW_WIDTH" : r->env);
         p->footer = footer;
     } else if (r && r->selected != r->running) p->footer = "* Applies when the game starts again";
+    else if (r == &rows[TEXTURES] && !texpack_available()) p->footer = "No pack: see texture_pack in dhd.ini";
 }
 
 static void page_back(MenuPage *p)  /* Triangle: the values the page opened with, close */

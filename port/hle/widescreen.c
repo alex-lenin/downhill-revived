@@ -1,0 +1,290 @@
+/* Widescreen (finding 043 for the field of view, finding 056 for the HUD and any aspect).
+
+   The 3D view is Hor+: every X field of view times s = (4/3) / aspect, every Y factor (relative to
+   X) divided by s, so the vertical view stays and the sides widen. The map of what to change is
+   the PCSX2 widescreen patch for this disc, SCUS-97177_5AE01D98.pnach by Aced14 in
+   github.com/PCSX2/pcsx2_patches (finding 043); the values are worked out here for any aspect,
+   no pnach is read. Constants in code: port/patches.py (port_fov_x is s).
+
+   The picture is still 640 (or 512) pixels wide, shown wider. What the game draws in 2D would be
+   stretched by 1/s, so (port/patches_widescreen.py) the 2D draw code maps its X through here:
+   - menus, popups and every other 2D: a 4:3 picture in the middle (x about the view's centre,
+     times s); a rectangle reaching a side of the view (fades, backgrounds) keeps its sides;
+   - the race HUD: each element keeps its shape and is anchored to the side it sits on (left,
+     middle or right third of the view): its distance to that side is kept, in the height's units.
+     The HUD's 3D pieces (the speedometer, the track bar, the place) are scene objects placed in
+     front of the camera (func_00176930); they get the same move, in camera space. Its text is
+     drawn by the HUD's own code (0x1751C8-0x17C2A0), which calls the port_hud_text_* wrappers.
+
+   DHD_WIDESCREEN (dhd.ini widescreen): 0 off; 1 the display's shape (the monitor's, or the
+   window size's when windowed), unless DHD_ASPECT names a ratio, which is then used; or W:H.
+   This changes EE memory and what the game culls, so the game-state gates run without it. */
+#include "hle.h"
+
+#include <windows.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+float port_fov_x = 1.0f;  /* s: 1, or (4/3) / aspect */
+
+static int widescreen;
+static double aspect = 4.0 / 3.0;
+
+/* The game's views (func_0023D650, func_0023D8D8): an entry per view, its View first the focal
+   length in pixels (x0, the X field of view, already times s) and the size in pixels. */
+typedef struct { float x0; unsigned short width, height; } WsView;
+typedef struct { void *camera; WsView *view; int mode; char pad[8]; } WsEntry;
+extern WsEntry D_0075A9D0[32];
+void func_0023D618(int view, int *x, int *y);   /* the view's centre in GS pixels */
+void func_0023D650(int view, int *width, int *height);
+void func_0020F9F0(int font, int view, int x, int y, const char *text);  /* centred text */
+void func_0020F9A8(int font, int view, int x, int y, const char *text);  /* left-aligned text */
+
+/* Pixels, not the 96-dpi units Windows gives a program that doesn't say it knows them: the
+   monitor's real size here, and the window and its back buffer at the monitor's own resolution
+   (a borderless window on a scaled display was drawn smaller and enlarged by Windows). */
+void host_display_aware(void)
+{
+    static int done;
+    if (done++) return;
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    typedef BOOL(WINAPI * ContextFn)(HANDLE);
+    typedef BOOL(WINAPI * AwareFn)(void);
+    ContextFn context = user32 ? (ContextFn)(void *)GetProcAddress(user32, "SetProcessDpiAwarenessContext") : NULL;
+    if (context && context((HANDLE)-4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */)) return;
+    AwareFn aware = user32 ? (AwareFn)(void *)GetProcAddress(user32, "SetProcessDPIAware") : NULL;
+    if (aware) aware();
+}
+
+/* "W:H" or "WxH" as W / H; 0 if it isn't one. */
+static double ratio(const char *v)
+{
+    double w, h;
+    char sep;
+    if (!v || sscanf(v, "%lf%c%lf", &w, &sep, &h) != 3 || (sep != ':' && sep != 'x') || w <= 0 || h <= 0) return 0;
+    return w / h;
+}
+
+/* The primary monitor's shape (present.c puts the borderless and fullscreen window there). */
+static double monitor_aspect(void)
+{
+    MONITORINFO m = {sizeof m};
+    POINT origin = {0, 0};
+    if (!GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &m)) return 16.0 / 9.0;
+    double w = m.rcMonitor.right - m.rcMonitor.left, h = m.rcMonitor.bottom - m.rcMonitor.top;
+    return w > 0 && h > 0 ? w / h : 16.0 / 9.0;
+}
+
+/* The shape the game is shown in: what DHD_WIDESCREEN names, else DHD_ASPECT's ratio, else the
+   window size's (windowed) or the monitor's. 0: widescreen off. */
+static double wanted_aspect(void)
+{
+    const char *on = getenv("DHD_WIDESCREEN");
+    double named = ratio(on);
+    if (named) return named;
+    if (!on || !atoi(on)) return 0;
+    if ((named = ratio(getenv("DHD_ASPECT")))) return named;
+    const char *mode = getenv("DHD_WINDOW");
+    if (!mode || !strcmp(mode, "windowed")) {
+        const char *w = getenv("DHD_WINDOW_WIDTH"), *h = getenv("DHD_WINDOW_HEIGHT");
+        int width = w && atoi(w) > 0 ? atoi(w) : 896, height = h && atoi(h) > 0 ? atoi(h) : 672;
+        return (double)width / height;
+    }
+    return monitor_aspect();
+}
+
+static uint32_t float_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float bits_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+void host_widescreen_init(void)
+{
+    /* PS2 address, retail word, 1 for an X (times s) or 0 for a Y factor (divided by s). The view
+       table D_0027ECC0 (0xC0 bytes a view: X at +0, Y at +0x20) for 1P, 2P both ways, 4P and
+       paused; the menu's Y; three tree sprite widths. */
+    static const uint32_t words[][3] = {
+        {0x27ECC0, 0x438A8000, 1}, {0x27ECE0, 0x3F15551D, 0},  /* paused X, 1P Y */
+        {0x27ED80, 0x438A8000, 1}, {0x27EDA0, 0x3F155550, 0},  /* 2P horizontal */
+        {0x27EE40, 0x438A8000, 1}, {0x27EE60, 0x3F155550, 0},
+        {0x27EF00, 0x435E0000, 1}, {0x27EF20, 0x3F15551D, 0},  /* 2P vertical */
+        {0x27EFC0, 0x435E0000, 1}, {0x27EFE0, 0x3F15551D, 0},
+        {0x27F0A0, 0x3EF0A3D7, 0},                             /* menu Y */
+        {0x27F140, 0x43520000, 1}, {0x27F160, 0x3EF0A3D7, 0},  /* 4P */
+        {0x27F200, 0x43520000, 1}, {0x27F220, 0x3EF0A3D7, 0},
+        {0x27F2C0, 0x43520000, 1}, {0x27F2E0, 0x3EF0A3D7, 0},
+        {0x27F380, 0x43520000, 1}, {0x27F3A0, 0x3EF0A3D7, 0},
+        {0x26C5C0, 0x438A8000, 1}, {0x26C700, 0x438A8000, 1},  /* trees */
+        {0x26C758, 0x438A8000, 1},
+    };
+    host_display_aware();
+    double want = wanted_aspect();
+    if (want < 4.0 / 3.0 + 0.01) return;  /* off, or a 4:3 (or narrower) display */
+    if (want > 4.0) want = 4.0;
+    widescreen = 1;
+    aspect = want;
+    port_fov_x = (float)(4.0 / 3.0 / aspect);
+    /* The picture's shape follows (DHD_ASPECT "wide", the default with widescreen on). */
+    char text[32];
+    snprintf(text, sizeof text, "%d:1000", (int)(aspect * 1000 + 0.5));
+    _putenv_s("DHD_WIDESCREEN_ASPECT", text);
+    const char *shape = getenv("DHD_ASPECT");
+    if (!shape || !*shape) _putenv_s("DHD_ASPECT", "wide");
+    unsigned changed = 0;
+    for (unsigned i = 0; i < sizeof words / sizeof *words; i++) {
+        uint32_t *at = (uint32_t *)(uintptr_t)(PS2_RAM_BASE + words[i][0]);
+        float v = bits_float(words[i][1]);
+        if (*at == words[i][1]) { *at = float_bits(words[i][2] ? v * port_fov_x : v / port_fov_x); changed++; }
+        else hle_log("widescreen: %06X holds %08X, not %08X; left\n", words[i][0], *at, words[i][1]);
+    }
+    hle_log("widescreen: aspect %.4f (s %.4f), %u of %u data words\n", aspect, port_fov_x, changed,
+            (unsigned)(sizeof words / sizeof *words));
+}
+
+/* The bike shop builds its HUD and shadow at run time: when the shop's block is set up (the
+   halfword at 0xA095D0 reads 2), widen the HUD bars and the shadow, as the patch's conditional
+   lines do (for 16:9: 1.33, 1.33 and -111). Writing 0xA095D0 itself ends the condition. The
+   shadow word is -95.886 in retail (C2BFC5EA, logged in round 40) and -111 in the 16:9 patch;
+   other shapes take the line through those two points in 1/s. The game writes the bars back each
+   field, as on PCSX2, whose patch is applied every field too. */
+void host_widescreen_vsync(void)
+{
+    if (!widescreen || *(volatile uint16_t *)(uintptr_t)(PS2_RAM_BASE + 0xA095D0) != 2) return;
+    volatile uint32_t *top = (volatile uint32_t *)(uintptr_t)(PS2_RAM_BASE + 0xA095D0);
+    volatile uint32_t *bottom = (volatile uint32_t *)(uintptr_t)(PS2_RAM_BASE + 0xA09610);
+    volatile uint32_t *shadow = (volatile uint32_t *)(uintptr_t)(PS2_RAM_BASE + 0xA60038);
+    *top = float_bits(1.0f / port_fov_x);     /* top HUD width */
+    *bottom = float_bits(1.0f / port_fov_x);  /* bottom HUD width */
+    *shadow = float_bits(-95.886f - (111.0f - 95.886f) * 3.0f * (1.0f / port_fov_x - 1.0f));  /* shadow width */
+}
+
+/* ---- the 2D draw code's X (port/patches_widescreen.py) ---- */
+
+static int view_size(int view, int *cx, int *w)
+{
+    int cy, h;
+    if (view < 0 || view >= 32 || !D_0075A9D0[view].view) return 0;
+    func_0023D618(view, cx, &cy);
+    func_0023D650(view, w, &h);
+    return *w > 0;
+}
+
+static int scaled(double v) { return (int)floor(v + 0.5); }
+
+/* A point of something in the middle 4:3 (menus, popups, fades): x in GS pixels, about view 0's
+   centre; a point at or past a side of the view (a full-width rectangle's corner) stays. */
+int port_ws_point(int x)
+{
+    int cx, w;
+    if (!widescreen || !view_size(0, &cx, &w) || abs(x - cx) * 2 >= w) return x;
+    return cx + scaled((x - cx) * port_fov_x);
+}
+
+/* A rectangle from x, w wide (GS pixels), as port_ws_point maps its sides. */
+void port_ws_span(int *x, int *w)
+{
+    int left = port_ws_point(*x), right = port_ws_point(*x + *w);
+    *x = left;
+    *w = right - left;
+}
+
+/* A width (or height-free size) of a 2D thing, so it keeps its shape. */
+int port_ws_size(int w) { return widescreen ? scaled(w * port_fov_x) : w; }
+
+/* The side a HUD element at x (GS pixels) belongs to, in GS pixels: the left or right side of
+   the view, or its centre. */
+static int anchor(int view, int x)
+{
+    int cx, w;
+    if (!view_size(view, &cx, &w)) return x;
+    int third = w / 6;  /* a third of the width either side of the centre: the middle third */
+    return x < cx - third ? cx - w / 2 : x > cx + third ? cx + w / 2 : cx;
+}
+
+/* A point of a HUD element whose reference point is at ref (GS pixels): kept as far from its
+   side as it was (anchor). */
+int port_ws_hud_point(int view, int ref, int x)
+{
+    if (!widescreen) return x;
+    int a = anchor(view, ref);
+    return a + scaled((x - a) * port_fov_x);
+}
+
+/* The HUD's 3D pieces: local is the offset from the camera (x right, y forward, z up) that
+   func_00176930 places a piece at. A piece in a side third moves out with that side: by the
+   width the view gained at its depth. */
+void port_ws_hud_offset(int view, float *local)
+{
+    if (!widescreen || view < 0 || view >= 32 || !D_0075A9D0[view].view) return;
+    const WsView *v = D_0075A9D0[view].view;
+    float depth = local[1], focal = v->x0, half = v->width * 0.5f;
+    if (depth <= 0 || focal <= 0 || half <= 0) return;
+    /* where it is across the 4:3 view, -1 left side .. 1 right side */
+    float u = local[0] * (focal / port_fov_x) / (depth * half);
+    if (fabsf(u) <= 1.0f / 3) return;
+    float gained = (1.0f - port_fov_x) * depth * half / focal;  /* half the width gained there */
+    local[0] += u > 0 ? gained : -gained;
+}
+
+/* ---- text (func_0020FBB0, func_0020FDB0) ---- */
+
+static int hud_text;       /* the HUD's code is drawing (port_hud_text_*) */
+static int text_open;      /* a string is being drawn: text_anchor holds its side */
+static int text_anchor;    /* 1/16 pixels from the view's left side */
+
+/* A string starts: ref is its line's x (left, centre or right, by its alignment), 1/16 pixels
+   from the view's left side. Menus and popups keep it in the middle 4:3; the HUD's to its side. */
+void port_ws_text_begin(int view, int ref)
+{
+    int cx, w;
+    text_open = 0;
+    if (!widescreen || !view_size(view, &cx, &w)) return;
+    int w16 = w * 16;
+    text_anchor = w16 / 2;
+    if (hud_text) text_anchor = ref < w16 / 3 ? 0 : ref > w16 * 2 / 3 ? w16 : w16 / 2;
+    text_open = 1;
+}
+
+void port_ws_text_end(void) { text_open = 0; }
+
+/* A glyph's left side (pen, 1/16 pixels from the view's left side) in a view w pixels wide. */
+int port_ws_glyph_x(int w, int pen)
+{
+    if (!widescreen) return pen;
+    int a = text_open ? text_anchor : w * 8;
+    return a + scaled((pen - a) * port_fov_x);
+}
+
+/* A glyph's width, 1/16 pixels. */
+int port_ws_glyph_w(int width) { return port_ws_size(width); }
+
+/* The HUD's text calls (port/patches_widescreen.py renames them in its units). */
+void port_hud_text_c(int font, int view, int x, int y, const char *text)
+{
+    hud_text = 1;
+    func_0020F9F0(font, view, x, y, text);
+    hud_text = 0;
+}
+
+void port_hud_text_l(int font, int view, int x, int y, const char *text)
+{
+    hud_text = 1;
+    func_0020F9A8(font, view, x, y, text);
+    hud_text = 0;
+}
+
+/* ---- the picture (port/gs/gpu_native.inc) ---- */
+
+/* The widescreen picture's shape (width / height), 0 when off. */
+double host_widescreen_aspect(void) { return widescreen ? aspect : 0; }
+
+/* The game may be showing a full-screen loading card: at the start (the front end's screen
+   D_0029DED8 is 0, the title, whose 3D comes once the front end has loaded) or while a race loads
+   (screen 9 with its phase D_0043F348 0, loading, or 5, loaded and waiting for X, before the
+   flyover). Read by the renderer's thread, a field or two late at most. */
+int host_widescreen_loading(void)
+{
+    int menu = *(volatile int32_t *)(uintptr_t)(PS2_RAM_BASE + 0x29DED8);
+    int phase = *(volatile int32_t *)(uintptr_t)(PS2_RAM_BASE + 0x43F348);
+    return menu == 0 || (menu == 9 && (phase == 0 || phase == 5));
+}

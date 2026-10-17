@@ -821,16 +821,16 @@ void host_wait_wall(double seconds)
         YieldProcessor();
 }
 
-/* MPEG/IPU playback isn't written (finding 021): played, a movie crashes the port. So every movie
-   is skipped: the startup sequence (func_001EBFD8) and OPTIONS > VIDEO CLIPS (func_001B53C0),
-   whatever DHD_SKIP_MOVIES (dhd.ini skip_movies) says. DHD_MOVIES=1 plays them anyway, for work
-   on the decoder. */
+/* The startup movies (func_001EBFD8: the logos, then the attract movie) play unless dhd.ini's
+   skip_movies (DHD_SKIP_MOVIES, PC SETTINGS > Skip Movies) is nonzero; movies play natively
+   (port/hle/movie.c, finding 055). The race, gate and bench tools set DHD_SKIP_MOVIES=1, so their
+   runs stay as they were. OPTIONS > VIDEO CLIPS always plays the clip the player chose. */
 int host_skip_movies(void)
 {
     static int logged;
-    const char *play = getenv("DHD_MOVIES");
-    if (play && atoi(play)) return 0;
-    if (!logged++) hle_log("DHD_SKIP_MOVIES: bypassing startup movie sequence (movies are always skipped)\n");
+    const char *skip = getenv("DHD_SKIP_MOVIES");
+    if (!skip || !atoi(skip)) return 0;
+    if (!logged++) hle_log("DHD_SKIP_MOVIES: bypassing startup movie sequence\n");
     return 1;
 }
 
@@ -852,6 +852,9 @@ static void apply_setting(const char *key, const char *value)
         {"filter", "DHD_FILTER"}, {"vibration", "DHD_VIBRATION"}, {"remap", "DHD_REMAP"}, {"memory_card", "DHD_MEMCARD"},
         {"sound_latency_ms", "DHD_SND_LATENCY_MS"},
         {"server", "DHD_NET_SERVER"}, {"name", "DHD_NET_NAME"}, {"rider", "DHD_NET_RIDER"},  /* online (port/online) */
+        {"update_url", "DHD_UPDATE_URL"}, {"auto_update", "DHD_AUTO_UPDATE"},  /* the updater (update.c) */
+        {"texture_pack", "DHD_TEXTURE_PACK"}, {"textures", "DHD_TEXTURES"},  /* texture packs (port/gs/texpack.c) */
+        {"texture_cache_mb", "DHD_TEXTURE_CACHE_MB"},
     };
     if (!_strnicmp(key, "DHD_", 4)) { setting(key, value); return; }
     if (!_stricmp(key, "renderer")) { setting("DHD_RENDER", _stricmp(value, "native") ? "exact" : "native"); return; }
@@ -903,7 +906,7 @@ static void note_overrides(void)
 {
     static const char *const names[] = {"DHD_SCALE", "DHD_WINDOW", "DHD_WINDOW_WIDTH", "DHD_WINDOW_HEIGHT",
                                         "DHD_ASPECT", "DHD_PRESENT_FILTER", "DHD_WIDESCREEN", "DHD_SKIP_MOVIES",
-                                        "DHD_VIBRATION", "DHD_RENDER"};
+                                        "DHD_VIBRATION", "DHD_RENDER", "DHD_TEXTURES"};
     char list[256] = ",";
     if (getenv("DHD_RELAUNCHED")) return;
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
@@ -924,6 +927,18 @@ int host_setting_locked(const char *name)
    a "server =" line with an address replaces it, for anyone running their own. */
 #define OFFICIAL_SERVER "wss://dhd-online.downhill-revived.workers.dev"
 
+static int settings_has(const char *key);
+
+/* A player's settings where dhd.ini doesn't say (round 40, finding 056): the native renderer at
+   2x, borderless on the monitor at its own resolution, widescreen in the monitor's shape with
+   the HUD kept in shape, the startup movies played (skip_movies 0, finding 055). Only
+   with a dhd.ini (the game writes one on the first start; the release ships none): the tools
+   run without one and keep the old defaults, and a line in dhd.ini or a DHD_* variable wins. */
+static const char *const player_defaults[][3] = {
+    {"renderer", "native", "DHD_RENDER"}, {"scale", "2", "DHD_SCALE"}, {"window", "borderless", "DHD_WINDOW"},
+    {"widescreen", "1", "DHD_WIDESCREEN"}, {"DHD_ASPECT", "wide", "DHD_ASPECT"}, {"skip_movies", "0", "DHD_SKIP_MOVIES"},
+};
+
 void host_settings_load(void)
 {
     char path[MAX_PATH];
@@ -939,7 +954,11 @@ void host_settings_load(void)
         char *key = trim(s), *value = setting_value(trim(eq + 1));
         if (*key && *value) apply_setting(key, value);
     }
-    if (f) fclose(f);
+    if (f) {
+        fclose(f);
+        for (unsigned i = 0; i < sizeof player_defaults / sizeof *player_defaults; i++)
+            if (!settings_has(player_defaults[i][0])) setting(player_defaults[i][2], player_defaults[i][1]);
+    }
     setting("DHD_NET_SERVER", OFFICIAL_SERVER);  /* no server set (an empty "server =" sets none) */
 }
 
@@ -968,10 +987,37 @@ static const char settings_template[] =
     "; on the first start, and OPTIONS > PC SETTINGS writes the display settings here. DHD_*\n"
     "; environment variables override them.\n"
     "\n"
+    "; scale: the 3D picture's resolution, 1-4 times the PlayStation 2's, or window.\n"
+    "; window: windowed (width x height), borderless or fullscreen (the monitor's own resolution).\n"
+    "; widescreen: 1 the monitor's shape (a wider view, the HUD and menus kept in shape), 0 off,\n"
+    ";   or a shape such as 21:9. DHD_ASPECT, the picture's shape: wide (widescreen's), 4:3, 16:9,\n"
+    ";   stretch or pixels.\n"
+    "renderer = native\n"
+    "scale = 2\n"
+    "window = borderless\n"
+    "widescreen = 1\n"
+    "DHD_ASPECT = wide\n"
+    "skip_movies = 0\n"
+    "\n"
     "; Online races use the official server, wss://dhd-online.downhill-revived.workers.dev, when\n"
     "; server is empty. To use a server of your own, put its address here, for example\n"
     ";   server = wss://races.example.org\n"
-    "server =\n";
+    "server =\n"
+    "\n"
+    "; At start the game looks for a newer release and offers it; online races need the newest.\n"
+    "; auto_update = ask (asks first), on (updates without asking) or off (never looks).\n"
+    "; update_url: where to look, a latest.json or a GitHub releases API address; empty means\n"
+    "; the official releases. An update replaces dhd.exe and the text files, never dhd.ini or saves.\n"
+    "update_url =\n"
+    "auto_update = ask\n"
+    "\n"
+    "; A texture pack (upscale mod) made for PCSX2 works unchanged: texture_pack is its folder of\n"
+    "; PNGs, the full path of PCSX2's textures\\SCUS-97177\\replacements folder for example (in\n"
+    "; Documents\\PCSX2). When empty, a textures\\SCUS-97177\\replacements folder beside dhd.exe is\n"
+    "; used if there is one. textures = off draws the game's own textures (PC SETTINGS > Texture\n"
+    "; Pack).\n"
+    "texture_pack =\n"
+    "textures = on\n";
 
 /* Writes key = value into dhd.ini: replaces the key's first line, else adds one at the end; every
    other line (comments, sections, unknown keys) stays as it was. A missing dhd.ini starts as
@@ -1128,15 +1174,14 @@ int host_disc_ready(void)
     }
     _putenv_s("DHD_ISO", chosen);
     hle_log("settings: disc image %s\n", chosen);
-    /* What the launcher writes for a player (Launcher.ps1), where dhd.ini doesn't say: the native
-       renderer (the exact one stays the default without dhd.ini, for the tools) and no movies.
-       This start uses them too. */
-    static const char *const defaults[][3] = {{"renderer", "native", "DHD_RENDER"}, {"skip_movies", "1", "DHD_SKIP_MOVIES"}};
+    /* The player defaults where dhd.ini doesn't say (a new dhd.ini has them from its template;
+       without dhd.ini the tools' defaults stay, the exact renderer among them). This start uses
+       them too. */
     int saved = settings_save("iso", chosen);
-    for (unsigned i = 0; i < sizeof defaults / sizeof *defaults; i++)
-        if (!settings_has(defaults[i][0])) {
-            setting(defaults[i][2], defaults[i][1]);
-            if (saved) settings_save(defaults[i][0], defaults[i][1]);
+    for (unsigned i = 0; i < sizeof player_defaults / sizeof *player_defaults; i++)
+        if (!settings_has(player_defaults[i][0])) {
+            setting(player_defaults[i][2], player_defaults[i][1]);
+            if (saved) settings_save(player_defaults[i][0], player_defaults[i][1]);
         }
     if (!saved) {
         char path[MAX_PATH];
@@ -1148,56 +1193,4 @@ int host_disc_ready(void)
     return 0;
 }
 
-/* Widescreen 16:9 (DHD_WIDESCREEN=1, dhd.ini "widescreen = 1"). The map of what to change is
-   the PCSX2 widescreen patch for this disc, SCUS-97177_5AE01D98.pnach by Aced14 in
-   github.com/PCSX2/pcsx2_patches (finding 043); the values are applied here, no pnach is read.
-   Hor+: every X field of view times 3/4, every Y factor (relative to X) times 4/3, so the
-   vertical view stays and the sides widen. Constants in code: port/patches.py, port_fov_x.
-   This changes EE memory and what the game culls, so both online players need the same
-   setting, and the game-state gates run without it. */
-float port_fov_x = 1.0f;
-
-static int widescreen;
-
-void host_widescreen_init(void)
-{
-    /* PS2 address, retail word, 16:9 word. The view table D_0027ECC0 (0xC0 bytes a view: X at
-       +0, Y at +0x20) for 1P, 2P both ways, 4P and paused; the menu's Y; three tree sprite widths. */
-    static const uint32_t words[][3] = {
-        {0x27ECC0, 0x438A8000, 0x434FC000}, {0x27ECE0, 0x3F15551D, 0x3F471C26},  /* paused X, 1P Y */
-        {0x27ED80, 0x438A8000, 0x434FC000}, {0x27EDA0, 0x3F155550, 0x3F471C6A},  /* 2P horizontal */
-        {0x27EE40, 0x438A8000, 0x434FC000}, {0x27EE60, 0x3F155550, 0x3F471C6A},
-        {0x27EF00, 0x435E0000, 0x43268000}, {0x27EF20, 0x3F15551D, 0x3F471C26},  /* 2P vertical */
-        {0x27EFC0, 0x435E0000, 0x43268000}, {0x27EFE0, 0x3F15551D, 0x3F471C26},
-        {0x27F0A0, 0x3EF0A3D7, 0x3F206D3A},                                      /* menu Y */
-        {0x27F140, 0x43520000, 0x431D8000}, {0x27F160, 0x3EF0A3D7, 0x3F206D3A},  /* 4P */
-        {0x27F200, 0x43520000, 0x431D8000}, {0x27F220, 0x3EF0A3D7, 0x3F206D3A},
-        {0x27F2C0, 0x43520000, 0x431D8000}, {0x27F2E0, 0x3EF0A3D7, 0x3F206D3A},
-        {0x27F380, 0x43520000, 0x431D8000}, {0x27F3A0, 0x3EF0A3D7, 0x3F206D3A},
-        {0x26C5C0, 0x438A8000, 0x434FC000}, {0x26C700, 0x438A8000, 0x434FC000},  /* trees */
-        {0x26C758, 0x438A8000, 0x434FC000},
-    };
-    const char *on = getenv("DHD_WIDESCREEN");
-    if (!on || !atoi(on)) return;
-    widescreen = 1;
-    port_fov_x = 0.75f;
-    if (!getenv("DHD_ASPECT")) _putenv_s("DHD_ASPECT", "16:9");
-    unsigned changed = 0;
-    for (unsigned i = 0; i < sizeof words / sizeof *words; i++) {
-        uint32_t *at = (uint32_t *)(uintptr_t)(PS2_RAM_BASE + words[i][0]);
-        if (*at == words[i][1]) { *at = words[i][2]; changed++; }
-        else hle_log("widescreen: %06X holds %08X, not %08X; left\n", words[i][0], *at, words[i][1]);
-    }
-    hle_log("widescreen: 16:9, %u of %u data words\n", changed, (unsigned)(sizeof words / sizeof *words));
-}
-
-/* The bike shop builds its HUD and shadow at run time: when the shop's block is set up (the
-   halfword at 0xA095D0 reads 2), widen the HUD bars and the shadow, as the patch's conditional
-   lines do. Writing 0xA095D0 itself ends the condition. */
-void host_widescreen_vsync(void)
-{
-    if (!widescreen || *(volatile uint16_t *)(uintptr_t)(PS2_RAM_BASE + 0xA095D0) != 2) return;
-    *(volatile uint32_t *)(uintptr_t)(PS2_RAM_BASE + 0xA095D0) = 0x3FAA3D71;  /* top HUD width */
-    *(volatile uint32_t *)(uintptr_t)(PS2_RAM_BASE + 0xA09610) = 0x3FAA3D71;  /* bottom HUD width */
-    *(volatile uint32_t *)(uintptr_t)(PS2_RAM_BASE + 0xA60038) = 0xC2DE0000;  /* shadow width */
-}
+/* Widescreen: port/hle/widescreen.c. */

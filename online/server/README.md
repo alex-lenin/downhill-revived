@@ -65,6 +65,15 @@ Check it with `curl https://dhd-online.<account-subdomain>.workers.dev/v1/health
 the load test with `--url wss://...`. A custom domain can be added later under the Worker's
 *Settings → Domains & Routes* in the dashboard; the paths stay the same.
 
+### Minimum client version
+
+`MIN_VERSION` under `vars` in `wrangler.jsonc` (`MAJOR.MINOR.PATCH`) is the oldest game release
+the server lets in; older ones get `client_outdated` (close 4009) and the message "A new version
+is out. Update to play online." (`docs/online-protocol.md`). 0.1.0 sends no version and
+counts as 0.1.0. Raise it after a release is published, so players update, and deploy again;
+`/v1/health` shows the value in force. For a one-off change without editing the file:
+`npx wrangler deploy --var MIN_VERSION:0.2.0`.
+
 Live logs: `npx wrangler tail`. Redeploying disconnects every open room (Durable Objects
 restart on a new version), so don't deploy during races.
 

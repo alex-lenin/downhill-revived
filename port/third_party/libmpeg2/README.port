@@ -1,0 +1,17 @@
+libmpeg2 0.5.1 (MPEG-1/MPEG-2 video decoder), its portable C core, used by port/hle/movie.c to
+decode the video of the game's movies (MOV/*.PSS on the player's disc). Finding 055.
+
+Source:  mpeg2dec_0.5.1.orig.tar.gz from Debian
+         (https://deb.debian.org/debian/pool/main/m/mpeg2dec/), the libmpeg2 0.5.1 release,
+         sha256 dee22e893cb5fc2b2b6ebd60b88478ab8556cb3b93f9a0d7ce8f3b61851871d4 (as listed in
+         Debian's mpeg2dec_0.5.1-11.dsc). Upstream: https://libmpeg2.sourceforge.io/
+Authors: Michel Lespinasse, Aaron Holtzman and the contributors in AUTHORS.
+Licence: GNU GPL version 2 or (at your option) any later version (COPYING; each file's header).
+         The port is GPL-3, which that option allows.
+
+Files: libmpeg2/{alloc,cpu_accel,cpu_state,decode,header,idct,motion_comp,slice}.c,
+mpeg2_internal.h, vlc.h and include/{mpeg2,attributes}.h, copied and flattened into this
+folder, unchanged but for one line: header.c's default_intra_quantizer_matrix is uint16_t, not
+uint8_t (same values), so dhd.exe holds no 64-byte copy of the game executable's own copy of
+that MPEG-2 table (port/tools/scan_retail.py; marked in the file). config.h is the port's own (portable C, no CPU-specific code). The MMX/AltiVec/VIS/
+Alpha/ARM files, libmpeg2convert, libvo and the mpeg2dec program are not used.

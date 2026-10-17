@@ -376,10 +376,25 @@ void hle_puppet_drop(int lobby, int host)
 int hle_puppet_grid(uint8_t *r, int index)
 {
     int slot = slot_of(r), want = index;
-    if (pp.online && slot >= 0 && slot < pp.nslots && lobby_of(slot) != slot)
-        want = FIELD(rider(lobby_of(slot)), 0x7978, int32_t);
+    /* Only when the race has no start-point list (func_001A0498 found none): the place is a node
+       of the track's path. The human (pad 0) and the first AI rider (AI index 0) share node 0
+       there, so online every rider takes the node of its global id: distinct, the same on every PC. */
+    if (pp.online && slot >= 0 && slot < NRIDERS) want = to_global(slot);
     if (pp.online) fprintf(stderr, "puppet: slot %d starts at grid place %d (its own %d)\n", slot, want, index);
     return want;
+}
+
+/* func_0011AEC0, after every rider is placed: offline the game swaps each human with a random
+   rider (func_00222BD8), so the player starts at a random gate. That draw differs from PC to PC,
+   and every PC's human is its own slot 0: each PC put its player in another gate, a puppet's
+   owner and an AI rider could share one, and when the snapshots began at GO the puppets jumped to
+   where their owners were, onto other riders. Online the swap is skipped (the draw still happens):
+   every rider stays on the start point of its global id (hle_puppet_start_point), so the humans
+   line up side by side and the grid is the same on every PC. */
+int hle_puppet_keep_grid(void)
+{
+    if (pp.online) fprintf(stderr, "puppet: online grid kept (no random start swap)\n");
+    return pp.online;
 }
 
 /* func_0012C450 first asks the race (D_0043EEC0, func_001A0498) for its next start point: they

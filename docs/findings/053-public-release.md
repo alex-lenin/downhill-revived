@@ -204,6 +204,51 @@ The zip is unchanged by the packaging fix (sha256 5434d5db...b033). The folder w
 After the three were stopped the lobby stayed listed (1 player) for about two minutes, then the
 server dropped it.
 
+## 6. Release 0.2.0 (round 41): a new gate reference, the zip, smoke and updater checks
+
+Build: `build_clean.py` on 22e70d54 (main after findings 054-057 and the icon commits),
+compile 62 s, link 198 s; dhd.exe sha256 2253ddf9d124662a76c70bdfb391854a1e124e09a81e9d5537b384056d47f706.
+The zip's README.txt is from 777fa75b (known gaps updated; the exe is unchanged by it).
+
+Gate reference `build/port/compare/r40-plain`:
+- On 22e70d54 against r39-plain the arms match each other at every moment through GO+4500 and in
+  all 1,161 readbacks; against r39-plain both arms differ in exactly 2 words at GO+0/2/12/16,
+  0x004F4324 (0x10 -> 0x24) and 0x004F4454 (0 -> 0x10). Those are GS packet bytes left in the
+  font buffer by the main menu's EXIT GAME text (finding 056), not race state.
+- So the reference is recorded from that build (`--record`, its exact arm; arms matched, 1,159
+  readbacks), and `gate_native_renderer.py`'s default is now r40-plain: the release build, and
+  the first build with every round-40 change in.
+- The gate on HEAD (the same exe; 777fa75b changes only README.txt) against r40-plain:
+  NATIVE RENDERER GAME-STATE GATE MATCH, EE at every moment, 1,151 readbacks. The readback count
+  varies from run to run (1,161, 1,159, 1,151 on this exe); within a run the arms always agree.
+
+Package: `package_release.py --exe build/port/clean/22e70d54/dhd.exe` wrote
+`DownhillRevived-0.2.0-win.zip` (2,135 KB, sha256
+a14684e0576fc8534afc0d09b5dd8045a3a97f20cedc72dd4ac2d0ed29756a0c) and `latest.json` (version 0.2.0,
+the v0.2.0 release asset URL, that sha256, size 2,186,595). `scan_retail.py`: 14 runs of 64+
+bytes, all from the decompiled source, none other. `llvm-readobj --coff-resources`: ICON ids 1-7
+and GROUP_ICON 1 (port/res/dhd.rc); the window title bar shows it.
+
+Smoke test, the zip unzipped into a new folder, no `DHD_*` variables except `DHD_WINDOW=windowed`
+(so the borderless default didn't cover the desktop of the PC in use), menus by `DHD_NAV`,
+dialogs by window messages:
+- First start: the disc prompt; the real disc chosen; dhd.ini written with `renderer = native`,
+  `scale = 2`, `window = borderless`, `widescreen = 1`, `DHD_ASPECT = wide`, `skip_movies = 0`,
+  `auto_update = ask`, `textures = on` and the iso. The movies played (SCEA, copyright, the
+  Incognito logo animation).
+- EXIT GAME > Yes, Quit: "exit game: chosen in the main menu", exit code 0, no process left.
+- A race (the gate's menu script): Alpine, the race clock running at 60 fps.
+The folder was deleted.
+
+Updater dry run (finding 054 tested the mechanics with a fake 0.2.1; this ran the real 0.2.0
+zip): a copy of this dhd.exe with its three "0.2.0" strings changed to "0.1.9", in a folder with
+`auto_update = on`, `update_url` = a latest.json on a local `http.server` naming the 0.2.0 zip and
+its sha256, a README and a save file. Log: "0.2.0 is available (this is 0.1.9)", downloaded
+2,186,595 bytes with the right sha256, "installed over 0.1.9; starting it", the new process
+deleted dhd.exe.old and found "0.2.0 is the newest". After it: dhd.exe is the release's (sha256
+2253ddf9...), README.txt replaced, LICENSE and notices added, dhd.ini and the save byte for byte
+the same, no dhd-update folder. The folder was deleted.
+
 ## Open
 
 - A save writes `saves\card1` on demand; the first run above made none.

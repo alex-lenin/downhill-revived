@@ -102,6 +102,7 @@ def focus_game():
 def run_once(exe, extra, window, timeout, log_path, sound=False):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DHD_', 'ROUND_'))}
     env.update(DHD_ISO=os.environ['DHD_ISO'], DHD_FRAME_CLOCK='1', DHD_SKIP_MOVIES='1', DHD_MEMCARD='0', DHD_SND_OFF='1',
+               DHD_SETTINGS='none',  # no dhd.ini beside the exe is read (finding 056)
                DHD_AUTOPAD_FRAMES=compare.frame_script(compare.parse_pad(race.NAVIGATION)),
                DHD_NAV=race.NAV, DHD_RACE_SYNC='1', DHD_RACE_PAD=race.RACE_PAD, DHD_RACE_SEED='81257',
                DHD_BENCH=window, DHD_BENCH_EXIT='1')

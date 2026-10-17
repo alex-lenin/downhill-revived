@@ -25,11 +25,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--exe', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
-    # r39-plain: the exact arm of this gate on b7904561, a plain build_clean.py executable (the
-    # release build, no --recomp-basis). It differs from r38-reviewed (1499a7c4, linked on the
-    # frozen object basis) only in 54 words of dead main-thread stack, 0x8A0450-0x8A0780 (finding
-    # 053). r38-reviewed itself came after the 65 words of finding 050 were traced.
-    ap.add_argument('--reference', type=Path, default=ROOT / 'build/port/compare/r39-plain')
+    # r40-plain: the exact arm of this gate on 22e70d54 (release 0.2.0), a plain build_clean.py
+    # executable. It differs from r39-plain (b7904561, 0.1.0) only in 2 words, 0x4F4324 and
+    # 0x4F4454: EXIT GAME text left in the font packet buffer (finding 056; finding 053 section 6).
+    # r39-plain differed from r38-reviewed (1499a7c4, the frozen object basis) only in 54 words of
+    # dead main-thread stack; r38-reviewed came after the 65 words of finding 050 were traced.
+    ap.add_argument('--reference', type=Path, default=ROOT / 'build/port/compare/r40-plain')
     ap.add_argument('--env', action='append', default=[], help='additional NAME=VALUE for the native arm')
     # A contributor's own reference: run the gate once with --record on a plain build_clean.py
     # executable of a revision known to be good (a release commit). Its exact arm becomes

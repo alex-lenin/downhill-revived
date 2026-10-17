@@ -1,7 +1,13 @@
 """The public release zip: build/release/DownhillRevived-<version>-win.zip.
 
     python port/tools/build_clean.py
-    python port/tools/package_release.py --exe build/port/clean/<rev>/dhd.exe [--version 0.1.0]
+    python port/tools/package_release.py --exe build/port/clean/<rev>/dhd.exe
+
+The version is port/include/version.h's DHD_VERSION, the one the exe was built with (--version,
+if given, must be the same). Beside the zip goes latest.json, the update manifest the game's
+updater reads (port/hle/update.c, finding 054): {"version", "url" (the zip as a GitHub release
+asset of tag v<version>, or --base-url + the zip's name), "sha256" (the zip's), "size", "page"}.
+Publish both as assets of the GitHub release tagged v<version>.
 
 The zip holds one folder, DownhillRevived-<version>, with:
   dhd.exe                  a plain build_clean.py executable (VU1 AOT on, no local object basis)
@@ -36,7 +42,17 @@ import scan_retail  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE = ROOT / 'port' / 'release'
-DEFAULT_VERSION = '0.1.0'
+VERSION_H = ROOT / 'port' / 'include' / 'version.h'
+# Where players get releases: latest.json names the zip as an asset of the release v<version>.
+RELEASES = 'https://github.com/skuza-oss/downhill-revived/releases'
+
+
+def header_version():
+    """DHD_VERSION from port/include/version.h: the one place the release's version is written."""
+    m = re.search(r'#define\s+DHD_VERSION\s+"([^"]+)"', VERSION_H.read_text(encoding='utf-8'))
+    if not m:
+        sys.exit('%s: no DHD_VERSION' % VERSION_H)
+    return m.group(1)
 GAME_DATA = re.compile(r'\.(iso|bin|img|elf|irx|mc2|ps2|raw|vpk|vag|pss)$|^SCUS_|bios', re.I)
 # an absolute Windows path: a drive letter, a separator, then at least two printable characters
 ABSOLUTE = re.compile(rb'(?<![A-Za-z0-9])[A-Za-z]:[\\/][\x20-\x7e]{2,}')
@@ -101,13 +117,20 @@ def crlf(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--exe', type=Path, required=True, help='build/port/clean/<rev>/dhd.exe (manifest.json beside it)')
-    ap.add_argument('--version', default=DEFAULT_VERSION)
+    ap.add_argument('--version', help="must equal port/include/version.h's DHD_VERSION (the default)")
     ap.add_argument('--out', type=Path, help='default build/release/DownhillRevived-<version>-win.zip')
+    ap.add_argument('--base-url', help="latest.json's zip address is this + the zip's name (default: the GitHub "
+                    "release asset of tag v<version>), for a self-hosted update source")
     ap.add_argument('--settings', type=Path, help="a dhd.ini whose server line must not be in the package")
     ap.add_argument('--elf', type=Path, default=ROOT / 'iso' / 'SCUS_971.77', help='your retail ELF, for the game-data scan')
     a = ap.parse_args()
-    if not re.fullmatch(r'[0-9A-Za-z.+-]+', a.version):
-        sys.exit('version: letters, digits, . + - only')
+    version = header_version()
+    if a.version and a.version != version:
+        sys.exit('--version %s, but port/include/version.h says %s (the exe reports that one); bump the header '
+                 'and build again' % (a.version, version))
+    a.version = version
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', a.version):
+        sys.exit('version %r: MAJOR.MINOR.PATCH digits only (the updater and the server compare them)' % a.version)
     name = 'DownhillRevived-%s' % a.version
     out = (a.out or ROOT / 'build' / 'release' / (name + '-win.zip')).resolve()
     if ROOT / 'build' not in out.parents:
@@ -121,6 +144,8 @@ def main():
         sys.exit('%s: not a build_clean.py executable with VU1 AOT (see %s); not packaged' % (exe, manifest.name))
     if info.get('recomp_basis'):
         sys.exit('%s was linked with a local object basis (%s); a release is built without one' % (exe, info['recomp_basis']))
+    if b'dhd-port %s ' % a.version.encode() not in exe.read_bytes():
+        sys.exit('%s was not built with version %s (port/include/version.h); build it again' % (exe, a.version))
     servers = server_strings(a.settings)
     problems = exe_problems(exe, servers)
     if problems:
@@ -155,8 +180,16 @@ def main():
             info_entry.external_attr = 0o644 << 16
             z.writestr(info_entry, data)
     zip_hash = hashlib.sha256(out.read_bytes()).hexdigest()
+    # The updater's manifest (port/hle/update.c): published beside the zip as a release asset.
+    zip_url = (a.base_url.rstrip('/') + '/' + out.name if a.base_url
+               else '%s/download/v%s/%s' % (RELEASES, a.version, out.name))
+    manifest_path = out.with_name('latest.json')
+    manifest_path.write_text(json.dumps({
+        'name': 'Downhill Revived', 'version': a.version, 'url': zip_url, 'sha256': zip_hash,
+        'size': out.stat().st_size, 'page': '%s/tag/v%s' % (RELEASES, a.version)}, indent=1) + '\n', encoding='utf-8')
     print('%s (%d KB)' % (out, out.stat().st_size // 1024))
     print('  zip sha256 %s' % zip_hash)
+    print('  %s: version %s, %s' % (manifest_path, a.version, zip_url))
     print('  dhd.exe sha256 %s, from %s (built %s)' % (digest, info.get('commit', '?')[:8], info.get('built', '?')))
     return 0
 

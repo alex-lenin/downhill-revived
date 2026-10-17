@@ -28,6 +28,11 @@ void host_safe_vprint(FILE *f, const char *fmt, va_list ap);  /* checks %s point
 int host_relaunch_reserving(uintptr_t at, size_t size);       /* see host.c */
 void host_settings_load(void); /* dhd.ini next to the exe into DHD_* variables (host.c) */
 int host_disc_ready(void);     /* the disc image checked, else asked for; nonzero: cancelled */
+/* update.c, the auto-updater (finding 054); all but update_request in the first dhd.exe */
+void update_save_environment(void);  /* before dhd.ini: the environment to start an update with */
+void update_at_start(void);   /* after dhd.ini: dhd.exe.old away, then a newer release offered */
+int update_after_game(int code);  /* the game's exit code; updates when the game asked to */
+void update_request(void);    /* the online menu's Update Now: ends the game for the update */
 
 /* ---- game_data.c: the game's data from the player's disc ---- */
 /* NULL if the disc image at path holds the retail SCUS_971.77 (checked by SHA-1), then in *elf
@@ -38,8 +43,10 @@ void host_console_init(void);  /* the log's destination without a console window
 int host_setting_save(const char *key, const char *value);  /* one dhd.ini line, others kept */
 int host_setting_locked(const char *name);  /* the environment sets this DHD_* variable */
 void host_pad_vibrate(int port, int light, int heavy);  /* the DualShock 2's motors to the PC pad */
-void host_widescreen_init(void);  /* DHD_WIDESCREEN: 16:9 field of view (host.c) */
+void host_widescreen_init(void);  /* DHD_WIDESCREEN: Hor+ field of view, any aspect (widescreen.c) */
 void host_widescreen_vsync(void); /* its live-memory part, once a field */
+double host_widescreen_aspect(void);  /* the widescreen picture's width / height; 0 when off */
+void host_display_aware(void);    /* the process sees real pixels (DPI aware), before any window */
 void *host_fiber_main(void);  /* makes the calling OS thread a fiber; returns it */
 void *host_fiber_create(void (*fn)(void *), void *arg);
 void host_fiber_switch(void *fiber);

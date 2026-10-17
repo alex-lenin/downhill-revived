@@ -185,9 +185,27 @@ the file. A few useful ones:
 |---|---|
 | `iso` / `DHD_ISO` | the disc image |
 | `scale` / `DHD_SCALE` | internal resolution, `1` to `4` or `window` |
-| `widescreen` / `DHD_WIDESCREEN` | `1` for 16:9 |
+| `widescreen` / `DHD_WIDESCREEN` | `1` the monitor's shape, `0` off, or a shape such as `21:9` |
+| `DHD_ASPECT` | the picture's shape: `wide`, `4:3`, `16:9`, `stretch` or `pixels` |
 | `window` / `DHD_WINDOW` | `windowed`, `borderless` or `fullscreen` |
+| `skip_movies` / `DHD_SKIP_MOVIES` | `1` skips the movies (the test tools set it) |
 | `vibration` / `DHD_VIBRATION` | `0` turns rumble off |
 | `memory_card` / `DHD_MEMCARD` | `0` turns the memory card off |
+| `texture_pack` / `DHD_TEXTURE_PACK` | a PCSX2-format texture pack folder |
+| `textures` / `DHD_TEXTURES` | `off` draws the game's own textures |
+| `texture_cache_mb` / `DHD_TEXTURE_CACHE_MB` | graphics memory for replacement textures |
+| `auto_update` / `DHD_AUTO_UPDATE` | `ask`, `on` or `off` |
+| `update_url` / `DHD_UPDATE_URL` | a `latest.json` or GitHub releases API address (empty: the official releases) |
 | `server` / `DHD_NET_SERVER` | the online server address (empty: the official server) |
-| `DHD_RENDER` | `native` (default for players) or `exact` (the reference) |
+| `renderer` / `DHD_RENDER` | `native` (default for players) or `exact` (the reference) |
+
+A dhd.ini without a key gets the player defaults (`port/hle/host.c`, `player_defaults`):
+native renderer, scale 2, borderless, widescreen 1, movies on. With no dhd.ini at all (the test
+tools set `DHD_SETTINGS=none`) none of them apply. Tools that drive the game (`DHD_NAV`,
+`DHD_RACE_SYNC`, ...) never run the updater.
+
+## Releases
+
+`port/include/version.h` holds the version, the only place it is written. `package_release.py`
+names the zip after it and writes `build/release/latest.json` beside it (version, the release
+asset URL, the zip's SHA-256 and size) for the updater; publish both as release assets.

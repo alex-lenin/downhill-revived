@@ -22,7 +22,7 @@ host.
 | WebSocket | `/v1/rooms/new` | Create a room; this socket becomes its host. |
 | WebSocket | `/v1/rooms/<CODE>` | Join the room with that join code (case-insensitive). |
 | GET | `/v1/lobbies` | Public lobby list (JSON, below). |
-| GET | `/v1/health` | `{"ok":true,"protocol":1}` |
+| GET | `/v1/health` | `{"ok":true,"protocol":1,"minVersion":"0.1.0"}` |
 
 Join codes are 6 characters from `23456789ABCDEFGHJKMNPQRSTUVWXYZ` (no `0 O 1 I L`). Clients
 upper-case what the user types and reject characters outside that alphabet.
@@ -49,6 +49,23 @@ A refusal is one text frame followed by a close:
 | `room_not_found` | 4006 | No room has this code (or it was closed). |
 | `kicked` | 4007 | The host removed this player. |
 | `hello_timeout` | 4008 | No `hello` within 10 seconds. |
+| `client_outdated` | 4009 | `hello.clientVersion` is below the server's `MIN_VERSION` (below). |
+
+### Minimum client version
+
+The server refuses releases older than its `MIN_VERSION` (a Worker variable in
+`online/server/wrangler.jsonc`, `MAJOR.MINOR.PATCH`; default `0.1.0`, every release). Since
+0.2.0 the client sends its release in `hello.clientVersion` (`port/include/version.h`). A
+`hello` without it is 0.1.0, which did not send one; an unparseable one counts as outdated. The
+refusal carries both versions:
+
+```json
+{"type":"error","code":"client_outdated","message":"A new version is out. Update to play online.",
+ "minVersion":"0.2.0","clientVersion":"0.1.0"}
+```
+
+0.1.0 knows no `client_outdated`: like any refusal it shows `message` on the ONLINE screen.
+0.2.0 and later show the same text and add an **Update Now** row (finding 054).
 
 Non-fatal errors (a non-host sending a host command, a `start` while someone is not ready)
 use the same `error` frame **without** a close; the client just shows `message`.
@@ -59,7 +76,8 @@ use the same `error` frame **without** a close; the client just shows `message`.
 
 ```jsonc
 // First message, required. name: 1-24 characters.
-{"type":"hello","protocol":1,"version":"dhd-port 0.4.0","isoSha256":"<64 lowercase hex>","name":"Rider"}
+{"type":"hello","protocol":1,"version":"dhd-port 0.2.0 1a2b3c4d5e6f7a8b","clientVersion":"0.2.0",
+ "isoSha256":"<64 lowercase hex>","name":"Rider"}
 
 // Host only. Every field optional; omitted fields keep their value.
 {"type":"settings","track":3,"laps":2,"seed":12345,"public":true,"maxPlayers":4,"roomName":"Friday race"}
@@ -236,8 +254,8 @@ frames.
 `GET /v1/lobbies` → `200 application/json`:
 
 ```json
-{"protocol":1,"lobbies":[
-  {"code":"K7QX2M","roomName":"Friday race","version":"dhd-port 0.4.0","track":3,
+{"protocol":1,"minVersion":"0.1.0","lobbies":[
+  {"code":"K7QX2M","roomName":"Friday race","version":"dhd-port 0.2.0 1a2b3c4d5e6f7a8b","track":3,
    "players":2,"maxPlayers":4,"hostName":"Ann"}]}
 ```
 

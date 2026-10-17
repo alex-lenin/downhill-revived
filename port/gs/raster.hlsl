@@ -454,6 +454,7 @@ cbuffer Native : register(b3) {
 };
 Texture2D<float4> native_texture : register(t4);
 Texture2D<float4> native_source : register(t5);
+SamplerState native_replace_sampler : register(s1);   // texture packs (flag 2048)
 
 struct NativeVaryings {
     float4 position : SV_Position;
@@ -496,9 +497,25 @@ float4 native_texel(int2 c) {
     return t;
 }
 
+// A replacement from a texture pack (texpack.c, flag 2048) in native_texture: any size, with
+// mipmaps. It covers the same normalised texture space as the GS texture (as PCSX2 maps one) and
+// the sampler filters it; region clamp stays inside the region's replacement texels.
+float4 native_replacement(float2 uv, float2 across, float2 down) {
+    float2 size, gs_size = (float2)native_tex_size;
+    native_texture.GetDimensions(size.x, size.y);
+    float2 half_texel = gs_size / size * 0.5;
+    if (native_wrap.x == 2) uv.x = clamp(uv.x, native_region.x + half_texel.x, native_region.y + 1 - half_texel.x);
+    if (native_wrap.y == 2) uv.y = clamp(uv.y, native_region.z + half_texel.y, native_region.w + 1 - half_texel.y);
+    float4 t = native_texture.SampleGrad(native_replace_sampler, uv / gs_size, across / gs_size, down / gs_size);
+    t.rgb *= 255;
+    t.a *= native_alpha_scale;
+    return t;
+}
+
 // flags: 1 textured, 2 TCC, 4-8 TFX, 16 fog, 32 bilinear, 64 alpha test, 128 keep the
 // pixels that fail it (second pass of AFAIL), 256 texture alpha from TEXA (24-bit source),
-// 512 colour premultiplied by alpha (Cs * As blending, where As can exceed 1), 1024 a sprite.
+// 512 colour premultiplied by alpha (Cs * As blending, where As can exceed 1), 1024 a sprite,
+// 2048 a texture pack's replacement.
 // Targets keep the whole GS alpha (0..255 as a fraction of 255, so a texture drawn with alpha 0xFF
 // still reads 0xFF: the rider shadow); the blender takes As / 128 from the second output
 // (dual-source blending, SRC1_ALPHA).
@@ -509,24 +526,27 @@ NativeOutput native_pixel(NativeVaryings i) {
     float2 uv = i.stqf.xy / q * (float2)native_tex_size;
     float2 across = ddx(uv), down = ddy(uv);
     if (native_flags & 1) {
-        uint T = native_scale & 255, E = native_scale >> 16 & 255;
-        // An upscaled sprite of a 1x texture samples where the GS samples its pixel, the corner of
-        // the pixel's block: the HUD, text and screen passes look as at 1x, with no seams between
-        // tiles and nothing read past their texels (PCSX2's "round sprite"). A sprite's texture
-        // coordinates are affine, so the derivatives give them there.
-        if ((native_flags & 1024) && T > 1 && E == 1) {
-            float2 corner = floor(i.position.xy / T) * T - i.position.xy;
-            uv += across * corner.x + down * corner.y;
-        }
-        uv *= E;
         float4 t;
-        if (native_flags & 32) {
-            uv -= 0.5;
-            int2 b = (int2)floor(uv);
-            float2 f = uv - floor(uv);
-            t = lerp(lerp(native_texel(b), native_texel(b + int2(1, 0)), f.x),
-                     lerp(native_texel(b + int2(0, 1)), native_texel(b + int2(1, 1)), f.x), f.y);
-        } else t = native_texel((int2)floor(uv));
+        if (native_flags & 2048) t = native_replacement(uv, across, down);
+        else {
+            uint T = native_scale & 255, E = native_scale >> 16 & 255;
+            // An upscaled sprite of a 1x texture samples where the GS samples its pixel, the corner
+            // of the pixel's block: the HUD, text and screen passes look as at 1x, with no seams
+            // between tiles and nothing read past their texels (PCSX2's "round sprite"). A sprite's
+            // texture coordinates are affine, so the derivatives give them there.
+            if ((native_flags & 1024) && T > 1 && E == 1) {
+                float2 corner = floor(i.position.xy / T) * T - i.position.xy;
+                uv += across * corner.x + down * corner.y;
+            }
+            uv *= E;
+            if (native_flags & 32) {
+                uv -= 0.5;
+                int2 b = (int2)floor(uv);
+                float2 f = uv - floor(uv);
+                t = lerp(lerp(native_texel(b), native_texel(b + int2(1, 0)), f.x),
+                         lerp(native_texel(b + int2(0, 1)), native_texel(b + int2(1, 1)), f.x), f.y);
+            } else t = native_texel((int2)floor(uv));
+        }
         uint tfx = (native_flags >> 2) & 3;
         float3 rgb = tfx == 1 ? t.rgb : min(floor(t.rgb * color.rgb / 128), 255);
         if (tfx >= 2) rgb = min(rgb + color.a, 255);

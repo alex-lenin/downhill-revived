@@ -85,8 +85,10 @@ static int init(void)
     const D3D_FEATURE_LEVEL *required = hardware_enabled ? hardware : reference;
     unsigned required_count = hardware_enabled ? 2 : 1;
     HRESULT hr;
+    host_display_aware();  /* real pixels: a borderless window at the monitor's own resolution */
     wc.lpfnWndProc = window_proc; wc.hInstance = GetModuleHandleA(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.lpszClassName = "DHDNativeGS";
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));  /* port/res/dhd.rc */
     if (!RegisterClassA(&wc)) return 0;
     /* DHD_WINDOW: windowed (default; DHD_WINDOW_WIDTH x DHD_WINDOW_HEIGHT inside, 896x672),
        borderless (the whole monitor) or fullscreen (exclusive, the monitor's current mode). */
@@ -395,6 +397,14 @@ void gs_window_title(const char *utf8)
     SetWindowTextW(window, title);
 }
 
+/* EXIT GAME (port/hle/exit_menu.c): the window closes as when its close button is clicked, and
+   the game ends at the next gs_pump_messages. */
+void gs_window_close(void)
+{
+    if (window) PostMessageA(window, WM_CLOSE, 0, 0);
+    else exit(0);
+}
+
 /* The window's own thread handles its messages (window_thread); here the game ends once it closed. */
 void gs_pump_messages(void)
 {
@@ -486,6 +496,8 @@ static void bench_vsync(void)
     if (quit && !strcmp(quit, "1")) ExitProcess(0);
 }
 
+const uint32_t *movie_picture(unsigned *width, unsigned *height);  /* port/hle/movie.c */
+
 void gs_vsync(void)
 {
     static int profile, gpu_trace;
@@ -514,13 +526,21 @@ void gs_vsync(void)
     if ((pmode & 3) && bp != previous_bp) { gs_presented_frames++; previous_bp = bp; }
     unsigned width = 640, height = 448;
     int gpu_frame = 1;
+    /* While a movie plays (port/hle/movie.c, finding 055) its picture is shown instead. */
+    unsigned movie_width, movie_height;
+    const uint32_t *movie = movie_picture(&movie_width, &movie_height);
     if (gs_gpu_native(&gs)) {
         /* The native renderer's thread draws and presents; capture waits for its picture. */
+        gs_native_movie(&gs, movie, movie_width, movie_height);
         gs_native_vsync(&gs, swapchain, &width, &height, resize_pending);
         resize_pending = 0;
     } else {
         gpu_frame = !cpu_scanout && gs_gpu_display(&gs, &width, &height);
-        if (!gpu_frame) {
+        if (movie) {
+            gpu_frame = 0;
+            width = movie_width, height = movie_height;
+            memcpy(pixels, movie, (size_t)width * height * 4);
+        } else if (!gpu_frame) {
             if (!gs_display(&gs, pixels, &width, &height)) memset(pixels, 0, width * height * 4);
         }
         if (!resize(width, height)) return;

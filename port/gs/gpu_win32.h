@@ -21,6 +21,9 @@ void gs_native_lock(Gs *g, int lock);  /* the render thread's context lock (EE t
 void gs_native_present_options(Gs *g);  /* DHD_PRESENT_FILTER and DHD_ASPECT read again */
 /* The last field's picture at the renderer's resolution (DHD_SCALE), owned by the renderer. */
 uint32_t *gs_native_picture(Gs *g, unsigned *width, unsigned *height);
+/* The field being recorded shows this RGBA picture instead of the display circuit's (a movie,
+   port/hle/movie.c), or the circuit again with NULL. Game thread, before gs_native_vsync. */
+void gs_native_movie(Gs *g, const uint32_t *rgba, unsigned width, unsigned height);
 #ifdef DHD_GS_TEST_BUILD
 /* Diagnostic only: coherent raw GPU image, including unpredicted writes.
    Unlike g->sync this never filters pages or merges into g->vram. */
