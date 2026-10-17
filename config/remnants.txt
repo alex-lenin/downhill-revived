@@ -1,0 +1,9 @@
+# Functions that stay asm: dead-strip leftovers splat split out, plus hand-written/runtime code (tools/queue.py marks them
+# 'remnant'). 4-byte pieces and pieces without any jr/j are detected automatically; list the
+# rest here: NAME  reason
+func_001992E0  dead-strip leftover (sra) + pad, glued to an unnamed empty function at +8
+func_00159778  dead-strip leftover (addiu sp) glued to a  float-getter epilogue fragment
+func_001FB608  crtstuff __do_global_ctors_aux (compiler runtime, 16-byte save slots): stays asm
+func_001FB6C0  crtstuff __do_global_ctors driver (sibling call SN gcc never emits): stays asm
+func_001FBDD0  one-instruction thunk (j func_001FD4B8, no frame; sibling call SN gcc never emits): stays asm
+func_00217D88  hand-written asm (COP0 bc0t with hand-placed nops): stays asm

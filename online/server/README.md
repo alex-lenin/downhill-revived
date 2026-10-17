@@ -1,0 +1,79 @@
+# Online server
+
+Lobbies, join codes and the lockstep input relay for the PC port's online races. Cloudflare
+Workers + Durable Objects, TypeScript. The wire protocol is `docs/online-protocol.md`; the plan
+is `docs/ONLINE-PLAN.md`.
+
+| File | What |
+|---|---|
+| `src/index.ts` | Worker entry: routes `/v1/lobbies`, `/v1/health` and room WebSockets. |
+| `src/room.ts` | `Room` Durable Object, one per join code: lobby, start, race relay, leave handling. |
+| `src/lobbies.ts` | `LobbyIndex` Durable Object (a single global one): the public lobby list. |
+| `src/desync.ts` | Compares the per-field state hashes racers send. |
+| `src/protocol.ts` | Constants, join codes, input-delay formula, frame parsing. |
+| `test/` | Vitest suite, run inside the Workers runtime (`@cloudflare/vitest-plugin`). |
+| `tools/loadtest.mjs` | Simulated lockstep race against a running server; reports relay latency. |
+
+Rooms use the WebSocket hibernation API, so an idle lobby costs little. The relay path does
+no awaits and no copies: it fixes the slot byte and sends the received buffer to the other
+racers.
+
+## Develop and test
+
+Node 22 or newer.
+
+```sh
+cd online/server
+npm install
+npm test                 # unit + integration tests (workerd, no network)
+npm run typecheck        # generates src/worker-configuration.d.ts, then tsc
+npm run dev              # local server on http://127.0.0.1:8787
+npm run loadtest         # in a second terminal: 4 players, 600 fields
+node tools/loadtest.mjs --players 8 --fields 300
+node tools/loadtest.mjs --desync     # last player's hash differs from field 299: expects one desync event
+node tools/loadtest.mjs --url wss://dhd-online.<account>.workers.dev   # against a deployment
+```
+
+Measured on 2026-10-16 with `wrangler dev` on the dev PC (4 players, 600 fields at 59.94 Hz,
+3 fields per frame): all 1,800 inputs per player arrived intact, no field waited for input,
+relay one-way (sender → server → receiver) median 2.5 ms, p99 9 ms; binary PING round-trip
+median 4.3 ms. These are local numbers: on the internet add the players' own round-trips to
+the nearest Cloudflare location.
+
+## Deploy
+
+The official server is `wss://dhd-online.downhill-revived.workers.dev`; the game uses it
+when `dhd.ini` names no other. Running your own is optional. You need a Cloudflare account
+(the free plan supports Durable Objects with SQLite storage):
+
+```sh
+cd online/server
+npm install
+npx wrangler login       # opens the browser once; stores the token in your user profile, not here
+npx wrangler deploy
+```
+
+`wrangler deploy` prints the URL, `https://dhd-online.<account-subdomain>.workers.dev`. Players
+put `server = wss://dhd-online.<account-subdomain>.workers.dev` in their `dhd.ini`. The client
+then uses:
+
+- create a room: `wss://dhd-online.<account-subdomain>.workers.dev/v1/rooms/new`
+- join a room: `wss://dhd-online.<account-subdomain>.workers.dev/v1/rooms/<CODE>`
+- lobby list: `https://dhd-online.<account-subdomain>.workers.dev/v1/lobbies`
+
+Check it with `curl https://dhd-online.<account-subdomain>.workers.dev/v1/health`, then run
+the load test with `--url wss://...`. A custom domain can be added later under the Worker's
+*Settings → Domains & Routes* in the dashboard; the paths stay the same.
+
+Live logs: `npx wrangler tail`. Redeploying disconnects every open room (Durable Objects
+restart on a new version), so don't deploy during races.
+
+The Durable Object classes are created by the `v1` migration in `wrangler.jsonc`. Renaming or
+removing a class later needs a new migration entry, not an edit of `v1`.
+
+## Limits and what is not there yet
+
+- No reconnect: a dropped racer becomes AI for the rest of the race.
+- No authentication or rate limiting beyond the protocol checks (version, ISO hash, sizes).
+- The server does not check the ISO hash against the known US ISO; the client must refuse
+  other regions, and the server only makes everyone match the host.

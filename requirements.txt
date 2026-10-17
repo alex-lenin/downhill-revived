@@ -1,0 +1,6 @@
+splat64[mips]==0.50.0
+spimdisasm==1.42.4
+rabbitizer==1.16.2
+ninja==1.13.2
+PyYAML==6.0.3
+intervaltree==3.1.0

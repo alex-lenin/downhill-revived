@@ -1,0 +1,79 @@
+# --- Game data: never commit any of it -------------------------------------------------
+iso/
+*.iso
+*.ISO
+*.bin
+*.img
+*.cue
+*.chd
+*.cso
+*.elf
+*.ELF
+*.irx
+*.IRX
+SCUS_*
+bios/
+*.mc2
+*.ps2
+*.p2s
+# generated from your own executable by tools/split.py
+asm/
+assets/
+expected/
+
+# --- Build outputs ---------------------------------------------------------------------
+build/
+build-try/
+build.ninja
+.ninja_log
+.ninja_deps
+__pycache__/
+*.pyc
+/*.o
+/*.s
+/*.d
+/*.c.*
+/*.cpp.*
+# gcc -da RTL dumps from scratch builds
+/*.rtl
+/*.addressof
+/*.bp
+/*.combine
+/*.cse
+/*.cse2
+/*.dbr
+/*.flow
+/*.flow2
+/*.gcse
+/*.greg
+/*.jump
+/*.jump2
+/*.loop
+/*.lreg
+/*.mach
+/*.regmove
+/*.sched
+/*.sched2
+
+# --- Toolchain and external tools (downloaded by tools/setup_toolchain.py) ---------------
+tools/compilers/
+tools/ext/
+
+# --- Player files: settings, saves, logs, captures -------------------------------------
+dhd.ini
+online-settings.txt
+iso-check.txt
+saves/
+*.log
+*.dmp
+*.gs
+*.gs.xz
+*.wav
+*.bmp
+*.zip
+
+# --- Local notes and editor/agent settings ---------------------------------------------
+docs/private/
+.claude/
+.vscode/
+.idea/

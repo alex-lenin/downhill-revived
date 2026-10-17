@@ -1,0 +1,24 @@
+{
+  "name": "dhd-online-server",
+  "private": true,
+  "type": "module",
+  "description": "Downhill Domination PC port: online lobbies and lockstep relay (Cloudflare Workers + Durable Objects)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "types": "wrangler types src/worker-configuration.d.ts",
+    "typecheck": "wrangler types src/worker-configuration.d.ts && tsc --noEmit",
+    "test": "vitest run",
+    "loadtest": "node tools/loadtest.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.3",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12",
+    "wrangler": "^4.151.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261012.1": true
+  }
+}

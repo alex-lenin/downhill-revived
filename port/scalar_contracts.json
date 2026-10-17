@@ -1,0 +1,636 @@
+{
+  "version": 1,
+  "assembly": {
+    "__builtin_fabsf": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "__ieee754_sqrtf": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "__kernel_cosf": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "__kernel_sinf": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float",
+        "int"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "__pack_d": {
+      "ret": "double",
+      "args": [
+        "int"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "__pack_f": {
+      "ret": "float",
+      "args": [
+        "int"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "__unpack_d": {
+      "ret": "void",
+      "args": [
+        "int",
+        "int"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "__unpack_f": {
+      "ret": "void",
+      "args": [
+        "int",
+        "int"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "copysignf": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "fabsf": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "finitef": {
+      "ret": "int",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "floorf": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "func_001FB6E0": {
+      "ret": "int64",
+      "args": [
+        "int64",
+        "int"
+      ],
+      "evidence": "SN signed 64-bit modulo helper; retail sd a0 and integer divisor"
+    },
+    "func_001FC7B8": {
+      "ret": "double",
+      "args": [
+        "double",
+        "double"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_001FC810": {
+      "ret": "double",
+      "args": [
+        "double",
+        "double"
+      ],
+      "evidence": "retail-proven shared soft_double.h / rider_geometry.h contracts (round 7)"
+    },
+    "func_001FC878": {
+      "ret": "double",
+      "args": [
+        "double",
+        "double"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_001FCB20": {
+      "ret": "double",
+      "args": [
+        "double",
+        "double"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_001FCDA0": {
+      "ret": "int",
+      "args": [
+        "double",
+        "double"
+      ],
+      "evidence": "retail-proven shared soft_double.h / rider_geometry.h contracts (round 7)"
+    },
+    "func_001FCDF0": {
+      "ret": "double",
+      "args": [
+        "int"
+      ],
+      "evidence": "retail-proven shared soft_double.h / rider_geometry.h contracts (round 7)"
+    },
+    "func_001FCEA8": {
+      "ret": "int",
+      "args": [
+        "double"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_001FCF40": {
+      "ret": "int",
+      "args": [
+        "double"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_001FCFE0": {
+      "ret": "double",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int64"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_001FD010": {
+      "ret": "float",
+      "args": [
+        "double"
+      ],
+      "evidence": "retail-proven shared soft_double.h / rider_geometry.h contracts (round 7)"
+    },
+    "func_001FD238": {
+      "ret": "int",
+      "args": [
+        "float"
+      ],
+      "evidence": "SN unsigned float-to-int packer consumes f12, returns v0"
+    },
+    "func_001FD2D0": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_001FD300": {
+      "ret": "double",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail-proven shared soft_double.h / rider_geometry.h contracts (round 7)"
+    },
+    "func_0020D028": {
+      "ret": "void",
+      "args": [
+        "int"
+      ],
+      "variadic": true,
+      "evidence": "matching empty variadic native definition; retail FPR stores are the varargs save area"
+    },
+    "func_00213658": {
+      "ret": "int",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "float",
+        "float"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_00213C08": {
+      "ret": "int",
+      "args": [
+        "int",
+        "int",
+        "float",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "collision dispatcher a0..a3,t0..t3 and f12; shared callers 00210A18 / 00210CA8"
+    },
+    "func_0021CB98": {
+      "ret": "void",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int",
+        "float",
+        "float"
+      ],
+      "evidence": "retail parameter-block reader/setup uses four GPR pointers/flags and f12/f13"
+    },
+    "func_0022B028": {
+      "ret": "void",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    },
+    "func_00248058": {
+      "ret": "int",
+      "args": [
+        "int"
+      ],
+      "evidence": "Retail saves a0 in s2, copies exactly eight RTC bytes to [s2], and returns RPC integer status v0; ps2sdk sceCdReadClock."
+    },
+    "func_002484F8": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "func_002487A0": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "func_00248990": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "func_00248A80": {
+      "ret": "double",
+      "args": [
+        "double"
+      ],
+      "evidence": "retail-proven shared soft_double.h / rider_geometry.h contracts (round 7)"
+    },
+    "func_00248B90": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "func_00248C90": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "func_00248D90": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail f12/f13 inputs / f0 result"
+    },
+    "func_00248EB8": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail f12/f13 inputs / f0 result"
+    },
+    "func_00248FF8": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail f12/f13 inputs / f0 result"
+    },
+    "func_00249808": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00249C38": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00249FD8": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_0024A2C0": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_0024A510": {
+      "ret": "float",
+      "args": [
+        "float",
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_0024ADA0": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_0024C118": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00254D08": {
+      "ret": "int",
+      "args": [
+        "int"
+      ],
+      "variadic": true,
+      "evidence": "retail variadic register save area; f12/f14/f16/f18 stores are varargs spills, not fixed FP arguments",
+      "format_arg": 0
+    },
+    "func_00254D68": {
+      "ret": "int",
+      "args": [
+        "int",
+        "int"
+      ],
+      "variadic": true,
+      "evidence": "retail variadic register save area; f12/f14/f16/f18 stores are varargs spills, not fixed FP arguments",
+      "format_arg": 1
+    },
+    "func_00259120": {
+      "ret": "int",
+      "args": [
+        "int",
+        "int"
+      ],
+      "variadic": true,
+      "evidence": "retail variadic register save area; f12/f14/f16/f18 stores are varargs spills, not fixed FP arguments"
+    },
+    "func_00260908": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00260AF8": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00260CB0": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00260E08": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "retail-proven shared soft_double.h / rider_geometry.h contracts (round 7)"
+    },
+    "func_002610B8": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00261250": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00261408": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00261540": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "int",
+        "int"
+      ],
+      "evidence": "retail input register uses: f12/f13 and GPR inputs before overwrite; scalar f0 result (float_returns.json)"
+    },
+    "func_00261E48": {
+      "ret": "float",
+      "args": ["int"],
+      "evidence": "retail virtual scale getter: unused this in a0, constant 1.0 result in f0; D_00283A48 slot 4 (finding 021)"
+    },
+    "func_002627A0": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_002628A0": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00262B48": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00262C20": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00262D30": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00262FE0": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00263270": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00263320": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00263438": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00263578": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00263860": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_002638D8": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_002639D0": {
+      "ret": "float",
+      "args": [
+        "int",
+        "int",
+        "float"
+      ],
+      "evidence": "reviewed animation callback ABI, animation.h / finding 021"
+    },
+    "func_00263B88": {
+      "ret": "float",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail f12 input / f0 result and consistent native scalar consumers"
+    },
+    "isnanf": {
+      "ret": "int",
+      "args": [
+        "float"
+      ],
+      "evidence": "retail register inputs / unpack-pack call chain / preserved scalar result; GCC fp-bit.c used for helper meanings"
+    }
+  }
+}

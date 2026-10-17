@@ -1,0 +1,154 @@
+/* The PS2 system on the PC: the EE kernel's services and the IOP's, written natively (finding
+   020). The game's SDK calls them through their retail entry points (func_XXXXXXXX), which these
+   files define under readable names with an asm label. */
+#ifndef HLE_H
+#define HLE_H
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "memory.h"
+
+/* Defines a C function under the retail name of the SDK function it replaces. */
+#define RETAIL(name) __asm__("_" #name)
+
+/* Logs to stderr; DHD_LOG set in the environment turns on the verbose messages. */
+void hle_log(const char *fmt, ...);
+extern int hle_verbose;
+
+/* ---- host.c ---- */
+void host_init(void);         /* the crash report */
+void host_thread_name(const char *name); /* names the calling OS thread for bench/profile reports */
+unsigned host_thread_cpu(const char **names, double *seconds, unsigned max); /* CPU time of each */
+void host_poll_dump(void);   /* optional watchdog request at a kernel boundary */
+void host_backtrace(void);    /* the same report, here */
+void host_safe_vprint(FILE *f, const char *fmt, va_list ap);  /* checks %s pointers */
+int host_relaunch_reserving(uintptr_t at, size_t size);       /* see host.c */
+void host_settings_load(void); /* dhd.ini next to the exe into DHD_* variables (host.c) */
+int host_disc_ready(void);     /* the disc image checked, else asked for; nonzero: cancelled */
+
+/* ---- game_data.c: the game's data from the player's disc ---- */
+/* NULL if the disc image at path holds the retail SCUS_971.77 (checked by SHA-1), then in *elf
+   (if elf isn't NULL) a malloc'd copy of it; else why not, in words for the player. */
+const char *game_data_read(const char *path, uint8_t **elf);
+int game_data_load(void);      /* the data image into PS2 RAM from DHD_ISO's disc; 0: can't */
+void host_console_init(void);  /* the log's destination without a console window (host.c) */
+int host_setting_save(const char *key, const char *value);  /* one dhd.ini line, others kept */
+int host_setting_locked(const char *name);  /* the environment sets this DHD_* variable */
+void host_pad_vibrate(int port, int light, int heavy);  /* the DualShock 2's motors to the PC pad */
+void host_widescreen_init(void);  /* DHD_WIDESCREEN: 16:9 field of view (host.c) */
+void host_widescreen_vsync(void); /* its live-memory part, once a field */
+void *host_fiber_main(void);  /* makes the calling OS thread a fiber; returns it */
+void *host_fiber_create(void (*fn)(void *), void *arg);
+void host_fiber_switch(void *fiber);
+void host_fiber_delete(void *fiber);
+void *host_fiber_current(void);
+double host_seconds(void);    /* since the first call */
+double host_wall_seconds(void); /* diagnostics; game clock can be virtual */
+void host_sleep_ms(unsigned ms);
+void host_wait_wall(double seconds); /* until host_wall_seconds() reaches it, without spinning long */
+/* Just-in-time frames (kernel.c): the picture handed on at this VBLANK, when to show it (0: at
+   once) and when its pad was read; the presenter calls pacing_present just before it presents. */
+void pacing_handed(double *due, double *began);
+void pacing_present(double due, double began);
+enum { PAD_SELECT = 0x0001, PAD_L3 = 0x0002, PAD_R3 = 0x0004, PAD_START = 0x0008, PAD_UP = 0x0010,
+       PAD_RIGHT = 0x0020, PAD_DOWN = 0x0040, PAD_LEFT = 0x0080, PAD_L2 = 0x0100, PAD_R2 = 0x0200,
+       PAD_L1 = 0x0400, PAD_R1 = 0x0800, PAD_TRIANGLE = 0x1000, PAD_CIRCLE = 0x2000, PAD_CROSS = 0x4000,
+       PAD_SQUARE = 0x8000 };
+int autopad_read(const char *script, double seconds, uint16_t *buttons);
+int autopad_nav(const char *script, unsigned long long field, uint16_t *buttons);  /* DHD_NAV */
+void race_sync_vsync(unsigned long long field);  /* DHD_RACE_SYNC, see autopad.c */
+int race_sync_pad(int player, uint16_t *buttons);
+int race_sync_capture(const char *prefix, char *name, size_t size);
+
+/* One controller's state, as a DualShock 2 reports it: buttons as libpad's bits (1 = pressed,
+   0x0001 SELECT, L3, R3, START, UP, RIGHT, DOWN, LEFT, L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS,
+   0x8000 SQUARE), sticks 0..255 (128 centred, down/right positive), pressures 0..255 in the
+   order right, left, up, down, triangle, circle, cross, square, L1, R1, L2, R2. */
+typedef struct {
+    uint16_t buttons;
+    uint8_t right_x, right_y, left_x, left_y;
+    uint8_t pressure[12];
+} HostPad;
+void host_pad_read(int port, HostPad *out);  /* a script if one is set, else the controller */
+int host_pad_script(int player, HostPad *out);  /* DHD_NAV / DHD_AUTOPAD / DHD_RACE_PAD; 0 if none */
+void host_pad_device(int port, HostPad *out);   /* XInput pad, else DualSense/DS4, else the keyboard */
+
+/* ---- kernel.c ---- */
+enum { INTC_GS = 0, INTC_VBLANK_START = 2, INTC_VBLANK_END = 3, INTC_TIMER0 = 9 };
+
+void kernel_init(void);
+void kernel_dump(void);
+/* Creates the main thread (SetupThread) and runs the threads; returns when the game exits. */
+void kernel_run(void (*root)(void), uint32_t gp, uint32_t stack, uint32_t stack_size);
+/* Delivers the interrupts that are due (vsync, alarms) and switches thread if one of higher
+   priority became ready. Called at every kernel entry. */
+void kernel_poll(void);
+/* A store to INTC_STAT (0x1000F000): clears the causes whose bits are set in value. */
+void kernel_intc_write(uint32_t value);
+/* Runs the handlers of a DMAC channel (a transfer the hardware layer finished). */
+void kernel_dmac_interrupt(int channel);
+
+/* ---- dma.c ---- */
+void vif_feed(int unit, const uint32_t *words, uint32_t n);  /* vif.c */
+void dma_mmio_write(uintptr_t address, uint64_t value, unsigned size);
+void dma_poll(void);  /* ends the DMA transfers the game started (see dma.c) */
+void graphics_feed(int unit, const uint32_t *words, uint32_t count);
+void graphics_wait(void);
+/* Writes deferred store-image reads (graphics.c) before host code passes PS2 RAM to the OS. */
+void graphics_settle(void);
+void graphics_shutdown(void);
+/* VIF1/GIF run on the graphics worker unless DHD_MTVU=0 (graphics_queue.c). */
+int graphics_threaded(void);
+
+/* ---- sif.c: RPC servers (one per IOP module server id) ---- */
+typedef void (*RpcServer)(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_unknown(const char *server, int fno, void *send, int ssize, void *recv, int rsize);
+int sif_poll(void);
+double sif_next_event(void);
+void sif_command(uint32_t cid, void *packet);  /* an IOP message to the EE's handler */
+
+/* cdvd.c */
+void rpc_cd_init(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_cd_scmd(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_cd_ncmd(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_cd_search(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_cd_diskready(int fno, void *send, int ssize, void *recv, int rsize);
+int cdvd_find(const char *path, uint32_t *lsn, uint32_t *size);  /* a disc file by path */
+int cdvd_read(uint32_t lsn, uint32_t count, void *dst);           /* 2048-byte sectors */
+
+/* pad.c */
+void rpc_pad(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_pad_ext(int fno, void *send, int ssize, void *recv, int rsize);
+void pad_vsync(void);  /* refreshes the controllers' frames in EE memory */
+void pad_refresh(void);  /* the newest frames' input read again (just-in-time frames, kernel.c) */
+
+/* ---- online.c: where the pads' input comes from ---- */
+int pads_connected(void);   /* controllers plugged in: DHD_PADS (1-4), 4 in an online race */
+int pads_multitap(void);    /* 3-4 pads: a multitap on port 0, player i in slot i */
+void pads_begin_field(void);                /* each vsync, before the pads are read */
+void pads_read(int player, HostPad *out);   /* player i's controller for this field */
+int pads_online(void);      /* an online race: started with DHD_NET_* or from the ONLINE menu */
+void hle_online_from_menu(void);            /* the ONLINE menu's room started its race */
+void hle_online_version(char *out, size_t size);  /* the build's identity for the lobby */
+void kernel_pace_slip(double seconds);      /* kernel.c: the frame clock waited this long */
+void kernel_pace_shared(int on);            /* kernel.c: online, fields keep to the shared race clock */
+int host_stack_ranges(uintptr_t (**ranges)[2]);  /* host.c: the EE threads' host stacks [low, high) */
+
+/* iop.c */
+void *iop_ptr(uint32_t addr);  /* host pointer of an IOP memory address */
+void rpc_fileio(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_iop_heap(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_loadfile(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_mc(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_mtap(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_mtap_open(int fno, void *send, int ssize, void *recv, int rsize);        /* 0x80000901 */
+void rpc_mtap_connection(int fno, void *send, int ssize, void *recv, int rsize);  /* 0x80000903 */
+void rpc_mtap_version(int fno, void *send, int ssize, void *recv, int rsize);     /* 0x80000905 */
+void rpc_sound(int fno, void *send, int ssize, void *recv, int rsize);
+void rpc_sound2(int fno, void *send, int ssize, void *recv, int rsize);
+void sound_tick(void); /* sound.c: one frame of game time (finding 022) */
+
+#endif

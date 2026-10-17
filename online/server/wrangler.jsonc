@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dhd-online",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "Room" },
+      { "name": "LOBBIES", "class_name": "LobbyIndex" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room", "LobbyIndex"] }
+  ]
+}

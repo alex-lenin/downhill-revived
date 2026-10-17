@@ -1,0 +1,2641 @@
+/* Native renderer (DHD_RENDER=native). GS primitives become ordinary D3D11 triangles drawn
+   into real render targets with a real depth buffer, hardware blending and decoded, cached
+   textures. Pictures are close to the GS, not bit-exact.
+
+   Game state stays exact. The only GS data the EE consumes in a race is the lens-flare Z probe
+   (func_00228328 reads a 4x4 PSMZ32 patch every frame). The exact backend keeps running on its
+   own device, but only for Z-writing primitives inside a watch rectangle around the last probe,
+   clipped to it, in order. A probe outside the watch rectangle (a camera cut) is answered by
+   replaying the logged Z-writing primitives since the last full overwrite of the probed pixels.
+   A probe at the Z buffer's bottom edge reads one row past it, into the next buffer (sky colours
+   in a frame buffer, darkened by the rider shadow texture, which comes from a downsample of the
+   frame). So while the probe is near the bottom edge the exact backend draws whole frames too:
+   every render target an exactly drawn primitive samples joins the exact set, and the rows a
+   probe can reach past the Z buffer (the band) are drawn exactly. The flare moves smoothly, so
+   these exact frames start several fields before the probe reaches the edge.
+
+   Each field's draws are recorded on the GS worker as a command list; at vsync the list goes
+   to a render thread that owns the presentation device's context, so presentation no longer
+   holds up the EE.
+
+   DHD_INTERP=1 adds frames between game fields for 120/144 Hz displays. The simulation stays at
+   59.94 Hz and runs no extra game code: the render thread keeps the last two recorded fields and
+   on every display refresh re-runs the newer field's command list with its vertices moved
+   towards the older field's. A draw command is paired with the older field's next command of
+   the same state and vertex count (the camera, the riders and rigid objects); anything unpaired
+   (particles, the flare, changing geometry) and anything that jumps is held at the newer field.
+   The picture lags the game by one field. DHD_INTERP_HZ=N paces presentation to N Hz with a
+   timer instead of the display's vsync. */
+
+#include <process.h>
+#include <math.h>
+#include <limits.h>
+#include <intrin.h>
+
+double host_wall_seconds(void); /* port/hle/host.c */
+
+enum { NATIVE_SURFACES = 48, NATIVE_TEXTURES = 4096, NATIVE_WATCH = 128, NATIVE_CONVERTS = 64 };
+
+typedef struct {
+    float x, y, z, s, t, q, fog;
+    uint32_t rgba;
+} NativeVertex;
+
+typedef struct {
+    float target[2]; uint32_t flags, atst;
+    uint32_t aref; float alpha_scale, texa_alpha;
+    uint32_t scale;                    /* set when drawn: target, texture, sampled scale (raster.hlsl) */
+    float fog[4];
+    int32_t tex_offset[2]; uint32_t tex_size[2];
+    uint32_t wrap[4];
+    uint32_t region[4];
+} NativeConstants;
+
+typedef struct {
+    uint64_t key;
+    ID3D11Texture2D *texture;
+    ID3D11ShaderResourceView *view;
+    uint64_t used;        /* last field that drew with it */
+} NativeTexture;
+
+/* A render target or depth buffer: GS memory from page `page`, `bw` pages wide. */
+typedef struct {
+    unsigned page, bw, wide, depth;    /* wide: 16-bit pixel layout (64x64 pages) */
+    unsigned zpsm;                     /* depth: the Z format it was last drawn with */
+    volatile LONG extent[2];           /* pixels claimed so far (GS worker; only grows) */
+    unsigned scale, size[2];           /* render thread: its resolution scale; texture size (scaled pixels) */
+    ID3D11Texture2D *texture;
+    ID3D11RenderTargetView *rtv;
+    ID3D11DepthStencilView *dsv;
+    ID3D11ShaderResourceView *srv;
+} NativeSurface;
+
+enum { NATIVE_DRAW, NATIVE_COPY, NATIVE_IMPORT };
+typedef struct {
+    uint8_t kind, depth_key, color_mask, pad;
+    int16_t target, depth, texture_surface;
+    int16_t convert;                   /* the frame's texture conversion this draw samples, or -1 */
+    uint32_t blend_key, blend_fix;
+    NativeTexture *texture;
+    D3D11_RECT scissor;
+    NativeConstants constants;
+    uint32_t first, count;
+    /* NATIVE_COPY: source surface rectangle to (x, y) in target; NATIVE_IMPORT: pixels. */
+    int16_t source;
+    int x, y, w, h, sx, sy;
+    uint32_t *pixels;
+} NativeCommand;
+
+/* DHD_INTERP pairs vertices by segment: one GIF tag's primitives (a VU1 batch, a piece of a
+   mesh), under one draw state. Draw commands merge many of them, and culling or clipping in
+   any one changes the command's vertex count. */
+typedef struct {
+    uint32_t first, count, key;      /* key: a hash of the command's draw state */
+} NativeSegment;
+
+/* A texture the GPU rebuilds from a surface just before the draw that samples it (native_convert
+   in raster.hlsl); the constants match its cbuffer. */
+typedef struct {
+    uint32_t tex[4], size[4];
+    uint32_t slot[4][4];               /* per source surface: page, bw, 1 for depth, Z units (float bits) */
+    uint8_t pages[512];                /* per GS page: 0 the CPU copy (the decoded base), 1-4 a source slot */
+    uint32_t palette[256];
+} NativeConvertConstants;
+typedef struct {
+    int16_t surface[4];
+    NativeTexture *base;               /* the texture decoded from the CPU copy, or NULL */
+    NativeConvertConstants constants;
+} NativeConvert;
+
+typedef struct {
+    NativeVertex *vertices;
+    unsigned vertex_count, vertex_capacity;
+    NativeCommand *commands;
+    unsigned command_count, command_capacity;
+    NativeConvert *converts;
+    unsigned convert_count, convert_capacity;
+    int display_surface;
+    uint32_t display[12];
+    uint64_t field;
+    double time;                     /* host wall seconds at vsync */
+    double due, began;               /* when to present it (0: at once), when its pad was read (kernel.c) */
+    NativeSegment *segments;         /* DHD_INTERP: the vertices of each GIF tag */
+    unsigned segment_count, segment_capacity;
+    int32_t *pair;                   /* DHD_INTERP: each segment's partner in the older field, or -1 */
+    unsigned pair_capacity;
+} NativeFrame;
+
+/* Primitives that write Z buffer memory, for the exact probe answer: Z writes (zbp) and colour
+   writes into a Z buffer's pages (fbp; the game clears part of its Z buffer that way). */
+enum { NATIVE_NO_PAGE = 0xFFFF };
+typedef struct {
+    unsigned type, count, state, zbp, fbp;
+    int box[4];
+    GsVertex v[3];
+    uint8_t unconditional;
+} NativeLogDraw;
+typedef struct { uint64_t reg[128]; uint16_t clut[1024]; } NativeLogState;
+typedef struct {
+    NativeLogDraw *draws; unsigned draw_count, draw_capacity;
+    NativeLogState *states; unsigned state_count, state_capacity;
+    uint64_t state_version;
+} NativeLog;
+
+typedef struct {
+    uint64_t draws, primitives, commands, decoded, decoded_texels, cache_hits, imports, copies;
+    uint64_t texture_from_surface, texture_unsupported, blend_approximate, date_ignored;
+    uint64_t probe_hits, probe_replays, probe_uncovered, probe_replayed_draws, exact_draws;
+    uint64_t color_reads, copy_fallbacks, display_missing, frames, presented;
+    uint64_t unsupported_why[6]; /* depth, format, width class, block offset, buffer width, layout */
+    uint64_t interp_frames, paired_vertices, held_vertices, jumped_vertices, z_alias_draws;
+    uint64_t band_draws, band_rt_textures, probe_band_hits, band_moves, target_draws, exact_targets, full_fields;
+    uint64_t converted, conversions_run, blend_dest_alpha;
+} NativeStats;
+
+enum { NATIVE_FRAMES = 6, NATIVE_INTERVALS = 8192 };
+
+/* DHD_NATIVE_SURFACES=1: how each surface is used, printed at exit. Sprites that sample a surface
+   are binned by texels per pixel (<0.75, about 1, about 2, more) and, for the 1:1 ones, by the
+   fraction of a texel between U and the pixel's X (quarters): which sampling the upscaled
+   surfaces have to keep aligned. */
+typedef struct {
+    uint64_t draws, depth_draws, sampled, copied_in, copied_out, converted, displayed;
+    int depth_with;
+    uint64_t pair[NATIVE_SURFACES], ratio[NATIVE_SURFACES][4], offset[NATIVE_SURFACES][4];
+} NativeUsage;
+
+typedef struct Native {
+    Gpu *exact;
+    ID3D11Device *device;
+    ID3D11DeviceContext *context;
+    CRITICAL_SECTION context_lock;
+    /* recording (GS worker) */
+    NativeFrame frames[NATIVE_FRAMES];
+    NativeFrame *recording;
+    NativeCommand current;
+    int current_valid;
+    uint64_t state_version, written;
+    unsigned state_ctxt, state_prim;
+    float zscale; uint32_t zmax;
+    int skip;                        /* the current state draws nothing */
+    int box[4];                      /* pixels the open draw has touched */
+    unsigned target_psm, depth_psm;
+    int passes;                      /* AFAIL second pass needed */
+    NativeCommand second;
+    NativeSurface surfaces[NATIVE_SURFACES];
+    volatile LONG surface_count;
+    int16_t owner[512];
+    uint32_t owner_writes[512];
+    int16_t top_owner[512];          /* the colour surface that last drew a page, for a Z24 buffer's top byte */
+    uint32_t top_writes[512];
+    uint64_t page_hash[512];
+    uint32_t page_hashed[512];
+    uint8_t page_hash_valid[512];
+    NativeTexture textures[NATIVE_TEXTURES];
+    unsigned texture_count;
+    uint64_t field;
+    /* exact Z probe */
+    NativeLog logs[2];               /* previous field, this field */
+    struct { int on, valid; unsigned zbp; int rect[4]; uint8_t covered[NATIVE_WATCH * NATIVE_WATCH]; unsigned missing; } watch;
+    uint8_t zbw[512];                /* buffer width each Z buffer was last drawn with */
+    uint8_t zbase[512];              /* pages used as a Z buffer base */
+    uint8_t band[512];               /* pages kept exact all the time */
+    uint16_t band_pages[64];
+    uint8_t exact_target[512];       /* render target bases drawn exactly, whole */
+    uint64_t full_until;             /* exact frames run through this field */
+    unsigned full_hold;              /* fields they run on after the probe leaves the edge */
+    unsigned band_count, band_key;   /* the Z buffer (base, width, rows) the band follows */
+    int trace_probes;
+    FILE *texlog;                    /* DHD_NATIVE_TEXLOG: textures drawn without their pixels */
+    NativeUsage *usage;              /* DHD_NATIVE_SURFACES */
+    uint64_t replay_version;
+    /* render thread */
+    HANDLE thread;
+    CRITICAL_SECTION queue_lock;
+    CONDITION_VARIABLE queue_changed;
+    NativeFrame *pending[2], *free_frames[NATIVE_FRAMES];
+    unsigned pending_count, free_count;
+    uint64_t handed, rendered;
+    int quit, resize;
+    IDXGISwapChain *swapchain;
+    ID3D11Texture2D *backbuffer;
+    ID3D11RenderTargetView *back_view;
+    unsigned buffer_width, buffer_height;
+    HWND window;
+    float aspect;  /* the picture's shape in the window (DHD_ASPECT): width/height, 0 stretched, -1 its pixels */
+    ID3D11VertexShader *present_vertex;
+    ID3D11PixelShader *present_pixel;
+    ID3D11SamplerState *present_sampler;
+    ID3D11VertexShader *vertex_shader;
+    ID3D11PixelShader *pixel_shader;
+    ID3D11ComputeShader *scanout_shader, *convert_shader;
+    ID3D11Buffer *convert_constants, *inverse;
+    ID3D11ShaderResourceView *inverse_view;
+    struct { ID3D11Texture2D *texture; ID3D11ShaderResourceView *srv; ID3D11UnorderedAccessView *uav; unsigned w, h; }
+        converted[NATIVE_CONVERTS];
+    ID3D11InputLayout *layout;
+    ID3D11Buffer *vertex_buffer, *constant_buffer, *display_constants;
+    unsigned vertex_buffer_capacity;
+    ID3D11RasterizerState *rasterizer;
+    struct { uint32_t key; ID3D11BlendState *state; } blends[128];
+    unsigned blend_count;
+    ID3D11DepthStencilState *depth_states[16];
+    /* DHD_SCALE: wide surfaces (frame and Z buffers) are drawn this many times larger; 0 until
+       "match window" has seen the window. Narrow ones (the shadow and its blur) stay at 1x. */
+    unsigned scale_setting, scale;
+    ID3D11PixelShader *blit_pixel;
+    ID3D11Buffer *blit_constants;
+    ID3D11Texture2D *import;           /* a 1x page, drawn into an upscaled surface */
+    ID3D11ShaderResourceView *import_view;
+    NativeConvertConstants convert_scratch;
+    uint32_t *picture;                 /* DHD_SCREENSHOT of an upscaled picture */
+    size_t picture_size;
+    ID3D11Texture2D *scratch, *display, *display_readback;
+    ID3D11ShaderResourceView *scratch_view;
+    unsigned scratch_size[2];
+    ID3D11UnorderedAccessView *display_uav;
+    ID3D11ShaderResourceView *display_view;
+    unsigned display_width, display_height;
+    NativeStats stats;
+    /* DHD_INTERP */
+    int interp;
+    uint64_t segment_tags;           /* GIF tags seen when the open segment started */
+    uint32_t segment_key;
+    double interp_hz;
+    double present_due, present_began;  /* the picture being drawn (NativeFrame due, began) */
+    NativeFrame *older, *newer;      /* held by the render thread */
+    NativeVertex *mixed;
+    unsigned mixed_capacity;
+    int32_t *same;                   /* native_mixed: segments by vertex positions (open addressing) */
+    unsigned same_capacity;
+    uint8_t *paired;
+    unsigned paired_capacity;
+    HANDLE timer;
+    double last_present, first_present;
+    float intervals[NATIVE_INTERVALS];   /* ms between presents, a ring */
+    uint64_t interval_count;
+    uint64_t bench_presented, bench_interp;  /* counters at the DHD_BENCH window's first field */
+    /* DHD_NATIVE_TRACE=prefix: prefix-fields.csv, a line per recorded field (GS worker at vsync),
+       and prefix-pictures.csv, a line per picture (render thread) with its GPU time. */
+    FILE *trace_fields, *trace_pictures;
+    NativeStats trace_last;
+    struct { uint64_t self_copies, self_copy_px, copies, copy_px, imports, import_px, draws; } drawn;
+    struct {
+        ID3D11Query *disjoint, *begin, *end;
+        int pending; uint64_t field; float t, cpu_ms;
+        uint64_t self_copies, self_copy_px, copies, copy_px, imports, import_px, draws;
+    } gpu_time[8];
+    unsigned gpu_time_next;
+} Native;
+
+static int psm_wide(unsigned psm) { return (psm & 7) == 2; }
+static int psm_color(unsigned psm) { return psm == 0 || psm == 1 || psm == 2 || psm == 10; }
+
+/* ---- surfaces and page ownership (GS worker; descriptors are append-only) ---- */
+
+static int native_surface(Native *n, unsigned page, unsigned bw, unsigned psm, unsigned depth)
+{
+    unsigned wide = psm_wide(psm), count = (unsigned)n->surface_count;
+    if (!bw) bw = 1;
+    for (unsigned i = 0; i < count; i++) {
+        NativeSurface *s = &n->surfaces[i];
+        if (s->page == page && s->bw == bw && s->wide == wide && s->depth == depth) return (int)i;
+    }
+    if (count == NATIVE_SURFACES) return -1;
+    NativeSurface *s = &n->surfaces[count];
+    s->page = page; s->bw = bw; s->wide = wide; s->depth = depth;
+    InterlockedExchange(&n->surface_count, (LONG)count + 1);  /* the render thread creates its textures */
+    return (int)count;
+}
+
+static int native_owner(Native *n, const Gs *g, unsigned page)
+{
+    page &= 511;
+    return n->owner_writes[page] == g->page_writes[page] ? n->owner[page] : -1;
+}
+
+/* Pixel origin of a GS page inside a surface, or 0 when the page is outside its layout. */
+static int native_page_origin(const NativeSurface *s, unsigned page, int *x, int *y)
+{
+    unsigned rel = (page - s->page) & 511, ph = s->wide ? 64 : 32;
+    if (rel / s->bw * ph >= 2048) return 0;
+    *x = (int)(rel % s->bw) * 64; *y = (int)(rel / s->bw * ph);
+    return 1;
+}
+
+/* Leaves at once: the exit report would wait on the render thread. */
+static void native_oom(const char *what)
+{
+    fprintf(stderr, "gs native: out of memory (%s)\n", what);
+    fflush(stderr);
+    ExitProcess(1);
+}
+
+static NativeCommand *native_command(Native *n)
+{
+    NativeFrame *f = n->recording;
+    if (f->command_count == f->command_capacity) {
+        unsigned capacity = f->command_capacity ? f->command_capacity * 2 : 4096;
+        NativeCommand *grown = realloc(f->commands, capacity * sizeof *grown);
+        if (!grown) native_oom("commands");
+        f->commands = grown; f->command_capacity = capacity;
+    }
+    NativeCommand *c = &f->commands[f->command_count++];
+    memset(c, 0, sizeof *c);
+    c->target = c->depth = c->texture_surface = c->source = c->convert = -1;
+    return c;
+}
+
+/* CPU memory (uploads, or nothing yet) becomes the surface's starting content for that page. */
+static void native_import_page(Native *n, Gs *g, int surface, unsigned page)
+{
+    NativeSurface *s = &n->surfaces[surface];
+    int x, y;
+    if (s->depth || !native_page_origin(s, page, &x, &y)) return;
+    unsigned w = 64, h = s->wide ? 64 : 32, psm = s->wide ? GS_PSMCT16 : GS_PSMCT32;
+    int previous = native_owner(n, g, page);
+    NativeCommand *c = native_command(n);
+    c->target = (int16_t)surface; c->x = x; c->y = y; c->w = (int)w; c->h = (int)h;
+    if (previous >= 0 && previous != surface && !n->surfaces[previous].depth &&
+        n->surfaces[previous].wide == s->wide &&
+        native_page_origin(&n->surfaces[previous], page, &c->sx, &c->sy)) {
+        c->kind = NATIVE_COPY; c->source = (int16_t)previous;
+        n->stats.copies++;
+        if (n->usage) n->usage[previous].copied_out++, n->usage[surface].copied_in++;
+        return;
+    }
+    c->kind = NATIVE_IMPORT;
+    c->pixels = malloc(w * h * 4);
+    if (!c->pixels) native_oom("import");
+    for (unsigned j = 0; j < h; j++)
+        for (unsigned i = 0; i < w; i++) {
+            uint32_t v = gs_image_pixel(g->vram, psm, s->page * 32, s->bw, (unsigned)x + i, (unsigned)y + j);
+            if (s->wide) v = gs_color(v, GS_PSMCT16, 0x80ull << 32 | 0x80);
+            unsigned a = v >> 24;
+            c->pixels[j * w + i] = (v & 0xFFFFFF) | a << 24;
+        }
+    n->stats.imports++;
+}
+
+/* Makes the surface own every page of a rectangle, importing the colour pages it did not own. */
+static void native_claim(Native *n, Gs *g, int surface, unsigned psm, int x0, int y0, int x1, int y1)
+{
+    NativeSurface *s = &n->surfaces[surface];
+    uint32_t pages[16] = {0};
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > 2047) x1 = 2047;
+    if (y1 > 2047) y1 = 2047;
+    if (x1 < x0 || y1 < y0) return;
+    if (x1 + 1 > s->extent[0]) InterlockedExchange(&s->extent[0], x1 + 1);
+    if (y1 + 1 > s->extent[1]) InterlockedExchange(&s->extent[1], y1 + 1);
+    gs_mark_pages(pages, psm, s->page * 32, s->bw, (unsigned)x0, (unsigned)y0, (unsigned)x1, (unsigned)y1);
+    for (unsigned word = 0; word < 16; word++)
+        for (uint32_t bits = pages[word]; bits; bits &= bits - 1) {
+            unsigned long bit;
+            _BitScanForward(&bit, bits);
+            unsigned page = word * 32 + bit;
+            if (native_owner(n, g, page) == surface) continue;
+            if (!s->depth) native_import_page(n, g, surface, page);
+            n->owner[page] = (int16_t)surface;
+            n->owner_writes[page] = g->page_writes[page];
+            if (!s->depth && !s->wide) { n->top_owner[page] = (int16_t)surface; n->top_writes[page] = g->page_writes[page]; }
+        }
+}
+
+/* ---- textures ---- */
+
+static uint64_t native_mix(uint64_t h, uint64_t v)
+{
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h * 0xFF51AFD7ED558CCDull;
+}
+
+static uint64_t native_page_hash(Native *n, const Gs *g, unsigned page)
+{
+    if (!n->page_hash_valid[page] || n->page_hashed[page] != g->page_writes[page]) {
+        const uint64_t *words = (const uint64_t *)((const uint8_t *)g->vram + page * 8192);
+        uint64_t h = page;
+        for (unsigned i = 0; i < 1024; i += 4)
+            h = native_mix(h, words[i] ^ words[i + 1] * 3 ^ words[i + 2] * 5 ^ words[i + 3] * 7);
+        n->page_hash[page] = h; n->page_hashed[page] = g->page_writes[page]; n->page_hash_valid[page] = 1;
+    }
+    return n->page_hash[page];
+}
+
+static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w, unsigned h, uint64_t key)
+{
+    unsigned slot = (unsigned)(key % NATIVE_TEXTURES);
+    for (unsigned probe = 0; probe < 16; probe++) {
+        NativeTexture *t = &n->textures[(slot + probe) % NATIVE_TEXTURES];
+        if (t->texture && t->key == key) { t->used = n->field; n->stats.cache_hits++; return t; }
+    }
+    /* Free the oldest of the probed slots unless a queued or rendering field may use it. */
+    NativeTexture *victim = NULL;
+    for (unsigned probe = 0; probe < 16; probe++) {
+        NativeTexture *t = &n->textures[(slot + probe) % NATIVE_TEXTURES];
+        if (!t->texture) { victim = t; break; }
+        if (t->used + 8 < n->field && (!victim || t->used < victim->used)) victim = t;
+    }
+    if (!victim) return NULL;
+    if (victim->texture) {
+        ID3D11ShaderResourceView_Release(victim->view); ID3D11Texture2D_Release(victim->texture);
+        victim->texture = NULL; victim->view = NULL;
+    }
+    unsigned psm = (unsigned)(tex0 >> 20) & 63, tbp = (unsigned)tex0 & 0x3FFF, tbw = (unsigned)(tex0 >> 14) & 63;
+    uint32_t *pixels = malloc((size_t)w * h * 4), palette[256];
+    if (!pixels) return NULL;
+    int indexed = psm == GS_PSMT8 || psm == GS_PSMT4 || psm == GS_PSMT8H || psm == GS_PSMT4HL || psm == GS_PSMT4HH;
+    if (indexed) for (unsigned i = 0; i < 256; i++) palette[i] = gs_palette(g, tex0, i);
+    if (!tbw) tbw = 1;
+    for (unsigned y = 0; y < h; y++)
+        for (unsigned x = 0; x < w; x++) {
+            uint32_t v = gs_image_pixel(g->vram, psm, tbp, tbw, x, y);
+            pixels[y * w + x] = indexed ? palette[v & 255] : gs_color(v, psm, g->reg[GS_TEXA]);
+        }
+    D3D11_TEXTURE2D_DESC d = {0};
+    d.Width = w; d.Height = h; d.MipLevels = d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA data = {pixels, w * 4, 0};
+    HRESULT hr = ID3D11Device_CreateTexture2D(n->device, &d, &data, &victim->texture);
+    free(pixels);
+    if (FAILED(hr)) { victim->texture = NULL; return NULL; }
+    if (FAILED(ID3D11Device_CreateShaderResourceView(n->device, (ID3D11Resource *)victim->texture, NULL, &victim->view))) {
+        ID3D11Texture2D_Release(victim->texture); victim->texture = NULL; return NULL;
+    }
+    victim->key = key; victim->used = n->field;
+    n->stats.decoded++; n->stats.decoded_texels += (uint64_t)w * h;
+    return victim;
+}
+
+/* Where a page of a texture lives when the native renderer drew some of its pages: 0 for the
+   CPU copy of GS memory, else 1 + the surface whose pixels hold the page. A Z24 buffer keeps the
+   top byte (8H, 4HL and 4HH textures): what a colour draw into its memory left there, or the CPU
+   copy (uploads; the logo). */
+static int native_page_source(Native *n, Gs *g, unsigned page, unsigned psm)
+{
+    int o = native_owner(n, g, page);
+    if (o < 0) return 0;
+    const NativeSurface *s = &n->surfaces[o];
+    if (s->depth && s->zpsm == GS_PSMZ24 && (psm == GS_PSMT8H || psm == GS_PSMT4HL || psm == GS_PSMT4HH)) {
+        int top = n->top_owner[page];
+        return top >= 0 && n->top_writes[page] == g->page_writes[page] ? 1 + top : 0;
+    }
+    if (s->wide || (s->depth && (s->zpsm & 7) == 2)) return -1;
+    return 1 + o;
+}
+
+/* A texture over GS memory some of which native surfaces drew, in a layout the draw can't sample
+   from a surface directly: a 32-bit target read as 16-bit (the shadow), the frame buffers' alpha
+   read as a 4-bit texture (the haze), part of a texture page drawn over (the loading screen). The
+   GPU rebuilds it just before the draw: the CPU copy decoded as usual, with the drawn pages read
+   from their surfaces (native_convert in raster.hlsl). */
+static int native_convert_texture(Native *n, Gs *g, uint64_t tex0, unsigned w, unsigned h, const uint32_t pages[16],
+                                  uint64_t key, NativeCommand *c)
+{
+    unsigned psm = (unsigned)(tex0 >> 20) & 63, tbp = (unsigned)tex0 & 0x3FFF, tbw = (unsigned)(tex0 >> 14) & 63;
+    if (!tbw) tbw = 1;
+    if ((psm & 0x30) == 0x30) return 0;
+    NativeFrame *f = n->recording;
+    if (f->convert_count == NATIVE_CONVERTS) return 0;
+    if (!f->converts && !(f->converts = malloc(NATIVE_CONVERTS * sizeof *f->converts))) native_oom("conversions");
+    NativeConvert *v = &f->converts[f->convert_count];
+    memset(v, 0, sizeof *v);
+    for (unsigned i = 0; i < 4; i++) v->surface[i] = -1;
+    unsigned slots = 0;
+    for (unsigned p = 0; p < 512; p++) {
+        if (!(pages[p / 32] & (1u << (p & 31)))) continue;
+        int src = native_page_source(n, g, p, psm);
+        if (src < 0) return 0;
+        if (!src) continue;
+        unsigned slot = 0;
+        while (slot < slots && v->surface[slot] != src - 1) slot++;
+        if (slot == slots) {
+            if (slots == 4) return 0;
+            const NativeSurface *s = &n->surfaces[src - 1];
+            float unit = s->zpsm == GS_PSMZ32 ? 4294967296.0f : s->zpsm == GS_PSMZ24 ? 16777216.0f : 65536.0f;
+            v->surface[slot] = (int16_t)(src - 1);
+            if (n->usage) n->usage[src - 1].converted++;
+            v->constants.slot[slot][0] = s->page; v->constants.slot[slot][1] = s->bw; v->constants.slot[slot][2] = s->depth;
+            memcpy(&v->constants.slot[slot][3], &unit, 4);
+            slots++;
+        }
+        v->constants.pages[p] = (uint8_t)(1 + slot);
+    }
+    if (!slots) return 0;
+    v->base = native_decode(n, g, tex0, w, h, key);
+    uint64_t texa = g->reg[GS_TEXA];
+    v->constants.tex[0] = psm; v->constants.tex[1] = tbp; v->constants.tex[2] = tbw;
+    v->constants.size[0] = w; v->constants.size[1] = h;
+    v->constants.size[2] = (uint32_t)texa; v->constants.size[3] = (uint32_t)(texa >> 32);
+    if (gs_bits_per_pixel(psm) <= 8)
+        for (unsigned i = 0; i < 256; i++) v->constants.palette[i] = gs_palette(g, tex0, i);
+    if (n->texlog)
+        for (unsigned i = 0; i < slots; i++) {
+            const NativeSurface *s = &n->surfaces[v->surface[i]];
+            fprintf(n->texlog, "%llu,convert,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", (unsigned long long)n->field, s->zpsm, psm,
+                    tbp, tbw, w, h, s->page, s->bw, s->wide, s->depth);
+        }
+    c->convert = (int16_t)f->convert_count++;
+    c->texture = NULL;
+    n->stats.converted++;
+    return 1;
+}
+
+static void native_texture(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
+{
+    uint64_t tex0 = g->reg[GS_TEX0_1 + ctxt], clamp = g->reg[GS_CLAMP_1 + ctxt], tex1 = g->reg[GS_TEX1_1 + ctxt];
+    unsigned psm = (unsigned)(tex0 >> 20) & 63, tbp = (unsigned)tex0 & 0x3FFF, tbw = (unsigned)(tex0 >> 14) & 63;
+    unsigned tw = (unsigned)(tex0 >> 26) & 15, th = (unsigned)(tex0 >> 30) & 15;
+    if (tw > 10) tw = 10;
+    if (th > 10) th = 10;
+    unsigned w = 1u << tw, h = 1u << th;
+    NativeConstants *k = &c->constants;
+    k->flags |= 1 | (unsigned)(tex0 >> 34 & 1) << 1 | (unsigned)(tex0 >> 35 & 3) << 2;
+    if (tex1 >> 5 & 1) k->flags |= 32;
+    k->tex_size[0] = w; k->tex_size[1] = h;
+    k->wrap[0] = (uint32_t)clamp & 3; k->wrap[1] = (uint32_t)(clamp >> 2) & 3;
+    k->region[0] = (uint32_t)(clamp >> 4) & 1023; k->region[1] = (uint32_t)(clamp >> 14) & 1023;
+    k->region[2] = (uint32_t)(clamp >> 24) & 1023; k->region[3] = (uint32_t)(clamp >> 34) & 1023;
+    k->alpha_scale = 255;
+    unsigned page = (tbp / 32) & 511;
+    int owner = native_owner(n, g, page);
+    if (owner >= 0) {
+        NativeSurface *s = &n->surfaces[owner];
+        int x, y;
+        if (!s->depth && psm_color(psm) && psm_wide(psm) == (int)s->wide && tbp % 32 == 0 &&
+            (tbw == s->bw || w <= 64) && native_page_origin(s, page, &x, &y)) {
+            c->texture_surface = (int16_t)owner;
+            k->tex_offset[0] = x; k->tex_offset[1] = y;
+            k->alpha_scale = 255;
+            if (psm == GS_PSMCT24) { k->flags |= 256; k->texa_alpha = (float)(g->reg[GS_TEXA] & 255); }
+            n->stats.texture_from_surface++;
+            return;
+        }
+    }
+    uint32_t pages[16] = {0};
+    gs_mark_pages(pages, psm, tbp, tbw ? tbw : 1, 0, 0, w - 1, h - 1);
+    uint64_t key = native_mix(native_mix(tex0 & 0x7FFFFFFFFFFull, (uint64_t)w << 32 | h), psm == GS_PSMCT24 || psm_wide(psm) ? g->reg[GS_TEXA] : 0);
+    unsigned gpu_pages = 0, gpu_page = 0;
+    for (unsigned p = 0; p < 512; p++)
+        if (pages[p / 32] & (1u << (p & 31))) {
+            key = native_mix(key, native_page_hash(n, g, p));
+            if (native_owner(n, g, p) >= 0 && !gpu_pages++) gpu_page = p;
+        }
+    if (psm == GS_PSMT8 || psm == GS_PSMT4 || psm == GS_PSMT8H || psm == GS_PSMT4HL || psm == GS_PSMT4HH) {
+        unsigned entries = psm == GS_PSMT8 || psm == GS_PSMT8H ? 256 : 16;
+        for (unsigned i = 0; i < entries; i++) key = native_mix(key, gs_palette(g, tex0, i));
+    }
+    if (gpu_pages) {
+        if (native_convert_texture(n, g, tex0, w, h, pages, key, c)) return;
+        /* Drawn over, but the CPU copy holds it (a Z24 buffer's top byte), or out of reach. */
+        if (owner >= 0) {
+            const NativeSurface *s = &n->surfaces[owner];
+            unsigned why = s->depth ? 0 : !psm_color(psm) ? 1 : psm_wide(psm) != (int)s->wide ? 2 :
+                           tbp % 32 ? 3 : !(tbw == s->bw || w <= 64) ? 4 : 5;
+            n->stats.texture_unsupported++;
+            if (n->texlog)
+                fprintf(n->texlog, "%llu,unsupported,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", (unsigned long long)n->field, why,
+                        psm, tbp, tbw, w, h, s->page, s->bw, s->wide, s->depth);
+            if (++n->stats.unsupported_why[why] <= 12 && getenv("DHD_NATIVE_WHY"))
+                fprintf(stderr, "native texture: psm=%u tbp=%u tbw=%u %ux%u on surface page=%u bw=%u wide=%u depth=%u\n",
+                        psm, tbp, tbw, w, h, s->page, s->bw, s->wide, s->depth);
+        } else if (n->texlog)
+            fprintf(n->texlog, "%llu,gpu_pages,%u,%u,%u,%u,%u,%u,%u,,,\n", (unsigned long long)n->field, gpu_pages, psm, tbp,
+                    tbw, w, h, gpu_page);
+    }
+    c->texture = native_decode(n, g, tex0, w, h, key);
+    if (!c->texture) {
+        k->flags &= ~1u;
+        if (n->texlog)
+            fprintf(n->texlog, "%llu,decode_failed,,%u,%u,%u,%u,%u,,,,\n", (unsigned long long)n->field, psm, tbp, tbw, w, h);
+    }
+}
+
+/* ---- GS state to draw state ---- */
+
+enum { BLEND_ZERO = 1, BLEND_ONE = 2, BLEND_SA = 5, BLEND_ISA = 6, BLEND_DA = 7, BLEND_IDA = 8, BLEND_F = 14, BLEND_IF = 15 };
+
+/* GS blending ((A - B) * C >> 7) + D per colour, as factors of Cs and Cd: m * C + k. */
+static uint32_t native_blend(Native *n, uint64_t alpha)
+{
+    unsigned a = (unsigned)alpha & 3, b = (unsigned)(alpha >> 2) & 3, c = (unsigned)(alpha >> 4) & 3, d = (unsigned)(alpha >> 6) & 3;
+    static const unsigned positive[3] = {BLEND_SA, BLEND_DA, BLEND_F}, inverse[3] = {BLEND_ISA, BLEND_IDA, BLEND_IF};
+    unsigned factor[2], op = 1, negative[2] = {0, 0};
+    if (c == 3) c = 2;
+    if (c == 1 && a != b) n->stats.blend_dest_alpha++;   /* D3D gives Ad / 255, the GS Ad / 128 */
+    for (unsigned side = 0; side < 2; side++) {
+        int m = (a == side) - (b == side), k = d == side;
+        if (a == b) m = 0;
+        if (!m) factor[side] = k ? BLEND_ONE : BLEND_ZERO;
+        else if (m > 0) factor[side] = k ? (n->stats.blend_approximate++, BLEND_ONE) : positive[c];
+        else if (k) factor[side] = inverse[c];
+        else factor[side] = positive[c], negative[side] = 1;
+    }
+    if (negative[0] && negative[1]) n->stats.blend_approximate++;
+    else if (negative[0]) op = 3;   /* REV_SUBTRACT: Cd * f - Cs * f */
+    else if (negative[1]) op = 2;   /* SUBTRACT */
+    return 1 | factor[0] << 1 | factor[1] << 6 | op << 11;
+}
+
+static void native_state(Native *n, Gs *g, unsigned prim, unsigned ctxt)
+{
+    NativeCommand *c = &n->current;
+    uint64_t frame = g->reg[GS_FRAME_1 + ctxt], zbuf = g->reg[GS_ZBUF_1 + ctxt], test = g->reg[GS_TEST_1 + ctxt];
+    uint64_t scissor = g->reg[GS_SCISSOR_1 + ctxt];
+    unsigned fbp = (unsigned)frame & 511, fbw = (unsigned)(frame >> 16) & 63, fpsm = (unsigned)(frame >> 24) & 63;
+    uint32_t fbmsk = (uint32_t)(frame >> 32);
+    memset(c, 0, sizeof *c);
+    c->kind = NATIVE_DRAW; c->target = c->depth = c->texture_surface = c->source = c->convert = -1;
+    n->skip = 0; n->passes = 0;
+    if (!psm_color(fpsm)) { n->skip = 1; return; }
+    c->target = (int16_t)native_surface(n, fbp, fbw, fpsm, 0);
+    if (c->target < 0) { n->skip = 1; return; }
+    c->scissor.left = (LONG)(scissor & 2047); c->scissor.right = (LONG)(scissor >> 16 & 2047) + 1;
+    c->scissor.top = (LONG)(scissor >> 32 & 2047); c->scissor.bottom = (LONG)(scissor >> 48 & 2047) + 1;
+    n->target_psm = fpsm;
+    unsigned mask = 15;
+    if (psm_wide(fpsm)) {
+        if ((fbmsk & 0xF8) == 0xF8) mask &= ~1u;
+        if ((fbmsk & 0xF800) == 0xF800) mask &= ~2u;
+        if ((fbmsk & 0xF80000) == 0xF80000) mask &= ~4u;
+        if (fbmsk & 0x80000000u) mask &= ~8u;
+    } else {
+        for (unsigned i = 0; i < 4; i++) if ((fbmsk >> (i * 8) & 255) == 255) mask &= ~(1u << i);
+        if (fpsm == GS_PSMCT24) mask &= ~8u;
+    }
+    /* Z: ZTE off behaves as ALWAYS. GS Z is an integer of the buffer's width; depth is its fraction. */
+    unsigned ztst = test >> 16 & 1 ? (unsigned)(test >> 17) & 3 : 1, zwrite = !(zbuf >> 32 & 1);
+    unsigned zpsm = 48 | ((unsigned)(zbuf >> 24) & 15);
+    if (ztst == 0) { n->skip = 1; return; }
+    if (ztst != 1 || zwrite) {
+        c->depth = (int16_t)native_surface(n, (unsigned)zbuf & 511, fbw, zpsm, 1);
+        c->depth_key = c->depth >= 0 ? (uint8_t)(8 | ztst | zwrite << 2) : 0;
+        if (c->depth >= 0 && zwrite) n->surfaces[c->depth].zpsm = zpsm;
+        n->depth_psm = zpsm;
+    }
+    n->zmax = zpsm == GS_PSMZ32 ? UINT32_MAX : (zpsm & 7) == 1 ? 0xFFFFFF : 0xFFFF;
+    n->zscale = zpsm == GS_PSMZ32 ? (float)(1.0 / 4294967296.0) : (zpsm & 7) == 1 ? 1.0f / 16777216 : 1.0f / 65536;
+    NativeConstants *k = &c->constants;
+    k->target[0] = k->target[1] = 2048;
+    if ((prim & 7) == 6) k->flags |= 1024;   /* a sprite: whole pixels when upscaled */
+    if (prim & 16) native_texture(n, g, ctxt, c);
+    if (prim & 32) {
+        uint64_t fog = g->reg[GS_FOGCOL];
+        k->flags |= 16;
+        k->fog[0] = (float)(fog & 255); k->fog[1] = (float)(fog >> 8 & 255); k->fog[2] = (float)(fog >> 16 & 255);
+    }
+    if (test >> 14 & 1) n->stats.date_ignored++;
+    c->blend_key = prim & 64 ? native_blend(n, g->reg[GS_ALPHA_1 + ctxt]) : 0;
+    c->blend_fix = (uint32_t)(g->reg[GS_ALPHA_1 + ctxt] >> 32) & 255;
+    /* Cs * As + Cd (or + 0): As reaches 2 on the GS but a blend factor stops at 1, so the shader
+       premultiplies and the blend takes Cs as it is (sun halos and glows). */
+    unsigned source = c->blend_key >> 1 & 31, destination = c->blend_key >> 6 & 31;
+    if (c->blend_key && source == BLEND_SA && (destination == BLEND_ZERO || destination == BLEND_ONE)) {
+        c->blend_key = (c->blend_key & ~(31u << 1)) | BLEND_ONE << 1;
+        k->flags |= 512;
+    }
+    c->color_mask = (uint8_t)mask;
+    /* Alpha test. AFAIL decides what a failing pixel still writes: a second pass draws exactly
+       the failing pixels with the remaining writes. */
+    unsigned ate = test & 1, atst = (unsigned)(test >> 1) & 7, afail = (unsigned)(test >> 12) & 3;
+    if (ate && atst != 1) {
+        k->flags |= 64; k->atst = atst; k->aref = (uint32_t)(test >> 4) & 255;
+        if (afail) {
+            n->second = *c;
+            n->second.constants.flags |= 128;
+            if (afail == 1) n->second.depth_key &= ~4;                       /* FB_ONLY */
+            if (afail == 2) n->second.color_mask = 0;                        /* ZB_ONLY */
+            if (afail == 3) { n->second.depth_key &= ~4; n->second.color_mask &= 7; } /* RGB_ONLY */
+            n->passes = 1;
+        }
+    }
+    if (!c->color_mask && !(c->depth_key & 4) && !n->passes) n->skip = 1;
+}
+
+/* ---- recording ---- */
+
+static void native_reserve(NativeFrame *f, unsigned more)
+{
+    if (f->vertex_count + more <= f->vertex_capacity) return;
+    unsigned capacity = f->vertex_capacity ? f->vertex_capacity * 2 : 1 << 16;
+    while (capacity < f->vertex_count + more) capacity *= 2;
+    NativeVertex *grown = realloc(f->vertices, capacity * sizeof *grown);
+    if (!grown) native_oom("vertices");
+    f->vertices = grown; f->vertex_capacity = capacity;
+}
+
+static void native_open(Native *n)
+{
+    NativeFrame *f = n->recording;
+    NativeCommand *c = native_command(n);
+    *c = n->current;
+    c->first = f->vertex_count; c->count = 0;
+    if (n->passes) {
+        NativeCommand *second = native_command(n);
+        *second = n->second;
+        second->first = f->vertex_count; second->count = 0;
+    }
+    n->current_valid = 1;
+    n->box[0] = n->box[1] = 4096; n->box[2] = n->box[3] = -4096;
+    /* Not the target: the game draws alternate fields into its two frame buffers. */
+    uint32_t key = 2166136261u;
+    const uint32_t parts[] = {(uint32_t)c->depth, c->depth_key, c->color_mask, c->blend_key,
+                              c->blend_fix, (uint32_t)(uintptr_t)c->texture, (uint32_t)c->texture_surface,
+                              c->constants.flags};
+    for (unsigned i = 0; i < sizeof parts / sizeof *parts; i++) key = (key ^ parts[i]) * 16777619u;
+    n->segment_key = key;
+    n->segment_tags = UINT64_MAX;
+    n->stats.commands += 1 + n->passes;
+}
+
+/* DHD_NATIVE_SURFACES: a finished draw (the open state's primitive type). */
+static void native_note_usage(Native *n, const NativeCommand *c)
+{
+    NativeUsage *u = &n->usage[c->target];
+    u->draws++;
+    if (c->depth >= 0 && (c->depth_key & 8)) u->depth_draws++, u->depth_with = c->depth;
+    if (c->texture_surface < 0) return;
+    unsigned s = (unsigned)c->texture_surface;
+    n->usage[s].sampled++;
+    u->pair[s]++;
+    if ((n->state_prim & 7) != 6) return;
+    const NativeVertex *a = &n->recording->vertices[c->first], *b = a + 5;
+    float tw = (float)c->constants.tex_size[0];
+    float ua = a->s / (a->q ? a->q : 1) * tw, ub = b->s / (b->q ? b->q : 1) * tw, dx = fabsf(b->x - a->x);
+    float ratio = dx > 0 ? fabsf(ub - ua) / dx : 0;
+    u->ratio[s][ratio < 0.75f ? 0 : ratio < 1.5f ? 1 : ratio < 2.5f ? 2 : 3]++;
+    if (ratio >= 0.75f && ratio < 1.5f) {
+        float c0 = ua - (a->x - 0.5f);
+        u->offset[s][(int)((c0 - floorf(c0)) * 4) & 3]++;
+    }
+}
+
+/* Ends the open draw. The pages it drew become its surfaces'; pages they did not own yet are
+   imported first, so those commands go in front of the draw. */
+static void native_close(Native *n, Gs *g)
+{
+    NativeFrame *f = n->recording;
+    if (!n->current_valid) return;
+    n->current_valid = 0;
+    unsigned draws = 1 + n->passes, at = f->command_count - draws;
+    NativeCommand saved[2];
+    memcpy(saved, &f->commands[at], draws * sizeof *saved);
+    unsigned count = f->vertex_count - saved[0].first;
+    if (!count) { f->command_count = at; return; }
+    saved[0].count = saved[draws - 1].count = count;
+    const D3D11_RECT *s = &saved[0].scissor;
+    int x0 = n->box[0] > s->left ? n->box[0] : s->left, y0 = n->box[1] > s->top ? n->box[1] : s->top;
+    int x1 = n->box[2] < s->right - 1 ? n->box[2] : s->right - 1, y1 = n->box[3] < s->bottom - 1 ? n->box[3] : s->bottom - 1;
+    f->command_count = at;
+    native_claim(n, g, saved[0].target, n->target_psm, x0, y0, x1, y1);
+    if (saved[0].depth >= 0) native_claim(n, g, saved[0].depth, n->depth_psm, x0, y0, x1, y1);
+    NativeCommand *c = native_command(n);
+    *c = saved[0];
+    if (draws == 2) { c = native_command(n); *c = saved[1]; }
+    if (n->usage) native_note_usage(n, &saved[0]);
+}
+
+static void native_set(NativeVertex *o, const GsVertex *v, const GsVertex *colour, uint64_t offset, const Native *n,
+                       int fst, float tw, float th, float x, float y)
+{
+    uint32_t z = v->z > n->zmax ? n->zmax : v->z;
+    (void)offset;
+    o->x = x; o->y = y;
+    o->z = (float)((double)z * n->zscale);
+    if (fst) { o->s = (float)v->u / 16.0f / tw; o->t = (float)v->v / 16.0f / th; o->q = 1; }
+    else { o->s = v->s; o->t = v->t; o->q = v->q; }
+    o->fog = (float)(v->fog & 255) / 255.0f;
+    o->rgba = colour->rgba;
+}
+
+static void native_record(Native *n, Gs *g, unsigned type, const GsVertex *v, unsigned count, unsigned prim, unsigned ctxt)
+{
+    if (n->state_version != g->state_version || n->state_ctxt != ctxt || n->state_prim != prim ||
+        ((prim & 16) && n->written != g->pixels_written) || !n->current_valid) {
+        native_close(n, g);
+        native_state(n, g, prim, ctxt);
+        n->state_version = g->state_version; n->state_ctxt = ctxt; n->state_prim = prim;
+        n->written = g->pixels_written;
+        if (n->skip) return;
+        native_open(n);
+    }
+    if (n->skip) return;
+    NativeFrame *f = n->recording;
+    uint64_t offset = g->reg[GS_XYOFFSET_1 + ctxt];
+    int fst = prim >> 8 & 1, flat = !(prim >> 3 & 1);
+    float tw = (float)n->current.constants.tex_size[0], th = (float)n->current.constants.tex_size[1];
+    if (tw == 0) tw = 1;
+    if (th == 0) th = 1;
+    float x[3], y[3];
+    for (unsigned i = 0; i < count; i++) {
+        x[i] = (float)((int)v[i].x - (int)(offset & 65535)) / 16.0f + 0.5f;
+        y[i] = (float)((int)v[i].y - (int)(offset >> 32 & 65535)) / 16.0f + 0.5f;
+        int px = (int)x[i], py = (int)y[i];
+        if (px - 1 < n->box[0]) n->box[0] = px - 1;
+        if (py - 1 < n->box[1]) n->box[1] = py - 1;
+        if (px + 1 > n->box[2]) n->box[2] = px + 1;
+        if (py + 1 > n->box[3]) n->box[3] = py + 1;
+    }
+    const GsVertex *last = &v[count - 1];
+    native_reserve(f, 6);
+    if (n->interp) {
+        uint64_t tags = g->packets[0] + g->packets[1] + g->packets[2];
+        if (tags != n->segment_tags || !f->segment_count) {
+            n->segment_tags = tags;
+            if (f->segment_count == f->segment_capacity) {
+                unsigned capacity = f->segment_capacity ? f->segment_capacity * 2 : 4096;
+                NativeSegment *grown = realloc(f->segments, capacity * sizeof *grown);
+                if (!grown) native_oom("segments");
+                f->segments = grown; f->segment_capacity = capacity;
+            }
+            f->segments[f->segment_count++] = (NativeSegment){f->vertex_count, 0, n->segment_key};
+        }
+    }
+    NativeVertex *o = &f->vertices[f->vertex_count];
+    if (type >= 3 && type <= 5 && count == 3) {
+        for (unsigned i = 0; i < 3; i++) native_set(&o[i], &v[i], flat ? last : &v[i], offset, n, fst, tw, th, x[i], y[i]);
+        f->vertex_count += 3;
+    } else if (type == 6 && count == 2) {
+        /* Sprites: the second vertex supplies Z, fog and colour; texture coordinates span the corners. */
+        NativeVertex a, b;
+        native_set(&a, &v[0], last, offset, n, fst, tw, th, x[0], y[0]);
+        native_set(&b, &v[1], last, offset, n, fst, tw, th, x[1], y[1]);
+        a.z = b.z; a.fog = b.fog;
+        if (!fst) a.q = b.q, a.s *= b.q / (v[0].q ? v[0].q : 1), a.t *= b.q / (v[0].q ? v[0].q : 1);
+        NativeVertex c0 = a, c1 = b, c2 = a, c3 = b;
+        c1.y = a.y; c1.t = a.t;   /* top right */
+        c2.y = b.y; c2.t = b.t;   /* bottom left */
+        o[0] = c0; o[1] = c1; o[2] = c2; o[3] = c2; o[4] = c1; o[5] = c3;
+        f->vertex_count += 6;
+    } else {
+        /* Points and lines: one-pixel quads along the major axis. */
+        NativeVertex a, b;
+        native_set(&a, &v[0], flat ? last : &v[0], offset, n, fst, tw, th, x[0] - 0.5f, y[0] - 0.5f);
+        b = a;
+        if (count == 2) native_set(&b, &v[1], last, offset, n, fst, tw, th, x[1] - 0.5f, y[1] - 0.5f);
+        int horizontal = fabsf(b.x - a.x) >= fabsf(b.y - a.y);
+        NativeVertex q[4] = {a, a, b, b};
+        if (count == 1) { q[1].x += 1; q[2].y += 1; q[3].x += 1; q[3].y += 1; }
+        else if (horizontal) { q[1].y += 1; q[3].y += 1; }
+        else { q[1].x += 1; q[3].x += 1; }
+        for (unsigned i = 0; i < 4; i++) q[i].x += 0.5f, q[i].y += 0.5f;
+        o[0] = q[0]; o[1] = q[1]; o[2] = q[2]; o[3] = q[2]; o[4] = q[1]; o[5] = q[3];
+        f->vertex_count += 6;
+    }
+    if (n->interp) f->segments[f->segment_count - 1].count = f->vertex_count - f->segments[f->segment_count - 1].first;
+    n->stats.primitives++;
+}
+
+/* ---- exact Z for the lens-flare probe ---- */
+
+static int native_overlap(const int a[4], const int b[4])
+{
+    return a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3];
+}
+
+/* Whether a primitive certainly covers pixel (px, py). Sprites use the rasterizer's exact rule,
+   min <= p < max (raster.hlsl draw_pixel); triangles count only strict interior pixels, so
+   their edge rules never matter. The box is already clipped to the scissor. */
+static int native_covers(const NativeLogDraw *d, const uint64_t *reg, unsigned ctxt, int px, int py)
+{
+    int X = px * 16, Y = py * 16, x[3], y[3];
+    unsigned scanmask = (unsigned)reg[GS_SCANMSK] & 3;
+    if (px < d->box[0] || px > d->box[2] || py < d->box[1] || py > d->box[3]) return 0;
+    if ((scanmask == 2 && !(py & 1)) || (scanmask == 3 && (py & 1))) return 0;
+    uint64_t offset = reg[GS_XYOFFSET_1 + ctxt];
+    for (unsigned i = 0; i < d->count; i++) {
+        x[i] = (int)d->v[i].x - (int)(offset & 65535);
+        y[i] = (int)d->v[i].y - (int)(offset >> 32 & 65535);
+    }
+    if (d->type == 6) {
+        int x0 = x[0] < x[1] ? x[0] : x[1], x1 = x[0] < x[1] ? x[1] : x[0];
+        int y0 = y[0] < y[1] ? y[0] : y[1], y1 = y[0] < y[1] ? y[1] : y[0];
+        return X >= x0 && X < x1 && Y >= y0 && Y < y1;
+    }
+    if (d->count != 3) return 0;
+    int64_t e[3];
+    for (unsigned i = 0; i < 3; i++) {
+        unsigned j = (i + 1) % 3;
+        e[i] = (int64_t)(x[j] - x[i]) * (Y - y[i]) - (int64_t)(y[j] - y[i]) * (X - x[i]);
+    }
+    return (e[0] > 0 && e[1] > 0 && e[2] > 0) || (e[0] < 0 && e[1] < 0 && e[2] < 0);
+}
+
+/* The context a logged primitive drew with. */
+static unsigned native_log_context(const uint64_t *reg)
+{
+    return (unsigned)((reg[GS_PRMODECONT] & 1 ? reg[GS_PRIM] : reg[GS_PRMODE]) >> 9 & 1);
+}
+
+static void native_log(Native *n, Gs *g, unsigned type, const GsVertex *v, unsigned count, unsigned zbp, unsigned fbp,
+                       int unconditional, const int box[4])
+{
+    NativeLog *log = &n->logs[1];
+    /* state_version covers every drawing register except these, which the replay also reads;
+       vertex registers change per primitive and travel with the logged vertices. */
+    const uint64_t *last = log->state_count ? log->states[log->state_count - 1].reg : NULL;
+    if (!last || log->state_version != g->state_version || last[GS_PRIM] != g->reg[GS_PRIM] ||
+        last[GS_PRMODE] != g->reg[GS_PRMODE] || last[GS_PRMODECONT] != g->reg[GS_PRMODECONT] ||
+        last[GS_XYOFFSET_1] != g->reg[GS_XYOFFSET_1] || last[GS_XYOFFSET_2] != g->reg[GS_XYOFFSET_2]) {
+        if (log->state_count == log->state_capacity) {
+            unsigned capacity = log->state_capacity ? log->state_capacity * 2 : 1024;
+            NativeLogState *grown = realloc(log->states, capacity * sizeof *grown);
+            if (!grown) native_oom("log states");
+            log->states = grown; log->state_capacity = capacity;
+        }
+        NativeLogState *s = &log->states[log->state_count++];
+        memcpy(s->reg, g->reg, sizeof s->reg); memcpy(s->clut, g->clut, sizeof s->clut);
+        log->state_version = g->state_version;
+    }
+    if (log->draw_count == log->draw_capacity) {
+        unsigned capacity = log->draw_capacity ? log->draw_capacity * 2 : 16384;
+        NativeLogDraw *grown = realloc(log->draws, capacity * sizeof *grown);
+        if (!grown) native_oom("log draws");
+        log->draws = grown; log->draw_capacity = capacity;
+    }
+    NativeLogDraw *d = &log->draws[log->draw_count++];
+    d->type = type; d->count = count; d->state = log->state_count - 1;
+    d->zbp = zbp; d->fbp = fbp; d->unconditional = (uint8_t)unconditional;
+    memcpy(d->box, box, sizeof d->box);
+    memcpy(d->v, v, count * sizeof *v);
+}
+
+static int native_writes(const NativeLogDraw *d, unsigned zbp) { return d->zbp == zbp || d->fbp == zbp; }
+
+/* Runs logged primitives [first, end) through the exact backend, clipped to rect. */
+/* The exact backend's clip: rect, or the watch rectangle (nothing while there is none). */
+static void native_clip(Native *n, const int rect[4])
+{
+    static const int none[4] = {1, 1, 0, 0};
+    memcpy(n->exact->clip, rect ? rect : n->watch.on ? n->watch.rect : none, sizeof n->exact->clip);
+}
+
+static void native_band_add(Native *n, unsigned page)
+{
+    if (page < 512 && !n->band[page] && n->band_count < 64) {
+        n->band[page] = 1;
+        n->band_pages[n->band_count++] = (uint16_t)page;
+    }
+}
+
+/* The pixels of a 32-bit buffer (base page, width w) that lie in the band. A probe reads the
+   first NATIVE_BAND_ROWS rows of a band page in the Z layout; a colour layout holds the same
+   words at rows 16 on (the Z and colour block orders swap page halves: PCSX2 blockTable32Z). */
+enum { NATIVE_BAND_ROWS = 4 };
+static int native_band_rect(const Native *n, unsigned base, unsigned w, int zlayout, int rect[4])
+{
+    int found = 0;
+    if (!w) return 0;
+    for (unsigned i = 0; i < n->band_count; i++) {
+        unsigned page = n->band_pages[i];
+        if (page < base || (page - base) / w >= 64) continue;
+        int x = (int)((page - base) % w) * 64, y = (int)((page - base) / w) * 32 + (zlayout ? 0 : 16);
+        if (x < rect[0]) rect[0] = x;
+        if (y < rect[1]) rect[1] = y;
+        if (x + 63 > rect[2]) rect[2] = x + 63;
+        if (y + NATIVE_BAND_ROWS - 1 > rect[3]) rect[3] = y + NATIVE_BAND_ROWS - 1;
+        found = 1;
+    }
+    return found;
+}
+
+static void native_exact_replay(Native *n, Gs *g, const int rect[4], unsigned zbp)
+{
+    static uint64_t saved_reg[128];
+    static uint16_t saved_clut[1024];
+    /* Latest point after which every probed pixel is overwritten unconditionally. */
+    unsigned total = n->logs[0].draw_count + n->logs[1].draw_count, start = 0, width = (unsigned)(rect[2] - rect[0] + 1);
+    unsigned height = (unsigned)(rect[3] - rect[1] + 1), left = width * height;
+    uint8_t found[NATIVE_WATCH * NATIVE_WATCH];
+    if (width > NATIVE_WATCH || height > NATIVE_WATCH) { n->stats.probe_uncovered++; return; }
+    memset(found, 0, width * height);
+    for (unsigned i = total; i-- > 0 && left;) {
+        NativeLog *log = i < n->logs[0].draw_count ? &n->logs[0] : &n->logs[1];
+        NativeLogDraw *d = &log->draws[i < n->logs[0].draw_count ? i : i - n->logs[0].draw_count];
+        if (!d->unconditional || !native_writes(d, zbp) || !native_overlap(d->box, rect)) continue;
+        const uint64_t *reg = log->states[d->state].reg;
+        unsigned ctxt = native_log_context(reg);
+        for (unsigned y = 0; y < height; y++)
+            for (unsigned x = 0; x < width; x++)
+                if (!found[y * width + x] && native_covers(d, reg, ctxt, rect[0] + (int)x, rect[1] + (int)y))
+                    found[y * width + x] = 1, left--;
+        if (!left) start = i;
+    }
+    if (left) n->stats.probe_uncovered++;
+    if (left && n->trace_probes) {
+        unsigned first = 0;
+        while (found[first]) first++;
+        int px = rect[0] + (int)(first % width), py = rect[1] + (int)(first / width), shown = 0;
+        for (unsigned i = total; i-- > 0 && shown < 40;) {
+            NativeLog *log = i < n->logs[0].draw_count ? &n->logs[0] : &n->logs[1];
+            NativeLogDraw *d = &log->draws[i < n->logs[0].draw_count ? i : i - n->logs[0].draw_count];
+            if (px < d->box[0] || px > d->box[2] || py < d->box[1] || py > d->box[3]) continue;
+            const uint64_t *reg = log->states[d->state].reg;
+            unsigned ctxt = native_log_context(reg);
+            uint64_t zbuf = reg[GS_ZBUF_1 + ctxt], frame = reg[GS_FRAME_1 + ctxt], test = reg[GS_TEST_1 + ctxt];
+            fprintf(stderr, "native uncovered %d,%d: draw %u type %u zbp %u fbp %u uncond %u covers %d zpsm %u zmsk %u "
+                    "test %llx frame psm %u fbw %u fbmsk %08x scissor %llx box %d,%d-%d,%d v %u,%u %u,%u %u,%u z %u\n",
+                    px, py, i, d->type, d->zbp, d->fbp, d->unconditional, native_covers(d, reg, ctxt, px, py),
+                    (unsigned)(zbuf >> 24) & 15, (unsigned)(zbuf >> 32) & 1, (unsigned long long)test,
+                    (unsigned)(frame >> 24) & 63, (unsigned)(frame >> 16) & 63, (unsigned)(frame >> 32),
+                    (unsigned long long)reg[GS_SCISSOR_1 + ctxt], d->box[0], d->box[1], d->box[2], d->box[3],
+                    d->v[0].x, d->v[0].y, d->v[1].x, d->v[1].y, d->v[2].x, d->v[2].y, d->v[d->count - 1].z);
+            shown++;
+        }
+    }
+    if (n->trace_probes)
+        fprintf(stderr, "native probe: field %llu replay %d,%d-%d,%d zbp %u uncovered %u from %u of %u (%u+%u)\n",
+                (unsigned long long)n->field, rect[0], rect[1], rect[2], rect[3], zbp, left, start, total,
+                n->logs[0].draw_count, n->logs[1].draw_count);
+    memcpy(saved_reg, g->reg, sizeof saved_reg); memcpy(saved_clut, g->clut, sizeof saved_clut);
+    uint64_t saved_version = g->state_version;
+    unsigned restored = UINT_MAX;
+    int restored_masked = -1;
+    NativeLog *restored_log = NULL;
+    native_clip(n, rect);
+    for (unsigned i = start; i < total; i++) {
+        NativeLog *log = i < n->logs[0].draw_count ? &n->logs[0] : &n->logs[1];
+        NativeLogDraw *d = &log->draws[i < n->logs[0].draw_count ? i : i - n->logs[0].draw_count];
+        if (!native_writes(d, zbp) || !native_overlap(d->box, rect)) continue;
+        /* Out of order, so colour writes are masked unless they are the Z memory itself. */
+        int masked = d->fbp != zbp;
+        if (d->state != restored || log != restored_log || masked != restored_masked) {
+            memcpy(g->reg, log->states[d->state].reg, sizeof g->reg);
+            memcpy(g->clut, log->states[d->state].clut, sizeof g->clut);
+            if (masked) g->reg[GS_FRAME_1] |= 0xFFFFFFFFull << 32, g->reg[GS_FRAME_2] |= 0xFFFFFFFFull << 32;
+            g->state_version = (1ull << 63) | ++n->replay_version;
+            restored = d->state; restored_log = log; restored_masked = masked;
+        }
+        draw(g, d->type, d->v, d->count);
+        n->stats.probe_replayed_draws++;
+    }
+    memcpy(g->reg, saved_reg, sizeof saved_reg); memcpy(g->clut, saved_clut, sizeof saved_clut);
+    g->state_version = saved_version;
+    /* Back to the watch rectangle for in-order draws. */
+    native_clip(n, NULL);
+}
+
+static void native_watch_cover(Native *n, const NativeLogDraw *d, const uint64_t *reg, unsigned ctxt)
+{
+    int x0 = d->box[0] > n->watch.rect[0] ? d->box[0] : n->watch.rect[0];
+    int y0 = d->box[1] > n->watch.rect[1] ? d->box[1] : n->watch.rect[1];
+    int x1 = d->box[2] < n->watch.rect[2] ? d->box[2] : n->watch.rect[2];
+    int y1 = d->box[3] < n->watch.rect[3] ? d->box[3] : n->watch.rect[3];
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+            uint8_t *c = &n->watch.covered[(y - n->watch.rect[1]) * NATIVE_WATCH + (x - n->watch.rect[0])];
+            if (!*c && native_covers(d, reg, ctxt, x, y)) { *c = 1; n->watch.missing--; }
+        }
+    if (!n->watch.missing) n->watch.valid = 1;
+}
+
+static void native_exact(Native *n, Gs *g, unsigned type, const GsVertex *v, unsigned count, unsigned prim, unsigned ctxt)
+{
+    uint64_t zbuf = g->reg[GS_ZBUF_1 + ctxt], test = g->reg[GS_TEST_1 + ctxt], frame = g->reg[GS_FRAME_1 + ctxt];
+    if (test >> 16 & 1 && !(test >> 17 & 3)) return;               /* ZTST NEVER: nothing is written */
+    unsigned zbp = (unsigned)zbuf & 511, fbp = (unsigned)frame & 511, fbw = (unsigned)(frame >> 16) & 63;
+    uint64_t offset = g->reg[GS_XYOFFSET_1 + ctxt], scissor = g->reg[GS_SCISSOR_1 + ctxt];
+    unsigned zpsm = 48 | ((unsigned)(zbuf >> 24) & 15), fpsm = (unsigned)(frame >> 24) & 63;
+    int zwrite = !(zbuf >> 32 & 1), colour = (uint32_t)(frame >> 32) != 0xFFFFFFFFu;
+    if (zwrite) {
+        n->zbase[zbp] = 1;
+        /* The page row after the Z buffer's last scissored row. */
+        unsigned rows = (unsigned)(((scissor >> 48 & 2047) + 32) / 32), key = zbp | fbw << 9 | rows << 15;
+        if (!psm_wide(zpsm) && fbw && key != n->band_key) {
+            for (unsigned i = 0; i < n->band_count; i++) n->band[n->band_pages[i]] = 0;
+            n->band_count = 0; n->band_key = key;
+            for (unsigned k = 0; k < fbw; k++) native_band_add(n, zbp + rows * fbw + k);
+            n->stats.band_moves++;
+        }
+    }
+    int alias = colour && n->zbase[fbp] && (!n->zbw[fbp] || n->zbw[fbp] == fbw);
+    int band[4] = {INT_MAX, INT_MAX, INT_MIN, INT_MIN}, banded = 0, full = n->field <= n->full_until;
+    if (full && n->band_count) {
+        if (colour && !psm_wide(fpsm)) banded |= native_band_rect(n, fbp, fbw, (fpsm & 0x30) == 0x30, band);
+        if (zwrite && !psm_wide(zpsm)) banded |= native_band_rect(n, zbp, fbw, 1, band);
+    }
+    int target = full && colour && n->exact_target[fbp];
+    if (!zwrite && !alias && !banded && !target) return;
+    int box[4] = {65536, 65536, -65536, -65536};
+    for (unsigned i = 0; i < count; i++) {
+        int x = (int)v[i].x - (int)(offset & 65535), y = (int)v[i].y - (int)(offset >> 32 & 65535);
+        if (x < box[0]) box[0] = x;
+        if (y < box[1]) box[1] = y;
+        if (x > box[2]) box[2] = x;
+        if (y > box[3]) box[3] = y;
+    }
+    box[0] = box[0] >> 4; box[1] = box[1] >> 4; box[2] = (box[2] + 15) >> 4; box[3] = (box[3] + 15) >> 4;
+    if (box[0] < (int)(scissor & 2047)) box[0] = (int)(scissor & 2047);
+    if (box[1] < (int)(scissor >> 32 & 2047)) box[1] = (int)(scissor >> 32 & 2047);
+    if (box[2] > (int)(scissor >> 16 & 2047)) box[2] = (int)(scissor >> 16 & 2047);
+    if (box[3] > (int)(scissor >> 48 & 2047)) box[3] = (int)(scissor >> 48 & 2047);
+    if (box[0] > box[2] || box[1] > box[3]) return;
+    banded = banded && native_overlap(box, band);
+    if (banded) n->stats.band_draws++;
+    if (target) n->stats.target_draws++;
+    if (banded || target) {
+        /* A render target the native renderer drew, sampled here: from now on it is drawn
+           exactly too (the rider shadow texture under the band's sky, for one). */
+        uint64_t tex0 = g->reg[GS_TEX0_1 + ctxt];
+        int owner = prim >> 4 & 1 ? native_owner(n, g, (unsigned)(tex0 & 0x3FFF) / 32) : -1;
+        if (owner >= 0 && !n->surfaces[owner].depth) {
+            n->stats.band_rt_textures++;
+            if (!n->exact_target[n->surfaces[owner].page]) {
+                n->exact_target[n->surfaces[owner].page] = 1;
+                n->stats.exact_targets++;
+                if (n->trace_probes)
+                    fprintf(stderr, "native exact target: field %llu page %u bw %u (sampled by fbp %u)\n",
+                            (unsigned long long)n->field, n->surfaces[owner].page, n->surfaces[owner].bw, fbp);
+            }
+        }
+    }
+    int watched = 0;
+    if (zwrite || alias) {
+        /* Unconditional: the written value never depends on what memory held before. Z24
+           writes leave the top byte, which nothing else changes in a Z buffer. */
+        unsigned ztst = test >> 16 & 1 ? (unsigned)(test >> 17) & 3 : 1, ate = test & 1, atst = (unsigned)(test >> 1) & 7;
+        unsigned afail = (unsigned)(test >> 12) & 3, date = (unsigned)(test >> 14) & 1;
+        unsigned abe = (unsigned)((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) >> 6 & 1);
+        int z_full = zwrite && ztst == 1 && !date && (!ate || atst == 1 || afail == 2) && !psm_wide(zpsm);
+        int colour_full = alias && ztst == 1 && !date && (!ate || atst == 1) && !abe &&
+                          ((unsigned)(frame >> 24) & 63) == GS_PSMCT32 && !(uint32_t)(frame >> 32);
+        native_log(n, g, type, v, count, zwrite ? zbp : NATIVE_NO_PAGE, alias ? fbp : NATIVE_NO_PAGE,
+                   zwrite ? z_full : colour_full, box);
+        if (alias) n->stats.z_alias_draws++;
+        if (zwrite) n->zbw[zbp] = (uint8_t)fbw;
+        watched = n->watch.on && ((zwrite && zbp == n->watch.zbp) || (alias && fbp == n->watch.zbp)) &&
+                  native_overlap(box, n->watch.rect);
+        if (watched) {
+            NativeLog *log = &n->logs[1];
+            NativeLogDraw *d = &log->draws[log->draw_count - 1];
+            if (!n->watch.valid && d->unconditional) native_watch_cover(n, d, log->states[d->state].reg, ctxt);
+        }
+    }
+    /* Each pixel is drawn once: an exact target is drawn whole, overlapping clips merge into
+       their bounding box. */
+    if (target) {
+        static const int whole[4] = {0, 0, 2047, 2047};
+        native_clip(n, whole);
+        draw(g, type, v, count);
+        n->stats.exact_draws++;
+    } else if (watched && banded && native_overlap(band, n->watch.rect)) {
+        const int *w = n->watch.rect;
+        int both[4] = {band[0] < w[0] ? band[0] : w[0], band[1] < w[1] ? band[1] : w[1],
+                       band[2] > w[2] ? band[2] : w[2], band[3] > w[3] ? band[3] : w[3]};
+        native_clip(n, both);
+        draw(g, type, v, count);
+        n->stats.exact_draws++;
+    } else {
+        if (watched) { native_clip(n, NULL); draw(g, type, v, count); n->stats.exact_draws++; }
+        if (banded) { native_clip(n, band); draw(g, type, v, count); n->stats.exact_draws++; }
+    }
+    native_clip(n, NULL);
+}
+
+/* A Z probe as rectangles in draw coordinates. The read (width sbw) and the draws (width fbw)
+   share GS pages, so each page-sized part of the read maps on its own; a read crossing the
+   buffer's right edge continues on the next row of pages. Returns 0 when there are too many. */
+static unsigned native_probe_pieces(const int rect[4], unsigned psm, unsigned sbw, unsigned fbw, int pieces[][4],
+                                    unsigned max, int merge)
+{
+    int pw = 64, ph = (psm & 7) == 2 ? 64 : 32;
+    unsigned count = 0;
+    if (!sbw) sbw = 1;
+    if (!fbw) fbw = sbw;
+    for (int y = rect[1]; y <= rect[3]; y = (y / ph + 1) * ph)
+        for (int x = rect[0]; x <= rect[2]; x = (x / pw + 1) * pw) {
+            int x1 = (x / pw + 1) * pw - 1, y1 = (y / ph + 1) * ph - 1;
+            unsigned page = (unsigned)(y / ph) * sbw + (unsigned)(x / pw);
+            int dx = (int)(page % fbw) * pw - x / pw * pw, dy = (int)(page / fbw) * ph - y / ph * ph;
+            if (count == max) return 0;
+            int *piece = pieces[count++];
+            piece[0] = x + dx; piece[1] = y + dy;
+            piece[2] = (x1 < rect[2] ? x1 : rect[2]) + dx; piece[3] = (y1 < rect[3] ? y1 : rect[3]) + dy;
+        }
+    /* Pieces that tile their bounding box (the usual case, sbw == fbw) are one rectangle. */
+    int box[4] = {INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+    long area = 0;
+    for (unsigned i = 0; i < count; i++) {
+        const int *q = pieces[i];
+        area += (long)(q[2] - q[0] + 1) * (q[3] - q[1] + 1);
+        if (q[0] < box[0]) box[0] = q[0];
+        if (q[1] < box[1]) box[1] = q[1];
+        if (q[2] > box[2]) box[2] = q[2];
+        if (q[3] > box[3]) box[3] = q[3];
+    }
+    if (merge && count > 1 && area == (long)(box[2] - box[0] + 1) * (box[3] - box[1] + 1)) {
+        memcpy(pieces[0], box, sizeof box);
+        count = 1;
+    }
+    return count;
+}
+
+/* Deferred reads: a Z probe gets exact pixels; colour reads keep the CPU image (counted). */
+static void native_stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[16])
+{
+    Gpu *gpu = g->backend;
+    Native *n = gpu->native;
+    uint64_t blt = g->reg[GS_BITBLTBUF], pos = g->reg[GS_TRXPOS], size = g->reg[GS_TRXREG];
+    unsigned psm = (unsigned)(blt >> 24) & 63, sbp = (unsigned)blt & 0x3FFF, sbw = (unsigned)(blt >> 16) & 63;
+    int rect[4] = {(int)(pos & 2047), (int)(pos >> 16 & 2047), 0, 0};
+    rect[2] = rect[0] + (int)(size & 4095) - 1; rect[3] = rect[1] + (int)(size >> 32 & 4095) - 1;
+    if ((psm & 0x30) == 0x30 && sbp % 32 == 0) {
+        unsigned zbp = sbp / 32;
+        if (n->band_count && (n->band_key & 511) == zbp && rect[3] + 32 >= (int)(n->band_key >> 15) * 32)
+            n->full_until = n->field + n->full_hold;
+        int pieces[16][4];
+        unsigned count = native_probe_pieces(rect, psm, sbw, n->zbw[zbp], pieces, 16, !n->band_count);
+        if (!count) n->stats.probe_uncovered++;
+        for (unsigned i = 0; i < count; i++) {
+            const int *q = pieces[i];
+            unsigned fbw = n->zbw[zbp] ? n->zbw[zbp] : (sbw ? sbw : 1), in_band = 1;
+            for (int y = q[1] / 32; y <= q[3] / 32; y++)
+                for (int x = q[0] / 64; x <= q[2] / 64; x++)
+                    in_band &= n->band[(zbp + (unsigned)y * fbw + (unsigned)x) & 511];
+            if (q[3] % 32 >= NATIVE_BAND_ROWS || q[3] / 32 != q[1] / 32) in_band = 0;
+            if (in_band) {
+                n->stats.probe_band_hits++;
+                if (n->trace_probes)
+                    fprintf(stderr, "native probe: field %llu read %d,%d-%d,%d piece %u/%u %d,%d-%d,%d band\n",
+                            (unsigned long long)n->field, rect[0], rect[1], rect[2], rect[3], i + 1, count,
+                            q[0], q[1], q[2], q[3]);
+                continue;
+            }
+            int inside = n->watch.on && n->watch.valid && n->watch.zbp == zbp && q[0] >= n->watch.rect[0] &&
+                         q[1] >= n->watch.rect[1] && q[2] <= n->watch.rect[2] && q[3] <= n->watch.rect[3];
+            if (inside) n->stats.probe_hits++;
+            else { native_exact_replay(n, g, q, zbp); n->stats.probe_replays++; }
+            if (n->trace_probes)
+                fprintf(stderr, "native probe: field %llu read %d,%d-%d,%d sbw %u fbw %u piece %u/%u %d,%d-%d,%d %s\n",
+                        (unsigned long long)n->field, rect[0], rect[1], rect[2], rect[3], sbw, n->zbw[zbp], i + 1, count,
+                        q[0], q[1], q[2], q[3], inside ? "watched" : "replayed");
+        }
+        /* Keep the watch while the probe stays well inside it; otherwise move it to the probe. */
+        const int *q = count ? pieces[0] : rect;
+        int margin = 8;
+        if (!n->watch.on || n->watch.zbp != zbp || q[0] < n->watch.rect[0] + margin || q[1] < n->watch.rect[1] + margin ||
+            q[2] > n->watch.rect[2] - margin || q[3] > n->watch.rect[3] - margin) {
+            int half = 32;
+            n->watch.on = 1; n->watch.valid = 0; n->watch.zbp = zbp;
+            n->watch.rect[0] = q[0] - half < 0 ? 0 : q[0] - half;
+            n->watch.rect[1] = q[1] - half < 0 ? 0 : q[1] - half;
+            n->watch.rect[2] = q[2] + half;
+            n->watch.rect[3] = q[3] + half;
+            if (n->watch.rect[2] - n->watch.rect[0] >= NATIVE_WATCH) n->watch.rect[2] = n->watch.rect[0] + NATIVE_WATCH - 1;
+            if (n->watch.rect[3] - n->watch.rect[1] >= NATIVE_WATCH) n->watch.rect[3] = n->watch.rect[1] + NATIVE_WATCH - 1;
+            memset(n->watch.covered, 0, sizeof n->watch.covered);
+            n->watch.missing = (unsigned)((n->watch.rect[2] - n->watch.rect[0] + 1) * (n->watch.rect[3] - n->watch.rect[1] + 1));
+            native_clip(n, NULL);
+        }
+    } else n->stats.color_reads++;
+    stage_pages(g, want, staged);
+}
+
+/* ---- GS hooks ---- */
+
+static void native_draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
+{
+    Gpu *gpu = g->backend;
+    Native *n = gpu->native;
+    unsigned prim = (unsigned)((g->reg[GS_PRIM] & 7) |
+                    ((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) & 0x7F8));
+    unsigned ctxt = prim >> 9 & 1;
+    native_exact(n, g, type, v, count, prim, ctxt);
+    native_record(n, g, type, v, count, prim, ctxt);
+    n->stats.draws++;
+}
+
+/* TRXDIR 2. Between rendered surfaces it is a GPU copy; otherwise the CPU copies GS memory
+   (as gs.c would), so later texture decodes see it. */
+static int native_local_copy(Gs *g)
+{
+    Gpu *gpu = g->backend;
+    Native *n = gpu->native;
+    uint64_t b = g->reg[GS_BITBLTBUF], p = g->reg[GS_TRXPOS], r = g->reg[GS_TRXREG];
+    unsigned width = (unsigned)r & 4095, height = (unsigned)(r >> 32) & 4095;
+    unsigned spsm = (unsigned)(b >> 24) & 63, sbp = (unsigned)b & 0x3FFF, sbw = (unsigned)(b >> 16) & 63;
+    unsigned dpsm = (unsigned)(b >> 56) & 63, dbp = (unsigned)(b >> 32) & 0x3FFF, dbw = (unsigned)(b >> 48) & 63;
+    unsigned sx = (unsigned)p & 2047, sy = (unsigned)(p >> 16) & 2047, dx = (unsigned)(p >> 32) & 2047, dy = (unsigned)(p >> 48) & 2047;
+    if (!width || !height) return 1;
+    int source = native_owner(n, g, sbp / 32);
+    if (source >= 0 && !n->surfaces[source].depth && psm_color(spsm) && spsm == dpsm && sbp % 32 == 0 && dbp % 32 == 0 &&
+        n->surfaces[source].bw == (sbw ? sbw : 1) && !(p >> 59 & 3)) {
+        int ox, oy;
+        if (native_page_origin(&n->surfaces[source], sbp / 32, &ox, &oy)) {
+            int target = native_surface(n, dbp / 32, dbw, dpsm, 0);
+            if (target >= 0) {
+                native_close(n, g);
+                native_claim(n, g, target, dpsm, (int)dx, (int)dy, (int)(dx + width - 1), (int)(dy + height - 1));
+                NativeCommand *c = native_command(n);
+                c->kind = NATIVE_COPY; c->source = (int16_t)source; c->target = (int16_t)target;
+                c->sx = ox + (int)sx; c->sy = oy + (int)sy; c->x = (int)dx; c->y = (int)dy; c->w = (int)width; c->h = (int)height;
+                n->stats.copies++;
+                if (n->usage) n->usage[source].copied_out++, n->usage[target].copied_in++;
+                return 1;
+            }
+        }
+    }
+    n->stats.copy_fallbacks++;
+    sync_range(g, sbp * 256, 4 * 1024 * 1024);
+    for (unsigned y = 0; y < height; y++) for (unsigned x = 0; x < width; x++) {
+        unsigned ex = p >> 59 & 1 ? width - 1 - x : x, ey = p >> 60 & 1 ? height - 1 - y : y;
+        uint32_t v = gs_read_pixel(g, spsm, sbp, sbw, (sx + ex) & 2047, (sy + ey) & 2047);
+        gs_write_pixel(g, dpsm, dbp, dbw, (dx + ex) & 2047, (dy + ey) & 2047, v);
+    }
+    return 1;
+}
+
+/* ---- render thread ---- */
+
+static ID3D11BlendState *native_blend_state(Native *n, uint32_t key, unsigned mask)
+{
+    uint32_t full = key | mask << 16;
+    for (unsigned i = 0; i < n->blend_count; i++) if (n->blends[i].key == full) return n->blends[i].state;
+    D3D11_BLEND_DESC d = {0};
+    D3D11_RENDER_TARGET_BLEND_DESC *t = &d.RenderTarget[0];
+    t->BlendEnable = key & 1;
+    /* As comes from the shader's second output (As / 128; the target keeps alpha / 255). */
+    static const D3D11_BLEND dual[32] = {[BLEND_SA] = D3D11_BLEND_SRC1_ALPHA, [BLEND_ISA] = D3D11_BLEND_INV_SRC1_ALPHA};
+    unsigned src = key >> 1 & 31, dst = key >> 6 & 31;
+    t->SrcBlend = key ? (dual[src] ? dual[src] : (D3D11_BLEND)src) : D3D11_BLEND_ONE;
+    t->DestBlend = key ? (dual[dst] ? dual[dst] : (D3D11_BLEND)dst) : D3D11_BLEND_ZERO;
+    t->BlendOp = key ? (D3D11_BLEND_OP)(key >> 11 & 7) : D3D11_BLEND_OP_ADD;
+    t->SrcBlendAlpha = D3D11_BLEND_ONE; t->DestBlendAlpha = D3D11_BLEND_ZERO; t->BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    t->RenderTargetWriteMask = (UINT8)mask;
+    ID3D11BlendState *state = NULL;
+    if (FAILED(ID3D11Device_CreateBlendState(n->device, &d, &state))) return NULL;
+    if (n->blend_count < sizeof n->blends / sizeof *n->blends)
+        n->blends[n->blend_count].key = full, n->blends[n->blend_count++].state = state;
+    return state;
+}
+
+static ID3D11DepthStencilState *native_depth_state(Native *n, unsigned key)
+{
+    if (!n->depth_states[key & 15]) {
+        static const D3D11_COMPARISON_FUNC func[4] = {D3D11_COMPARISON_NEVER, D3D11_COMPARISON_ALWAYS,
+                                                       D3D11_COMPARISON_GREATER_EQUAL, D3D11_COMPARISON_GREATER};
+        D3D11_DEPTH_STENCIL_DESC d = {0};
+        d.DepthEnable = (key & 8) != 0;
+        d.DepthWriteMask = key & 4 ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+        d.DepthFunc = func[key & 3];
+        ID3D11Device_CreateDepthStencilState(n->device, &d, &n->depth_states[key & 15]);
+    }
+    return n->depth_states[key & 15];
+}
+
+/* Surfaces at least this many pages wide are upscaled (the 512- and 640-pixel frame and Z
+   buffers); narrower ones stay at 1x: the 64-pixel shadow, its blur and the copies between them,
+   which sample each other by whole texels and would blur less at a finer grid (PCSX2 draws such
+   effect targets at native resolution too). A Z buffer takes its frame's width, so a target and
+   its depth always share a scale. */
+enum { NATIVE_SCALED_BW = 4 };
+
+/* The size a surface's texture needs, in GS pixels: what the GS worker has claimed, in 64-pixel
+   steps, never less than the texture already has. */
+static void native_wanted(const NativeSurface *s, unsigned want[2])
+{
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned e = (unsigned)s->extent[i];
+        if (s->texture && s->size[i] / s->scale > e) e = s->size[i] / s->scale;
+        want[i] = e < 64 ? 64 : e > 2048 ? 2048 : (e + 63) & ~63u;
+    }
+}
+
+static void native_release_surface(NativeSurface *s)
+{
+    if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
+    if (s->dsv) ID3D11DepthStencilView_Release(s->dsv);
+    if (s->srv) ID3D11ShaderResourceView_Release(s->srv);
+    if (s->texture) ID3D11Texture2D_Release(s->texture);
+    s->rtv = NULL; s->dsv = NULL; s->srv = NULL; s->texture = NULL;
+}
+
+/* Creates the surface's texture at its scale, or a larger one keeping what it holds. */
+static int native_surface_resources(Native *n, NativeSurface *s, const unsigned want[2])
+{
+    if (!s->scale) s->scale = s->bw >= NATIVE_SCALED_BW ? n->scale : 1;
+    unsigned w = want[0] * s->scale, h = want[1] * s->scale;
+    if (s->texture && s->size[0] >= w && s->size[1] >= h) return 1;
+    NativeSurface old = *s;
+    if (old.texture) {
+        if (w < old.size[0]) w = old.size[0];
+        if (h < old.size[1]) h = old.size[1];
+    }
+    s->texture = NULL; s->rtv = NULL; s->dsv = NULL; s->srv = NULL;
+    D3D11_TEXTURE2D_DESC d = {0};
+    d.Width = w; d.Height = h; d.MipLevels = d.ArraySize = 1; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
+    int ok;
+    if (s->depth) {
+        /* Typeless, so a conversion can read the Z buffer as a texture (the depth haze). */
+        d.Format = DXGI_FORMAT_R32_TYPELESS; d.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv = {DXGI_FORMAT_D32_FLOAT, D3D11_DSV_DIMENSION_TEXTURE2D};
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {DXGI_FORMAT_R32_FLOAT, D3D11_SRV_DIMENSION_TEXTURE2D};
+        sv.Texture2D.MipLevels = 1;
+        ok = SUCCEEDED(ID3D11Device_CreateTexture2D(n->device, &d, NULL, &s->texture)) &&
+             SUCCEEDED(ID3D11Device_CreateDepthStencilView(n->device, (ID3D11Resource *)s->texture, &dv, &s->dsv)) &&
+             SUCCEEDED(ID3D11Device_CreateShaderResourceView(n->device, (ID3D11Resource *)s->texture, &sv, &s->srv));
+        if (ok) ID3D11DeviceContext_ClearDepthStencilView(n->context, s->dsv, D3D11_CLEAR_DEPTH, 0, 0);
+    } else {
+        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ok = SUCCEEDED(ID3D11Device_CreateTexture2D(n->device, &d, NULL, &s->texture)) &&
+             SUCCEEDED(ID3D11Device_CreateRenderTargetView(n->device, (ID3D11Resource *)s->texture, NULL, &s->rtv)) &&
+             SUCCEEDED(ID3D11Device_CreateShaderResourceView(n->device, (ID3D11Resource *)s->texture, NULL, &s->srv));
+        const float zero[4] = {0, 0, 0, 0};
+        if (ok) ID3D11DeviceContext_ClearRenderTargetView(n->context, s->rtv, zero);
+    }
+    if (!ok) {
+        native_release_surface(s);
+        s->texture = old.texture; s->rtv = old.rtv; s->dsv = old.dsv; s->srv = old.srv;
+        return old.texture != NULL;
+    }
+    s->size[0] = w; s->size[1] = h;
+    if (old.texture) {
+        ID3D11DeviceContext_CopySubresourceRegion(n->context, (ID3D11Resource *)s->texture, 0, 0, 0, 0,
+                                                  (ID3D11Resource *)old.texture, 0, NULL);
+        native_release_surface(&old);
+    }
+    return 1;
+}
+
+/* DHD_SCALE=window: the smallest scale whose picture is as tall as the window. */
+static unsigned native_match_window(Native *n, const NativeFrame *f)
+{
+    DXGI_SWAP_CHAIN_DESC desc;
+    RECT client = {0, 0, 0, 0};
+    if (n->swapchain && SUCCEEDED(IDXGISwapChain_GetDesc(n->swapchain, &desc))) GetClientRect(desc.OutputWindow, &client);
+    unsigned lines = f->display_surface >= 0 && f->display[6] ? f->display[6] : 448, scale = 1;
+    while (scale < 4 && scale * lines < (unsigned)client.bottom) scale++;
+    fprintf(stderr, "gs native: resolution scale %u (window %ld lines, picture %u)\n", scale, client.bottom, lines);
+    return scale;
+}
+
+/* The draw state native_render keeps, again after a blit used the pipeline. */
+static void native_bind_pipeline(Native *n)
+{
+    ID3D11DeviceContext *c = n->context;
+    UINT stride = sizeof(NativeVertex), zero = 0;
+    ID3D11DeviceContext_IASetVertexBuffers(c, 0, 1, &n->vertex_buffer, &stride, &zero);
+    ID3D11DeviceContext_IASetInputLayout(c, n->layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(c, n->vertex_shader, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, n->pixel_shader, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(c, 3, 1, &n->constant_buffer);
+    ID3D11DeviceContext_PSSetConstantBuffers(c, 3, 1, &n->constant_buffer);
+    ID3D11DeviceContext_RSSetState(c, n->rasterizer);
+}
+
+/* A w x h rectangle (GS pixels) of a texture at scale `from`, at (sx, sy), into surface t at
+   (x, y), when the scales differ (raster.hlsl native_blit). Leaves no target bound. */
+static void native_blit(Native *n, ID3D11ShaderResourceView *source, unsigned from, int sx, int sy, NativeSurface *t,
+                        int x, int y, int w, int h)
+{
+    ID3D11DeviceContext *c = n->context;
+    unsigned T = t->scale;
+    if (x + w > (int)(t->size[0] / T)) w = (int)(t->size[0] / T) - x;
+    if (y + h > (int)(t->size[1] / T)) h = (int)(t->size[1] / T) - y;
+    if (!t->rtv || !n->blit_pixel || w <= 0 || h <= 0) return;
+    float map[4] = {(float)(sx - x), (float)(sy - y), (float)T, (float)from};
+    D3D11_VIEWPORT viewport = {(float)(x * (int)T), (float)(y * (int)T), (float)(w * (int)T), (float)(h * (int)T), 0, 1};
+    D3D11_RECT rect = {x * (LONG)T, y * (LONG)T, (x + w) * (LONG)T, (y + h) * (LONG)T};
+    ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)n->blit_constants, 0, NULL, map, 0, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &t->rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(c, NULL, NULL, ~0u);
+    ID3D11DeviceContext_OMSetDepthStencilState(c, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_VSSetShader(c, n->present_vertex, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, n->blit_pixel, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(c, 5, 1, &n->blit_constants);
+    ID3D11DeviceContext_PSSetShaderResources(c, 7, 1, &source);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &viewport);
+    ID3D11DeviceContext_RSSetScissorRects(c, 1, &rect);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(c, 7, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+    native_bind_pipeline(n);
+}
+
+/* The scratch texture holds at least w x h pixels (a copy of a region a draw samples). */
+static int native_scratch(Native *n, unsigned w, unsigned h)
+{
+    if (n->scratch && n->scratch_size[0] >= w && n->scratch_size[1] >= h) return 1;
+    if (n->scratch_view) ID3D11ShaderResourceView_Release(n->scratch_view);
+    if (n->scratch) ID3D11Texture2D_Release(n->scratch);
+    n->scratch = NULL; n->scratch_view = NULL;
+    if (w < n->scratch_size[0]) w = n->scratch_size[0];
+    if (h < n->scratch_size[1]) h = n->scratch_size[1];
+    D3D11_TEXTURE2D_DESC t = {0};
+    t.Width = w; t.Height = h; t.MipLevels = t.ArraySize = 1; t.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT; t.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(n->device, &t, NULL, &n->scratch)) ||
+        FAILED(ID3D11Device_CreateShaderResourceView(n->device, (ID3D11Resource *)n->scratch, NULL, &n->scratch_view))) {
+        if (n->scratch) ID3D11Texture2D_Release(n->scratch);
+        n->scratch = NULL; n->scratch_size[0] = n->scratch_size[1] = 0;
+        return 0;
+    }
+    n->scratch_size[0] = w; n->scratch_size[1] = h;
+    return 1;
+}
+
+/* A w x h rectangle (GS pixels) of surface s at (sx, sy) to surface t at (x, y). */
+static void native_copy(Native *n, NativeSurface *s, NativeSurface *t, int sx, int sy, int x, int y, int w, int h)
+{
+    ID3D11DeviceContext *c = n->context;
+    if (s->scale != t->scale) { native_blit(n, s->srv, s->scale, sx, sy, t, x, y, w, h); return; }
+    int S = (int)s->scale;
+    if (sx + w > (int)s->size[0] / S) w = (int)s->size[0] / S - sx;
+    if (sy + h > (int)s->size[1] / S) h = (int)s->size[1] / S - sy;
+    if (x + w > (int)t->size[0] / S) w = (int)t->size[0] / S - x;
+    if (y + h > (int)t->size[1] / S) h = (int)t->size[1] / S - y;
+    if (w <= 0 || h <= 0) return;
+    D3D11_BOX box = {(UINT)(sx * S), (UINT)(sy * S), 0, (UINT)((sx + w) * S), (UINT)((sy + h) * S), 1};
+    n->drawn.copies++; n->drawn.copy_px += (uint64_t)w * h;
+    if (s == t) {
+        if (!native_scratch(n, box.right, box.bottom)) return;
+        ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)n->scratch, 0, box.left, box.top, 0, (ID3D11Resource *)s->texture, 0, &box);
+        ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)t->texture, 0, (UINT)(x * S), (UINT)(y * S), 0, (ID3D11Resource *)n->scratch, 0, &box);
+    } else
+        ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)t->texture, 0, (UINT)(x * S), (UINT)(y * S), 0, (ID3D11Resource *)s->texture, 0, &box);
+}
+
+/* Rebuilds conversion i of the frame into its texture; returns the view to sample, or NULL. */
+static ID3D11ShaderResourceView *native_run_convert(Native *n, const NativeFrame *f, unsigned i)
+{
+    ID3D11DeviceContext *c = n->context;
+    const NativeConvert *v = &f->converts[i];
+    unsigned w = v->constants.size[0], h = v->constants.size[1];
+    if (!n->convert_shader) return NULL;
+    ID3D11ShaderResourceView *views[9] = {v->base ? v->base->view : NULL};
+    NativeConvertConstants *constants = &n->convert_scratch;
+    *constants = v->constants;
+    constants->tex[3] = 0;   /* each source's scale, a byte per slot */
+    for (unsigned k = 0; k < 4; k++) {
+        const NativeSurface *s = v->surface[k] >= 0 ? &n->surfaces[v->surface[k]] : NULL;
+        if (s && !s->srv) return NULL;
+        views[1 + k + (s && s->depth ? 4 : 0)] = s ? s->srv : NULL;
+        constants->tex[3] |= (s ? s->scale : 1) << (k * 8);
+    }
+    if (n->converted[i].w != w || n->converted[i].h != h) {
+        if (n->converted[i].uav) ID3D11UnorderedAccessView_Release(n->converted[i].uav);
+        if (n->converted[i].srv) ID3D11ShaderResourceView_Release(n->converted[i].srv);
+        if (n->converted[i].texture) ID3D11Texture2D_Release(n->converted[i].texture);
+        memset(&n->converted[i], 0, sizeof n->converted[i]);
+        D3D11_TEXTURE2D_DESC t = {0};
+        t.Width = w; t.Height = h; t.MipLevels = t.ArraySize = 1; t.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT;
+        t.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        if (FAILED(ID3D11Device_CreateTexture2D(n->device, &t, NULL, &n->converted[i].texture)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(n->device, (ID3D11Resource *)n->converted[i].texture, NULL, &n->converted[i].srv)) ||
+            FAILED(ID3D11Device_CreateUnorderedAccessView(n->device, (ID3D11Resource *)n->converted[i].texture, NULL, &n->converted[i].uav)))
+            return NULL;
+        n->converted[i].w = w; n->converted[i].h = h;
+    }
+    ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)n->convert_constants, 0, NULL, constants, 0, 0);
+    ID3D11DeviceContext_CSSetShader(c, n->convert_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetConstantBuffers(c, 4, 1, &n->convert_constants);
+    ID3D11DeviceContext_CSSetShaderResources(c, 6, 1, &n->inverse_view);
+    ID3D11DeviceContext_CSSetShaderResources(c, 8, 9, views);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c, 2, 1, &n->converted[i].uav, NULL);
+    ID3D11DeviceContext_Dispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
+    ID3D11ShaderResourceView *none[9] = {NULL};
+    ID3D11UnorderedAccessView *no_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(c, 8, 9, none);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c, 2, 1, &no_uav, NULL);
+    n->stats.conversions_run++;
+    return n->converted[i].srv;
+}
+
+static void native_render(Native *n, NativeFrame *f, const NativeVertex *vertices)
+{
+    ID3D11DeviceContext *c = n->context;
+    unsigned surfaces = (unsigned)n->surface_count;
+    if (!n->scale) n->scale = n->scale_setting ? n->scale_setting : native_match_window(n, f);
+    /* Texture sizes: what each surface claimed; a target and the Z buffer drawn with it alike, as
+       D3D binds only views of equal size together. */
+    unsigned want[NATIVE_SURFACES][2];
+    for (unsigned i = 0; i < surfaces; i++) native_wanted(&n->surfaces[i], want[i]);
+    for (int changed = 1, pass = 0; changed && pass < 4; pass++) {
+        changed = 0;
+        for (unsigned i = 0; i < f->command_count; i++) {
+            const NativeCommand *k = &f->commands[i];
+            if (k->kind != NATIVE_DRAW || k->depth < 0 || !(k->depth_key & 8)) continue;
+            unsigned *a = want[k->target], *b = want[k->depth];
+            for (unsigned j = 0; j < 2; j++)
+                if (a[j] != b[j]) { a[j] = b[j] = a[j] > b[j] ? a[j] : b[j]; changed = 1; }
+        }
+    }
+    for (unsigned i = 0; i < surfaces; i++) native_surface_resources(n, &n->surfaces[i], want[i]);
+    if (f->vertex_count > n->vertex_buffer_capacity) {
+        if (n->vertex_buffer) ID3D11Buffer_Release(n->vertex_buffer);
+        n->vertex_buffer = NULL;
+        unsigned capacity = n->vertex_buffer_capacity ? n->vertex_buffer_capacity : 1 << 18;
+        while (capacity < f->vertex_count) capacity *= 2;
+        D3D11_BUFFER_DESC b = {0};
+        b.ByteWidth = capacity * sizeof(NativeVertex); b.Usage = D3D11_USAGE_DYNAMIC;
+        b.BindFlags = D3D11_BIND_VERTEX_BUFFER; b.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(n->device, &b, NULL, &n->vertex_buffer))) { n->vertex_buffer_capacity = 0; return; }
+        n->vertex_buffer_capacity = capacity;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (f->vertex_count && SUCCEEDED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)n->vertex_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        memcpy(mapped.pData, vertices, f->vertex_count * sizeof(NativeVertex));
+        ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)n->vertex_buffer, 0);
+    }
+    native_bind_pipeline(n);
+    int bound_target = -2, bound_depth = -2, last_convert = -1;
+    for (unsigned i = 0; i < f->command_count; i++) {
+        NativeCommand *k = &f->commands[i];
+        if (k->kind == NATIVE_IMPORT) {
+            NativeSurface *s = &n->surfaces[k->target];
+            D3D11_BOX box = {(UINT)k->x, (UINT)k->y, 0, (UINT)(k->x + k->w), (UINT)(k->y + k->h), 1};
+            last_convert = -1;
+            if (!s->texture) continue;
+            if (s->scale == 1)
+                ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)s->texture, 0, &box, k->pixels, (UINT)k->w * 4, 0);
+            else if (k->w <= 64 && k->h <= 64) {
+                /* Upscaled: the page goes to a 1x texture and is drawn in, a block per pixel. */
+                D3D11_BOX page = {0, 0, 0, (UINT)k->w, (UINT)k->h, 1};
+                ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)n->import, 0, &page, k->pixels, (UINT)k->w * 4, 0);
+                native_blit(n, n->import_view, 1, 0, 0, s, k->x, k->y, k->w, k->h);
+                bound_target = bound_depth = -2;
+            }
+            n->drawn.imports++; n->drawn.import_px += (uint64_t)k->w * k->h;
+            continue;
+        }
+        if (k->kind == NATIVE_COPY) {
+            NativeSurface *s = &n->surfaces[k->source], *t = &n->surfaces[k->target];
+            last_convert = -1;
+            if (!s->texture || !t->texture) continue;
+            if (s->scale != t->scale) bound_target = bound_depth = -2;
+            native_copy(n, s, t, k->sx, k->sy, k->x, k->y, k->w, k->h);
+            continue;
+        }
+        if (!k->count) continue;
+        NativeSurface *target = &n->surfaces[k->target];
+        NativeSurface *depth = k->depth >= 0 && (k->depth_key & 8) ? &n->surfaces[k->depth] : NULL;
+        if (!target->rtv) continue;
+        if (depth && (!depth->dsv || depth->size[0] != target->size[0] || depth->size[1] != target->size[1])) depth = NULL;
+        unsigned T = target->scale, S = 1;
+        ID3D11ShaderResourceView *view = NULL;
+        if (k->texture_surface >= 0) {
+            NativeSurface *s = &n->surfaces[k->texture_surface];
+            view = s->srv; S = s->scale;
+            if (k->texture_surface == k->target) {
+                /* Sampling the target: draw from a copy of the region the texture can reach. */
+                int x = k->constants.tex_offset[0], y = k->constants.tex_offset[1];
+                int w = (int)k->constants.tex_size[0], h = (int)k->constants.tex_size[1];
+                if (x + w > (int)(s->size[0] / S)) w = (int)(s->size[0] / S) - x;
+                if (y + h > (int)(s->size[1] / S)) h = (int)(s->size[1] / S) - y;
+                if (w < 0) w = 0;
+                if (h < 0) h = 0;
+                if (!native_scratch(n, (unsigned)(x + w) * S, (unsigned)(y + h) * S)) continue;
+                D3D11_BOX box = {(UINT)x * S, (UINT)y * S, 0, (UINT)(x + w) * S, (UINT)(y + h) * S, 1};
+                ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+                bound_target = bound_depth = -2;
+                if (w && h)
+                    ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)n->scratch, 0, box.left, box.top, 0, (ID3D11Resource *)s->texture, 0, &box);
+                n->drawn.self_copies++; n->drawn.self_copy_px += (uint64_t)w * h;
+                view = n->scratch_view;
+            }
+        } else if (k->texture) view = k->texture->view;
+        else if (k->convert >= 0) {
+            /* Again for each run of draws: the surface may have changed since. */
+            static ID3D11ShaderResourceView *converted;
+            if (k->convert != last_convert) {
+                ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+                bound_target = bound_depth = -2;
+                converted = native_run_convert(n, f, (unsigned)k->convert);
+                last_convert = k->convert;
+            }
+            view = converted;
+            if (!view) continue;
+        }
+        if (k->convert < 0) last_convert = -1;
+        if (k->target != bound_target || (depth ? k->depth : -1) != bound_depth) {
+            ID3D11ShaderResourceView *none = NULL;
+            ID3D11DeviceContext_PSSetShaderResources(c, 4, 1, &none);
+            ID3D11DeviceContext_OMSetRenderTargets(c, 1, &target->rtv, depth ? depth->dsv : NULL);
+            /* GS coordinates stay; the viewport scales them (a vertex at x lands at (x + 0.5) * T). */
+            D3D11_VIEWPORT viewport = {0, 0, 2048.0f * T, 2048.0f * T, 0, 1};
+            ID3D11DeviceContext_RSSetViewports(c, 1, &viewport);
+            bound_target = k->target; bound_depth = depth ? k->depth : -1;
+        }
+        ID3D11DeviceContext_PSSetShaderResources(c, 4, 1, &view);
+        float fix = k->blend_fix / 128.0f;
+        float factor[4] = {fix, fix, fix, fix};
+        ID3D11DeviceContext_OMSetBlendState(c, native_blend_state(n, k->blend_key, k->color_mask), factor, ~0u);
+        ID3D11DeviceContext_OMSetDepthStencilState(c, native_depth_state(n, depth ? k->depth_key : 0), 0);
+        D3D11_RECT scissor = {k->scissor.left * (LONG)T, k->scissor.top * (LONG)T, k->scissor.right * (LONG)T,
+                              k->scissor.bottom * (LONG)T};
+        ID3D11DeviceContext_RSSetScissorRects(c, 1, &scissor);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)n->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            NativeConstants *constants = mapped.pData;
+            *constants = k->constants;
+            constants->scale = T | S << 8 | (S < T ? S : T) << 16;
+            ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)n->constant_buffer, 0);
+        }
+        ID3D11DeviceContext_Draw(c, k->count, k->first);
+        n->drawn.draws++;
+    }
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(c, 4, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+}
+
+static int native_scanout(Native *n, NativeFrame *f)
+{
+    ID3D11DeviceContext *c = n->context;
+    if (f->display_surface < 0 || !n->surfaces[f->display_surface].srv) return 0;
+    /* An upscaled display surface gives a picture as many times larger (raster.hlsl). */
+    unsigned scale = n->surfaces[f->display_surface].scale;
+    uint32_t d[12];
+    memcpy(d, f->display, sizeof d);
+    d[5] *= scale; d[6] *= scale; d[8] = scale;
+    if (n->display_width != d[5] || n->display_height != d[6]) {
+        if (n->display_uav) ID3D11UnorderedAccessView_Release(n->display_uav);
+        if (n->display_view) ID3D11ShaderResourceView_Release(n->display_view);
+        n->display_view = NULL;
+        if (n->display) ID3D11Texture2D_Release(n->display);
+        if (n->display_readback) ID3D11Texture2D_Release(n->display_readback);
+        n->display_uav = NULL; n->display = n->display_readback = NULL;
+        n->display_width = n->display_height = 0;
+        D3D11_TEXTURE2D_DESC t = {0};
+        t.Width = d[5]; t.Height = d[6]; t.MipLevels = t.ArraySize = 1;
+        t.Format = DXGI_FORMAT_R8G8B8A8_UNORM; t.SampleDesc.Count = 1;
+        t.Usage = D3D11_USAGE_DEFAULT; t.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(n->device, &t, NULL, &n->display))) return 0;
+        if (FAILED(ID3D11Device_CreateUnorderedAccessView(n->device, (ID3D11Resource *)n->display, NULL, &n->display_uav))) return 0;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(n->device, (ID3D11Resource *)n->display, NULL, &n->display_view))) return 0;
+        t.Usage = D3D11_USAGE_STAGING; t.BindFlags = 0; t.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(n->device, &t, NULL, &n->display_readback))) return 0;
+        n->display_width = d[5]; n->display_height = d[6];
+    }
+    ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)n->display_constants, 0, NULL, d, 0, 0);
+    ID3D11DeviceContext_CSSetShader(c, n->scanout_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetConstantBuffers(c, 1, 1, &n->display_constants);
+    ID3D11DeviceContext_CSSetShaderResources(c, 5, 1, &n->surfaces[f->display_surface].srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c, 1, 1, &n->display_uav, NULL);
+    ID3D11DeviceContext_Dispatch(c, (d[5] + 7) / 8, (d[6] + 7) / 8, 1);
+    ID3D11ShaderResourceView *no_view = NULL;
+    ID3D11UnorderedAccessView *no_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(c, 5, 1, &no_view);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c, 1, 1, &no_uav, NULL);
+    return 1;
+}
+
+void pacing_handed(double *due, double *began);   /* port/hle/kernel.c, just-in-time frames */
+void pacing_present(double due, double began);
+
+static void native_present(Native *n)
+{
+    static const GUID texture_iid = {0x6F15AAF2,0xD208,0x4E89,{0x9A,0xB4,0x48,0x95,0x35,0xD3,0x4F,0x9C}};
+    if (!n->display || !n->swapchain) return;
+    if (!n->window) {
+        DXGI_SWAP_CHAIN_DESC desc;
+        if (SUCCEEDED(IDXGISwapChain_GetDesc(n->swapchain, &desc))) n->window = desc.OutputWindow;
+    }
+    /* The back buffer is the window's size; the picture is scaled into it. */
+    RECT client = {0, 0, 0, 0};
+    if (n->window) GetClientRect(n->window, &client);
+    unsigned w = (unsigned)client.right, h = (unsigned)client.bottom;
+    if (!w || !h) return;  /* minimised */
+    if (!n->backbuffer || n->buffer_width != w || n->buffer_height != h || n->resize) {
+        if (n->back_view) { ID3D11RenderTargetView_Release(n->back_view); n->back_view = NULL; }
+        if (n->backbuffer) { ID3D11Texture2D_Release(n->backbuffer); n->backbuffer = NULL; }
+        HRESULT hr = IDXGISwapChain_ResizeBuffers(n->swapchain, 2, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, gs_swap_chain_flags());
+        if (SUCCEEDED(hr)) hr = IDXGISwapChain_GetBuffer(n->swapchain, 0, &texture_iid, (void **)&n->backbuffer);
+        if (SUCCEEDED(hr)) hr = ID3D11Device_CreateRenderTargetView(n->device, (ID3D11Resource *)n->backbuffer, NULL, &n->back_view);
+        if (FAILED(hr)) { fprintf(stderr, "gs native: resize failed (%08lX)\n", hr); return; }
+        n->buffer_width = w; n->buffer_height = h; n->resize = 0;
+    }
+    ID3D11DeviceContext *c = n->context;
+    float aspect = n->aspect < 0 ? (float)n->display_width / n->display_height : n->aspect, vw = (float)w, vh = (float)h;
+    if (aspect > 0) {
+        if (vw > vh * aspect) vw = floorf(vh * aspect + 0.5f);
+        else vh = floorf(vw / aspect + 0.5f);
+    }
+    D3D11_VIEWPORT viewport = {floorf((w - vw) / 2), floorf((h - vh) / 2), vw, vh, 0, 1};
+    /* DHD_VIEW (present.h gs_native_view): one quarter of the 3-4 player split screen (presets
+       6-9) fills the picture: the whole is drawn twice as large, shifted and cut to the picture;
+       every view is still drawn and the game is unchanged (finding 041). */
+    int view = gs_native_view - 1;
+    D3D11_RECT cut = {(LONG)viewport.TopLeftX, (LONG)viewport.TopLeftY, (LONG)(viewport.TopLeftX + vw),
+                      (LONG)(viewport.TopLeftY + vh)};
+    if (view >= 0 && view < 4) {
+        viewport.TopLeftX -= (view & 1) * vw, viewport.TopLeftY -= (view >> 1) * vh;
+        viewport.Width *= 2, viewport.Height *= 2;
+    }
+    static const float black[4] = {0, 0, 0, 1};
+    ID3D11DeviceContext_ClearRenderTargetView(c, n->back_view, black);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &n->back_view, NULL);
+    ID3D11DeviceContext_OMSetBlendState(c, NULL, NULL, ~0u);
+    ID3D11DeviceContext_OMSetDepthStencilState(c, NULL, 0);
+    ID3D11DeviceContext_RSSetState(c, n->rasterizer);  /* scissor on */
+    ID3D11DeviceContext_RSSetScissorRects(c, 1, &cut);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &viewport);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(c, n->present_vertex, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, n->present_pixel, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &n->display_view);
+    ID3D11DeviceContext_PSSetSamplers(c, 0, 1, &n->present_sampler);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+    if (n->interp) IDXGISwapChain_Present(n->swapchain, !n->interp_hz ? 1 : 0, 0);
+    else {
+        pacing_present(n->present_due, n->present_began);  /* holds the picture to its due time */
+        gs_present(n->swapchain);
+    }
+    n->stats.presented++;
+    double now = host_wall_seconds();
+    if (n->last_present) n->intervals[n->interval_count++ % NATIVE_INTERVALS] = (float)((now - n->last_present) * 1000);
+    else n->first_present = now;
+    n->last_present = now;
+}
+
+/* DHD_NATIVE_TRACE: writes the pictures whose GPU timestamps have arrived, oldest first (all of
+   them when asked to wait). Context lock held. */
+static void native_gpu_collect(Native *n, int wait)
+{
+    for (unsigned k = 0; k < 8; k++) {
+        unsigned i = (n->gpu_time_next + k) % 8;
+        if (!n->gpu_time[i].pending) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT d;
+        UINT64 a = 0, b = 0;
+        UINT flags = wait ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH;
+        HRESULT hr;
+        while ((hr = ID3D11DeviceContext_GetData(n->context, (ID3D11Asynchronous *)n->gpu_time[i].disjoint, &d, sizeof d, flags)) == S_FALSE && wait)
+            YieldProcessor();
+        if (hr != S_OK) return;  /* in order: later ones are not ready either */
+        double gpu = -1;
+        if (!d.Disjoint && d.Frequency &&
+            ID3D11DeviceContext_GetData(n->context, (ID3D11Asynchronous *)n->gpu_time[i].begin, &a, sizeof a, 0) == S_OK &&
+            ID3D11DeviceContext_GetData(n->context, (ID3D11Asynchronous *)n->gpu_time[i].end, &b, sizeof b, 0) == S_OK)
+            gpu = (double)(b - a) * 1000.0 / (double)d.Frequency;
+        fprintf(n->trace_pictures, "%llu,%.3f,%.3f,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                (unsigned long long)n->gpu_time[i].field, n->gpu_time[i].t, n->gpu_time[i].cpu_ms, gpu,
+                n->gpu_time[i].draws, n->gpu_time[i].self_copies, n->gpu_time[i].self_copy_px, n->gpu_time[i].copies,
+                n->gpu_time[i].copy_px, n->gpu_time[i].imports, n->gpu_time[i].import_px);
+        n->gpu_time[i].pending = 0;
+    }
+}
+
+/* One picture: draw the field's commands (with these vertices), scan out, present. Context lock held. */
+static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertices, float t)
+{
+    unsigned slot = n->gpu_time_next % 8;
+    double start = 0;
+    if (n->trace_pictures) {
+        if (n->gpu_time[slot].pending) native_gpu_collect(n, 1);
+        if (!n->gpu_time[slot].disjoint) {
+            D3D11_QUERY_DESC q = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            ID3D11Device_CreateQuery(n->device, &q, &n->gpu_time[slot].disjoint);
+            q.Query = D3D11_QUERY_TIMESTAMP;
+            ID3D11Device_CreateQuery(n->device, &q, &n->gpu_time[slot].begin);
+            ID3D11Device_CreateQuery(n->device, &q, &n->gpu_time[slot].end);
+        }
+        memset(&n->drawn, 0, sizeof n->drawn);
+        start = host_wall_seconds();
+        ID3D11DeviceContext_Begin(n->context, (ID3D11Asynchronous *)n->gpu_time[slot].disjoint);
+        ID3D11DeviceContext_End(n->context, (ID3D11Asynchronous *)n->gpu_time[slot].begin);
+    }
+    native_render(n, f, vertices);
+    int shown = native_scanout(n, f);
+    /* The end stamp goes before Present, so the vsync wait isn't counted as GPU work. */
+    if (n->trace_pictures) ID3D11DeviceContext_End(n->context, (ID3D11Asynchronous *)n->gpu_time[slot].end);
+    double drawn_at = n->trace_pictures ? host_wall_seconds() : 0;
+    if (shown) native_present(n);
+    if (n->trace_pictures) {
+        ID3D11DeviceContext_End(n->context, (ID3D11Asynchronous *)n->gpu_time[slot].disjoint);
+        n->gpu_time[slot].pending = 1;
+        n->gpu_time[slot].field = f->field; n->gpu_time[slot].t = t;
+        n->gpu_time[slot].cpu_ms = (float)((drawn_at - start) * 1000);
+        n->gpu_time[slot].draws = n->drawn.draws;
+        n->gpu_time[slot].self_copies = n->drawn.self_copies; n->gpu_time[slot].self_copy_px = n->drawn.self_copy_px;
+        n->gpu_time[slot].copies = n->drawn.copies; n->gpu_time[slot].copy_px = n->drawn.copy_px;
+        n->gpu_time[slot].imports = n->drawn.imports; n->gpu_time[slot].import_px = n->drawn.import_px;
+        n->gpu_time_next++;
+        native_gpu_collect(n, 0);
+    }
+}
+
+static void native_recycle(NativeFrame *f)
+{
+    for (unsigned i = 0; i < f->command_count; i++) free(f->commands[i].pixels);
+    f->command_count = 0; f->vertex_count = 0; f->segment_count = 0; f->convert_count = 0;
+}
+
+/* DHD_INTERP: pairs each segment of the newer field with an unused segment of the older field with
+   the same draw state and vertex count: of those in the next 256, the one whose first and last
+   vertices are nearest. Taking simply the next one paired a tree or a ground piece with its
+   neighbour whenever the game culled one or sorted them differently, and moved it halfway there
+   in the in-between pictures. */
+static void native_pair(Native *n, const NativeFrame *a, NativeFrame *b)
+{
+    if (b->pair_capacity < b->segment_count) {
+        int32_t *grown = realloc(b->pair, b->segment_count * sizeof *grown);
+        if (!grown) native_oom("pairs");
+        b->pair = grown; b->pair_capacity = b->segment_count;
+    }
+    if (n->paired_capacity < a->segment_count) {
+        uint8_t *grown = realloc(n->paired, a->segment_count);
+        if (!grown) native_oom("pairs");
+        n->paired = grown; n->paired_capacity = a->segment_count;
+    }
+    memset(n->paired, 0, a->segment_count);
+    unsigned cursor = 0;
+    for (unsigned j = 0; j < b->segment_count; j++) {
+        const NativeSegment *sb = &b->segments[j];
+        b->pair[j] = -1;
+        if (!sb->count) continue;
+        /* Look a little way ahead only: segments mostly keep their order from field to field. */
+        const NativeVertex *fb = b->vertices + sb->first, *lb = fb + sb->count - 1;
+        float best_distance = 1e30f;
+        int best = -1;
+        for (unsigned step = 0; step < a->segment_count && step < 256; step++) {
+            unsigned i = (cursor + step) % a->segment_count;
+            const NativeSegment *sa = &a->segments[i];
+            if (n->paired[i] || sa->count != sb->count || sa->key != sb->key) continue;
+            const NativeVertex *fa = a->vertices + sa->first, *la = fa + sa->count - 1;
+            float d = fabsf(fa->x - fb->x) + fabsf(fa->y - fb->y) + fabsf(la->x - lb->x) + fabsf(la->y - lb->y);
+            if (d < best_distance) best_distance = d, best = (int)i;
+            if (d < 0.5f) break;
+        }
+        if (best >= 0) {
+            n->paired[best] = 1; b->pair[j] = best;
+            while (cursor < a->segment_count && n->paired[cursor]) cursor++;  /* the first unused */
+        }
+    }
+    static int trace = -1; static unsigned calls;
+    if (trace < 0) trace = getenv("DHD_INTERP_TRACE") != NULL;
+    if (trace && calls++ % 120 == 0) {
+        unsigned pairs = 0;
+        for (unsigned j = 0; j < b->segment_count; j++) pairs += b->pair[j] >= 0;
+        fprintf(stderr, "interp pair: field %llu segments %u/%u commands %u/%u vertices %u/%u pairs %u\n",
+                (unsigned long long)b->field, a->segment_count, b->segment_count, a->command_count, b->command_count,
+                a->vertex_count, b->vertex_count, pairs);
+        for (unsigned j = 0; j < 6 && j < a->segment_count && j < b->segment_count; j++)
+            fprintf(stderr, "  seg %u: %u+%u %08X | %u+%u %08X\n", j, a->segments[j].first, a->segments[j].count,
+                    a->segments[j].key, b->segments[j].first, b->segments[j].count, b->segments[j].key);
+    }
+}
+
+static uint32_t native_positions_hash(const NativeVertex *v, unsigned count)
+{
+    uint32_t h = 2166136261u ^ count;
+    for (unsigned i = 0; i < count; i++) {
+        uint32_t w[3];
+        memcpy(w, &v[i].x, sizeof w);
+        h = (h ^ w[0]) * 16777619u; h = (h ^ w[1]) * 16777619u; h = (h ^ w[2]) * 16777619u;
+    }
+    return h;
+}
+
+static int native_same_positions(const NativeVertex *a, const NativeVertex *b, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++)
+        if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z) return 0;
+    return 1;
+}
+
+/* The newer field's vertices moved back towards the older field's: at t = 0 the older field,
+   at t = 1 the newer. A segment drawn again over the same vertices (the ground's detail and
+   lighting passes, a tree's layers, depth tested equal) moves exactly as the first one did,
+   paired or not; else the passes fought in the in-between pictures. An unpaired segment moves
+   as the last paired one of its draw state did on average (mostly the camera's motion), so a
+   piece the game clipped differently this field stays with its neighbours. */
+static const NativeVertex *native_mixed(Native *n, const NativeFrame *a, const NativeFrame *b, float t)
+{
+    if (n->mixed_capacity < b->vertex_count) {
+        NativeVertex *grown = realloc(n->mixed, b->vertex_count * sizeof *grown);
+        if (!grown) native_oom("interpolated vertices");
+        n->mixed = grown; n->mixed_capacity = b->vertex_count;
+    }
+    memcpy(n->mixed, b->vertices, b->vertex_count * sizeof *n->mixed);
+    unsigned size = 1;
+    while (size < 2 * b->segment_count) size *= 2;
+    if (n->same_capacity < size) {
+        int32_t *grown = realloc(n->same, size * sizeof *grown);
+        if (!grown) native_oom("interpolated segments");
+        n->same = grown; n->same_capacity = size;
+    }
+    memset(n->same, 0xFF, size * sizeof *n->same);
+    static struct { uint32_t key; int set; float x, y, z; } moves[256];  /* by draw state; render thread only */
+    memset(moves, 0, sizeof moves);
+    float back = 1 - t;
+    uint64_t paired = 0, jumped = 0;
+    for (unsigned j = 0; j < b->segment_count; j++) {
+        const NativeSegment *sb = &b->segments[j];
+        const NativeVertex *vb = b->vertices + sb->first;
+        NativeVertex *o = n->mixed + sb->first;
+        if (!sb->count) continue;
+        unsigned slot = native_positions_hash(vb, sb->count) & (size - 1);
+        int same = -1;
+        for (; n->same[slot] >= 0; slot = (slot + 1) & (size - 1)) {
+            const NativeSegment *s = &b->segments[n->same[slot]];
+            if (s->count == sb->count && native_same_positions(b->vertices + s->first, vb, sb->count)) {
+                same = n->same[slot];
+                break;
+            }
+        }
+        if (same >= 0) {
+            const NativeVertex *m = n->mixed + b->segments[same].first;
+            for (unsigned v = 0; v < sb->count; v++) o[v].x = m[v].x, o[v].y = m[v].y, o[v].z = m[v].z;
+            continue;
+        }
+        n->same[slot] = (int32_t)j;
+        unsigned move = (sb->key * 2654435761u) >> 24;
+        if (b->pair[j] < 0) {
+            if (!moves[move].set || moves[move].key != sb->key) continue;  /* held */
+            for (unsigned v = 0; v < sb->count; v++) {
+                o[v].x = vb[v].x + moves[move].x * back;
+                o[v].y = vb[v].y + moves[move].y * back;
+                o[v].z = vb[v].z + moves[move].z * back;
+            }
+            continue;
+        }
+        const NativeSegment *sa = &a->segments[b->pair[j]];
+        const NativeVertex *va = a->vertices + sa->first;
+        /* A large jump is a different object that happens to share the state: hold it. */
+        float jump = 0, mx = 0, my = 0, mz = 0;
+        for (unsigned v = 0; v < sb->count; v++) {
+            float dx = fabsf(vb[v].x - va[v].x), dy = fabsf(vb[v].y - va[v].y);
+            if (dx > jump) jump = dx;
+            if (dy > jump) jump = dy;
+        }
+        if (jump > 96) { jumped += sb->count; continue; }
+        for (unsigned v = 0; v < sb->count; v++) {
+            float dx = va[v].x - vb[v].x, dy = va[v].y - vb[v].y, dz = va[v].z - vb[v].z;
+            o[v].x = vb[v].x + dx * back;
+            o[v].y = vb[v].y + dy * back;
+            o[v].z = vb[v].z + dz * back;
+            mx += dx, my += dy, mz += dz;
+        }
+        moves[move].key = sb->key, moves[move].set = 1;
+        moves[move].x = mx / sb->count, moves[move].y = my / sb->count, moves[move].z = mz / sb->count;
+        paired += sb->count;
+    }
+    n->stats.paired_vertices += paired; n->stats.jumped_vertices += jumped;
+    n->stats.held_vertices += b->vertex_count - paired - jumped;
+    return n->mixed;
+}
+
+static void native_sleep_until(Native *n, double when)
+{
+    double left = when - host_wall_seconds();
+    if (left > 0.001 && n->timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)((left - 0.0007) * 1e7);
+        if (SetWaitableTimer(n->timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(n->timer, INFINITE);
+    } else if (left > 0.002)
+        Sleep((DWORD)((left - 0.0015) * 1000));
+    while (host_wall_seconds() < when) YieldProcessor();
+}
+
+/* DHD_INTERP_DUMP=prefix with DHD_INTERP_DUMP_FIELDS=first-last: every picture shown while the
+   newer field is in that window, as prefix-fNNNNNN-KK-tTTT.bmp (K counts the pictures of that
+   field, T is t in thousandths). Kept in memory (at most 400) and written after the window, so
+   the pictures keep their real timing. A diagnostic for the in-between pictures. Context lock
+   held. */
+static void native_dump_picture(Native *n, const NativeFrame *b, float t)
+{
+    enum { MAX = 400 };
+    static int init, written;
+    static const char *prefix;
+    static unsigned long long first, last, field;
+    static unsigned picture, count, w, h;
+    static struct { unsigned long long field; unsigned picture; int t; uint32_t *pixels; } kept[MAX];
+    if (!init++) {
+        const char *range = getenv("DHD_INTERP_DUMP_FIELDS");
+        prefix = getenv("DHD_INTERP_DUMP");
+        if (!range || sscanf(range, "%llu-%llu", &first, &last) != 2) prefix = NULL;
+    }
+    if (!prefix || written || b->field < first || !n->display_readback) return;
+    if (b->field > last || count == MAX) {
+        for (unsigned i = 0; i < count; i++) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s-f%06llu-%02u-t%04d.bmp", prefix, kept[i].field, kept[i].picture, kept[i].t);
+            FILE *f = fopen(path, "wb");
+            if (!f) continue;
+            BITMAPFILEHEADER file = {0};
+            BITMAPINFOHEADER info = {0};
+            file.bfType = 0x4D42; file.bfOffBits = sizeof file + sizeof info; file.bfSize = file.bfOffBits + w * h * 4;
+            info.biSize = sizeof info; info.biWidth = w; info.biHeight = -(LONG)h;
+            info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
+            fwrite(&file, sizeof file, 1, f); fwrite(&info, sizeof info, 1, f);
+            for (unsigned j = 0; j < w * h; j++) {
+                uint32_t v = kept[i].pixels[j];
+                kept[i].pixels[j] = (v & 0xFF00FF00) | (v & 255) << 16 | (v >> 16 & 255);
+            }
+            fwrite(kept[i].pixels, 4, (size_t)w * h, f);
+            fclose(f);
+            free(kept[i].pixels);
+        }
+        written = 1;
+        return;
+    }
+    picture = field == b->field ? picture + 1 : 0;
+    field = b->field;
+    w = n->display_width, h = n->display_height;
+    uint32_t *pixels = malloc((size_t)w * h * 4);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (!pixels) return;
+    ID3D11DeviceContext_CopyResource(n->context, (ID3D11Resource *)n->display_readback, (ID3D11Resource *)n->display);
+    if (FAILED(ID3D11DeviceContext_Map(n->context, (ID3D11Resource *)n->display_readback, 0, D3D11_MAP_READ, 0, &mapped))) {
+        free(pixels);
+        return;
+    }
+    for (unsigned y = 0; y < h; y++)
+        memcpy(pixels + y * w, (const uint8_t *)mapped.pData + y * mapped.RowPitch, w * 4);
+    ID3D11DeviceContext_Unmap(n->context, (ID3D11Resource *)n->display_readback, 0);
+    kept[count].field = field, kept[count].picture = picture, kept[count].t = (int)(t * 1000), kept[count].pixels = pixels;
+    count++;
+}
+
+/* The frame buffer a field drew into last: the display circuit still shows the one the field
+   before finished (double buffering), so an in-between picture drawn from this field shows only
+   if scanned out from here. -1 when the field drew into no other surface like the displayed one. */
+static int native_drawn_surface(Native *n, const NativeFrame *f)
+{
+    if (f->display_surface < 0) return -1;
+    const NativeSurface *shown = &n->surfaces[f->display_surface];
+    for (unsigned i = f->command_count; i-- > 0;) {
+        const NativeCommand *c = &f->commands[i];
+        if (c->kind != NATIVE_DRAW || c->target < 0 || c->target == f->display_surface) continue;
+        const NativeSurface *s = &n->surfaces[c->target];
+        if (!s->depth && s->bw == shown->bw && s->wide == shown->wide && s->srv) return c->target;
+    }
+    return -1;
+}
+
+/* DHD_INTERP: one picture per display refresh (or DHD_INTERP_HZ tick) from the two held fields. */
+static void native_interp_thread(Native *n)
+{
+    double next = 0;
+    for (;;) {
+        EnterCriticalSection(&n->queue_lock);
+        while (!n->pending_count && !n->newer && !n->quit)
+            SleepConditionVariableCS(&n->queue_changed, &n->queue_lock, INFINITE);
+        if (n->quit) { LeaveCriticalSection(&n->queue_lock); return; }
+        /* One new field per picture: every field's uploads and copies reach the surfaces. */
+        int fresh = 0;
+        if (n->pending_count) {
+            NativeFrame *f = n->pending[0];
+            n->pending[0] = n->pending[1];
+            n->pending_count--;
+            if (n->older) { native_recycle(n->older); n->free_frames[n->free_count++] = n->older; }
+            n->older = n->newer; n->newer = f; fresh = 1;
+        }
+        WakeAllConditionVariable(&n->queue_changed);
+        LeaveCriticalSection(&n->queue_lock);
+        NativeFrame *a = n->older, *b = n->newer;
+        double now = host_wall_seconds(), period = a ? b->time - a->time : 0;
+        /* No interpolation across pauses, loading or a missing older field. */
+        int mix = a && period > 0.004 && period < 0.1;
+        if (fresh && mix) native_pair(n, a, b);
+        float t = mix ? (float)((now - b->time) / period) : 1;
+        if (t < 0) t = 0;
+        EnterCriticalSection(&n->context_lock);
+        /* Experiments (DHD_INTERP_MODE): once = each field drawn once, at the first picture;
+           drawn = each picture scanned out from the frame buffer the field drew into. */
+        static int mode = -1;
+        if (mode < 0) {
+            const char *m = getenv("DHD_INTERP_MODE");
+            mode = m && !strcmp(m, "once") ? 1 : m && !strcmp(m, "drawn") ? 2 : 0;
+        }
+        int shown = b->display_surface, drawn = mode == 2 ? native_drawn_surface(n, b) : -1;
+        if (drawn >= 0) b->display_surface = drawn;
+        if (mode == 1 && !fresh) native_present(n);
+        else if (t < 1) { native_picture(n, b, native_mixed(n, a, b, t), t); n->stats.interp_frames++; }
+        else native_picture(n, b, b->vertices, 1);
+        b->display_surface = shown;
+        native_dump_picture(n, b, t < 1 ? t : 1);
+        LeaveCriticalSection(&n->context_lock);
+        if (fresh) {
+            EnterCriticalSection(&n->queue_lock);
+            n->rendered = b->field;
+            WakeAllConditionVariable(&n->queue_changed);
+            LeaveCriticalSection(&n->queue_lock);
+        }
+        if (n->interp_hz) {
+            now = host_wall_seconds();
+            next = next && next > now - 0.05 ? next + 1 / n->interp_hz : now + 1 / n->interp_hz;
+            native_sleep_until(n, next);
+        }
+    }
+}
+
+void host_thread_name(const char *name);  /* port/hle/host.c */
+
+static unsigned __stdcall native_thread(void *argument)
+{
+    Native *n = argument;
+    host_thread_name("native");
+    if (n->interp) { native_interp_thread(n); return 0; }
+    for (;;) {
+        EnterCriticalSection(&n->queue_lock);
+        while (!n->pending_count && !n->quit) SleepConditionVariableCS(&n->queue_changed, &n->queue_lock, INFINITE);
+        if (n->quit) { LeaveCriticalSection(&n->queue_lock); return 0; }
+        NativeFrame *f = n->pending[0];
+        n->pending[0] = n->pending[1];
+        n->pending_count--;
+        WakeAllConditionVariable(&n->queue_changed);
+        LeaveCriticalSection(&n->queue_lock);
+        gs_frame_latency_wait();
+        EnterCriticalSection(&n->context_lock);
+        n->present_due = f->due, n->present_began = f->began;
+        native_picture(n, f, f->vertices, 1);
+        LeaveCriticalSection(&n->context_lock);
+        native_recycle(f);
+        EnterCriticalSection(&n->queue_lock);
+        n->free_frames[n->free_count++] = f;
+        n->rendered = f->field;
+        WakeAllConditionVariable(&n->queue_changed);
+        LeaveCriticalSection(&n->queue_lock);
+    }
+}
+
+/* ---- presentation interface (EE thread, GS worker idle) ---- */
+
+/* The PC settings page (EE thread): the context lock around a swap chain change, and the
+   present options read again. */
+void gs_native_lock(Gs *g, int lock)
+{
+    Native *n = ((Gpu *)g->backend)->native;
+    if (lock) EnterCriticalSection(&n->context_lock);
+    else LeaveCriticalSection(&n->context_lock);
+}
+
+static HRESULT native_present_options(Native *n);
+void gs_native_present_options(Gs *g)
+{
+    Native *n = ((Gpu *)g->backend)->native;
+    EnterCriticalSection(&n->context_lock);
+    native_present_options(n);
+    LeaveCriticalSection(&n->context_lock);
+}
+
+int gs_gpu_native(const Gs *g)
+{
+    return g && g->backend && ((const Gpu *)g->backend)->native != NULL;
+}
+
+void gs_native_vsync(Gs *g, IDXGISwapChain *swapchain, unsigned *width, unsigned *height, int resize)
+{
+    Gpu *gpu = g->backend;
+    Native *n = gpu->native;
+    NativeFrame *f = n->recording;
+    native_close(n, g);
+    /* The display circuit, as gs_gpu_display reads it. */
+    uint64_t pmode = gs_priv_read(g, GS_PMODE);
+    unsigned circuit = pmode & 1 ? 0 : 1;
+    uint64_t fb = gs_priv_read(g, circuit ? GS_DISPFB2 : GS_DISPFB1);
+    uint64_t display = gs_priv_read(g, circuit ? GS_DISPLAY2 : GS_DISPLAY1);
+    uint32_t *d = f->display;
+    memset(d, 0, sizeof f->display);
+    d[0] = (unsigned)(fb >> 15) & 31; d[1] = ((unsigned)fb & 511) * 32;
+    d[2] = (unsigned)(fb >> 9) & 63; d[3] = (unsigned)(fb >> 32) & 2047; d[4] = (unsigned)(fb >> 43) & 2047;
+    d[5] = ((unsigned)(display >> 32) & 4095) + 1; d[5] /= ((unsigned)(display >> 23) & 15) + 1;
+    d[6] = ((unsigned)(display >> 44) & 2047) + 1; d[6] /= ((unsigned)(display >> 27) & 3) + 1;
+    d[7] = (gs_priv_read(g, GS_SMODE2) & 3) == 3;
+    /* scanout reads display_state[0] = d[0..3] and [1] = d[4..7] with b.x = DBY etc. */
+    uint32_t packed[12] = {d[0], d[1] / 32, d[2], d[3], d[4], d[5], d[6], d[7]};
+    f->display_surface = -1;
+    if ((pmode & 3) && d[2] && d[5] && d[6] && d[5] <= 1024 && d[6] <= 1024 && psm_color(d[0])) {
+        f->display_surface = native_surface(n, (unsigned)fb & 511, d[2], d[0], 0);
+        if (f->display_surface >= 0) {
+            native_claim(n, g, f->display_surface, d[0], (int)d[3], (int)d[4], (int)(d[3] + d[5] - 1),
+                         (int)(d[4] + (d[6] >> d[7]) - 1));
+            if (n->usage) n->usage[f->display_surface].displayed++;
+        }
+        *width = d[5]; *height = d[6];
+    } else n->stats.display_missing++;
+    memcpy(f->display, packed, sizeof packed);
+    f->field = ++n->field;
+    f->time = host_wall_seconds();
+    pacing_handed(&f->due, &f->began);
+    n->stats.frames++;
+    if (n->field <= n->full_until) n->stats.full_fields++;
+    if (n->trace_fields) {
+        extern uint64_t kernel_vsync_count;
+        const NativeStats *s = &n->stats, *l = &n->trace_last;
+        fprintf(n->trace_fields, "%llu,%llu,%.6f,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d\n",
+                (unsigned long long)f->field, (unsigned long long)kernel_vsync_count, f->time, f->command_count,
+                f->vertex_count, s->primitives - l->primitives, s->decoded - l->decoded, s->decoded_texels - l->decoded_texels,
+                s->texture_from_surface - l->texture_from_surface, s->texture_unsupported - l->texture_unsupported,
+                s->imports - l->imports, s->copies - l->copies, s->copy_fallbacks - l->copy_fallbacks,
+                s->exact_draws - l->exact_draws, s->color_reads - l->color_reads, n->field <= n->full_until);
+        n->trace_last = *s;
+    }
+    /* Hand the field to the render thread; at most one waits. */
+    EnterCriticalSection(&n->queue_lock);
+    n->swapchain = swapchain;
+    n->resize |= resize;
+    if (!n->thread) {
+        n->thread = (HANDLE)_beginthreadex(NULL, 0, native_thread, n, 0, NULL);
+        SetThreadPriority(n->thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    /* One field waits for the render thread; with DHD_INTERP two, so the EE never waits for a
+       display refresh. */
+    while (n->pending_count >= (n->interp ? 2u : 1u)) SleepConditionVariableCS(&n->queue_changed, &n->queue_lock, INFINITE);
+    while (!n->free_count) SleepConditionVariableCS(&n->queue_changed, &n->queue_lock, INFINITE);
+    n->pending[n->pending_count++] = f;
+    n->handed = f->field;
+    n->recording = n->free_frames[--n->free_count];
+    WakeAllConditionVariable(&n->queue_changed);
+    LeaveCriticalSection(&n->queue_lock);
+    /* The probe log keeps this field and the previous one. */
+    NativeLog spare = n->logs[0];
+    n->logs[0] = n->logs[1];
+    n->logs[1] = spare;
+    n->logs[1].draw_count = n->logs[1].state_count = 0;
+    n->logs[1].state_version = UINT64_MAX;
+}
+
+/* The last handed field's picture, once the render thread has drawn it, in n->picture (its size
+   in width and height; upscaled with DHD_SCALE). */
+static int native_picture_read(Native *n, unsigned *width, unsigned *height)
+{
+    EnterCriticalSection(&n->queue_lock);
+    while (n->rendered < n->handed) SleepConditionVariableCS(&n->queue_changed, &n->queue_lock, INFINITE);
+    LeaveCriticalSection(&n->queue_lock);
+    EnterCriticalSection(&n->context_lock);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    size_t size = (size_t)n->display_width * n->display_height;
+    int ok = n->display_readback != NULL;
+    if (ok && size > n->picture_size) {
+        uint32_t *grown = realloc(n->picture, size * 4);
+        if (grown) n->picture = grown, n->picture_size = size;
+        else ok = 0;
+    }
+    if (ok) {
+        ID3D11DeviceContext_CopyResource(n->context, (ID3D11Resource *)n->display_readback, (ID3D11Resource *)n->display);
+        ok = SUCCEEDED(ID3D11DeviceContext_Map(n->context, (ID3D11Resource *)n->display_readback, 0, D3D11_MAP_READ, 0, &mapped));
+    }
+    if (ok) {
+        for (unsigned y = 0; y < n->display_height; y++)
+            memcpy(n->picture + y * n->display_width, (uint8_t *)mapped.pData + y * mapped.RowPitch, n->display_width * 4);
+        ID3D11DeviceContext_Unmap(n->context, (ID3D11Resource *)n->display_readback, 0);
+        *width = n->display_width; *height = n->display_height;
+    }
+    LeaveCriticalSection(&n->context_lock);
+    return ok;
+}
+
+/* gs_gpu_capture: the picture into a 1x-sized buffer (pixels[] in present.c), so only when it fits. */
+static int native_capture(Native *n, uint32_t *pixels)
+{
+    unsigned w, h;
+    if (!native_picture_read(n, &w, &h) || (size_t)w * h > 1024 * 1024) return 0;
+    memcpy(pixels, n->picture, (size_t)w * h * 4);
+    return 1;
+}
+
+uint32_t *gs_native_picture(Gs *g, unsigned *width, unsigned *height)
+{
+    Native *n = ((Gpu *)g->backend)->native;
+    return native_picture_read(n, width, height) ? n->picture : NULL;
+}
+
+/* Displayed pictures per second and the spread of the time between them (the worst 1% is the mean
+   of the longest hundredth). Context lock held, or the renderer stopped. */
+static void native_intervals(Native *n, const char *label, uint64_t presented, uint64_t interpolated)
+{
+    static float sorted[NATIVE_INTERVALS];
+    unsigned count = n->interval_count < NATIVE_INTERVALS ? (unsigned)n->interval_count : NATIVE_INTERVALS;
+    if (!count) return;
+    memcpy(sorted, n->intervals, count * sizeof *sorted);
+    for (unsigned i = 1; i < count; i++) {   /* insertion sort: a report, not a hot path */
+        float v = sorted[i];
+        unsigned j = i;
+        while (j && sorted[j - 1] > v) { sorted[j] = sorted[j - 1]; j--; }
+        sorted[j] = v;
+    }
+    unsigned worst = count / 100 ? count / 100 : 1;
+    double tail = 0;
+    for (unsigned i = count - worst; i < count; i++) tail += sorted[i];
+    double seconds = n->last_present - n->first_present;
+    const NativeStats *s = &n->stats;
+    uint64_t total = s->paired_vertices + s->held_vertices + s->jumped_vertices;
+    fprintf(stderr, "%s: displayed_fps=%.2f present_ms p50=%.2f p99=%.2f worst1pct=%.2f max=%.2f interpolated=%llu "
+            "paired=%.1f%% held=%.1f%% jumped=%.1f%%\n", label,
+            seconds > 0 && presented ? (double)(presented - 1) / seconds : 0, sorted[count / 2], sorted[count * 99 / 100],
+            tail / worst, sorted[count - 1], (unsigned long long)interpolated, total ? 100.0 * s->paired_vertices / total : 0,
+            total ? 100.0 * s->held_vertices / total : 0, total ? 100.0 * s->jumped_vertices / total : 0);
+    fflush(stderr);
+}
+
+/* DHD_BENCH (present.c): presents are counted from the window's first field to its last. */
+void gs_native_bench(Gs *g, int end)
+{
+    if (!gs_gpu_native(g)) return;
+    Native *n = ((Gpu *)g->backend)->native;
+    EnterCriticalSection(&n->context_lock);
+    if (!end) {
+        n->interval_count = 0; n->last_present = 0;
+        n->bench_presented = n->stats.presented; n->bench_interp = n->stats.interp_frames;
+        n->stats.paired_vertices = n->stats.held_vertices = n->stats.jumped_vertices = 0;
+    } else {
+        native_intervals(n, "bench interp", n->stats.presented - n->bench_presented, n->stats.interp_frames - n->bench_interp);
+    }
+    LeaveCriticalSection(&n->context_lock);
+}
+
+static void native_profile(Native *n)
+{
+    const NativeStats *s = &n->stats;
+    fprintf(stderr, "profile native: frames=%llu presented=%llu draws=%llu primitives=%llu commands=%llu surfaces=%ld "
+            "decoded=%llu texels=%llu cache_hits=%llu from_surface=%llu unsupported_textures=%llu imports=%llu copies=%llu "
+            "copy_fallbacks=%llu blend_approx=%llu date=%llu probe_hits=%llu probe_replays=%llu probe_uncovered=%llu "
+            "replayed=%llu exact_draws=%llu color_reads=%llu display_missing=%llu why=%llu,%llu,%llu,%llu,%llu,%llu "
+            "z_alias_draws=%llu band_pages=%u band_draws=%llu band_rt_textures=%llu probe_band_hits=%llu band_moves=%llu "
+            "exact_targets=%llu target_draws=%llu full_fields=%llu converted=%llu conversions_run=%llu blend_dest_alpha=%llu\n",
+            s->frames, s->presented, s->draws, s->primitives, s->commands, n->surface_count, s->decoded, s->decoded_texels,
+            s->cache_hits, s->texture_from_surface, s->texture_unsupported, s->imports, s->copies, s->copy_fallbacks,
+            s->blend_approximate, s->date_ignored, s->probe_hits, s->probe_replays, s->probe_uncovered,
+            s->probe_replayed_draws, s->exact_draws, s->color_reads, s->display_missing,
+            s->unsupported_why[0], s->unsupported_why[1], s->unsupported_why[2], s->unsupported_why[3],
+            s->unsupported_why[4], s->unsupported_why[5], s->z_alias_draws, n->band_count, s->band_draws,
+            s->band_rt_textures, s->probe_band_hits, s->band_moves, s->exact_targets, s->target_draws, s->full_fields,
+            s->converted, s->conversions_run, s->blend_dest_alpha);
+    if (n->interp) native_intervals(n, "profile interp", s->presented, s->interp_frames);
+    for (unsigned i = 0; n->usage && i < (unsigned)n->surface_count; i++) {
+        const NativeSurface *f = &n->surfaces[i];
+        const NativeUsage *u = &n->usage[i];
+        fprintf(stderr, "surface %u: page=%u bw=%u wide=%u depth=%u extent=%ldx%ld scale=%u size=%ux%u draws=%llu "
+                "depth_draws=%llu (z %d) sampled=%llu copied_in=%llu copied_out=%llu converted=%llu displayed=%llu\n", i,
+                f->page, f->bw, f->wide, f->depth, f->extent[0], f->extent[1], f->scale, f->size[0], f->size[1], u->draws, u->depth_draws, u->depth_draws ? u->depth_with : -1,
+                u->sampled, u->copied_in, u->copied_out, u->converted, u->displayed);
+        for (unsigned j = 0; j < NATIVE_SURFACES; j++)
+            if (u->pair[j])
+                fprintf(stderr, "  samples %u: %llu draws; sprites by texels/pixel <0.75 %llu, 1 %llu, 2 %llu, more %llu; "
+                        "1:1 offset quarters %llu %llu %llu %llu\n", j, u->pair[j], u->ratio[j][0], u->ratio[j][1],
+                        u->ratio[j][2], u->ratio[j][3], u->offset[j][0], u->offset[j][1], u->offset[j][2], u->offset[j][3]);
+    }
+}
+
+static void native_exit_report(void);
+static Native *native_reported;
+static void native_exit_report(void) { if (native_reported) native_profile(native_reported); }
+
+static ID3DBlob *native_compile(const char *entry, const char *target)
+{
+    static const D3D_SHADER_MACRO defines[] = {{"DHD_NATIVE", "1"}, {NULL, NULL}};
+    ID3DBlob *code = NULL, *errors = NULL;
+    HRESULT hr = D3DCompile(gs_shader, sizeof gs_shader - 1, gs_shader_path, defines, NULL, entry, target,
+                            D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &errors);
+    if (errors) { fprintf(stderr, "%s", (const char *)ID3D10Blob_GetBufferPointer(errors)); ID3D10Blob_Release(errors); }
+    return SUCCEEDED(hr) ? code : NULL;
+}
+
+/* The picture's filter and shape in the window, from DHD_PRESENT_FILTER and DHD_ASPECT; again
+   whenever the PC settings page changes them (gs_native_present_options). */
+static HRESULT native_present_options(Native *n)
+{
+    /* DHD_PRESENT_FILTER=point keeps the picture's pixels sharp; linear by default. */
+    const char *present_filter = getenv("DHD_PRESENT_FILTER");
+    D3D11_SAMPLER_DESC sampler = {present_filter && !strcmp(present_filter, "point") ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                                  D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, {0, 0, 0, 0}, 0, D3D11_FLOAT32_MAX};
+    ID3D11SamplerState *state = NULL;
+    HRESULT hr = ID3D11Device_CreateSamplerState(n->device, &sampler, &state);
+    if (FAILED(hr)) return hr;
+    if (n->present_sampler) ID3D11SamplerState_Release(n->present_sampler);
+    n->present_sampler = state;
+    /* DHD_ASPECT: 4:3 (a television's picture, the default), 16:9 or any W:H, stretch, or pixels. */
+    const char *aspect = getenv("DHD_ASPECT");
+    unsigned aw = 4, ah = 3;
+    if (aspect && !strcmp(aspect, "stretch")) n->aspect = 0;
+    else if (aspect && !strcmp(aspect, "pixels")) n->aspect = -1;
+    else {
+        if (aspect && (sscanf(aspect, "%u:%u", &aw, &ah) != 2 || !aw || !ah)) aw = 4, ah = 3;
+        n->aspect = (float)aw / ah;
+    }
+    return S_OK;
+}
+
+static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceContext *context)
+{
+    Native *n = calloc(1, sizeof *n);
+    if (!n) return 0;
+    n->exact = exact; n->device = device; n->context = context;
+    InitializeCriticalSection(&n->context_lock);
+    InitializeCriticalSection(&n->queue_lock);
+    InitializeConditionVariable(&n->queue_changed);
+    n->recording = &n->frames[0];
+    for (unsigned i = 1; i < NATIVE_FRAMES; i++) n->free_frames[n->free_count++] = &n->frames[i];
+    const char *interp = getenv("DHD_INTERP"), *hz = getenv("DHD_INTERP_HZ");
+    n->interp = interp && atoi(interp) != 0;
+    n->interp_hz = n->interp && hz ? atof(hz) : 0;
+    if (n->interp_hz)
+        n->timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                          TIMER_ALL_ACCESS);
+    n->logs[1].state_version = UINT64_MAX;
+    for (unsigned i = 0; i < 512; i++) n->owner[i] = n->top_owner[i] = -1;
+    ID3DBlob *vs = native_compile("native_vertex", "vs_5_0");
+    ID3DBlob *ps = native_compile("native_pixel", "ps_5_0");
+    ID3DBlob *cs = native_compile("native_scanout", "cs_5_0");
+    ID3DBlob *convert = native_compile("native_convert", "cs_5_0");
+    ID3DBlob *present_vs = native_compile("present_vertex", "vs_5_0"), *present_ps = native_compile("present_pixel", "ps_5_0");
+    HRESULT hr = vs && ps && cs && present_vs && present_ps ? S_OK : E_FAIL;
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(device, ID3D10Blob_GetBufferPointer(present_vs), ID3D10Blob_GetBufferSize(present_vs), NULL, &n->present_vertex);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(device, ID3D10Blob_GetBufferPointer(present_ps), ID3D10Blob_GetBufferSize(present_ps), NULL, &n->present_pixel);
+    if (present_vs) ID3D10Blob_Release(present_vs);
+    if (present_ps) ID3D10Blob_Release(present_ps);
+    if (SUCCEEDED(hr)) hr = native_present_options(n);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(device, ID3D10Blob_GetBufferPointer(vs), ID3D10Blob_GetBufferSize(vs), NULL, &n->vertex_shader);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(device, ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps), NULL, &n->pixel_shader);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateComputeShader(device, ID3D10Blob_GetBufferPointer(cs), ID3D10Blob_GetBufferSize(cs), NULL, &n->scanout_shader);
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateInputLayout(device, layout, 3, ID3D10Blob_GetBufferPointer(vs), ID3D10Blob_GetBufferSize(vs), &n->layout);
+    if (vs) ID3D10Blob_Release(vs);
+    if (ps) ID3D10Blob_Release(ps);
+    if (cs) ID3D10Blob_Release(cs);
+    if (SUCCEEDED(hr) && convert)
+        hr = ID3D11Device_CreateComputeShader(device, ID3D10Blob_GetBufferPointer(convert), ID3D10Blob_GetBufferSize(convert), NULL, &n->convert_shader);
+    if (convert) ID3D10Blob_Release(convert);
+    D3D11_BUFFER_DESC b = {0};
+    b.ByteWidth = sizeof(NativeConstants); b.Usage = D3D11_USAGE_DYNAMIC;
+    b.BindFlags = D3D11_BIND_CONSTANT_BUFFER; b.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateBuffer(device, &b, NULL, &n->constant_buffer);
+    b.ByteWidth = 48; b.Usage = D3D11_USAGE_DEFAULT; b.CPUAccessFlags = 0;
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateBuffer(device, &b, NULL, &n->display_constants);
+    b.ByteWidth = sizeof(NativeConvertConstants);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateBuffer(device, &b, NULL, &n->convert_constants);
+    {
+        /* Word in a page to the pixel holding it, for the colour (PSMCT32) and Z (PSMZ32) layouts. */
+        static uint32_t inverse[4096];
+        for (unsigned layout = 0; layout < 2; layout++)
+            for (unsigned y = 0; y < 32; y++)
+                for (unsigned x = 0; x < 64; x++)
+                    inverse[layout * 2048 + (gs_pixel_address(layout ? GS_PSMZ32 : GS_PSMCT32, 0, 1, x, y) >> 5 & 2047)] = x | y << 8;
+        D3D11_BUFFER_DESC ib = {sizeof inverse, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0,
+                                D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4};
+        D3D11_SUBRESOURCE_DATA id = {inverse, 0, 0};
+        if (SUCCEEDED(hr)) hr = ID3D11Device_CreateBuffer(device, &ib, &id, &n->inverse);
+        D3D11_SHADER_RESOURCE_VIEW_DESC iv = {DXGI_FORMAT_UNKNOWN, D3D11_SRV_DIMENSION_BUFFER};
+        iv.Buffer.NumElements = 4096;
+        if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(device, (ID3D11Resource *)n->inverse, &iv, &n->inverse_view);
+    }
+    D3D11_RASTERIZER_DESC r = {0};
+    r.FillMode = D3D11_FILL_SOLID; r.CullMode = D3D11_CULL_NONE; r.ScissorEnable = TRUE; r.DepthClipEnable = FALSE;
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateRasterizerState(device, &r, &n->rasterizer);
+    /* DHD_SCALE (dhd.ini "scale"): 1-4 (default 2), or "window" for the smallest scale whose
+       picture is as tall as the window. Upscaling draws only the pictures; the exact backend
+       answering the game's reads stays at 1x. */
+    const char *scale = getenv("DHD_SCALE");
+    n->scale_setting = 2;
+    if (scale && (!_stricmp(scale, "window") || !_stricmp(scale, "match"))) n->scale_setting = 0;
+    else if (scale && atoi(scale) >= 1) n->scale_setting = atoi(scale) > 4 ? 4 : (unsigned)atoi(scale);
+    ID3DBlob *blit = native_compile("native_blit", "ps_5_0");
+    if (SUCCEEDED(hr)) hr = blit ? ID3D11Device_CreatePixelShader(device, ID3D10Blob_GetBufferPointer(blit), ID3D10Blob_GetBufferSize(blit), NULL, &n->blit_pixel) : E_FAIL;
+    if (blit) ID3D10Blob_Release(blit);
+    D3D11_BUFFER_DESC bb = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateBuffer(device, &bb, NULL, &n->blit_constants);
+    D3D11_TEXTURE2D_DESC t = {0};
+    t.Width = t.Height = 64; t.MipLevels = t.ArraySize = 1; t.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT; t.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateTexture2D(device, &t, NULL, &n->import);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(device, (ID3D11Resource *)n->import, NULL, &n->import_view);
+    if (FAILED(hr)) { fprintf(stderr, "gs native: initialization failed (%08lX)\n", hr); return 0; }
+    ID3D11Device_AddRef(device); ID3D11DeviceContext_AddRef(context);
+    exact->native = n;
+    exact->clip[0] = exact->clip[1] = 1; exact->clip[2] = exact->clip[3] = 0;  /* nothing until a probe */
+    exact->clip_on = 1;
+    g->draw = native_draw;
+    g->local_copy = native_local_copy;
+    g->stage_pages = native_stage_pages;
+    n->trace_probes = getenv("DHD_NATIVE_PROBES") != NULL;
+    if (getenv("DHD_NATIVE_SURFACES") && !(n->usage = calloc(NATIVE_SURFACES, sizeof *n->usage))) native_oom("usage");
+    const char *texlog = getenv("DHD_NATIVE_TEXLOG");
+    if (texlog && *texlog && (n->texlog = fopen(texlog, "w")))
+        fputs("field,event,why,psm,tbp,tbw,w,h,surface_page,surface_bw,surface_wide,surface_depth\n", n->texlog);
+    const char *hold = getenv("DHD_NATIVE_FULL_HOLD");
+    n->full_hold = hold && *hold ? (unsigned)atoi(hold) : 20;
+    const char *trace = getenv("DHD_NATIVE_TRACE");
+    if (trace && *trace) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof path, "%s-fields.csv", trace);
+        if ((n->trace_fields = fopen(path, "w")))
+            fputs("field,vsync,time,commands,vertices,primitives,decoded,decoded_texels,from_surface,unsupported,"
+                  "imports,copies,copy_fallbacks,exact_draws,color_reads,full\n", n->trace_fields);
+        snprintf(path, sizeof path, "%s-pictures.csv", trace);
+        if ((n->trace_pictures = fopen(path, "w")))
+            fputs("field,t,cpu_ms,gpu_ms,draws,self_copies,self_copy_px,copies,copy_px,imports,import_px\n", n->trace_pictures);
+    }
+    native_reported = n;
+    atexit(native_exit_report);
+    fprintf(stderr, "gs: native renderer (DHD_RENDER=native); exact GS only for the Z probe\n");
+    if (n->scale_setting) fprintf(stderr, "gs: resolution scale %u (DHD_SCALE)\n", n->scale_setting);
+    else fprintf(stderr, "gs: resolution scale matching the window (DHD_SCALE)\n");
+    if (n->interp)
+        fprintf(stderr, "gs: interpolated frames (DHD_INTERP=1), paced by %s\n", n->interp_hz ? "DHD_INTERP_HZ" : "vsync");
+    return 1;
+}

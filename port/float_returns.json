@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "assembly": {
+    "__ieee754_sqrtf": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "__kernel_cosf": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "__kernel_sinf": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "__pack_d": {
+      "return": "double",
+      "evidence": "retail unpack/pack helper chain; complete software-double or f0 result is forwarded unchanged"
+    },
+    "__pack_f": {
+      "return": "float",
+      "evidence": "retail unpack/pack helper chain; complete software-double or f0 result is forwarded unchanged"
+    },
+    "copysignf": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "fabsf": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "floorf": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_001FC7B8": {
+      "return": "double",
+      "evidence": "retail unpack/pack helper chain; complete software-double or f0 result is forwarded unchanged"
+    },
+    "func_001FC810": {
+      "return": "double",
+      "evidence": "retail software-double libgcc/math result in 64-bit $v0; double-typed consumer in 00215B68 / sqrt chain"
+    },
+    "func_001FC878": {
+      "return": "double",
+      "evidence": "retail unpack/pack helper chain; complete software-double or f0 result is forwarded unchanged"
+    },
+    "func_001FCB20": {
+      "return": "double",
+      "evidence": "retail unpack/pack helper chain; complete software-double or f0 result is forwarded unchanged"
+    },
+    "func_001FCDF0": {
+      "return": "double",
+      "evidence": "libgcc signed int to software double conversion; 64-bit v0 result consumed by comparison"
+    },
+    "func_001FCFE0": {
+      "return": "double",
+      "evidence": "retail unpack/pack helper chain; complete software-double or f0 result is forwarded unchanged"
+    },
+    "func_001FD010": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_001FD2D0": {
+      "return": "float",
+      "evidence": "retail unpack/pack helper chain; complete software-double or f0 result is forwarded unchanged"
+    },
+    "func_001FD300": {
+      "return": "double",
+      "evidence": "retail software-double libgcc/math result in 64-bit $v0; double-typed consumer in 00215B68 / sqrt chain"
+    },
+    "func_002484F8": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_002487A0": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00248990": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00248A80": {
+      "return": "double",
+      "evidence": "retail software-double libgcc/math result in 64-bit $v0; double-typed consumer in 00215B68 / sqrt chain"
+    },
+    "func_00248B90": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00248C90": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00248D90": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00248EB8": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00248FF8": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00249808": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "func_00249C38": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "func_00249FD8": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "func_0024A2C0": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "func_0024A510": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "func_0024ADA0": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "func_0024C118": {
+      "return": "float",
+      "evidence": "retail SDK float math: f12/f13 inputs and f0 result consumed by float wrapper"
+    },
+    "func_00260908": {
+      "return": "float",
+      "evidence": "retail geometry primitive returns f0 (projection helpers consumed by 00260E08 / 00261540)"
+    },
+    "func_00260AF8": {
+      "return": "float",
+      "evidence": "retail geometry primitive returns f0 (projection helpers consumed by 00260E08 / 00261540)"
+    },
+    "func_00260CB0": {
+      "return": "float",
+      "evidence": "retail geometry primitive returns f0 (projection helpers consumed by 00260E08 / 00261540)"
+    },
+    "func_00260E08": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_002610B8": {
+      "return": "float",
+      "evidence": "retail geometry primitive returns f0 (projection helpers consumed by 00260E08 / 00261540)"
+    },
+    "func_00261250": {
+      "return": "float",
+      "evidence": "retail geometry primitive returns f0 (projection helpers consumed by 00260E08 / 00261540)"
+    },
+    "func_00261408": {
+      "return": "float",
+      "evidence": "retail geometry primitive returns f0 (projection helpers consumed by 00260E08 / 00261540)"
+    },
+    "func_00261540": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    },
+    "func_00261E48": {
+      "return": "float",
+      "evidence": "retail virtual scale getter sets f0 to 1.0; vtables include D_00283A48 slot 4; native float callers otherwise pop an empty x87 stack (finding 021)"
+    },
+    "func_002627A0": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_002628A0": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00262B48": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00262C20": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00262D30": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00262FE0": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00263270": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00263320": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00263438": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00263578": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00263860": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_002638D8": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_002639D0": {
+      "return": "float",
+      "evidence": "retail animation dispatch table D_004D0278 returns $f0 (finding 021)"
+    },
+    "func_00263B88": {
+      "return": "float",
+      "evidence": "retail floating-point result in $f0; native consumers use float"
+    }
+  }
+}

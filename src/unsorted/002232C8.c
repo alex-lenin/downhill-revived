@@ -1,0 +1,36 @@
+/* UNIT 0x002232C8 0x00223348 */
+/* Quaternion (q) to 4x4 rotation matrix (out), entirely in VU0 macro mode. */
+void func_002232C8(float out[4][4], float *q) {
+    __asm__ volatile(
+        "lqc2 $vf8, 0x0(%1)\n\t"
+        "vaddw.xyz $vf10, $vf0, $vf0w\n\t"
+        "vmr32.xyzw $vf9, $vf8\n\t"
+        "vmulx.xyzw $vf11, $vf8, $vf8x\n\t"
+        "vmuly.xyzw $vf12, $vf8, $vf8y\n\t"
+        "vmulz.xyzw $vf13, $vf8, $vf8z\n\t"
+        "vmul.xyzw $vf15, $vf9, $vf9\n\t"
+        "vsub.w $vf16, $vf0, $vf0\n\t"
+        "vaddw.y $vf16, $vf11, $vf13w\n\t"
+        "vsubw.z $vf16, $vf11, $vf12w\n\t"
+        "vaddy.x $vf16, $vf15, $vf15y\n\t"
+        "vsub.w $vf17, $vf0, $vf0\n\t"
+        "vsubw.x $vf17, $vf12, $vf13w\n\t"
+        "vaddw.z $vf17, $vf12, $vf11w\n\t"
+        "vaddw.y $vf17, $vf15, $vf15w\n\t"
+        "vmr32.xyzw $vf14, $vf15\n\t"
+        "vsub.w $vf18, $vf0, $vf0\n\t"
+        "vaddw.x $vf18, $vf13, $vf12w\n\t"
+        "vsubw.y $vf18, $vf13, $vf11w\n\t"
+        "vaddw.z $vf18, $vf14, $vf14w\n\t"
+        "vadd.xyzw $vf16, $vf16, $vf16\n\t"
+        "vadd.xyzw $vf17, $vf17, $vf17\n\t"
+        "vadd.xyzw $vf18, $vf18, $vf18\n\t"
+        "vsub.x $vf16, $vf10, $vf16\n\t"
+        "vsub.y $vf17, $vf10, $vf17\n\t"
+        "vsub.z $vf18, $vf10, $vf18\n\t"
+        "sqc2 $vf0, 0x30(%0)\n\t"
+        "sqc2 $vf16, 0x0(%0)\n\t"
+        "sqc2 $vf17, 0x10(%0)\n\t"
+        "sqc2 $vf18, 0x20(%0)"
+        : : "r"(out), "r"(q) : "memory");
+}

@@ -1,0 +1,49 @@
+Third-party notices for Downhill Revived (dhd.exe)
+===================================================
+
+Downhill Revived is licensed under the GNU General Public License, version 3 or (at your option)
+any later version (LICENSE.txt). It contains or is derived from the following third-party work.
+
+PCSX2 (https://github.com/PCSX2/pcsx2), GPL-3.0-or-later, Copyright PCSX2 Dev Team
+  The GS memory block and page layouts in port/gs/memory.c follow PCSX2's GSLocalMemory and
+  GSTables. PCSX2 is also the behaviour reference for the GS, VU and SPU2 code (written
+  independently).
+
+OpenGOAL (https://github.com/open-goal/jak-project), ISC License
+  The SPU2 Gaussian interpolation table in port/hle/sound_gaussian.h is adapted from OpenGOAL's
+  game/sound/common/interp_table.inc.
+
+  ISC License
+
+  Copyright (c) 2020-2026 OpenGOAL Team
+
+  Permission to use, copy, modify, and/or distribute this software for any
+  purpose with or without fee is hereby granted, provided that the above
+  copyright notice and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+PCSX2 widescreen patch for this game, by Aced14 (https://github.com/PCSX2/pcsx2_patches)
+  The 16:9 mode changes the values that patch lists; the changes are applied by our own code.
+
+xxHash (https://github.com/Cyan4973/xxHash), BSD-2-Clause
+  port/net/hash.c is written from the XXH64 specification; no xxHash code is included.
+
+LLVM / clang (https://llvm.org), Apache-2.0 WITH LLVM-exception
+  dhd.exe is compiled with clang and may contain the compiler's runtime support code, which is
+  covered by the LLVM exception (no notice required in binaries).
+
+Microsoft C runtime and Windows SDK import libraries
+  dhd.exe links the static Microsoft C runtime and uses Windows system libraries (Direct3D 11,
+  DXGI, the D3D compiler, WinHTTP), all part of Windows.
+
+The game itself
+  Downhill Domination and its code, data, names and trademarks belong to their owners. They are
+  not part of this package and are not covered by its licence: dhd.exe reads them at run time
+  from the player's own disc image.

@@ -1,0 +1,224 @@
+﻿/* Optional second FIFO: VIF/VU owns the producer, GS/D3D owns the consumer.
+   The EE may produce only after graphics_wait has retired both queues. */
+#include "gs_queue.h"
+GraphicsProvenance graphics_provenance;
+#ifdef GS_QUEUE_TEST
+enum { GS_RING_BYTES = 4096 };
+#else
+enum { GS_RING_BYTES = 8 * 1024 * 1024 };
+#endif
+typedef struct {
+    uint32_t bytes, path, words, pad;
+    GraphicsProvenance provenance;
+} GsPacket;
+static uint8_t *gs_ring;
+static HANDLE gs_worker, gs_available, gs_retired;
+static volatile LONG gs_written, gs_consumed, gs_stopping, gs_sleeping, gs_waiting;
+static uint32_t gs_position(volatile LONG *p)
+{
+    return (uint32_t)InterlockedCompareExchange(p, 0, 0);
+}
+static void gs_execute(unsigned path, const uint32_t *words, unsigned count, const GraphicsProvenance *p)
+{
+    gs.vu_entry = p->entry;
+    gs.vu_top = p->top;
+    gs.vu_itop = p->itop;
+    gs.vu_pc = p->pc;
+    gs.vu_clip = p->clip;
+    gs.vu_qword = p->qword;
+    gs.vu_overlay = p->overlay;
+    gs.vu_program = p->program;
+    gs.trace_seconds = p->seconds;
+    gs_feed(&gs, path, words, count);
+}
+static FILE *gs_profile_file;
+static int gs_profile_initialized;
+static double gs_profile_start, gs_profile_after, gs_profile_until, gs_profile_busy;
+static unsigned gs_profile_frame;
+static uint64_t gs_profile_cpu;
+static double gs_profile_begin(void)
+{
+    if (!gs_profile_initialized) {
+        gs_profile_initialized = 1;
+        const char *path = getenv("DHD_GS_WORKER_PROFILE");
+        if (path) {
+            gs_profile_file = fopen(path, "w");
+            if (!gs_profile_file) {
+                perror(path);
+                abort();
+            }
+            const char *a = getenv("DHD_VU1_PROFILE_AFTER"), *b = getenv("DHD_VU1_PROFILE_UNTIL");
+            gs_profile_after = a ? atof(a) : 90;
+            gs_profile_until = b ? atof(b) : 150;
+        }
+    }
+    if (!gs_profile_file)
+        return 0;
+    double now = host_wall_seconds();
+    if (now < gs_profile_after)
+        return 0;
+    if (!gs_profile_start) {
+        gs_profile_start = now;
+        gs_profile_frame = gs_presented_frames;
+        gs_profile_cpu = worker_cpu_ticks();
+    }
+    if (now >= gs_profile_until) {
+        fprintf(gs_profile_file, "wall_s,frames,busy_s,cpu_s\n%.6f,%u,%.6f,%.6f\n", now - gs_profile_start,
+                gs_presented_frames - gs_profile_frame, gs_profile_busy,
+                (worker_cpu_ticks() - gs_profile_cpu) * 1e-7);
+        fclose(gs_profile_file);
+        gs_profile_file = NULL;
+        return 0;
+    }
+    return now;
+}
+static DWORD WINAPI gs_consume(void *unused)
+{
+    (void)unused;
+    host_thread_name("gs");
+    _mm_setcsr((_mm_getcsr() | 0x1f80u) & ~(63u | 0xe040u));
+    for (;;) {
+        uint32_t at = gs_position(&gs_consumed);
+        if (at == gs_position(&gs_written)) {
+            if (gs_position(&gs_stopping))
+                return 0;
+            LONG64 idle = tl_begin();
+            idle_wait(&gs_written, at, &gs_sleeping, gs_available, INFINITE);
+            tl_add(TL_GS_IDLE, idle);
+            continue;
+        }
+        const GsPacket *p = (const GsPacket *)(gs_ring + (at & (GS_RING_BYTES - 1)));
+        if (p->path != UINT32_MAX) {
+            double start = gs_profile_begin();
+            gs_execute(p->path, (const uint32_t *)(p + 1), p->words, &p->provenance);
+            if (start)
+                gs_profile_busy += host_wall_seconds() - start;
+        }
+        InterlockedExchange(&gs_consumed, (LONG)(at + p->bytes));
+        if (gs_position(&gs_waiting))
+            SetEvent(gs_retired);
+    }
+}
+void graphics_gs_wait(void)
+{
+    if (!gs_worker)
+        return;
+    uint32_t target = gs_position(&gs_written);
+    while ((int32_t)(gs_position(&gs_consumed) - target) < 0)
+        idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1);
+}
+static void gs_queue_shutdown(void)
+{
+    if (!gs_worker)
+        return;
+    graphics_gs_wait();
+    InterlockedExchange(&gs_stopping, 1);
+    SetEvent(gs_available);
+    WaitForSingleObject(gs_worker, INFINITE);
+    CloseHandle(gs_worker);
+    CloseHandle(gs_available);
+    CloseHandle(gs_retired);
+    free(gs_ring);
+    gs_ring = NULL;
+    gs_worker = gs_available = gs_retired = NULL;
+}
+static void gs_queue_initialize(void)
+{
+    const char *option = getenv("DHD_GS_WORKER");
+    if (option && !atoi(option))
+        return;
+    /* Suspect capture reads GS counters synchronously inside the VU callback. */
+    if (getenv("DHD_VU_SUSPECT"))
+        return;
+#ifdef GS_QUEUE_TEST
+    gs_written = gs_consumed = (LONG)0xfffff800u;
+#endif
+    gs_ring = malloc(GS_RING_BYTES);
+    gs_available = CreateEventA(NULL, FALSE, FALSE, NULL);
+    gs_retired = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (gs_ring && gs_available && gs_retired)
+        gs_worker = CreateThread(NULL, 0, gs_consume, NULL, 0, NULL);
+    if (!gs_worker) {
+        fprintf(stderr, "GS worker initialization failed\n");
+        abort();
+    }
+    hle_log("graphics: separate GS/D3D worker enabled\n");
+}
+void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
+{
+    if (!gs_worker) {
+        gs_execute(path, words, count, &graphics_provenance);
+        return;
+    }
+    while (count) {
+        unsigned take = count > GS_RING_BYTES / 16 ? GS_RING_BYTES / 16 : count;
+        unsigned bytes = (sizeof(GsPacket) + take * 4 + 15) & ~15u;
+        uint32_t at = gs_position(&gs_written);
+        unsigned tail = GS_RING_BYTES - (at & (GS_RING_BYTES - 1)), wrap = bytes > tail ? tail : 0;
+        if (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap) {
+            LONG64 full = tl_begin();
+            while (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap)
+                idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1);
+            tl_add(TL_VU_FULL, full);
+        }
+        if (wrap) {
+            GsPacket *p = (GsPacket *)(gs_ring + (at & (GS_RING_BYTES - 1)));
+            p->bytes = wrap;
+            p->path = UINT32_MAX;
+            at += wrap;
+        }
+        GsPacket *p = (GsPacket *)(gs_ring + (at & (GS_RING_BYTES - 1)));
+        p->bytes = bytes;
+        p->path = path;
+        p->words = take;
+        p->pad = 0;
+        p->provenance = graphics_provenance;
+        memcpy(p + 1, words, take * 4);
+        InterlockedExchange(&gs_written, (LONG)(at + bytes));
+        if (gs_position(&gs_sleeping))
+            SetEvent(gs_available);
+        words += take;
+        count -= take;
+    }
+}
+int graphics_xgkick(const uint32_t *memory, unsigned qword)
+{
+    if (!gs_worker) {
+        const GraphicsProvenance *p = &graphics_provenance;
+        gs.vu_entry = p->entry;
+        gs.vu_top = p->top;
+        gs.vu_itop = p->itop;
+        gs.vu_pc = p->pc;
+        gs.vu_clip = p->clip;
+        gs.vu_qword = p->qword;
+        gs.vu_overlay = p->overlay;
+        gs.vu_program = p->program;
+        gs.trace_seconds = p->seconds;
+        return gs_xgkick(&gs, memory, qword);
+    }
+    /* Every completed XGKICK ends at EOP. Determine the span without touching
+       the concurrently owned GS parser, then copy before VU memory can change. */
+    unsigned total = 0;
+    for (;;) {
+        const uint32_t *tag = memory + ((qword + total) & 1023) * 4;
+        unsigned loops = tag[0] & 32767, mode = (tag[1] >> 26) & 3, regs = tag[1] >> 28;
+        if (!regs)
+            regs = 16;
+        unsigned payload = mode == 0 ? loops * regs : mode == 1 ? (loops * regs + 1) / 2 : loops;
+        if (payload >= 0x4000 - total)
+            return -1;
+        total += 1 + payload;
+        if (tag[0] & 0x8000)
+            break;
+        if (total == 0x4000)
+            return -1;
+    }
+    for (unsigned done = 0; done < total;) {
+        unsigned start = (qword + done) & 1023, take = 1024 - start;
+        if (take > total - done)
+            take = total - done;
+        graphics_gif_feed(1, memory + start * 4, take * 4);
+        done += take;
+    }
+    return 0;
+}

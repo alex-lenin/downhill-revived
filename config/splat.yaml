@@ -1,0 +1,49 @@
+name: dhd
+sha1: 4e25a222ad8a475b5d26c2e928e90b5f2b7075eb
+options:
+  basename: SCUS_971.77
+  target_path: iso/SCUS_971.77
+  base_path: ..
+  platform: ps2
+  compiler: EEGCC
+  asm_path: asm
+  src_path: src
+  build_path: build
+  # src/ is organised by hand (one file per translation unit); never let splat write C.
+  create_c_files: False
+  # A .s for every function, decompiled or not: tools read retail bytes and sizes from them.
+  disassemble_all: True
+  matchings_path: nonmatchings
+  symbol_addrs_path:
+    - config/symbol_addrs.txt
+  ld_script_path: build/splat.ld
+  undefined_funcs_auto_path: build/undefined_funcs_auto.txt
+  undefined_syms_auto_path: build/undefined_syms_auto.txt
+  asset_path: assets
+  # include/{macro,labels}.inc and include_asm.h are project-owned now.
+  generate_asm_macros_files: False
+  gp_value: 0x002A40F0
+  section_order: [".text", ".vutext", ".data", ".rodata", ".gcc_except_table", ".sdata", ".sbss", ".bss"]
+  string_encoding: ASCII
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+
+segments:
+  - name: main
+    type: code
+    start: 0x1000
+    vram: 0x0010A000
+    bss_size: 0x602710   # counted from the end of .sdata (0x29DCF0) to the end of .bss (0x8A0400)
+    subsegments:
+      - [0x1000, c, text]
+      - [0x15ABC0, bin, vutext]
+      - [0x164D00, data, data]
+      - [0x17F870, pad, pad_data]
+      - [0x17F880, rodata, rodata]
+      - [0x192F58, pad, pad_rodata]
+      - [0x192F80, gcc_except_table, gcc_except_table]
+      - [0x1930C8, pad, pad_except]
+      - [0x193100, sdata, sdata]
+      - { start: 0x194CF0, type: sbss, vram: 0x0029DD00, name: sbss }
+      - { start: 0x194CF0, type: bss, vram: 0x0029E580, name: bss }
+  - [0x194CF0]

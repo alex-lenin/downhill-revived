@@ -1,0 +1,11 @@
+# Game/engine functions written in assembly: no C form compiles to them under docs/WORKER.md's rules.
+# tools/queue.py gives them status 'handwritten' and never hands them out (also not with --retry-failed).
+# A splat "Handwritten function" marker alone is not proof (matched C with sync/MMI inline asm has it too):
+# list a function here only after reading its asm. NAME  reason
+func_0021B7E8  VU0 entry next to func_0021B8A8: vcallms microprograms, filler nop before bne, ori $t5,$zero,1 as li, addu $v0,$zero,$zero, t-registers only
+func_0021B8A8  callee-saved registers spilled to scratchpad 0x70000700 instead of the stack; trapping add; VU0 macro code
+func_0021CB58  bit-clear helper: trapping add for a pointer, filler nop before jr (gcc never emits either)
+func_0021CB98  VU0/scratchpad setup between two hand-written routines: filler nops outside delay slots, t-registers only, hand-grouped lq/sq
+func_0021CC44  VU0 routine: 18 trapping adds, filler nops, VU0 macro code (lqc2/sqc2/vmul) interleaved by hand
+func_0021D194  trapping add, dead por immediately overwritten, raw cvt.w.s word, filler nops
+func_0022B028  VU/MMI filter: 27 trapping adds used as register moves (gcc uses daddu/move), no stack frame

@@ -1,0 +1,41 @@
+/* UNIT 0x00119E60 0x00119FC8 */
+extern void func_0012BC58(void *, int);
+extern void func_0010A730(void *, int);
+extern void func_00199338(void *, int);
+extern float D_0029C13C[];
+typedef struct { int x0; char pad[0x1c]; } Entry;
+extern Entry D_002FF490[];
+typedef struct { char pad[0x5018c]; int x5018c; float x50190,x50194,x50198,x5019c; int x501a0,x501a4,x501a8,x501ac,x501b0,x501b4,x501b8,x501bc,x501c0,x501c4; } Obj;
+void func_00119E60(char *base) {
+    int count;
+    char *p;
+    int *slots;
+    int *slots2, *slots3;
+    char *p2, *p3;
+    float value;
+    int *q;
+    count=9; p=base; slots=(int *)(base+0x50164);
+    do { func_0012BC58(p,0); *slots=(int)p;  slots++; p+=0x7bd0; } while(--count>=0);
+    slots2=(int *)(base+0x50140); p2=base+0x4d620; count=8;
+    do { func_0010A730(p2,0); p2+=0x450;  *slots2=0; slots2++; } while(--count>=0);
+    slots3=(int *)(base+0x50130); p3=base+0x4fcf0; count=3;
+    do { func_00199338(p3,0); p3+=0x110;  *slots3=0; slots3++; } while(--count>=0);
+    count=7; q=(int *)D_002FF490; q=(int *)((char *)q+0xe4);
+    do { *q=0; count--; q-=8; } while(count>=0);
+    value=D_0029C13C[0];
+    ((Obj *)base)->x5018c=0;
+    ((Obj *)base)->x50190=value;
+    ((Obj *)base)->x50194=value;
+    ((Obj *)base)->x50198=value;
+    ((Obj *)base)->x501a4=0;
+    ((Obj *)base)->x501a0=0;
+    ((Obj *)base)->x501a8=0;
+    ((Obj *)base)->x501ac=0;
+    ((Obj *)base)->x501b0=0;
+    ((Obj *)base)->x501b4=0;
+    ((Obj *)base)->x501b8=0;
+    ((Obj *)base)->x501bc=0;
+    ((Obj *)base)->x501c0=0;
+    ((Obj *)base)->x5019c=value;
+    ((Obj *)base)->x501c4=0;
+}

@@ -1,0 +1,1175 @@
+/* The EE kernel (syscalls): threads, semaphores, interrupt handlers, alarms (finding 020).
+
+   PS2 threads are Windows fibers, so exactly one runs at a time and switches happen only where
+   the PS2 kernel would make them: a thread blocks (WaitSema, SleepThread), one of higher
+   priority becomes ready, or an interrupt handler readies one. The emulated MIPS registers of
+   recompiled code (ps2asm.h) are per thread and switched with it.
+   Interrupts are delivered at kernel entries and while every thread waits: VBLANK_START and
+   VBLANK_END at 59.94 Hz of host time, the alarms (SetAlarm) on the same clock. */
+#include "hle.h"
+#include "../gs/gs.h"
+#include "../gs/present.h"
+#include "timer.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <xmmintrin.h>
+
+#include "ps2asm.h"
+
+int hle_verbose;
+
+void hle_log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+}
+
+/* The game's debug prints (empty in the retail build, port/patches.py DEBUG_PRINT). */
+void hle_debug_print(const char *format, va_list args)
+{
+    if (hle_verbose) {
+        fputs("game: ", stderr);
+        host_safe_vprint(stderr, format, args);
+    }
+}
+
+/* A function the PC build doesn't have yet (port/tools/link.py writes a stub calling this). */
+void hle_missing(const char *name)
+{
+    hle_log("missing function %s called (from %p)\n", name, __builtin_return_address(0));
+    exit(3);
+}
+
+/* ---- errors (Sony's kernel codes) ---- */
+#define KE_ERROR (-1)
+#define KE_SEMA_ZERO (-419)
+#define KE_RELEASE_WAIT (-418)
+#define KE_UNKNOWN_THID (-407)
+#define KE_UNKNOWN_SEMID (-408)
+#define KE_DORMANT (-413)
+#define KE_NOT_WAIT (-415)
+
+/* ---- clock: EE bus cycles (147.456 MHz) from host time ---- */
+#define BUS_HZ 147456000.0
+#define VSYNC_CYCLES ((uint64_t)(BUS_HZ * 1001 / 60000)) /* NTSC 59.94 Hz */
+#define HSYNC_CYCLES (VSYNC_CYCLES / 262)               /* the alarms' unit */
+
+static uint64_t now_cycles(void)
+{
+    if (ee_frame_clock_enabled()) return ee_frame_clock_cycles();
+    return (uint64_t)(host_seconds() * BUS_HZ);
+}
+
+/* ---- threads ---- */
+enum { TS_RUN = 1, TS_READY = 2, TS_WAIT = 4, TS_SUSPEND = 8, TS_DORMANT = 0x10 };
+enum { WAIT_NONE, WAIT_SLEEP, WAIT_SEMA };
+
+typedef struct {               /* the game's thread parameter block (CreateThread, ReferThreadStatus) */
+    int32_t status;
+    uint32_t entry, stack, stack_size, gp;
+    int32_t init_priority, current_priority;
+    uint32_t attr, option;
+    int32_t wait_type, wait_id, wakeup_count;
+} ThreadParam;
+
+typedef struct {
+    ps2_q128 gpr[32];
+    uint64_t lo, hi, lo1, hi1;
+    float fpr[32], fpu_acc;
+} Registers;
+
+typedef struct {
+    int used, status, priority, init_priority;
+    uint32_t entry, stack, stack_size, gp, attr, option, arg;
+    int wait, wait_id, wait_result, wakeup_count;
+    int64_t order;  /* place in its priority's ready queue */
+    void *fiber, *dead_fiber;
+    Registers regs;
+} Thread;
+
+#define MAX_THREADS 256
+static Thread threads[MAX_THREADS];
+static Thread *current;         /* NULL while the idle loop runs */
+static void *idle_fiber;
+static int64_t order_back = 1, order_front = 0;
+static int in_interrupt;
+static void (*root_function)(void);
+static int game_exited;
+
+static int thread_id(Thread *t) { return (int)(t - threads); }
+
+static Thread *thread_of(int id)
+{
+    if (id == 0)  /* TH_SELF */
+        return current;
+    if (id <= 0 || id >= MAX_THREADS || !threads[id].used)
+        return NULL;
+    return &threads[id];
+}
+
+static void save_registers(Registers *r)
+{
+    memcpy(r->gpr, ps2.gpr, sizeof r->gpr);
+    r->lo = ps2.lo, r->hi = ps2.hi, r->lo1 = ps2.lo1, r->hi1 = ps2.hi1;
+    memcpy(r->fpr, ps2.fpr, sizeof r->fpr);
+    r->fpu_acc = ps2.fpu_acc;
+}
+
+static void load_registers(const Registers *r)
+{
+    memcpy(ps2.gpr, r->gpr, sizeof r->gpr);
+    ps2.lo = r->lo, ps2.hi = r->hi, ps2.lo1 = r->lo1, ps2.hi1 = r->hi1;
+    memcpy(ps2.fpr, r->fpr, sizeof r->fpr);
+    ps2.fpu_acc = r->fpu_acc;
+}
+
+static void make_ready(Thread *t, int front)
+{
+    t->status = TS_READY;
+    t->wait = WAIT_NONE;
+    t->order = front ? order_front-- : order_back++;
+}
+
+/* The ready thread that should run: lowest priority number, then queue order. */
+static Thread *pick(void)
+{
+    Thread *best = NULL;
+    for (int i = 1; i < MAX_THREADS; i++) {
+        Thread *t = &threads[i];
+        if (t->used && t->status == TS_READY
+            && (!best || t->priority < best->priority || (t->priority == best->priority && t->order < best->order)))
+            best = t;
+    }
+    return best;
+}
+
+static void run_thread(Thread *t)
+{
+    current = t;
+    t->status = TS_RUN;
+}
+
+/* Switches to the thread that should run now, if that isn't the current one. The current
+   thread, if still running, goes back to the front of its queue (preempted). */
+static void reschedule(void)
+{
+    if (in_interrupt || !current)
+        return;
+    Thread *self = current, *next = pick();
+    if (self->status == TS_RUN) {
+        if (!next || next->priority >= self->priority)
+            return;
+        make_ready(self, 1);
+    }
+    if (next) {
+        run_thread(next);
+        save_registers(&self->regs);
+        host_fiber_switch(next->fiber);
+    } else {
+        save_registers(&self->regs);
+        current = NULL;
+        host_fiber_switch(idle_fiber);
+    }
+    /* back on this thread (someone made it current) */
+    load_registers(&self->regs);
+    for (int i = 1; i < MAX_THREADS; i++)  /* fibers of threads that exited, now not running */
+        if (threads[i].dead_fiber && &threads[i] != current) {
+            host_fiber_delete(threads[i].dead_fiber);
+            threads[i].dead_fiber = NULL;
+        }
+}
+
+/* Blocks the current thread until something readies it; returns its wait result. */
+static int block(int kind, int id)
+{
+    Thread *self = current;
+    self->status = TS_WAIT;
+    self->wait = kind;
+    self->wait_id = id;
+    self->wait_result = 0;
+    reschedule();
+    return self->wait_result;
+}
+
+static void exit_current(void);
+
+/* The EE FPU as PCSX2 runs it by default (Pcsx2Config.cpp DEFAULT_FPU_FP_CONTROL_REGISTER): results
+   round toward zero and denormals are flushed. Each fiber keeps its own MXCSR (host_fiber_switch). */
+static void ee_float_mode(void)
+{
+    _mm_setcsr((_mm_getcsr() & 63u) | 0xFFC0u);  /* toward zero, FTZ, DAZ, exceptions masked */
+}
+
+static void thread_main(void *param)
+{
+    extern void ps2_fp_trap_enable(void);
+    ee_float_mode();
+    ps2_fp_trap_enable();
+    Thread *t = param;
+    memset(&t->regs, 0, sizeof t->regs);
+    load_registers(&t->regs);
+    ps2.gpr[28].d[0] = t->gp;
+    ps2.gpr[29].d[0] = (t->stack + t->stack_size - 0x40) & ~15u;  /* the stack of recompiled code */
+    if (thread_id(t) == 1)
+        root_function();
+    else
+        ((void (*)(uint32_t))(uintptr_t)t->entry)(t->arg);
+    exit_current();
+}
+
+static void start(Thread *t, uint32_t arg)
+{
+    t->arg = arg;
+    t->priority = t->init_priority;
+    t->wakeup_count = 0;
+    if (t->fiber && t->fiber != host_fiber_current())
+        host_fiber_delete(t->fiber);
+    else if (t->fiber)
+        t->dead_fiber = t->fiber;
+    t->fiber = host_fiber_create(thread_main, t);
+    make_ready(t, 0);
+}
+
+static void exit_current(void)
+{
+    Thread *self = current;
+    if (thread_id(self) == 1) {  /* the main thread returned: the game is over */
+        game_exited = 1;
+        current = NULL;
+        host_fiber_switch(idle_fiber);
+    }
+    self->status = TS_DORMANT;
+    self->dead_fiber = self->fiber;
+    self->fiber = NULL;
+    reschedule();
+}
+
+int CreateThread(ThreadParam *p) RETAIL(func_0025A4E0);
+int CreateThread(ThreadParam *p)
+{
+    for (int i = 2; i < MAX_THREADS; i++)
+        if (!threads[i].used) {
+            Thread *t = &threads[i];
+            memset(t, 0, sizeof *t);
+            t->used = 1;
+            t->status = TS_DORMANT;
+            t->entry = p->entry, t->stack = p->stack, t->stack_size = p->stack_size, t->gp = p->gp;
+            t->init_priority = t->priority = p->init_priority;
+            t->attr = p->attr, t->option = p->option;
+            if (hle_verbose)
+                hle_log("CreateThread %d: entry %08X stack %08X+%X priority %d\n", i, p->entry, p->stack,
+                        p->stack_size, p->init_priority);
+            return i;
+        }
+    return KE_ERROR;
+}
+
+int DeleteThread(int id) RETAIL(func_0025A4F0);
+int DeleteThread(int id)
+{
+    Thread *t = thread_of(id);
+    if (!t || t == current)
+        return KE_UNKNOWN_THID;
+    if (t->status != TS_DORMANT)
+        return KE_ERROR;
+    if (t->fiber)
+        host_fiber_delete(t->fiber);
+    t->used = 0;
+    return 0;
+}
+
+int StartThread(int id, uint32_t arg) RETAIL(func_0025A500);
+int StartThread(int id, uint32_t arg)
+{
+    kernel_poll();
+    Thread *t = thread_of(id);
+    if (!t || t == current)
+        return KE_UNKNOWN_THID;
+    if (t->status != TS_DORMANT)
+        return KE_ERROR;
+    start(t, arg);
+    reschedule();
+    return 0;
+}
+
+void ExitThread(void) RETAIL(func_0010A1D0);  /* crt0's: the root function's return */
+void ExitThread(void)
+{
+    exit_current();
+}
+
+static int terminate(int id)
+{
+    Thread *t = thread_of(id);
+    if (!t || t == current)
+        return KE_UNKNOWN_THID;
+    if (t->status == TS_DORMANT)
+        return KE_DORMANT;
+    t->status = TS_DORMANT;
+    t->wait = WAIT_NONE;
+    if (t->fiber)
+        host_fiber_delete(t->fiber);
+    t->fiber = NULL;
+    return 0;
+}
+
+int TerminateThread(int id) RETAIL(func_0025A530);
+int TerminateThread(int id) { return terminate(id); }
+int iTerminateThread(int id) RETAIL(func_0025A540);
+int iTerminateThread(int id) { return terminate(id); }
+
+static int change_priority(int id, int priority)
+{
+    Thread *t = thread_of(id);
+    if (!t)
+        return KE_UNKNOWN_THID;
+    int old = t->priority;
+    t->priority = priority;
+    if (t->status == TS_READY)
+        t->order = order_back++;
+    reschedule();
+    return old;
+}
+
+int ChangeThreadPriority(int id, int priority) RETAIL(func_0025A570);
+int ChangeThreadPriority(int id, int priority) { return change_priority(id, priority); }
+
+static int rotate(int priority)
+{
+    Thread *self = current;
+    if (self && self->priority == priority && !in_interrupt) {
+        make_ready(self, 0);
+        reschedule();
+        return 0;
+    }
+    Thread *first = NULL;
+    for (int i = 1; i < MAX_THREADS; i++) {
+        Thread *t = &threads[i];
+        if (t->used && t->status == TS_READY && t->priority == priority && (!first || t->order < first->order))
+            first = t;
+    }
+    if (first)
+        first->order = order_back++;
+    return 0;
+}
+
+int RotateThreadReadyQueue(int priority) RETAIL(func_0025A590);
+int RotateThreadReadyQueue(int priority) { kernel_poll(); return rotate(priority); }
+int iRotateThreadReadyQueue(int priority) RETAIL(func_0025A5A0);
+int iRotateThreadReadyQueue(int priority) { return rotate(priority); }
+
+static int release_wait(int id)
+{
+    Thread *t = thread_of(id);
+    if (!t)
+        return KE_UNKNOWN_THID;
+    if (t->status != TS_WAIT)
+        return KE_NOT_WAIT;
+    t->wait_result = KE_RELEASE_WAIT;
+    make_ready(t, 0);
+    reschedule();
+    return 0;
+}
+
+int ReleaseWaitThread(int id) RETAIL(func_0025A5B0);
+int ReleaseWaitThread(int id) { return release_wait(id); }
+int iReleaseWaitThread(int id) RETAIL(func_0025A5C0);
+int iReleaseWaitThread(int id) { return release_wait(id); }
+
+int GetThreadId(void) RETAIL(func_0025A5D0);
+int GetThreadId(void) { return current ? thread_id(current) : 0; }
+
+int ReferThreadStatus(int id, ThreadParam *info) RETAIL(func_0025A5E0);
+int ReferThreadStatus(int id, ThreadParam *info)
+{
+    Thread *t = thread_of(id);
+    if (!t)
+        return KE_UNKNOWN_THID;
+    if (info) {
+        info->status = t->status;
+        info->entry = t->entry, info->stack = t->stack, info->stack_size = t->stack_size, info->gp = t->gp;
+        info->init_priority = t->init_priority, info->current_priority = t->priority;
+        info->attr = t->attr, info->option = t->option;
+        info->wait_type = t->status == TS_WAIT ? (t->wait == WAIT_SLEEP ? 1 : 2) : 0;
+        info->wait_id = t->wait == WAIT_SEMA ? t->wait_id : 0;
+        info->wakeup_count = t->wakeup_count;
+    }
+    return t->status;
+}
+
+int SleepThread(void) RETAIL(func_0025A600);
+int SleepThread(void)
+{
+    kernel_poll();
+    if (current->wakeup_count > 0) {
+        current->wakeup_count--;
+        return 0;
+    }
+    return block(WAIT_SLEEP, 0);
+}
+
+static int wakeup(int id)
+{
+    Thread *t = thread_of(id);
+    if (!t || t == current)
+        return KE_UNKNOWN_THID;
+    if (t->status == TS_DORMANT)
+        return KE_DORMANT;
+    if (t->status == TS_WAIT && t->wait == WAIT_SLEEP) {
+        make_ready(t, 0);
+        reschedule();
+    } else {
+        t->wakeup_count++;
+    }
+    return 0;
+}
+
+int WakeupThread(int id) RETAIL(func_0025A610);
+int WakeupThread(int id) { return wakeup(id); }
+int iWakeupThread(int id) RETAIL(func_0025A620);
+int iWakeupThread(int id) { return wakeup(id); }
+
+/* func_0025B280: iGetThreadId */
+int iGetThreadId(void) RETAIL(func_0025B280);
+int iGetThreadId(void) { return current ? thread_id(current) : 0; }
+
+/* ---- semaphores ---- */
+typedef struct {
+    int32_t count, max_count, init_count, wait_threads;
+    uint32_t attr, option;
+} SemaParam;
+
+typedef struct {
+    int used, count, max_count, init_count;
+    uint32_t attr, option;
+} Sema;
+
+#define MAX_SEMAS 512
+static Sema semas[MAX_SEMAS];
+
+static Sema *sema_of(int id) { return id > 0 && id < MAX_SEMAS && semas[id].used ? &semas[id] : NULL; }
+
+static int waiting_on(int id)
+{
+    int n = 0;
+    for (int i = 1; i < MAX_THREADS; i++)
+        n += threads[i].used && threads[i].status == TS_WAIT && threads[i].wait == WAIT_SEMA && threads[i].wait_id == id;
+    return n;
+}
+
+int CreateSema(SemaParam *p) RETAIL(func_0025A6E0);
+int CreateSema(SemaParam *p)
+{
+    for (int i = 1; i < MAX_SEMAS; i++)
+        if (!semas[i].used) {
+            Sema *s = &semas[i];
+            s->used = 1;
+            s->count = s->init_count = p->init_count;
+            s->max_count = p->max_count;
+            s->attr = p->attr, s->option = p->option;
+            return i;
+        }
+    return KE_ERROR;
+}
+
+int DeleteSema(int id) RETAIL(func_0025A6F0);
+int DeleteSema(int id)
+{
+    Sema *s = sema_of(id);
+    if (!s)
+        return KE_UNKNOWN_SEMID;
+    for (int i = 1; i < MAX_THREADS; i++)
+        if (threads[i].used && threads[i].status == TS_WAIT && threads[i].wait == WAIT_SEMA && threads[i].wait_id == id) {
+            threads[i].wait_result = KE_ERROR;
+            make_ready(&threads[i], 0);
+        }
+    s->used = 0;
+    reschedule();
+    return id;
+}
+
+static int signal(int id)
+{
+    Sema *s = sema_of(id);
+    if (!s)
+        return KE_UNKNOWN_SEMID;
+    Thread *first = NULL;  /* waiters wake in the order they started waiting */
+    for (int i = 1; i < MAX_THREADS; i++) {
+        Thread *t = &threads[i];
+        if (t->used && t->status == TS_WAIT && t->wait == WAIT_SEMA && t->wait_id == id
+            && (!first || t->order < first->order))
+            first = t;
+    }
+    if (first) {
+        make_ready(first, 0);
+        reschedule();
+    } else {
+        s->count++;
+    }
+    return id;
+}
+
+int SignalSema(int id) RETAIL(func_0025A700);
+int SignalSema(int id) { kernel_poll(); return signal(id); }
+int iSignalSema(int id) RETAIL(func_0025A710);
+int iSignalSema(int id) { return signal(id); }
+
+int WaitSema(int id) RETAIL(func_0025A720);
+int WaitSema(int id)
+{
+    kernel_poll();
+    Sema *s = sema_of(id);
+    if (!s)
+        return KE_UNKNOWN_SEMID;
+    if (s->count > 0) {
+        s->count--;
+        return id;
+    }
+    current->order = order_back++;  /* the waiters' order */
+    int r = block(WAIT_SEMA, id);
+    return r < 0 ? r : id;
+}
+
+int PollSema(int id) RETAIL(func_0025A730);
+int PollSema(int id)
+{
+    kernel_poll();
+    Sema *s = sema_of(id);
+    if (!s)
+        return KE_UNKNOWN_SEMID;
+    if (s->count <= 0)
+        return KE_SEMA_ZERO;
+    s->count--;
+    return id;
+}
+
+int iPollSema(int id) RETAIL(func_0025A740);
+int iPollSema(int id) { return PollSema(id); }
+
+int ReferSemaStatus(int id, SemaParam *info) RETAIL(func_0025A750);
+int ReferSemaStatus(int id, SemaParam *info)
+{
+    Sema *s = sema_of(id);
+    if (!s)
+        return KE_UNKNOWN_SEMID;
+    info->count = s->count, info->max_count = s->max_count, info->init_count = s->init_count;
+    info->wait_threads = waiting_on(id);
+    info->attr = s->attr, info->option = s->option;
+    return id;
+}
+
+/* ---- interrupt handlers ---- */
+typedef int (*Handler)(int cause, uint32_t arg, uint32_t addr);
+
+typedef struct {
+    int used, cause, id;
+    Handler fn;
+    uint32_t arg;
+} HandlerEntry;
+
+#define MAX_HANDLERS 64
+static HandlerEntry intc_handlers[MAX_HANDLERS], dmac_handlers[MAX_HANDLERS];
+static uint32_t intc_enabled, dmac_enabled;
+static int next_handler_id = 1;
+
+static int add_handler(HandlerEntry *table, int cause, Handler fn, int next, uint32_t arg)
+{
+    (void)next;
+    for (int i = 0; i < MAX_HANDLERS; i++)
+        if (!table[i].used) {
+            table[i] = (HandlerEntry){1, cause, next_handler_id++, fn, arg};
+            if (hle_verbose)
+                hle_log("Add%sHandler(%d, %p) = %d\n", table == intc_handlers ? "Intc" : "Dmac", cause, fn,
+                        table[i].id);
+            return table[i].id;
+        }
+    return KE_ERROR;
+}
+
+static int remove_handler(HandlerEntry *table, int cause, int id)
+{
+    for (int i = 0; i < MAX_HANDLERS; i++)
+        if (table[i].used && table[i].cause == cause && table[i].id == id) {
+            table[i].used = 0;
+            return 0;
+        }
+    return KE_ERROR;
+}
+
+static void run_handlers(HandlerEntry *table, uint32_t enabled, int cause)
+{
+    if (!(enabled & (1u << cause)))
+        return;
+    Registers saved;  /* an interrupt leaves the interrupted code's registers alone */
+    save_registers(&saved);
+    in_interrupt++;
+    for (int i = 0; i < MAX_HANDLERS; i++)
+        if (table[i].used && table[i].cause == cause)
+            table[i].fn(cause, table[i].arg, 0);
+    in_interrupt--;
+    load_registers(&saved);
+}
+
+int AddIntcHandler(int cause, Handler fn, int next, uint32_t arg) RETAIL(func_0025A3C0);
+int AddIntcHandler(int cause, Handler fn, int next, uint32_t arg) { return add_handler(intc_handlers, cause, fn, next, arg); }
+int RemoveIntcHandler(int cause, int id) RETAIL(func_0025A3E0);
+int RemoveIntcHandler(int cause, int id) { return remove_handler(intc_handlers, cause, id); }
+int AddDmacHandler(int channel, Handler fn, int next, uint32_t arg) RETAIL(func_0025A3F0);
+int AddDmacHandler(int channel, Handler fn, int next, uint32_t arg) { return add_handler(dmac_handlers, channel, fn, next, arg); }
+int AddDmacHandler2(int channel, Handler fn, int next, uint32_t arg) RETAIL(func_0025A400);
+int AddDmacHandler2(int channel, Handler fn, int next, uint32_t arg) { return add_handler(dmac_handlers, channel, fn, next, arg); }
+int RemoveDmacHandler(int channel, int id) RETAIL(func_0025A410);
+int RemoveDmacHandler(int channel, int id) { return remove_handler(dmac_handlers, channel, id); }
+
+static int switch_bit(uint32_t *mask, int bit, int on)
+{
+    int was = (*mask >> bit) & 1;
+    *mask = on ? *mask | (1u << bit) : *mask & ~(1u << bit);
+    return was;
+}
+
+int EnableIntc(int cause) RETAIL(func_0025A420);
+int EnableIntc(int cause) { return switch_bit(&intc_enabled, cause, 1); }
+int DisableIntc(int cause) RETAIL(func_0025A430);
+int DisableIntc(int cause) { return switch_bit(&intc_enabled, cause, 0); }
+int EnableDmac(int channel) RETAIL(func_0025A440);
+int EnableDmac(int channel) { return switch_bit(&dmac_enabled, channel, 1); }
+int DisableDmac(int channel) RETAIL(func_0025A450);
+int DisableDmac(int channel) { return switch_bit(&dmac_enabled, channel, 0); }
+int iEnableIntc(int cause) RETAIL(func_0025A480);
+int iEnableIntc(int cause) { return switch_bit(&intc_enabled, cause, 1); }
+int iDisableIntc(int cause) RETAIL(func_0025A490);
+int iDisableIntc(int cause) { return switch_bit(&intc_enabled, cause, 0); }
+int iEnableDmac(int channel) RETAIL(func_0025A4A0);
+int iEnableDmac(int channel) { return switch_bit(&dmac_enabled, channel, 1); }
+int iDisableDmac(int channel) RETAIL(func_0025A4B0);
+int iDisableDmac(int channel) { return switch_bit(&dmac_enabled, channel, 0); }
+
+void kernel_dmac_interrupt(int channel)
+{
+    run_handlers(dmac_handlers, dmac_enabled, channel);
+}
+
+/* ---- alarms (in HSYNC units) ---- */
+typedef void (*AlarmHandler)(int id, uint16_t time, uint32_t arg);
+
+typedef struct {
+    int used;
+    uint64_t due;
+    uint16_t ticks;
+    AlarmHandler fn;
+    uint32_t arg;
+} Alarm;
+
+#define MAX_ALARMS 64
+static Alarm alarms[MAX_ALARMS];
+
+static int set_alarm(uint16_t ticks, AlarmHandler fn, uint32_t arg)
+{
+    for (int i = 0; i < MAX_ALARMS; i++)
+        if (!alarms[i].used) {
+            alarms[i] = (Alarm){1, now_cycles() + (uint64_t)ticks * HSYNC_CYCLES, ticks, fn, arg};
+            return i + 1;
+        }
+    return KE_ERROR;
+}
+
+int SetAlarm(uint16_t ticks, AlarmHandler fn, uint32_t arg) RETAIL(func_0025A460);
+int SetAlarm(uint16_t ticks, AlarmHandler fn, uint32_t arg) { return set_alarm(ticks, fn, arg); }
+int iSetAlarm(uint16_t ticks, AlarmHandler fn, uint32_t arg) RETAIL(func_0025A4C0);
+int iSetAlarm(uint16_t ticks, AlarmHandler fn, uint32_t arg) { return set_alarm(ticks, fn, arg); }
+
+static int release_alarm(int id)
+{
+    if (id <= 0 || id > MAX_ALARMS || !alarms[id - 1].used)
+        return KE_ERROR;
+    alarms[id - 1].used = 0;
+    return 0;
+}
+
+int ReleaseAlarm(int id) RETAIL(func_0025A470);
+int ReleaseAlarm(int id) { return release_alarm(id); }
+int iReleaseAlarm(int id) RETAIL(func_0025A4D0);
+int iReleaseAlarm(int id) { return release_alarm(id); }
+
+/* ---- vsync ---- */
+static uint64_t next_vsync;
+/* Delivered NTSC fields from boot; independent of host speed and buffer flips. */
+uint64_t kernel_vsync_count;
+static uint32_t vsync_flag_addr, vsync_csr_addr;  /* SetVSyncFlag */
+
+#define GS_CSR (*(volatile uint64_t *)0x12001000)
+
+/* INTC_STAT: the causes raised since the game last cleared them (a store of 1 clears a bit). */
+static uint32_t intc_stat;
+
+static void intc_raise(int cause)
+{
+    intc_stat |= 1u << cause;
+    *(volatile uint32_t *)(uintptr_t)PS2_INTC_STAT = intc_stat;
+}
+
+/* The store has already reached the mapped word; it holds the bits still raised. */
+void kernel_intc_write(uint32_t value)
+{
+    intc_stat &= ~value;
+    *(volatile uint32_t *)(uintptr_t)PS2_INTC_STAT = intc_stat;
+}
+
+/* Normal play runs the virtual frame clock (one game frame per field, as in the PCSX2
+   comparisons) and holds each field to its own wall deadline at 59.94 Hz: never faster. A port
+   that falls behind moves the deadlines instead of catching up, so it never skips or doubles a
+   field and the game's delta stays 1. DHD_FRAME_CLOCK=1 runs unpaced, DHD_PACE=wall lets wall
+   time drive the fields (the game then measures slow frames as 2 or 3 fields). */
+static int paced;
+static double pace_base;
+
+/* An online race waited `seconds` for the other players: the following fields keep their spacing
+   from the end of the wait instead of catching up (finding 042: a PC that started a little early
+   otherwise waits about one field on every field). */
+void kernel_pace_slip(double seconds)
+{
+    if (pace_base) pace_base += seconds;
+}
+
+/* An online race keeps every PC's fields on the clock they share from the synced start
+   (kernel_pace_shared): a PC that fell behind (a hitch, a stall, a PC too slow for the race) does
+   not start again from now. It runs without waiting, and while it is still more than a field late
+   each game frame gets two fields (the game measures the frame so and moves everything twice as
+   far, as on a PS2 that drops a frame), until it is back on time; the race clock counts both.
+   Three fields a frame lost race-clock time against the other PCs (finding 047), so two at most. */
+static int pace_shared, extras;  /* extras: fields given since the game last waited */
+static uint64_t frame_waits, extra_wait;  /* the game's vsync waits (intc_read); the one extras counts from */
+unsigned kernel_pace_extra_fields, kernel_pace_late_ms;  /* for the online log: extra fields given, how late */
+
+void kernel_pace_shared(int on)
+{
+    if (on && !pace_shared) pace_base = 0;  /* from this field */
+    pace_shared = on;
+}
+
+static void pace(void)
+{
+    double base = pace_base;
+    static uint64_t fields;
+    const double period = 1001.0 / 60000.0;
+    double now = host_wall_seconds(), due = base + (double)++fields * period;
+    if (!base || (!pace_shared && now > due + 2 * period)) {  /* the first field, or behind: start again from now */
+        pace_base = now, fields = 0;
+        return;
+    }
+    if (pace_shared) kernel_pace_late_ms = now > due ? (unsigned)((now - due) * 1000) : 0;
+    if (pace_shared && now > due + period) {
+        if (extra_wait != frame_waits) extra_wait = frame_waits, extras = 0;
+        if (!extras && ee_frame_clock_enabled()) {
+            extras++, kernel_pace_extra_fields++;
+            ee_frame_clock_advance(next_vsync);  /* the next field is due now: delivered before the game waits again */
+        }
+        return;
+    }
+    host_wait_wall(due);
+}
+
+/* Just-in-time frames (round 38, finding 052; DHD_LATENCY=0 turns them off). One VBLANK both
+   ends a frame (its handler shows the picture) and starts the next (padman's new pad state), so
+   pace()'s wait before it lies between the pad read and the picture: the input is a little over
+   a field old (17.1 ms in a race) when presented. Here the VBLANK runs as soon as the game reaches it and the picture is
+   handed on at once; the wait comes after it, and the pad is read again (pad_refresh) when it
+   ends. Every picture has a due time on a fixed 59.94 Hz grid, and the presenter holds it until
+   then (pacing_present), so the time between pictures stays one field. The wait ends `work`
+   before the next due: the longest a frame took in the last 5 s (not counting the ones longer
+   than a field), from that pad read to its picture ready to show, plus 1.5 ms. A picture that is late anyway moves the grid: the next one
+   still comes a whole field after it (one long frame, not a long and a short one). Only wall
+   time moves: the game sees the same fields, frames and pad frames (the frame clock stays
+   virtual). Off with DHD_INTERP and in online races (pace()). The idea is RetroArch's frame
+   delay and NVIDIA Reflex's just-in-time frame start. */
+#define WORK_SAMPLES 300
+#define FIELD_SECONDS (1001.0 / 60000.0)
+static int jit = -1;
+static double jit_due, frame_began;           /* the next picture's due; when this frame's pad was read */
+static double handed_due, handed_began;       /* the same for the picture being handed on now */
+static volatile float work_ms[WORK_SAMPLES];  /* pad read to picture ready, by the presenter */
+static volatile unsigned work_count;
+static volatile double shown_due, shown_at;   /* the presenter's last picture: its due (0 while written), when shown */
+static FILE *pacing_log[2];  /* DHD_PACING_LOG=prefix: prefix-ee.csv, prefix-present.csv (each frame) */
+
+static FILE *pacing_file(int which)
+{
+    static int opened;
+    if (!opened) {
+        opened = 1;
+        const char *prefix = getenv("DHD_PACING_LOG");
+        char path[512];
+        for (int i = 0; prefix && i < 2; i++) {
+            snprintf(path, sizeof path, "%s-%s.csv", prefix, i ? "present" : "ee");
+            pacing_log[i] = fopen(path, "w");
+            if (pacing_log[i]) setvbuf(pacing_log[i], NULL, _IOFBF, 1 << 16);
+        }
+        if (pacing_log[0]) fprintf(pacing_log[0], "field,now,shown,due,start,work_ms,began\n");
+        if (pacing_log[1]) fprintf(pacing_log[1], "due,began,ready,presented\n");
+    }
+    return pacing_log[which];
+}
+
+static int jit_on(void)
+{
+    if (jit < 0) {
+        const char *s = getenv("DHD_LATENCY");
+        jit = paced && !getenv("DHD_INTERP") && (!s || atoi(s) != 0);
+        hle_log("pacing: %s\n", jit ? "just-in-time frames" : paced ? "wait before VBLANK" : "unpaced");
+    }
+    return jit && !pace_shared;
+}
+
+static void jit_wait(void)
+{
+    const double period = FIELD_SECONDS;
+    unsigned count = work_count, n = count < WORK_SAMPLES ? count : WORK_SAMPLES;
+    double work = period;  /* until there are samples (no presenter: always), pace()'s timing */
+    if (n >= 30) {
+        /* Frames longer than a field (a load, a stall) are late however early they start, so they
+           don't count, unless they are more than one in ten (a slow stretch: then no delay). */
+        float worst = 0, field_ms = (float)(period * 1000);
+        unsigned longer = 0;
+        for (unsigned i = 0; i < n; i++) {
+            float w = work_ms[i];
+            if (w > field_ms) longer++;
+            else if (w > worst) worst = w;
+        }
+        if (longer * 10 <= n) work = worst / 1000.0 + 0.0015;
+    }
+    double now = host_wall_seconds(), shown = jit_due;
+    /* The presenter moved the grid if the picture handed now, or the one before it, was late. */
+    double last_due, last_at;
+    do last_due = shown_due, last_at = shown_at; while (last_due != shown_due);
+    if (shown && last_due == shown && last_at > shown) shown = last_at;
+    else if (shown && last_due > 0 && last_due + period - shown < 1e-6 && shown - last_due - period < 1e-6 &&
+             last_at + period > shown) shown = last_at + period;
+    double due = shown + period;
+    if (!shown || now > due) {  /* the first field, or more than a field late: start again from now */
+        jit_due = now + (work < period ? work : period);
+        frame_began = now;
+        return;
+    }
+    double start = due - work;
+    if (start < shown) start = shown;  /* never two frames in one field */
+    host_wait_wall(start);
+    jit_due = due;
+    frame_began = host_wall_seconds();
+    FILE *log = pacing_file(0);
+    if (log) fprintf(log, "%llu,%.6f,%.6f,%.6f,%.6f,%.3f,%.6f\n", (unsigned long long)kernel_vsync_count, now, shown,
+                     due, start, work * 1000, frame_began);
+}
+
+/* The picture handed on at this VBLANK: when to show it (0: at once) and when its pad was read. */
+void pacing_handed(double *due, double *began)
+{
+    *due = handed_due;
+    *began = handed_began;
+}
+
+/* The presenter, just before it presents a picture pacing_handed described: notes how long the
+   frame took, then waits for the due time, and at least a field after its last picture. */
+void pacing_present(double due, double began)
+{
+    static double last_at;
+    double now = host_wall_seconds(), target = due;
+    if (due > 0) {
+        if (began > 0 && now > began) {
+            unsigned i = work_count;
+            work_ms[i % WORK_SAMPLES] = (float)((now - began) * 1000);
+            work_count = i + 1;
+        }
+        if (last_at + FIELD_SECONDS > target) target = last_at + FIELD_SECONDS;
+        if (target > now && target < now + 0.05)
+            host_wait_wall(target);
+        last_at = host_wall_seconds();
+        shown_due = 0;  /* x86 keeps stores in order: a reader sees due 0 or both values */
+        shown_at = last_at;
+        shown_due = due;
+    }
+    FILE *log = pacing_file(1);
+    if (log) fprintf(log, "%.6f,%.6f,%.6f,%.6f\n", due, began, now, host_wall_seconds());
+    if (log && !(work_count % 60)) fflush(log), fflush(pacing_log[0]);  /* DHD_BENCH_EXIT ends with ExitProcess */
+    /* DHD_PACING_STATS=1: every 600 pictures, how old the pad state was when each was presented. */
+    static int stats = -1;
+    static double sum, worst;
+    static unsigned count;
+    if (stats < 0) stats = getenv("DHD_PACING_STATS") != NULL;
+    if (stats && began > 0) {
+        double age = (host_wall_seconds() - began) * 1000;
+        sum += age, count++;
+        if (age > worst) worst = age;
+        if (count == 600) {
+            fprintf(stderr, "pacing: %s, pad to present mean %.2f ms max %.2f ms\n",
+                    due > 0 ? "just-in-time" : "wait before VBLANK", sum / count, worst);
+            sum = worst = 0, count = 0;
+        }
+    }
+}
+
+#include "frame_profile.h"
+
+static void vsync(void)
+{
+    frame_profile_mark(0);
+    int fresh = paced && jit_on();
+    if (paced && !fresh) pace();
+    handed_due = fresh ? jit_due : 0;
+    handed_began = frame_began;
+    frame_profile_mark(1);
+    ++kernel_vsync_count;
+    /* Presentation and the VBLANK handler consume completed graphics state. */
+    graphics_wait();
+    frame_profile_mark(2);
+    /* CSR acknowledgements and VBLANK must share the read-only FIELD state. */
+    gs_vblank(&gs);
+    GS_CSR = gs_priv_read(&gs, 0x1000);
+    if (vsync_flag_addr) {
+        *(uint32_t *)(uintptr_t)vsync_flag_addr = 1;
+        *(uint64_t *)(uintptr_t)vsync_csr_addr = GS_CSR;
+    }
+    pad_vsync();  /* padman updates the controllers once a frame */
+    if (!fresh) frame_began = host_wall_seconds();
+    host_widescreen_vsync();
+    sound_tick(); /* 989snd renders one frame of audio (finding 022) */
+    intc_raise(INTC_VBLANK_START);
+    run_handlers(intc_handlers, intc_enabled, INTC_VBLANK_START);
+    frame_profile_mark(3);
+    graphics_wait(); /* handlers may have submitted another packet */
+    frame_profile_mark(4);
+    gs_vsync();  /* latch the display buffer selected by the VBLANK handler */
+    frame_profile_mark(5);
+    intc_raise(INTC_VBLANK_END);
+    run_handlers(intc_handlers, intc_enabled, INTC_VBLANK_END);
+    frame_profile_mark(6);
+    if (fresh) {
+        jit_wait();
+        pad_refresh();  /* the game reads the pad after this VBLANK: the state at the end of the wait */
+    }
+}
+
+static int deliver(void)
+{
+    int any = 0;
+    uint64_t now = now_cycles();
+    timer_poll(now);
+    Registers rpc_saved;
+    save_registers(&rpc_saved);
+    in_interrupt++;
+    any |= sif_poll();
+    in_interrupt--;
+    load_registers(&rpc_saved);
+    if (now >= next_vsync) {
+        next_vsync += VSYNC_CYCLES;
+        if (next_vsync < now)  /* fell far behind (a debugger stop): don't replay the frames */
+            next_vsync = now + VSYNC_CYCLES;
+        vsync();
+        any = 1;
+    }
+    for (int i = 0; i < MAX_ALARMS; i++)
+        if (alarms[i].used && now >= alarms[i].due) {
+            alarms[i].used = 0;
+            Registers saved;
+            save_registers(&saved);
+            in_interrupt++;
+            alarms[i].fn(i + 1, alarms[i].ticks, alarms[i].arg);
+            in_interrupt--;
+            load_registers(&saved);
+            any = 1;
+        }
+    return any;
+}
+
+void kernel_poll(void)
+{
+    if (in_interrupt)
+        return;
+    ee_frame_clock_poll();
+    host_poll_dump();
+    dma_poll();
+    if (deliver())
+        reschedule();
+}
+
+static uint64_t next_event(void);
+
+/* Lets time run to `due`: the frame clock jumps there, host time sleeps and then spins. */
+static void wait_until(uint64_t due)
+{
+    uint64_t now = now_cycles();
+    if (ee_frame_clock_enabled()) ee_frame_clock_advance(due);
+    else if (due > now) {
+        unsigned ms = (unsigned)((due - now) * 1000 / (uint64_t)BUS_HZ);
+        host_sleep_ms(ms);
+    }
+    while (now_cycles() < due)
+        ;
+}
+
+/* A read of INTC_STAT. Each game frame ends in sceGsSyncV (func_00243CE8), which clears
+   VBLANK_START and spins on it with interrupts enabled (func_0025AC00 also stops on the
+   SetVSyncFlag word); that wait is what holds the PS2 to one frame per field (PCSX2: boot, menus,
+   loads and race all run 1.000 frames per field). The EE only spins meanwhile, so while the bit is
+   clear a read lets time run to the next interrupt, delivered as usual; the game's loop then
+   reads again. */
+static void intc_read(void)
+{
+    if (in_interrupt)
+        return;
+    if (intc_stat & 1u << INTC_VBLANK_START)
+        return;
+    frame_waits++;
+    wait_until(next_event());
+    host_poll_dump();
+    dma_poll();
+    if (deliver())
+        reschedule();
+}
+
+static uint64_t next_event(void)
+{
+    uint64_t t = next_vsync;
+    double rpc_due = sif_next_event();
+    if (rpc_due < (double)t / BUS_HZ) {
+        t = (uint64_t)(rpc_due * BUS_HZ);
+        /* A fractional RPC deadline must not strand the virtual idle loop one
+           bus cycle before sif_poll's double-precision due time. */
+        if (ee_frame_clock_enabled()) ++t;
+    }
+    for (int i = 0; i < MAX_ALARMS; i++)
+        if (alarms[i].used && alarms[i].due < t)
+            t = alarms[i].due;
+    return t;
+}
+
+/* ---- the rest of the kernel ---- */
+void Exit(int code) RETAIL(func_0025A300);
+void Exit(int code)
+{
+    hle_log("Exit(%d) from %p (ra %08X)\n", code, __builtin_return_address(0), ps2.gpr[31].w[0]);
+    host_backtrace();
+    exit(code);
+}
+
+void FlushCache(int mode) RETAIL(func_0025A960);
+void FlushCache(int mode) { (void)mode; kernel_poll(); }
+
+static uint32_t heap_end;
+uint32_t EndOfHeap(void) RETAIL(func_0025A6C0);
+uint32_t EndOfHeap(void) { return heap_end; }
+
+static uint64_t gs_imr = 0x7F00;
+uint64_t GsGetIMR(void) RETAIL(func_0025AA00);
+uint64_t GsGetIMR(void) { return gs_imr; }
+uint64_t GsPutIMR(uint64_t imr) RETAIL(func_0025AA20);
+uint64_t GsPutIMR(uint64_t imr)
+{
+    uint64_t old = gs_imr;
+    gs_imr = imr;
+    return old;
+}
+
+void SetVSyncFlag(uint32_t flag, uint32_t csr) RETAIL(func_0025AA50);
+void SetVSyncFlag(uint32_t flag, uint32_t csr) { vsync_flag_addr = flag, vsync_csr_addr = csr; }
+
+void SetGsCrt(int interlace, int mode, int field) RETAIL(func_0025A2E0);
+void SetGsCrt(int interlace, int mode, int field)
+{
+    if (hle_verbose)
+        hle_log("SetGsCrt(%d, %d, %d)\n", interlace, mode, field);
+}
+
+int GetMemorySize(void) RETAIL(func_0025AB40);
+int GetMemorySize(void) { return PS2_RAM_SIZE; }
+
+void InitTLB(void) RETAIL(func_0025F6E0);
+void InitTLB(void) {}  /* the host maps the memory (memory.c) */
+
+/* Unknown syscalls the SDK makes: logged, and 0. */
+static int unknown(int n)
+{
+    hle_log("syscall 0x%X: not implemented\n", n);
+    return 0;
+}
+
+int Syscall80(void) RETAIL(func_00243670);
+int Syscall80(void) { return unknown(0x80); }
+int Syscall6B(void) RETAIL(func_0025A9B0);
+int Syscall6B(void) { return unknown(0x6B); }
+int Syscall82(void) RETAIL(func_0025AB50);
+int Syscall82(void) { return unknown(0x82); }
+int Deci2Call(int call, void *arg) RETAIL(func_0025AB10);
+int Deci2Call(int call, void *arg) { (void)call, (void)arg; return -1; }
+
+/* ---- startup and the idle loop ---- */
+void kernel_init(void)
+{
+    const char *frame_clock = getenv("DHD_FRAME_CLOCK"), *pacing = getenv("DHD_PACE");
+    const int unpaced = frame_clock && !strcmp(frame_clock, "1"), wall = pacing && !strcmp(pacing, "wall");
+    ee_frame_clock_reset(unpaced || !wall);
+    paced = !unpaced && !wall;
+    host_init();
+    gs_reset(&gs);
+    ps2_mmio_write = dma_mmio_write;
+    ps2_intc_read = intc_read;
+    intc_stat = 0;
+    *(volatile uint32_t *)(uintptr_t)PS2_INTC_STAT = 0;
+    ps2_graphics_sync = graphics_threaded() ? graphics_wait : NULL;
+    ps2_vu1_regs_sync = ps2_graphics_sync;
+    host_seconds();
+    kernel_vsync_count = 0;
+    next_vsync = VSYNC_CYCLES;
+    ps2.cop0[12] = 0x10001;  /* Status: EIE, IE */
+    hle_verbose = getenv("DHD_LOG") != NULL;
+}
+
+void kernel_run(void (*root)(void), uint32_t gp, uint32_t stack, uint32_t stack_size)
+{
+    idle_fiber = host_fiber_main();
+    ee_float_mode();
+    root_function = root;
+    Thread *main = &threads[1];
+    memset(main, 0, sizeof *main);
+    main->used = 1;
+    main->status = TS_DORMANT;
+    main->stack = stack, main->stack_size = stack_size, main->gp = gp;
+    main->init_priority = 0;
+    start(main, 0);
+    heap_end = stack + stack_size;  /* SetupHeap(_end, -1): up to the stack, which grows down to meet it */
+    while (!game_exited) {
+        Thread *next = pick();
+        if (next) {
+            run_thread(next);
+            host_fiber_switch(next->fiber);
+            continue;
+        }
+        /* every thread waits: sleep until the next interrupt */
+        wait_until(next_event());
+        deliver();
+        int any = 0;
+        for (int i = 1; i < MAX_THREADS; i++)
+            any |= threads[i].used && threads[i].status != TS_DORMANT;
+        if (!any) {
+            hle_log("kernel: no threads left\n");
+            return;
+        }
+    }
+}
+
+void kernel_dump(void)
+{
+    for (int i = 1; i < MAX_THREADS; i++) if (threads[i].used) {
+        Thread *t = &threads[i];
+        fprintf(stderr, "  thread %d entry=%08X state=%X priority=%d wait=%d/%d wake=%d\n",
+                i, t->entry, t->status, t->priority, t->wait, t->wait_id, t->wakeup_count);
+    }
+    for (int i = 1; i < MAX_SEMAS; i++) if (semas[i].used)
+        fprintf(stderr, "  semaphore %d count=%d max=%d\n", i, semas[i].count, semas[i].max_count);
+}
