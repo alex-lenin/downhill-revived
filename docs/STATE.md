@@ -1374,6 +1374,55 @@ and non-XInput pads work through SDL3.
   the rider steering 22, 43, 65, 85, 107, 127 over 100 ms; the gate passes. Real key presses,
   generic/Switch/8BitDo pads and actual vibration need someone at the PC.
 
+Round 44, progressive field jitter (finding 060): measured on twelve consecutive 2x widescreen
+main-menu fields. OFY alternates 0x7900/0x7908 with fixed raw 2D Y; DISPLAY/DBY stay constant.
+The logo and 3D background both bob by two output pixels. Native coordinate conversion removes
+the half-line OFY component before sprite rounding on screen-sized INT+FFMD targets, leaving
+exact rendering/readbacks untouched. Main-menu and OPTIONS captures now have zero alternating
+displacement; every legend crop is byte-identical. Eleven consecutive race fields also remove
+the HUD/world's two-pixel bob, preserving the original integer phase without filtering.
+Clean build 00c53232 (all 3,797 units compile) passes the unchanged default r40-plain gate:
+all EE moments match, 1,168 readback records / Z reads match through virtual GS field 9051.
+Proof and lossless diffs: build/port/r44jitter/. Exact rendering stays unchanged; no benchmarks.
+
+
+Round 45, pickup flare (finding 061): both native and exact sustained an oversized pickup glow.
+The port data converter relocated a packed duration word (0x00780000 -> 0x08780000), making
+particle template 16's duration 2168 instead of 120. Its intensity envelope stayed bright;
+this was game-visible particle data, not native GS blending or occlusion. The converter now
+preserves the timing pair at +0x18 of all 77 scale records (25 image words corrected).
+- Scripted retail PCSX2 now actually hits the same pickup: it flashes for two fields, then
+  shows fragments. The clean fixed build preserves that brief flash and removes the prolonged
+  glow in native and exact. Native's real-sun +240 capture is pixel-identical; non-pickup +960
+  changes only 44 pixels. No FPS benchmarks. Proof: build/port/r45pickup/.
+- Clean build 830c9150: all 3,797 units compile; exe build/port/clean/830c9150/dhd.exe.
+  Unchanged default r40-plain gate: **FAIL only for 29 intended words** (25 timing pairs and
+  four derived slopes), identical at every early checkpoint; all 29 match independent retail
+  RAM. The exact/native arms MATCH at all six EE moments through GO+75 seconds, and all 1,128
+  Z readbacks MATCH through GS field 9049. Reference and checker exclusions remain unchanged;
+  finding 061 enumerates the words. No src/ changes.
+
+Round 46, systematic data-fixup audit (finding 062): audited all 4,419 historical
+entries (4,394 after round 45). Confirmed 44 additional corruptions: 24 copied
+SDK instructions, 13 TLB fields, six text words, one inflate extra-bit word.
+Numeric schemas also remove two harmless identity entries; 4,348 fixups remain.
+The five synthetic schema/pointer regressions pass. Clean build f0308534:
+all 3,797 units compile; executable build/port/clean/f0308534/dhd.exe.
+Against r40-plain, exactly 73 intended words differ at every early checkpoint
+in both arms (44 new corrections + round 45's 29); every word matches independent
+retail RAM. Recorded r46-plain from this clean build and made it the default.
+The final default gate MATCHES all frozen-reference and paired EE checks through
+GO+75 seconds, with 1,096 Z readbacks matching through GS field 9017. No check
+exclusions changed.
+
+Round 47, release 0.2.3 prepared (finding 053 section 9): version-only commit
+bde3cf92 includes findings 060-062; its clean build compiles all 3,797 units.
+Default r46-plain gate MATCH: zero unexcluded differences in all 14 word
+comparisons, 1,121 matching Z readbacks through GS field 9042. Release zip and
+latest.json are in build/release; clean retail scan and icon verified. Extracted
+zip reaches Alpine; real 0.2.2 updater installs/restarts 0.2.3 with ini/save
+unchanged. Temporary test folders deleted.
+
 ## Online play (plan: docs/ONLINE-PLAN.md)
 2026-10-16 step 1, server (finding 039): `online/server/` is the Cloudflare Workers + Durable
 Objects server (lobbies, join codes, public list, lockstep input relay, desync detection);

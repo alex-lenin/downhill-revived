@@ -854,8 +854,40 @@ static void native_set(NativeVertex *o, const GsVertex *v, const GsVertex *colou
     o->rgba = colour->rgba;
 }
 
+/* Bounded field diagnostics: no EE/GS state is changed. Coordinates are logged before
+   native conversion and sprite snapping. Captures and CSVs belong under ignored build/. */
+static FILE *native_field_trace(const char *kind)
+{
+    static int initialized;
+    static unsigned long long first, last;
+    static FILE *draws, *registers;
+    extern uint64_t kernel_vsync_count;
+    if (!initialized) {
+        initialized = 1;
+        const char *prefix = getenv("DHD_FIELD_TRACE"), *range = getenv("DHD_FIELD_TRACE_FIELDS");
+        if (prefix && range && sscanf(range, "%llu-%llu", &first, &last) == 2) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s-draws.csv", prefix); draws = fopen(path, "w");
+            snprintf(path, sizeof path, "%s-registers.csv", prefix); registers = fopen(path, "w");
+            if (draws) fputs("field,path,type,context,frame,tex0,xyoffset,vertex,x,y,u,v,z\n", draws);
+            if (registers) fputs("field,xyoffset1,xyoffset2,pmode,smode2,dispfb1,display1,dispfb2,display2,csr\n", registers);
+        }
+    }
+    if (kernel_vsync_count < first || kernel_vsync_count > last) return NULL;
+    return *kind == 'd' ? draws : registers;
+}
+
 static void native_record(Native *n, Gs *g, unsigned type, const GsVertex *v, unsigned count, unsigned prim, unsigned ctxt)
 {
+    FILE *trace = native_field_trace("draws");
+    if (trace) {
+        extern uint64_t kernel_vsync_count;
+        for (unsigned i = 0; i < count; i++)
+            fprintf(trace, "%llu,%u,%u,%u,%llX,%llX,%llX,%u,%u,%u,%u,%u,%u\n",
+                    (unsigned long long)kernel_vsync_count, g->source_path, type, ctxt,
+                    (unsigned long long)g->reg[GS_FRAME_1 + ctxt], (unsigned long long)g->reg[GS_TEX0_1 + ctxt],
+                    (unsigned long long)g->reg[GS_XYOFFSET_1 + ctxt], i, v[i].x, v[i].y, v[i].u, v[i].v, v[i].z);
+    }
     n->recording->path1 += g->source_path == 1;
     if (n->state_version != g->state_version || n->state_ctxt != ctxt || n->state_prim != prim ||
         ((prim & 16) && n->written != g->pixels_written) || !n->current_valid) {
@@ -869,6 +901,15 @@ static void native_record(Native *n, Gs *g, unsigned type, const GsVertex *v, un
     if (n->skip) return;
     NativeFrame *f = n->recording;
     uint64_t offset = g->reg[GS_XYOFFSET_1 + ctxt];
+    /* The game alternates OFY by 8/16 of a framebuffer line in INT+FFMD mode.
+       Scanout line-doubles to progressive output; retaining that field displacement
+       makes the whole scene bob, and sprite rounding can turn it into a full line.
+       Remove only the half-line component on screen-sized targets, before rounding.
+       Small offscreen targets (shadows/blur) keep their own coordinates. This local
+       offset never reaches the exact GS rasterizer, probe replay or EE readbacks. */
+    if ((offset >> 32 & 15) == 8 && (gs_priv_read(g, GS_SMODE2) & 3) == 3 &&
+        (g->reg[GS_FRAME_1 + ctxt] >> 16 & 63) >= 8)
+        offset -= UINT64_C(8) << 32;
     int fst = prim >> 8 & 1, flat = !(prim >> 3 & 1);
     float tw = (float)n->current.constants.tex_size[0], th = (float)n->current.constants.tex_size[1];
     if (tw == 0) tw = 1;
@@ -2380,6 +2421,20 @@ int gs_gpu_native(const Gs *g)
 
 void gs_native_vsync(Gs *g, IDXGISwapChain *swapchain, unsigned *width, unsigned *height, int resize)
 {
+    FILE *trace = native_field_trace("registers");
+    if (trace) {
+        extern uint64_t kernel_vsync_count;
+        fprintf(trace, "%llu,%llX,%llX,%llX,%llX,%llX,%llX,%llX,%llX,%llX\n",
+                (unsigned long long)kernel_vsync_count,
+                (unsigned long long)g->reg[GS_XYOFFSET_1], (unsigned long long)g->reg[GS_XYOFFSET_2],
+                (unsigned long long)gs_priv_read(g, GS_PMODE), (unsigned long long)gs_priv_read(g, GS_SMODE2),
+                (unsigned long long)gs_priv_read(g, GS_DISPFB1), (unsigned long long)gs_priv_read(g, GS_DISPLAY1),
+                (unsigned long long)gs_priv_read(g, GS_DISPFB2), (unsigned long long)gs_priv_read(g, GS_DISPLAY2),
+                (unsigned long long)gs_priv_read(g, GS_CSR));
+        fflush(trace);
+        FILE *draws = native_field_trace("draws");
+        if (draws) fflush(draws);
+    }
     Gpu *gpu = g->backend;
     Native *n = gpu->native;
     NativeFrame *f = n->recording;

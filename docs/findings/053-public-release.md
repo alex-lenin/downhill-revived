@@ -305,6 +305,71 @@ font reads EE memory and writes only the native renderer's textures. Raising MIN
 0.2.2 is still worth doing: 0.2.0 players would otherwise see 0.2.2 rooms as "other version"
 with no hint, and 0.2.0 keeps the dead controller after an online race.
 
+## 9. Release 0.2.3 (round 47)
+
+Release revision **bde3cf923112bbbaf3c7ce2be0642c9c4a3b2b8d** (`bde3cf92`):
+`Version 0.2.3`, changing only `port/include/version.h`. Includes the progressive
+menu/race jitter correction (finding 060), pickup flare timing correction
+(finding 061), and all additional numeric data corrections in ece43567
+(finding 062). Later audit commits change tooling/documentation only; no
+`data.py` correction landed after this release revision.
+
+- Clean build: `python port/tools/build_clean.py --rev bde3cf923112bbbaf3c7ce2be0642c9c4a3b2b8d --tree build/port/clean/tree-release023 -j 4`.
+  All 3,797 units compile, zero errors (73 s); link 473 s, 714 asm-only
+  functions recompiled. SDL3 3.4.18 built inside the clean worktree by `sdl3.py`.
+  No recompilation basis or uncommitted root-checkout source was used.
+- Executable: `build/port/clean/bde3cf92/dhd.exe`, SHA-256
+  `879ec2d7b81037eeae6ae5d914c56930c35e1c915bdd43a02a7bec13d9cc9b5b`.
+- After finding 062 recorded and documented r46-plain, the default gate ran:
+  `python port/tools/gate_native_renderer.py --exe build/port/clean/bde3cf92/dhd.exe --out build/port/release023/gate --env DHD_SCALE=2`.
+  **NATIVE RENDERER GAME-STATE GATE MATCH**, result.json PASS, no failures.
+  Both arms match r46-plain at GO+0/+2/+12/+16; exact/native match all six
+  moments through GO+4500. **1,121 readback records / Z reads MATCH through
+  virtual GS field 9042**. Native rendering was exercised.
+- Word audit: every word in all eight frozen-reference and six paired
+  comparisons was checked with the unchanged gate equivalence rules:
+  **zero unexcluded differing words in all 14 comparisons**
+  (`build/port/release023/gate-word-audit.json`). The superseded r40-plain
+  29-word expectation was not applied: finding 062 audits the full 73-word
+  correction and records r46-plain. This release task changed no reference,
+  checker, or exclusions.
+- Package: `python port/tools/package_release.py --exe build/port/clean/bde3cf92/dhd.exe`.
+  `build/release/DownhillRevived-0.2.3-win.zip`, **2,876,789 bytes**, SHA-256
+  `8ad7d7fee60592dd1039bfdddf26b8ad3a47811f27b807d3e84b1a51e862b752`.
+  Packaging checks pass. `scan_retail.py`: 14 runs of 64+ bytes, all from
+  decompiled source, zero disallowed runs. ICON resources 1-7 and GROUP_ICON 1
+  are present (`llvm-readobj --coff-resources`).
+- Smoke: the zip extracted into a fresh temporary folder, `DHD_WINDOW=windowed`,
+  menus driven by `DHD_NAV`, movies skipped for this quick check. The window
+  title is "Downhill Revived"; title and main menu are reached, then Alpine
+  starts. The GO+30 capture logs clock 31, phase 2, field 3245; its race image
+  was inspected. The test process and relaunch child were stopped by PID.
+- Real updater: the original 0.2.2 release zip in another temporary folder,
+  `auto_update = on`, local `latest.json` for the real 0.2.3 zip served by
+  `python -m http.server`. Log: "0.2.3 is available (this is 0.2.2)", downloaded
+  2,876,789 bytes with the package SHA-256, "installed over 0.2.2; starting it",
+  then "0.2.3 is the newest". The installed exe matches the release SHA-256;
+  `dhd.exe.old` and the update work folder are removed. `dhd.ini` and the
+  synthetic `saves/card1/save.bin` remain byte-identical. Test/server processes
+  were stopped by PID; both temporary test folders were deleted.
+
+`build/release/latest.json`:
+
+```json
+{
+ "name": "Downhill Revived",
+ "version": "0.2.3",
+ "url": "https://github.com/skuza-oss/downhill-revived/releases/download/v0.2.3/DownhillRevived-0.2.3-win.zip",
+ "sha256": "8ad7d7fee60592dd1039bfdddf26b8ad3a47811f27b807d3e84b1a51e862b752",
+ "size": 2876789,
+ "page": "https://github.com/skuza-oss/downhill-revived/releases/tag/v0.2.3"
+}
+```
+
+Local proof: `build/port/release023/` holds the build/link, gate, scan, icon,
+packaging, smoke and updater logs and JSON results. These and all game-derived
+artifacts stay ignored. The zip and manifest were published afterwards as release v0.2.3.
+
 ## Open
 
 - A save writes `saves\card1` on demand; the first run above made none.

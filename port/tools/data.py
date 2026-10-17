@@ -208,6 +208,38 @@ for _index, _position, _matrix in (
 # player views got height 2160 and the top row's draws missed the screen (finding 041).
 NUMBERS = {0x27ECC0 + _index * 0xC0 + _offset for _index in range(12) for _offset in (4, 0xC)}
 
+# D_0027D300: 77 particle scale records, 0x50 bytes each (0022C468).
+# +0x18 packs two timing halfwords, not a pointer. Relocating e.g. 0x00780000
+# to 0x08780000 changes duration 120 to 2168; the pickup's flare then stays
+# bright instead of decaying before it is drawn (finding 061).
+NUMBERS.update(0x27D300 + _index * 0x50 + 0x18 for _index in range(77))
+
+# Round 46 audit (finding 062): these SDK blocks are copied MIPS instructions,
+# not pointers, including aligned AND/MULT words which splat names D_<address>.
+# Keep the intervening syscall descriptor tables (native function pointers).
+INSTRUCTION_WORDS = set()
+for _start, _end in ((0x282230, 0x2829D8), (0x2829F8, 0x283160),
+                     (0x2831A0, 0x283518)):
+    INSTRUCTION_WORDS.update(range(_start, _end, 4))
+NUMBERS.update(INSTRUCTION_WORDS)
+
+# InitTLB's 16-byte {PageMask, EntryHi, EntryLo0, EntryLo1} records,
+# consumed by syscall 0x56 in 0025F6E0. Even the word splat named
+# func_00180000 is an EntryHi value. D_002837D0's table pointers stay pointers.
+TLB_WORDS = set(range(0x283560, 0x2837D0, 4))
+NUMBERS.update(TLB_WORDS)
+
+# Inline rider text (Japan / '?' in D_0026F9D0), a popup's retry text,
+# a NUL-separated sound-name block, and the trick-help button-glyph string.
+# Text may start mid-word or contain glyph bytes beyond printable ASCII.
+TEXT_WORDS = {0x26FA6C, 0x270130, 0x28C82C, 0x2935D0, 0x2935D4, 0x29460C}
+NUMBERS.update(TEXT_WORDS)
+
+# inflate's cplext (D_002994F8): 32 unsigned-short extra-bit counts,
+# including trailing invalid-code sentinels 0,99,99,0; 00240CB8 reads e[*p-s].
+INFLATE_EXTRA_WORDS = set(range(0x2994F8, 0x299538, 4))
+NUMBERS.update(INFLATE_EXTRA_WORDS)
+
 
 NUMBER = re.compile(r'0x[0-9A-Fa-f]+|\d+')
 
