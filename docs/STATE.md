@@ -1467,6 +1467,72 @@ until captured and reviewed. Live jobs/evidence are local under build/port/r48sw
 finding 063 for intermediate build IDs, successful navigation, failed-route evidence and
 current limitations.
 
+Online forces 60; replay/ghost paths are disabled above 60. Clock/helper checks pass at
+60/61/75/90/100/120/144. Clean physics build `85229f7d` passes the default r46-plain gate (14 EE
+MATCH, 1,116 readback/Z records). Read-only diagnostic build `6a063c72` also passes (14 / 1,118) and
+exactly reproduces the 31-second rider traces. Final code `734a8cc2` additionally preserves Verlet
+prev.w; its final default r46-plain gate passes 14 EE comparisons and 1,110 readback/Z records
+through field 9031. Forced crash lasts 30 fields at both rates; pickup emitter visibility is 113-116
+/ 120 fields in the short pair. Full-pedal unsteered 60 finishes at 23551 fields; 120/144 wedge and
+do not finish by 30000. Separate periodic-bail fixture finishes at 24087 / 24683 fields (60 / 144,
++2.474%). Early 144 speed ratio is 1.01323, maximum path separation 7.78125 world units; AI finish
+variation and particle episode screening failures remain unresolved. Final busy-host unpaced 144
+throughput was about 104.48 real updates/s; 144 real updates/draws per game second is verified with
+the virtual clock. See finding 067 for the full fix inventory, failed acceptance evidence, private
+artifact paths and next investigations. Source/matching checks unchanged; no equivalence claim, no
+merge/push/publication.
+
+Round 52 continuation (finding 067, existing offline-unlock branch; acceptance still failed):
+contact traces identify per-update force clearing and a stable grounded wall equilibrium with no
+retail recovery timer. Preserving the force-clear window per legacy field brings dense equal-time
+five-second player speed ratios to 0.997961 / 0.999356 (120 / 144). The clean position-progress
+recovery refinement finishes at 432.733 / 402.400 seconds versus 392.517 at 60 (+10.246% / +2.518%).
+It removes indefinite grounded stalls; 120 still fails acceptance. This is an explicit human
+recovery-policy addition, not contact-equivalent physics. AI choice retries are now field-gated;
+per-rider route/finish equivalence remains unestablished. The isolated canonical 128-particle burst
+passes: initial particle records are identical at all three rates, and every lifetime cohort retires
+within one selected update of 60 (1.966667 / 1.975000 / 1.972222 seconds for the last particle).
+Exact rational update-count comparisons, not rounded timestamps, enforce this bound. Clean 07ea5e18
+passes the unchanged default r46-plain gate (14 EE MATCH, 1,159 readback/Z records through field
+9080). All nine AI finish at all rates, but routes/speeds remain divergent. Forced crash is 30
+fields. A later partial-grip conversion passed an isolated solver test but regressed 144 to 433.817
+seconds; it was rejected. Retained runtime is exactly 07ea5e18. Fresh retail SN build matches all
+eight checked sections. Sound unit checks pass; no listening/PCM equivalence or uncontended
+paced-144 result is claimed. Final clean 167fa3e2 passes the default gate again (14 EE MATCH, 1,106
+readback/Z records through field 9027). It differs from full-race-tested 07ea5e18 only in two COFF
+timestamp bytes; every loaded section is byte-identical. See finding 067 for per-fix evidence and
+remaining acceptance work.
+
+Round 52 chaos-aware measurement step complete (**equivalence acceptance FAILED**).
+Finding 067 records the full method, all-slot drift, censored finish distributions,
+provenance and limitations. Twelve common-60-prefix three-second windows cover
+three seeds and pedal/steering-prefix scripts; ten starts are supported, while
+any already-active ragdoll excludes its whole window. Snapshot comparison keeps
+raw data and canonicalizes only proven unused Euler w lanes. Observations are
+correlated and mixed signs do not prove zero bias.
+- Corrected force-window interval ownership (exact end boundaries belonged to
+  the preceding interval). Independent rational regression fails before/passes
+  after at 61/75/90/100/120/144. GO quarter-second AI drift changes
+  -1.5955% -> -0.6913% at 120; -5.3882% -> -4.5516% at 144: still biased.
+- Three-seed full-pedal player finishes: 60 [392.517, DNF>500, DNF>500],
+  120 [399.150, 411.617, 389.000], 144 [426.650, 380.267, 410.000] seconds.
+  Censoring differs, so distributions are NOT established equivalent.
+- Consumed-input steering first reproduces every 60 riding row (2,296,200
+  values). Its valid full-route result is 318.900 s at 60, DNF>500 at 120/144.
+  Earlier planned-timestamp exports remain rejected as full-route fixtures.
+- Pair relaxation remains removed; partial grip and passing floating-RNG
+  experiments are opt-in, OFF by default, not established bias fixes.
+  The grounded human watchdog remains explicit policy, provably inert at 60.
+- Final clean bba533d2 passes default r46-plain: 14 EE MATCH, 1,127 readback/Z
+  records through field 9048. Disabled-trial controls equal the measured default
+  policy in 379,800 values. Final particle probe passes; injected crash lasts
+  30 fields at all rates, but a later natural crash differs at 144. Sound HLE
+  tests pass (no PCM/listening claim). Retail check: all eight sections MATCH.
+  Morning launchers/README remain on gated167fa3e2: mixed results are not better.
+  altered gate comparisons/references, merge, push or publication. All evidence
+  stays private. Next: isolate the residual early AI/contact bias with the new
+  matched-prefix tool; retime active-ragdoll history before using such starts.
+
 Round 49, settings persistence (finding 064; **done**): fresh release 0.2.3, first-start
 disc chooser and generated ini, no DHD tool environment. SendInput changes and EXIT
 GAME/restart confirm original audio/stereo, four control schemes and difficulty reset; all
@@ -1537,6 +1603,181 @@ on one PC run slower than real time, so later lag on this PC isn't meaningful. N
 4-PC race; check the game's own results screen against the host's order, the host leaving,
 and a kick or throw by a puppet.
 
+Round 49, CPU speed toward 144 (finding 066; validated improvements; 6.9 ms target unmet):
+- Graphics FIFO observations use acquire loads; interlocked publications and
+  sleep/wake barriers stay. Long queue stress medians 3.602 -> 2.462 s on a busy
+  shared PC; order/hash, queued VIF fuzz and negative controls pass as expected.
+- Four guarded native VU1 loops: geometry 1430 and 2DC8, particles 0E10 and
+  projected particle quads 2E48. Exact arithmetic, flag/Q timing, old-value
+  within-pair stores and raw moves retained. Default mask 4095; 255 isolates
+  the pre-existing kernels. Unsupported inputs decline before direct writes.
+- Target-call replay gains: 1430 4.5-5.2x, 2DC8 1.6-2.8x, 0E10 4.7-5.1x,
+  2E48 4.6-5.6x. Three interleaved single-thread runs; busy-PC conditions,
+  aggregate variation and rejected experiments recorded in the finding.
+- Batched raw thread-cycle medians (old/all kernels) fall 12.54%, 15.47%,
+  21.65% across three 12,000-call captures, including unchanged restore/check
+  overhead. One counter pair per batch, 50 native replays per input, AB/BA/AB.
+  This measures thread work, not live race FPS or the 6.9 ms deadline.
+- All eight retail sections MATCH, no src/ changes. Integrated sequence:
+  36,000 checks; forced variants: 19,060; independent PCSX2: 1,584 standard
+  cases plus all 1,744 real target calls (positive new-kernel coverage).
+  All pass; queue/VIF/GS/sequence/oracle negative controls fail as expected.
+- Clean queue-only e65990ca and successive kernel commits e36d1fa8,
+  8d544317, 7c996d9c pass default r46-plain renderer gate (14 EE comparisons,
+  respectively 1,116 / 1,113 / 1,131 / 1,136 matching Z reads). Four-kernel
+  clean 451bab30 also MATCHES: 14 EE / 1,090 Z reads through field 9011.
+  Final report commit will be clean-built/gated again; no reference/exclusion change.
+  heavy CPU load, with before/during/after process evidence and focused window.
+  The historical 149.8 fields/s / 12.35 ms worst 1% is not a fresh baseline.
+
+The later 0078 setup and fused setup+loop prototypes pass real/variant replay comparisons but are
+discarded: whole-thread cycle medians regress in two of three captures. No extra setup dispatch or
+default-mask change is shipped.
+
+Round 49 follow-up: audited the 1430 native signature and added its short exit
+and common GIF tail. Altering either tail to read MAC flags makes the old
+kernel differ on 255/467 inputs; the stricter guard declines and matches all
+467. Retail coverage remains active: 36,000 sequence runs, 19,060 forced
+variants, and the 1,584-case PCSX2 suite all pass. See finding 066.
+
+The tightened-signature runtime also passes all 1,744 real PCSX2 target calls with positive
+coverage; rebuilt oracle negative control fails as expected. Clean 62ad9972 default renderer gate
+MATCHES (14 EE / 1,102 Z reads through 9023). Repeated batched CPU-cycle medians fall 11.68%,
+16.10%, 21.23%. A fresh guarded race campaign excludes the earlier exploratory/overlapped runs.
+
+Baseline fields/s 153.410 / 152.231 -> optimized 172.718 / 158.455; worst 1% 12.238 / 12.141 ms ->
+10.283 / 10.925 ms. Both whole-window averages exceed 144, but start windows remain below 144 and
+the 6.9 ms tail deadline is unmet. All accepted runs (including a late-window regression) remain
+reported. A single exploratory VU0 AOT sample is neutral; its default stays off. Final report
+revision requires its own clean build and unchanged r46-plain gate; the final artifact manifest and
+handoff carry its exact commit/result. No merge or push. Further unproven prototypes are not
+retained.
+
+GS follow-up to round 49 (finding 066): GS sampling showed queue consumers
+mostly polling PAUSE; retain the spin policy without a valid latency comparison.
+GS GIF staging is 7-12% of samples. Gather complete qwords when non-aliased and
+no partial is pending; preserve callback have=4/storage and all scalar tails.
+Single-thread GS-model replay raw CPU cycles fall 7.18-14.04% across six real
+captures, three interleaved runs; a second replication series falls 8.32-10.67%.
+18,000 synthetic packet comparisons, 48 aliases, five empty/invalid cases, and
+1,174,599 real captured qwords match complete state and ordered callback bytes.
+Both staging and callback-state negative controls fail. Updated GS suite
+passes 3,000 / 6,657,394 pixel fuzz; pixel negative control fails as expected.
+Live B/F figures above predate this addition; no new live FPS claim.
+Clean d246fd05 before this addition MATCHES 14 EE / 1,109 Z reads through
+9030. The final source revision requires a new clean build/default gate.
+
+Post-GS integration: split FIFO/provenance/fences and VIF tests pass again; 200,000 / 16,140,614
+UNPACK vectors have zero differences. All eight retail sections MATCH. Final GS source commit is
+clean-built/gated for handoff.
+
+Round 51 continuation (finding 066): clean 060383e5 gate MATCHES 14 EE / 1,101 Z reads; the VU0-AOT
+arm independently MATCHES 14 EE / 1,108 Z reads. Fresh AOT differential: 3,432 cases; PCSX2: 936
+interpreted and 936 AOT cases, zero differences. AOT remains opt-in pending a valid live benefit.
+The three hottest VU0 entries 0000/02E0/05E8 now have whole-entry native kernels, guarded by
+complete disc-loaded signatures on every call. Three million raw-bit CPU/data cases, 274
+mutated-word guards and 792 PCSX2 cases match; all three separate result-corruption controls fail.
+Single-thread median batch cycles versus AOT improve 3.32x / 5.00x / 4.59x. These are shared-PC
+replay gains, not new live FPS. Final integrated clean build/gate follows. Slow-field analysis
+retains every accepted outlier: the crowded start dominates the worst percent; 6285/9004 recur, and
+no single modulo-eight phase explains the tail. Cause attribution beyond the measured waits remains
+unproved.
+
+Round 51 VU0 extension: 07B8 squared-length and 0808 direction-transform entries also use
+whole-program native kernels (2.02x / 1.94x fewer batch cycles than AOT). Integrated five-kernel
+proof: five million raw-bit CPU/data cases, 304 changed-word guards, 1,320 PCSX2 cases with positive
+execution, all MATCH; all five result-corruption controls fail immediately. Full clean build and
+default renderer gate are the remaining integration checks. See finding 066.
+
+Round 51 integration done: clean 73ec1bb6 (3,797 fresh units, zero errors) passes default r46-plain,
+14 EE / 1,118 Z reads through 9039, with positive execution of all five VU0 kernels. The actual
+clean runtime object, with disc-loaded guards, repeats 3.21x / 5.36x / 5.41x / 2.05x / 2.10x lower
+per-entry replay cycles than AOT. Current VU1 36,000-call replay and 1,584-case PCSX2 suite,
+split/VIF tests and all eight retail sections MATCH. VU0 AOT remains opt-in. Combined CPU+FPS test
+build follows on a throwaway branch; its artifact README records its exact source and gate.
+
+2026-10-18 round-52 launch-isolation step complete (finding 067), acceptance still FAILED.
+Per-update countdown/GO controller, crank and solver traces identify reaction-interval quantization,
+thresholded pedal kicks and a straddling force-window defect; no isolated correction meets the
+target. The held-cap three-seed AI means are 313.346914 / 325.804321 / 325.333951 s at 60/120/144
+(27 finishes each). Cap/overlap experiments are OFF by default. Validated steering 60 replay matches
+2,296,200 values; higher-rate full-route steering is explicitly censored, with supported short
+windows recorded. Final clean b8a1641b passes default r46-plain (14 EE and 1,152 readback/Z records
+MATCH) and complete cold countdown/GO trace coverage. Morning launchers remain on clean167fa3e2.
+Next: actual collision-time force clears / rollback in 00131998, distinguishing committed and
+tentative integration before another proposed gameplay fix.
+
+Offline input-edge continuation complete (finding 067): the popup cache used whole-field timestamps
+and retained one pressed mask for two/three high-rate updates. Its port-only stamp now uses the real
+game frame; input/vibration/ action-lock timers keep legacy field units. 60 remains on the original
+clock. Windows SendInput and SDL integration suites pass at 60/120/144: 60 cursor presses each move
+once, all 18 punch taps each start one attack, confirms consume once, held buttons/sticks have no
+neutral holes, keyboard ramp reaches full lock. DHD_NAV Down/Up each consume once at all rates.
+Ten-second SDL menu holds preserve the original single move (before 60 and after 144). Clean
+43b5c068 passes default r46-plain: 14 EE comparisons and 1,143 readback/Z records MATCH through GS
+field 9064. FPS morning launchers point at this clean executable. This completes input acceptance
+only; existing high-rate physics-equivalence failures remain open. Combined test integration is
+merge-only and recorded in its private build/launcher evidence; no main merge, push or publication.
+
+Current EE samples and a fresh guarded baseline identify generic inline-asm dispatch and VU/GS
+pipeline work as remaining priorities. The baseline is 176.413 updates/s, worst-1% 10.474 ms; this
+is one exploratory run, not a new campaign median. A matrix-template prototype uses 77.75% fewer
+thread cycles (4.49x throughput); disabled VU0 timing removal also benefits short native entries.
+Shared-PC microbenchmarks are explicitly noisy and are not converted to FPS claims. The combined
+local prototype passes unchanged r46-plain: 14 EE and 1,147 readback/Z records MATCH. The existing
+PS2 image recheck MATCHES all eight sections; src/ and all production files are unchanged. A
+ten-minute guarded campaign obtained no quiet prototype timing slot, so no fresh frame A/B or
+steady-144 claim is made. Finding 069 ranks five opportunities with estimates, risks and effort,
+records rejected work, and identifies the remaining proof steps. This review does not change the
+open high-rate physics acceptance work.
+
+Win 4 (conditional VU0 timing) passes five million full-state raw-bit cases, 304 instruction guards,
+1,320 PCSX2 cases and five failing corruption controls. Stats-on coverage also matches. The
+unchanged r46-plain gate MATCHES 14 EE / 1,139 readbacks through field 9060. Guarded
+production-object timing is queued; final retention requires measured benefit. Next: measured
+inline-asm call census and specialization, then adaptive waits, lane-aware VU1 clamps, GS frontend.
+Final clean builds/race A/B, combined-tip merge and morning launchers are still outstanding.
+
+2026-10-18 revised user instruction cancels all performance timing. The owned controller is stopped.
+Win 1 specialization passes 1.4 million full-state cases, 448 callback cases and seven failing
+negative controls. Win 3 adaptive consumer waits passes exact full GS/VRAM/callback replay and
+corruption controls for both policies, plus VIF differential tests. CPU gains and wake latency are
+unmeasured. Finding 069 supersedes the earlier measured-benefit retention requirement. Next: VU1
+clamps, GS frontend, combined-tip merge, final clean build/gate/launchers.
+
+Finding 069 win 2 completed: four proven all-lane ACC clamps removed, compiler barriers retained.
+All 36,000 real full-state/GIF replays MATCH; the corrupted implementation fails 748/2,000 cases. No
+timings or extra oracle rounds.
+
+Finding 069 win 5 completed: raw-register-keyed exact-GS metadata cache. Decoder and ordered
+primitive replay/full GS+VRAM checks MATCH; corruption control fails. All five changes are included,
+with no final timing claims. Final combined-tip merge, one clean build, one unchanged r46-plain gate
+and launchers follow.
+
+Adaptive offline timing continuation in progress (finding 067): clean runtime 04d7bc06 builds all
+3,797 units with zero errors, ordinary flags, no recomp basis and 23 existing SDK stubs. High-rate
+paced steps follow filtered elapsed wall time, bounded by the selected interval and 1/60 second; the
+60/online clock paths stay original. Clock/Verlet and regular/variable-step input regressions pass;
+the fixed-step negative control fails the new wall-time assertion. Baseline full-AI races and a
+verified-PID forced-frame control are recorded. Final 120 all-AI race passes the clock target:
+opening 0.794817 -> 1.000476, whole race 0.916123 -> 1.000027 game/wall. AI GO and nine-rider mean
+finish improve in this fixture (323.598148 -> 321.374074 s). The 144/forced-after runs, final
+r46-plain gates and combined integration are pending.
+
+Finding 069 integration correction: first clean gate failed 33 canonical EE words despite matching
+exact/native arms/readbacks. Inlined ps2_asm temporaries changed host-stack residue in legacy
+quadword W slots; generic mode reproduced it. An out-of-line fast dispatcher restores the binding
+frame and early full EE MATCH. Assembly differentials/negative controls pass again. Corrected
+runtime relink reuses unchanged freshly compiled game objects; final gate must repeat.
+
+Finding 069 implementation handoff complete: all five optimizations included,
+combined tip 7b74859c merged. Accepted code 4cbe3c71 fixes the shared binding
+frame regression; full-state differentials and all corruption controls pass.
+Fresh 3,797-unit compilation and corrected runtime link succeed; unchanged
+r46-plain MATCHES all 14 EE comparisons and 1,133 Z readbacks through field
+checks are unchanged. Play-60/120/144 and README are in
+push or release. Imported high-rate AI/physics acceptance remains open (067).
+
 Round 50, keyboard text and lobby (finding 065, in progress): online name/code
 fields accept layout-translated WM_CHAR typing, Backspace, Enter, Esc and
 validated clipboard paste while suppressing keyboard pad mappings during entry.
@@ -1592,3 +1833,51 @@ through GS field 9,008, failures empty. Release zip + latest.json in build/relea
 scan clean and icon present. Extracted-zip physical-key smoke, music preference EXIT
 GAME/restart, typed join code, two-instance local online selection/READY/race and real 0.2.3
 -> 0.2.4 updater preservation checks PASS. Test temp folders deleted; only own PIDs stopped.
+Round 51, sweep fixes (finding 068; complete, branch fix/sweep-visuals): loading-card root isolated
+in a field-1 exact GS history. PSMT4HL font uploads change only alpha, but native invalidated whole
+colour pages and imported stale CPU RGB. Masked GPU alpha uploads now preserve RGB, the other nibble
+and untouched pixels. Identical-stream baseline/ordering-only/after replay isolates this cause;
+PCSX2 replay and independent retail show the complete card. All 41 fresh before/ after boot fields
+reviewed; native now keeps it. Thirteen synthetic GPU pixel checks pass; all eight matching-source
+retail sections MATCH. Clean b34e28c0: 3,797 units, zero errors, successful link. Fog Editor, dense
+Japan transition, final unchanged r46-plain gate and launcher are complete; details follow.
+
+Round 51 continuation: Fog Editor grey-fill candidate cleared. Fresh retail, native, exact and PCSX2
+GS replay agree across all five sliders, including a Right input on RED. Matching 00167370 calls
+00191078, whose explicit neutral RGB 90 -> 150 Gouraud bar matches the traced GS vertices. No colour
+change is made. See finding 068 for the source, packet and picture proof paths.
+
+Round 51 Japan visual acceptance: 301 consecutive fields per exact/baseline native/corrected native
+arm, selected track 12 read without writes. The PSMT4HL font upload at 6408 precisely triggers the
+baseline's Italy mosaic. The same alpha preservation fix keeps Japan's card; identical-stream
+before/after native, PCSX2 replay and dense independent retail confirm it. Retail's relevant
+539-field window is complete; 34 earlier uncaptured reset fields are explicitly excluded from
+coverage, without changing the strict helper. No extra runtime change. All three requested
+candidates now have outcomes.
+
+Round 51 final acceptance: unchanged r46-plain renderer gate MATCH, 14 EE comparisons and 1,114
+identical readbacks/Z reads through GS field 9,035; failures empty. Both final captures are field
+7,715. Native scale 2 is used, without widescreen in either gate arm. No reference, exclusion or
+checker change. All eight retail ELF sections MATCH; 13 synthetic pixel cases PASS.
+
+0.2.5 code cleanup (branch cleanup/0.2.5 over 99d04692; behaviour unchanged): the frame-rate,
+CPU-speed, performance-review and loading-screen work is kept; rejected trials (grip, pedal cap, AI
+jitter, force overlap), investigation probes/traces (particle probe, launch and solver traces,
+DHD_INPUT_TRACE, DHD_RACE_PAD_RECORD), statistics counters, stop-at-finish helpers, the
+DHD_TEST_SDL_PAD virtual pad and the one-off measurement scripts are removed (still in git history
+at 99d04692). Kept check for the high-rate path: `port/tools/test_fps_race.py` (seed 81257, unpaced
+DHD_FPS=144, DHD_FPS_TRACE rider state and step rows compared to a reference run). Kept diagnostic
+switches: DHD_ASM_GENERIC (ps2asm_fast.h), DHD_VU0_STATS, DHD_VU_INTERPRETER, DHD_VU0_NATIVE
+(vu0_interp.c), DHD_FIFO_ADAPTIVE (graphics_queue.c), DHD_FPS_TRACE/DHD_FPS_STOP (fps.c).
+
+Release 0.2.5 prepared, not published (2026-10-18, finding 053 section 11): R 18abe6f0, includes
+findings 066-069 and the recorded code cleanup. Plain clean build: 3,797 units, zero errors,
+successful link, no recompilation basis. Unchanged default r46-plain gate MATCH: 14 EE comparisons,
+1,151 matching readbacks/Z reads through GS field 9,072, failures empty. Zip and latest.json in
+build/release; retail scan clean, icon present, archived exe equals clean R. Extracted-zip
+first-start chooser/title/menus/race, music preference EXIT GAME/ restart and physical room-code
+typing PASS. Ini-selected 144 race runs; this smoke does not resolve finding 067's high-rate
+AI/physics-equivalence limits. Two-instance local-only Wrangler MIN_VERSION:0.2.4 online race PASS;
+reciprocal rider views and snapshot exchange confirmed. Downloaded published 0.2.4 -> local real
+0.2.5 updater PASS; dhd.ini/save byte-identical, installed exe equals R. Docs-only preparation
+commit; no push, release, deployment or server/site changes.

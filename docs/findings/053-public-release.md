@@ -456,6 +456,101 @@ No product changes were needed for these harness issues.
 Stopped only recorded task-owned game/server/helper PIDs. Deleted all three smoke, online
 guest and updater temporary folders. No third-party implementation copied.
 
+## 11. Release 0.2.5
+
+Prepared 2026-10-18; **not published**. Release revision **R =
+18abe6f00f7243d0ebe67d188809b7a4c39fc580** (`18abe6f0`), `Version 0.2.5`. Includes the CPU speed
+work (066), offline 120/144 FPS with input and adaptive clock fixes (067; online stays at 60), all
+five performance optimizations (069), loading-card/Japan mosaic fixes (068), and the code cleanup
+recorded in STATE.
+
+- Plain clean build: `python port/tools/build_clean.py`, with HEAD exactly R.
+  All 3,797 units compile, zero errors (62 s); link exit 0 (206 s), 23 existing
+  SDK stubs, no remaining undefined symbols. Ordinary flags, VU1 AOT enabled,
+  no recompilation basis or uncommitted checkout source.
+- Executable: `build/port/clean/18abe6f0/dhd.exe`, SHA-256
+  `d310080b2e437249ce85c8739493ca83d38f2376c34644b0c0b44be22aa2da39`.
+- Unchanged default gate: `python port/tools/gate_native_renderer.py --exe
+  build/port/clean/18abe6f0/dhd.exe --out build/port/release025/gate`, with
+  `DHD_ISO` referencing the player's own disc. **NATIVE RENDERER GAME-STATE
+  GATE MATCH**, result PASS, failures empty. All 14 EE comparisons match:
+  both arms against r46-plain at GO+0/+2/+12/+16, and all six paired moments
+  through GO+4,500. Both final capture fields 7,715; **1,151 readback records /
+  Z reads MATCH through virtual GS field 9,072**. Native rendering exercised.
+  No extra gate options, reference/checker/exclusion changes or word waivers.
+- Package: `python port/tools/package_release.py --exe
+  build/port/clean/18abe6f0/dhd.exe`. `build/release/DownhillRevived-0.2.5-win.zip`,
+  **2,910,390 bytes**, SHA-256
+  `26c93b4cc354ce1940ac9d080b3cff38edef1a1ff5251f3ec88a58d2ecb75683`.
+  Packaging checks pass; the four-file archive's executable equals R byte for
+  byte. `scan_retail.py`: 14 runs of 64+ bytes (3,423 bytes total), all SOURCE,
+  zero disallowed runs. `llvm-readobj --coff-resources`: ICON 1-7 and
+  GROUP_ICON 1 present.
+- Player smoke: extracted the actual zip into a new temporary folder, no ini
+  initially. Cleared inherited `DHD_*`/`ROUND_*`; supplied only
+  `DHD_WINDOW=windowed` and `DHD_LOG=1`. Selected the local disc through the
+  actual first-start message and file chooser; the game wrote `dhd.ini`.
+  Startup movies, title/main menu, retail rider/shop/track screens, countdown
+  and a running ten-rider Single Event race on Mt. Midoule Italy FR work with
+  physical SendInput keys. AUDIO / OTHER music raw 512 -> 312, accepted,
+  EXIT GAME/restart: raw 312 restored and the actual page shows 30. No manual
+  career save. ONLINE > Join With A Code accepts physically typed lowercase
+  `xsaqz2`, displayed as `XSAQZ2`; Esc cancels. Read-only process memory
+  verifies menu/clock/preference/text values; no game RAM writes.
+- High-rate smoke: before that restart, set `fps = 144` in the extracted
+  copy's ini, without a `DHD_FPS` environment override. Startup logs requested
+  144 real offline steps/s (online: 60). The retail selection flow reaches
+  countdown and a running race, phase 3, clock 659, HUD 00:10. This is a quick
+  launch/playability check, not a benchmark or high-rate equivalence proof.
+  Finding 067's unmet high-rate AI nonregression and physics-equivalence
+  requirements remain open; this check does not supersede them.
+- Online quick check: two instances of the extracted packaged executable,
+  `online_race.py --seconds 20 --capture g+20,g+600`, local Wrangler 4.151.0
+  `dev --local` on loopback with command-line `MIN_VERSION:0.2.4` override.
+  Health confirms that minimum; both Durable Objects are local. Scripted host
+  Kalolo and guest Drud join the same room and run Alpine. Reciprocal GO+20
+  captures show each other's rider beside the local player. Both exchange
+  snapshots, log `online grid kept (no random start swap)`, and reach GO+600
+  at field 2,327, clock 601, phase 3 (HUD 00:09), visibly riding the course.
+  Both request 60 steps/s. Tool exits 0; the 20-second window intentionally
+  does not wait for race results. This is a quick local check, not a multi-PC
+  latency/performance or full-race test.
+- Real updater: downloaded the original published
+  [0.2.4 release zip](https://github.com/skuza-oss/downhill-revived/releases/tag/v0.2.4)
+  anew, verified its SHA-256 against section 10, and extracted it separately.
+  `auto_update = on`, local latest.json and the real new zip served by a
+  loopback Python HTTP server. Logs: `0.2.5 is available (this is 0.2.4)`,
+  downloaded 2,910,390 bytes with the package SHA-256, `installed over 0.2.4;
+  starting it`, then `0.2.5 is the newest`. Installed executable equals R;
+  old executable and update work folder removed. `dhd.ini`, including valid
+  `game_options`, font/textures preferences, and synthetic
+  `saves/card1/save.bin` remain byte-identical. Updater result PASS.
+
+`build/release/latest.json`:
+
+```json
+{
+ "name": "Downhill Revived",
+ "version": "0.2.5",
+ "url": "https://github.com/skuza-oss/downhill-revived/releases/download/v0.2.5/DownhillRevived-0.2.5-win.zip",
+ "sha256": "26c93b4cc354ce1940ac9d080b3cff38edef1a1ff5251f3ec88a58d2ecb75683",
+ "size": 2910390,
+ "page": "https://github.com/skuza-oss/downhill-revived/releases/tag/v0.2.5"
+}
+```
+
+Evidence and harnesses: `build/port/release025/` holds build/link logs, gate method/result,
+packaging, retail scan, icon resources, player/online captures and logs, and smoke/online/updater
+result JSON. All stay ignored. The Computer Use native pipe returned unavailable twice, so live
+checks reused section 10's local SendInput/PrintWindow approach. Windows foreground restrictions
+needed explicit focus recovery; inputs during shop/track transitions were retried on the observed
+settled screen. These were harness issues, with no product change. No new release failure was found;
+the existing high-rate limits above remain.
+
+Stopped only task-owned game/server/helper processes by PID. No stash, FPS benchmark, push, GitHub
+release, deployment, server/site change, game-data/capture commit or publication. No third-party
+implementation copied.
+
 ## Open
 
 - A save writes `saves\card1` on demand; the first run above made none.
