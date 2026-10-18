@@ -1881,3 +1881,10 @@ AI/physics-equivalence limits. Two-instance local-only Wrangler MIN_VERSION:0.2.
 reciprocal rider views and snapshot exchange confirmed. Downloaded published 0.2.4 -> local real
 0.2.5 updater PASS; dhd.ini/save byte-identical, installed exe equals R. Docs-only preparation
 commit; no push, release, deployment or server/site changes.
+
+Online lobby navigation repair (2026-10-18, finding 065): online modals restore
+view/camera/projection, picker completion/cancellation uses stock title cleanup, and
+leaving/disconnecting clears selection requests and restores offline menu setup/cursor. Targeted
+shell/host compilation passed. Live navigation smoke was unavailable (local harness input did not
+advance the memory-card screen); no renderer/exactness work requested. Clean build and executable
+are in the task handoff and build/port/clean manifest. 
