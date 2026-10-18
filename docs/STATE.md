@@ -1888,3 +1888,12 @@ leaving/disconnecting clears selection requests and restores offline menu setup/
 shell/host compilation passed. Live navigation smoke was unavailable (local harness input did not
 advance the memory-card screen); no renderer/exactness work requested. Clean build and executable
 are in the task handoff and build/port/clean manifest. 
+
+Level-start repairs (2026-10-18, finding 072): host/guest flyby input uses the controller after
+online setup; only phases 2..4 count as GO. Accepted retail restart/level actions replace phase-drop
+inference; guest following clears on acceptance/initialization and has a 30-second/1,800-field
+give-up. Results use actual menus/rows, including early phase-2 results. Two-client normal start,
+pause/results TRY AGAIN/RE-START/NEW LEVEL, same/changed track and countdown restart PASS; offline
+physical skip PASS. Goggles and pre-load level chooser now keep 4:3 proportions in widescreen; final
+native 60-fps gate MATCH, all 14 EE checks and 1,123 readbacks/Z reads through GS field 9,044. No
+push/release. 
