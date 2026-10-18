@@ -20,7 +20,7 @@ void gs_window_apply(void);           /* port/gs/present.c */
 void gs_present_options_apply(void);
 int texpack_available(void);          /* port/gs/texpack.c */
 
-enum { ROWS = 10 };
+enum { ROWS = 11 };
 
 typedef struct { const char *text, *value; } Choice;
 typedef struct {
@@ -41,6 +41,7 @@ static const Choice filters[] = {{"Smooth", "linear"}, {"Sharp", "point"}};
 static const Choice switches[] = {{"OFF", "0"}, {"ON", "1"}};
 static const Choice toggles[] = {{"OFF", "off"}, {"ON", "on"}};
 static const Choice fonts[] = {{"Original", "original"}, {"Sharp", "sharp"}};
+static const Choice rates[] = {{"60", "60"}, {"120", "120"}, {"144", "144"}, {"Monitor", "monitor"}};
 
 #define CHOICES(c) c, (int)(sizeof c / sizeof *c)
 enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT };
@@ -55,6 +56,7 @@ static Row rows[ROWS] = {
     {"Vibration:", "vibration", "DHD_VIBRATION", "1", CHOICES(switches), 1},
     {"Texture Pack:", "textures", "DHD_TEXTURES", "on", CHOICES(toggles), 0},  /* port/gs/texpack.c */
     {"Font:", "font", "DHD_FONT", "sharp", CHOICES(fonts), 0},  /* port/gs/font_sharp.c */
+    {"Frame Rate:", "fps", "DHD_FPS", "60", CHOICES(rates), 0},
 };
 
 static MenuPage page;

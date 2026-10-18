@@ -27,6 +27,8 @@ void func_0018E098(struct Race *r){(void)r;}
 void func_001F8AC8(struct Race *r){(void)r;}
 void func_0018DCE8(struct Race *r){(void)r;}
 void func_0018E1C0(struct Race *r){(void)r;}
+int port_online_guest_track(void){return 0;}
+void func_001F8A08(void *r){(void)r;}
 int main(void){
  struct Race r={0}; _mm_setcsr((_mm_getcsr()&~0x680u)&~63u);
  r.x508=1;func_001F8920(&r);assert(complete==1 && r.x4A8==5);

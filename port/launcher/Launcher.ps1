@@ -88,7 +88,7 @@ function Save-Settings {
     $settings['iso'] = $iso.Text.Trim()
     $settings['renderer'] = 'native'  # the exact renderer is for developers: DHD_RENDER=exact
     $settings['scale'] = Get-Choice $scale
-    $settings.Remove('fps')  # the game's own 60 pictures a second; older launchers wrote 120/144/monitor
+    # Preserve the offline real-step rate selected in PC SETTINGS (finding 067).
     $settings['window'] = Get-Choice $window
     $settings['width'] = $wh[0]; $settings['height'] = $wh[1]
     $settings['DHD_ASPECT'] = Get-Choice $aspect

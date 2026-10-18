@@ -10,6 +10,7 @@
 #include "../gs/gs.h"
 #include "../gs/present.h"
 #include "timer.h"
+#include "../include/fps.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -758,7 +759,7 @@ static void pace(void)
 {
     double base = pace_base;
     static uint64_t fields;
-    const double period = 1001.0 / 60000.0;
+    const double period = port_frame_period();
     double now = host_wall_seconds(), due = base + (double)++fields * period;
     if (!base || (!pace_shared && now > due + 2 * period)) {  /* the first field, or behind: start again from now */
         pace_base = now, fields = 0;
@@ -790,7 +791,7 @@ static void pace(void)
    virtual). Off with DHD_INTERP and in online races (pace()). The idea is RetroArch's frame
    delay and NVIDIA Reflex's just-in-time frame start. */
 #define WORK_SAMPLES 300
-#define FIELD_SECONDS (1001.0 / 60000.0)
+#define FIELD_SECONDS port_frame_period()
 static int jit = -1;
 static double jit_due, frame_began;           /* the next picture's due; when this frame's pad was read */
 static double handed_due, handed_began;       /* the same for the picture being handed on now */
@@ -919,12 +920,16 @@ void pacing_present(double due, double began)
 static void vsync(void)
 {
     frame_profile_mark(0);
+    /* The original online clock accounts for this time. Do not charge it
+       again if the player returns to an offline high-rate menu/race. */
+    if (pads_online()) port_fps_wall_mode(paced);
     int fresh = paced && jit_on();
     if (paced && !fresh) pace();
     handed_due = fresh ? jit_due : 0;
     handed_began = frame_began;
     frame_profile_mark(1);
     ++kernel_vsync_count;
+    port_fps_observe();  /* DHD_FPS_TRACE */
     /* Presentation and the VBLANK handler consume completed graphics state. */
     graphics_wait();
     frame_profile_mark(2);
@@ -938,7 +943,17 @@ static void vsync(void)
     pad_vsync();  /* padman updates the controllers once a frame */
     if (!fresh) frame_began = host_wall_seconds();
     host_widescreen_vsync();
-    sound_tick(); /* 989snd renders one frame of audio (finding 022) */
+    /* Mixer/SPU time stays at the NTSC field rate, independently of real
+       offline simulation frames. Preserve the exact original call at 60. */
+    if (!port_fps_high()) sound_tick();
+    else {
+        static double audio_time;
+        audio_time += (double)port_step()/60.0;
+        while (audio_time >= 1001.0/60000.0) {
+            audio_time -= 1001.0/60000.0;
+            sound_tick();
+        }
+    }
     intc_raise(INTC_VBLANK_START);
     run_handlers(intc_handlers, intc_enabled, INTC_VBLANK_START);
     frame_profile_mark(3);
@@ -967,9 +982,10 @@ static int deliver(void)
     in_interrupt--;
     load_registers(&rpc_saved);
     if (now >= next_vsync) {
-        next_vsync += VSYNC_CYCLES;
+        uint64_t cycles = port_fps_high() ? (uint64_t)(BUS_HZ / port_fps()) : VSYNC_CYCLES;
+        next_vsync += cycles;
         if (next_vsync < now)  /* fell far behind (a debugger stop): don't replay the frames */
-            next_vsync = now + VSYNC_CYCLES;
+            next_vsync = now + cycles;
         vsync();
         any = 1;
     }
@@ -1115,6 +1131,7 @@ void kernel_init(void)
     const int unpaced = frame_clock && !strcmp(frame_clock, "1"), wall = pacing && !strcmp(pacing, "wall");
     ee_frame_clock_reset(unpaced || !wall);
     paced = !unpaced && !wall;
+    port_fps_wall_mode(paced);
     host_init();
     gs_reset(&gs);
     ps2_mmio_write = dma_mmio_write;

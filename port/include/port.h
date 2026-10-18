@@ -1,6 +1,7 @@
 /* Included first in every unit of the PC build (port/tools/transform.py adds it). */
 #ifndef PORT_H
 #define PORT_H
+#include "fps.h"
 
 /* SN EE long long is a 128-bit integer, unlike the host long long. */
 typedef int ps2_int128 __attribute__((mode(TI)));

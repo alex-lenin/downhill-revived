@@ -33,6 +33,7 @@
      W          R3        sprint
      F          L3        powerslide */
 #include "hle.h"
+#include "../include/fps.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -65,7 +66,7 @@ static const Key keys[] = {
 enum { KEYS = sizeof keys / sizeof *keys };
 
 #define RAMP_SECONDS 0.1
-#define FIELD_SECONDS (1.0 / 60)
+#define FIELD_SECONDS (port_fps_high() ? port_frame_period() : 1.0 / 60)
 
 static struct {
     int8_t held[KEYS];      /* 0 up, 1 down as in menus, 2 down as while riding */

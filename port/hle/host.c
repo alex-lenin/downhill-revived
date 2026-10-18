@@ -914,13 +914,11 @@ static void apply_setting(const char *key, const char *value)
         {"texture_pack", "DHD_TEXTURE_PACK"}, {"textures", "DHD_TEXTURES"},  /* texture packs (port/gs/texpack.c) */
         {"texture_cache_mb", "DHD_TEXTURE_CACHE_MB"},
         {"font", "DHD_FONT"},  /* the sharp font (port/gs/font_sharp.c) */
+        {"fps", "DHD_FPS"},
     };
     if (!_strnicmp(key, "DHD_", 4)) { setting(key, value); return; }
     if (!_stricmp(key, "renderer")) { setting("DHD_RENDER", _stricmp(value, "native") ? "exact" : "native"); return; }
-    /* fps (older launchers: 120, 144, monitor) is ignored: the game shows its own 60 pictures a
-       second. The interpolated in-between pictures (DHD_INTERP, finding 038) made ground and
-       trees shimmer while the camera moved; they stay an experiment behind the variable. */
-    if (!_stricmp(key, "fps")) return;
+    /* fps selects real offline simulation steps (finding 067). */
     for (unsigned i = 0; i < sizeof plain / sizeof *plain; i++)
         if (!_stricmp(key, plain[i].key)) { setting(plain[i].name, value); return; }
     hle_log("settings: unknown key %s\n", key);
@@ -1057,6 +1055,9 @@ static const char settings_template[] =
     "widescreen = 1\n"
     "DHD_ASPECT = wide\n"
     "skip_movies = 0\n"
+    "; Offline real simulation rate: 60 (original), 120, 144 or monitor (max 144).\n"
+    "; Online always uses 60. Frame rate changes apply at the next start.\n"
+    "fps = 60\n"
     "\n"
     "; Online races use the official server, wss://dhd-online.downhill-revived.workers.dev, when\n"
     "; server is empty. To use a server of your own, put its address here, for example\n"

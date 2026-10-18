@@ -8,6 +8,7 @@
    sit in a multitap on port 0, slots 0-3 (DHD_PADS, 4 online; finding 040). Player i's input
    comes from online.c's pads_read: the host's controller, a script, or the online lockstep. */
 #include "hle.h"
+#include "../include/fps.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -234,4 +235,14 @@ void rpc_pad(int fno, void *send, int ssize, void *recv, int rsize)
 void rpc_pad_ext(int fno, void *send, int ssize, void *recv, int rsize)
 {
     rpc_unknown("pad (ext)", fno, send, ssize, recv, rsize);
+}
+
+/* The popup cache is about real game updates, not elapsed 60-Hz fields.
+   The main loop and modal popup loop both advance this frame counter.
+   RPC waits can deliver another VBLANK inside an update: that must not
+   erase the edge before the other consumers of this update read it. */
+int port_input_stamp(int legacy_field)
+{
+    extern unsigned int D_0029E10C;
+    return port_fps_high() ? (int)D_0029E10C : legacy_field;
 }

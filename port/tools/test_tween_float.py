@@ -25,6 +25,7 @@ static float PS2_MIN(float a,float b){return a<b?a:b;}
 static float ps2_fdiv(float a,float b){return ps2_float_div(a,b);}
 static float ps2_fmul(float a,float b){return ps2_float_mul(a,b);}
 static float ps2_fadd(float a,float b){return ps2_float_add(a,b);}
+static float port_animation_fields(float ticks){return ticks;}  /* the 60 path */
 ''' + code + r'''
 static int tick;
 extern "C" int func_00202DA8(void){return tick;}

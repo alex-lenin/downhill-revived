@@ -6,6 +6,7 @@
 #include <string.h>
 
 static uint8_t down[256];
+static int input_rate=60;
 
 static HostPad neutral(void)
 {
@@ -135,6 +136,17 @@ int main(void)
     assert(keyboard_script("1:2:space+right,4:0.5:x", 1.5, fake) && fake[' '] && fake[0x27] && !fake['X']);
     assert(keyboard_script("1:2:space+right,4:0.5:x", 4.2, fake) && !fake[' '] && fake['X']);
     assert(!keyboard_script("1:2:nokey", 1, fake));
-    puts("test_keyboard: ok");
+    keyboard_reset();
+    memset(down,0,sizeof down);down[0x27]=1;input_rate=144;
+    for (int i=0;i<16;i++) {
+        double expected=(i+1)/(144.0*.1);
+        if(expected>1) expected=1;
+        double got=steering(pad(1,i/144.0).left_x);
+        assert(got>expected-.03 && got<expected+.03);
+    }
+    puts("test_keyboard: ok (60 and 144 Hz ramps)");
     return 0;
 }
+/* Standalone keyboard tests retain the original 60-Hz input interval. */
+int port_fps_high(void) { return input_rate>60; }
+double port_frame_period(void) { return 1.0/input_rate; }

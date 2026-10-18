@@ -534,6 +534,8 @@ patches_widescreen.add(PATCHES)
 patches_exit.add(PATCHES)
 import patches_options
 patches_options.add(PATCHES)
+import patches_fps
+patches_fps.add(PATCHES)
 
 # Online's retail preview flow (finding 065). These hooks return immediately offline.
 _ONLINE_SELECT_BEGIN = r"""

@@ -1,5 +1,6 @@
 """Execute the actual proximity update when its distance output is a sentinel."""
 from pathlib import Path
+import re
 import subprocess
 import sys
 from pctarget import HOST_TARGET
@@ -11,6 +12,9 @@ def main():
     import patches
     code=(ROOT/'src/unsorted/0011EDA8.c').read_text()
     for kind,old,new in patches.PATCHES['unsorted/0011EDA8.c']:
+        if kind=='re':  # the frame-rate gate on its ambient event roll (patches_fps.py)
+            code,n=re.subn(old[0],new,code);assert n==old[1]
+            continue
         assert kind=='text' and code.count(old)==1
         code=code.replace(old,new)
     out=ROOT/'build/port/runtime/proximity-float';out.mkdir(parents=True,exist_ok=True)
@@ -20,6 +24,8 @@ def main():
 #include <stdio.h>
 #include <xmmintrin.h>
 static float ps2_fmul(float a,float b){return ps2_float_mul(a,b);}
+static int port_fps_high(void){return 0;}  /* the 60 path */
+static int port_whole_step(void){return 1;}
 '''+code+r'''
 Game D_004B25A0; State D_002AF2C0; float D_0029C168[]={3.4028234663852886e38f};
 static float distance;static int calls,found,actions;
