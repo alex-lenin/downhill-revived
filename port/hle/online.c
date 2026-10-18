@@ -39,12 +39,15 @@
 #define EE_PTR(a) ((void *)(uintptr_t)(0x08000000u + (a)))
 enum { MENU = 0x29DED8, PHASE = 0x43F348, SETUP = 0x4B25A0, LEVEL_NAME = 0x4BD4DC, TRACK_NAMES = 0x26EE50 };
 enum { LOAD_MENU = 9, FLYBY_PHASE = 5 };  /* on the race screen: 5 the flight over the track, 1 countdown, 2-4 race */
+/* Retail func_0016B5A8: the flyby (5) is not a running race. */
+static int race_running(void) { return EE32(PHASE) >= 2 && EE32(PHASE) <= 4; }
+
 /* The race screen's menus: D_0029E290 is 1 while riding, 0 in a menu; D_003F52D0.x150 the open
    menu (a host pointer), each menu's first word its row. The pause menu's rows: RESUME, OPTIONS,
    TRICK LIST, NEW LEVEL, RE-START, MUSIC PLAYLIST, QUIT; RE-START and QUIT ask first ("No,
    Return" / "Yes"), NEW LEVEL opens the level list. */
 enum { RIDING = 0x29E290, OPEN_MENU = 0x3F5420, PAUSE_MENU = 0x38BC00, RESTART_ASK = 0x388990,
-       LEVEL_LIST = 0x386680, PAUSE_NEW_LEVEL = 3, PAUSE_RESTART = 4 };
+       LEVEL_LIST = 0x386680, RESULTS_MENU = 0x386B90, PAUSE_NEW_LEVEL = 3, PAUSE_RESTART = 4 };
 
 /* ---- the pads ---- */
 
@@ -305,6 +308,8 @@ static struct {
     /* the host's next race after the results (EVENT_REMATCH): 1 TRY AGAIN, 2 NEW LEVEL on
        rematch_track; rematch_fields: fields since this PC began choosing it on its menu */
     int rematch_want, rematch_track, rematch_fields;
+    int restart_accepted;        /* a retail menu action, never inferred from a phase */
+    double rematch_at;
     double end_done_at;
     double end_held_at;
 } on;
@@ -598,8 +603,10 @@ static void receive_frames(void)
             if (sender == on.host_slot) read_results(e, n - 2);
             break;
         case EVENT_REMATCH:
-            if (sender == on.host_slot && n - 2 >= 4 && e[3] < 26) {
+            if (sender == on.host_slot && sender != on.local_slot && n - 2 >= 4 && e[3] < 26 &&
+                !on.rematch_want && !on.restart_accepted) {
                 on.rematch_want = e[2] ? 2 : 1, on.rematch_track = e[3], on.rematch_fields = 0;
+                on.rematch_at = host_wall_seconds();
                 fprintf(stderr, "online: the host chose %s (track %d)\n", e[2] ? "NEW LEVEL" : "TRY AGAIN", e[3]);
             }
             break;
@@ -808,7 +815,7 @@ int hle_online_race_end(int ticks)
    human has finished or left (or 90 s after the first finished). */
 static void finish_step(void)
 {
-    if (EE32(PHASE) < 2) return;
+    if (!race_running()) return;
     static double test_finish = -1;  /* DHD_NET_TEST_FINISH=seconds: tests, this PC's rider finishes then */
     if (test_finish < 0) test_finish = getenv("DHD_NET_TEST_FINISH") ? atof(getenv("DHD_NET_TEST_FINISH")) : 0;
     if (test_finish > 0 && RACE_CLOCK > test_finish * 60 && !FINISHED(0) && !FINISH_NOW(0)) FINISH_NOW(0) = 1;
@@ -882,8 +889,8 @@ static void state_sync(void)
     uint8_t payload[NET_FRAME_MAX - 2];
     int n, clock = RACE_CLOCK;
     receive_frames();
-    if (EE32(MENU) != LOAD_MENU) return;
-    if (EE32(PHASE) >= 2 && !on.go_sent) {  /* GO: when it was, on the server's clock */
+    if (EE32(MENU) != LOAD_MENU || on.restart_accepted) return;
+    if (race_running() && !on.go_sent) {  /* GO: when it was, on the server's clock */
         uint8_t e[10] = {EVENT_VERSION, EVENT_GO};
         on.go_server = net_server_ms() - clock * (1000 / 59.94);
         memcpy(e + 2, &on.go_server, 8);
@@ -909,7 +916,7 @@ static void state_sync(void)
             set_env("DHD_NAV", script);
         }
     }
-    if (EE32(PHASE) < 2 || clock < on.last_sent + SNAPSHOT_TICKS && clock >= on.last_sent) return;
+    if (!race_running() || clock < on.last_sent + SNAPSHOT_TICKS && clock >= on.last_sent) return;
     on.last_sent = clock - clock % SNAPSHOT_TICKS;
     for (int slot = 0; slot < hle_online_race_riders(); slot++)
         if ((n = hle_puppet_pack(slot, payload, sizeof payload)) > 0) {
@@ -965,7 +972,7 @@ int func_0020F860(int pen, const char *text);  /* text width in sixteenths */
 extern float port_fov_x;  /* widescreen.c: glyph width scale, 1 when off */
 void hle_online_names(void *rider, int view)
 {
-    if (!online_mode() || !on.started || rider != RIDER(0) || EE32(PHASE) < 2) return;
+    if (!online_mode() || !on.started || rider != RIDER(0) || !race_running()) return;
     uint8_t *pen = EE_PTR(0x4F3570), kept[0x20];
     int cx, cy, w, h, drawn = 0;
     func_0023D618(view, &cx, &cy);
@@ -1039,28 +1046,74 @@ static void rematch_reset(int track)
     on.first_finish = 0;
     on.end_held = on.end_done = 0;
     on.end_held_at = on.end_done_at = 0;
-    on.rematch_want = on.rematch_fields = 0;
+    on.rematch_want = on.rematch_fields = on.restart_accepted = 0;
+    on.rematch_at = 0;
     on.setup.track = track;
     kernel_pace_shared(0);
     hle_puppet_rematch();
 }
 
-/* A guest on the results while the host is in the room: the host chooses the next race, the
-   guest's controller waits. When the host has chosen, the guest's menu makes the same choice: X on
-   TRY AGAIN (the menu's first row), or DOWN to NEW LEVEL, X, and X on the level list (the host's
-   track goes into the setup block before it loads, pads_begin_field). 1: out is this field's pad. */
+/* Called only when retail accepts TRY AGAIN / RE-START or a level selection.
+   Announce before the loader yields; phase 1 -> 1 is a valid countdown restart.
+   The initial level selection and the flyby's skip never announce a restart. */
+void hle_online_restart(void)
+{
+    if (!online_mode() || !on.started || EE32(MENU) != LOAD_MENU || on.restart_accepted) return;
+    if (on.rematch_want == 2) {
+        RaceSetup s = {on.rematch_track, {-1, -1, -1, -1}};
+        write_setup(&s);  /* the level list has just written its own cursor's track */
+    }
+    on.restart_accepted = 1;
+    on.rematch_want = on.rematch_fields = 0;
+    on.rematch_at = 0;
+    if (on.local_slot == on.host_slot && others_here()) {
+        int track = EE32(SETUP + 0x2A0);
+        uint8_t e[4] = {EVENT_VERSION, EVENT_REMATCH, (uint8_t)(track != on.setup.track), (uint8_t)track};
+        send_event(e, sizeof e);
+        fprintf(stderr, "online: accepted %s for everyone (track %d)\n",
+                track != on.setup.track ? "NEW LEVEL" : "RE-START", track);
+    }
+}
+
+/* Retail's race initialization has actually run. A phase observation can miss
+   a same-phase restart, and GO/results flags describe the previous race. */
+void hle_online_restart_ready(void)
+{
+    if (online_mode() && on.restart_accepted) rematch_reset(EE32(SETUP + 0x2A0));
+}
+
+/* Count fields once, independently of pad reads. A stale request, a closed room,
+   or an unrecognised menu must release the controller instead of pressing forever. */
+static int rematch_step(void)
+{
+    if (!on.rematch_want) return 0;
+    if (!others_here() || ++on.rematch_fields > 1800 || host_wall_seconds() - on.rematch_at > 30) {
+        fprintf(stderr, "online: stopped following the host's stale restart request\n");
+        on.rematch_want = on.rematch_fields = 0;
+        on.rematch_at = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int menu_open(int menu);
+
+/* Results stay under the host's control. Read the real row and submenu instead
+   of repeating DOWN/X on a timer, which can drift into SAVE or QUIT after a fade. */
 static int rematch_pad(HostPad *out)
 {
-    if (on.local_slot == on.host_slot || !on.end_done || EE32(PHASE) != 3 || !others_here()) return 0;
+    static uint16_t press;
+    if (on.local_slot == on.host_slot || !on.end_done || !others_here()) return 0;
     neutral(out);
-    if (!on.rematch_want || host_wall_seconds() - on.end_done_at < 6) return 1;  /* the menu shows first */
-    int f = on.rematch_fields++ % 240;  /* again after 4 s if the race hasn't restarted */
-    if (on.rematch_want == 1) {
-        if (f < 4) out->buttons = PAD_CROSS;
-    } else if (f < 4)
-        out->buttons = PAD_DOWN;
-    else if ((f >= 20 && f < 24) || (f >= 70 && f < 74))
-        out->buttons = PAD_CROSS;
+    if (!on.rematch_want || on.restart_accepted || host_wall_seconds() - on.end_done_at < 6) return 1;
+    int f = (on.rematch_fields - 1) % 12, row = on.rematch_want == 1 ? 0 : 1;
+    if (f == 0) {
+        if (menu_open(RESULTS_MENU))
+            press = EE32(RESULTS_MENU) < row ? PAD_DOWN : EE32(RESULTS_MENU) > row ? PAD_UP : PAD_CROSS;
+        else if (menu_open(LEVEL_LIST)) press = PAD_CROSS;
+        else press = PAD_TRIANGLE;
+    }
+    if (f < 4) out->buttons = press;
     return 1;
 }
 
@@ -1076,9 +1129,9 @@ static int menu_open(int menu)
 static int follow_pad(HostPad *out)
 {
     static uint16_t press;
-    if (on.local_slot == on.host_slot || on.end_done || !on.rematch_want || !others_here()) return 0;
+    if (on.local_slot == on.host_slot || on.end_done || !on.rematch_want || on.restart_accepted || !others_here()) return 0;
     neutral(out);
-    int f = on.rematch_fields++ % 12, row = on.rematch_want == 1 ? PAUSE_RESTART : PAUSE_NEW_LEVEL;
+    int f = (on.rematch_fields - 1) % 12, row = on.rematch_want == 1 ? PAUSE_RESTART : PAUSE_NEW_LEVEL;
     if (f == 0) {
         if (EE32(RIDING)) press = PAD_START;
         else if (menu_open(PAUSE_MENU)) press = EE32(PAUSE_MENU) < row ? PAD_DOWN : EE32(PAUSE_MENU) > row ? PAD_UP : PAD_CROSS;
@@ -1098,12 +1151,10 @@ static void guest_pad(HostPad *out)
     if (EE32(PAUSE_MENU) == PAUSE_NEW_LEVEL || EE32(PAUSE_MENU) == PAUSE_RESTART) out->buttons &= ~PAD_CROSS;
 }
 
-/* The online race is over: the game left the race screen (QUIT to the title, or a quit from the
-   pause menu), or after the results the player chose TRY AGAIN or NEW LEVEL, which start another
-   race on the same screen (race phase back to the flight or the countdown). This PC leaves the
-   room and plays offline again. Before, online mode and the race's spent menu script (DHD_NAV)
-   stayed on, so the game ignored the player's controller (the title's X). The ONLINE menu starts
-   the next online race as the first did. */
+/* Leaving the race screen (QUIT), or giving up an unreachable host restart,
+   returns this PC to offline control. Restore the previous script and seed so
+   the online boot script cannot swallow title-menu input. Accepted restarts
+   stay in the room and use rematch_reset instead. */
 static int connected;
 static void race_over(void)
 {
@@ -1155,7 +1206,7 @@ void pads_begin_field(void)
         exchange_rides();
         on.setup_done = 1;
     }
-    if (!on.started && on.setup_done && EE32(MENU) == LOAD_MENU && EE32(PHASE) >= 1 && EE32(PHASE) != FLYBY_PHASE) {
+    if (!on.started && on.setup_done && EE32(MENU) == LOAD_MENU && EE32(PHASE) == 1) {
         start_together();
         on.started = 1;
     }
@@ -1166,31 +1217,8 @@ void pads_begin_field(void)
         RaceSetup s = {on.rematch_track, {-1, -1, -1, -1}};
         write_setup(&s);
     }
-    /* the race started again: after the results (TRY AGAIN, NEW LEVEL), or during it from the
-       pause menu (RE-START, NEW LEVEL; past GO, the race phase back to the countdown or the flight) */
-    if (on.started && (on.end_done || on.go_sent) && EE32(MENU) == LOAD_MENU &&
-        (EE32(PHASE) < 2 || EE32(PHASE) == FLYBY_PHASE)) {
-        int track = EE32(SETUP + 0x2A0);
-        if (on.rematch_want) {  /* this guest's menu followed the host */
-            rematch_reset(track);
-            return;
-        }
-        if (on.local_slot == on.host_slot && others_here()) {
-            uint8_t e[4] = {EVENT_VERSION, EVENT_REMATCH, (uint8_t)(track != on.setup.track), (uint8_t)track};
-            send_event(e, sizeof e);
-            fprintf(stderr, "online: %s for everyone (track %d)\n", track != on.setup.track ? "NEW LEVEL" : "TRY AGAIN",
-                    track);
-            rematch_reset(track);
-            return;
-        }
-        if (!on.end_done) {  /* alone in the room: the next race is this PC's */
-            rematch_reset(track);
-            return;
-        }
-    }
-    if (on.started && (EE32(MENU) != LOAD_MENU ||
-                       (on.end_done && (EE32(PHASE) < 2 || EE32(PHASE) == FLYBY_PHASE))))
-        race_over();
+    if (rematch_step()) { race_over(); return; }
+    if (on.started && EE32(MENU) != LOAD_MENU) race_over();
 }
 
 /* Online: the menu script, then in the race this PC's controller (DHD_NET_SCRIPTED=1, tests:
@@ -1199,7 +1227,9 @@ void pads_read(int player, HostPad *out)
 {
     if (online_mode()) {
         /* the race, and after it the results and their menu (Try Again ... Quit, race phase 0) */
-        int race = EE32(MENU) == LOAD_MENU && (on.started || (EE32(PHASE) >= 1 && EE32(PHASE) != FLYBY_PHASE));
+        /* Once setup has been exchanged, the flyby and its skip prompt belong to the
+           player too. The boot script may already be spent after an earlier race. */
+        int race = EE32(MENU) == LOAD_MENU && on.setup_done;
         if (player == 0 && race && (rematch_pad(out) || follow_pad(out))) {
         } else if (player == 0 && race && !getenv("DHD_NET_SCRIPTED")) host_pad_device(0, out), guest_pad(out);
         else if (!on.released || !host_pad_script(player, out)) neutral(out);

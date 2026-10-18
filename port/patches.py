@@ -623,3 +623,22 @@ PATCHES['unsorted/001F8920.c'] = PATCHES.get('unsorted/001F8920.c', []) + [
      '        func_0018E1C0(race);\n'
      '        if (port_online_guest_track()) func_001F8A08(race);'),
 ]
+
+# Online restart lifecycle: hooks at accepted retail actions and actual race initialization.
+# Offline these helpers return without touching EE state.
+PATCHES['unsorted/0015C990.c'] = PATCHES.get('unsorted/0015C990.c', []) + [
+    ('text', 'void func_0015C990(void) {',
+     'extern void hle_online_restart(void);\nvoid func_0015C990(void) {\n    hle_online_restart();'),
+]
+PATCHES['unsorted/0015CC90.c'] = PATCHES.get('unsorted/0015CC90.c', []) + [
+    ('text', 'void func_0015CC90(struct Obj *obj, int wanted) {',
+     'extern void hle_online_restart(void);\nvoid func_0015CC90(struct Obj *obj, int wanted) {'),
+    ('text', '        D_004B25A0.x2a0 = selected;',
+     '        D_004B25A0.x2a0 = selected;\n        hle_online_restart();\n        selected = D_004B25A0.x2a0;'),
+]
+PATCHES['unsorted/0019EA38.c'] = PATCHES.get('unsorted/0019EA38.c', []) + [
+    ('text', 'void func_0019EA38(Obj *obj,int reset,int mode) {',
+     'extern void hle_online_restart_ready(void);\nvoid func_0019EA38(Obj *obj,int reset,int mode) {'),
+    ('text', 'func_00176E40(manager->x150,0); }\n}',
+     'func_00176E40(manager->x150,0); }\n hle_online_restart_ready();\n}'),
+]
