@@ -134,6 +134,7 @@ typedef struct {
     int32_t *pair;                   /* DHD_INTERP: each segment's partner in the older field, or -1 */
     unsigned pair_capacity;
     unsigned path1;                  /* primitives VU1 drew (PATH1): 0 in a field of 2D only */
+    unsigned flat_limit;             /* loading state at handoff, never read from the render thread */
 } NativeFrame;
 
 /* Primitives that write Z buffer memory, for the exact probe answer: Z writes (zbp) and colour
@@ -1989,17 +1990,12 @@ static int native_scanout(Native *n, NativeFrame *f)
 void pacing_handed(double *due, double *began);   /* port/hle/kernel.c, just-in-time frames */
 void pacing_present(double due, double began);
 
-/* The picture's size in a w x h window: its shape (DHD_ASPECT), but 4:3 in widescreen while the
-   game shows a full-screen 2D picture made for 4:3 (NATIVE_FLAT_FIELDS fields in a row, so a
-   single field never flips it): a field VU1 drew nothing in (the memory card warning, the
-   publisher cards), or, only while the game may show a loading card (host_widescreen_loading:
-   the title screen before its 3D, a race loading), one with fewer than NATIVE_FLAT_PRIMITIVES
-   VU1 primitives (a card is about 150 triangles of tiles; the title's 3D and the flyover that
-   follow in the same states draw thousands).
-   During the race, its countdown and its results it never applies (finding 056). */
-#define NATIVE_FLAT_PRIMITIVES 1000
+/* Full-screen 2D cards keep their 4:3 shape after eight consecutive flat
+   fields. The EE supplies a state-specific limit with each queued field: the
+   goggles transition has more geometry than the later tiled card. Race, results
+   and countdown views never use a primitive-count heuristic. */
 #define NATIVE_FLAT_FIELDS 8
-int host_widescreen_loading(void);  /* port/hle/widescreen.c */
+int host_widescreen_flat_limit(void);  /* port/hle/widescreen.c */
 static void native_viewport(const Native *n, unsigned w, unsigned h, float *vw, float *vh)
 {
     float aspect = n->aspect < 0 ? (float)n->display_width / n->display_height : n->aspect;
@@ -2125,7 +2121,7 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
     }
     native_render(n, f, vertices);
     int shown = f->movie_on ? native_movie_scanout(n, f) : native_scanout(n, f);
-    int flat = !f->path1 || (f->path1 < NATIVE_FLAT_PRIMITIVES && n->wide && host_widescreen_loading());
+    int flat = !f->path1 || (n->wide && f->path1 < f->flat_limit);
     n->flat_fields = flat ? n->flat_fields + 1 : 0;
     /* The end stamp goes before Present, so the vsync wait isn't counted as GPU work. */
     if (n->trace_pictures) ID3D11DeviceContext_End(n->context, (ID3D11Asynchronous *)n->gpu_time[slot].end);
@@ -2558,6 +2554,7 @@ void gs_native_vsync(Gs *g, IDXGISwapChain *swapchain, unsigned *width, unsigned
         *width = d[5]; *height = d[6];
     } else n->stats.display_missing++;
     memcpy(f->display, packed, sizeof packed);
+    f->flat_limit = host_widescreen_flat_limit();
     f->field = ++n->field;
     if (n->texpack) texpack_field(n->field);
     f->time = host_wall_seconds();

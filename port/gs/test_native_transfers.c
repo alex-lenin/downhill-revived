@@ -13,7 +13,7 @@ double host_wall_seconds(void) { return host_seconds(); }
 void host_thread_name(const char *n) {(void)n;}
 void pacing_handed(double *d,double *b) {*d=*b=0;}
 void pacing_present(double d,double b) {(void)d;(void)b;}
-int host_widescreen_loading(void) {return 1;}
+int host_widescreen_flat_limit(void) {return 1000;}
 double host_widescreen_aspect(void) {return 16.0/9;}
 UINT gs_swap_chain_flags(void) {return 0;}
 void gs_frame_latency_wait(void) {}

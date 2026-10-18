@@ -278,13 +278,16 @@ void port_hud_text_l(int font, int view, int x, int y, const char *text)
 /* The widescreen picture's shape (width / height), 0 when off. */
 double host_widescreen_aspect(void) { return widescreen ? aspect : 0; }
 
-/* The game may be showing a full-screen loading card: at the start (the front end's screen
-   D_0029DED8 is 0, the title, whose 3D comes once the front end has loaded) or while a race loads
-   (screen 9 with its phase D_0043F348 0, loading, or 5, loaded and waiting for X, before the
-   flyover). Read by the renderer's thread, a field or two late at most. */
-int host_widescreen_loading(void)
+/* Maximum PATH1 count of a full-screen loading picture in this state, or zero
+   where a small 3D race view must never be mistaken for a card. The goggles
+   transition before a level draws 3,648 primitives; the later tiled card draws
+   144..170. The shop exit (18) already shows the goggles before screen 9.
+   The flyby and title retain the lower limit, since they also draw 3D. */
+int host_widescreen_flat_limit(void)
 {
     int menu = *(volatile int32_t *)(uintptr_t)(PS2_RAM_BASE + 0x29DED8);
     int phase = *(volatile int32_t *)(uintptr_t)(PS2_RAM_BASE + 0x43F348);
-    return menu == 0 || (menu == 9 && (phase == 0 || phase == 5));
+    if (menu == 18 || (menu == 9 && phase == 0)) return 4096;
+    if (menu == 0 || (menu == 9 && phase == 5)) return 1000;
+    return 0;
 }
