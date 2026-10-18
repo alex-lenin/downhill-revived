@@ -90,6 +90,8 @@ void ps2_vu_aot_load(const void *vutext);
 extern ps2_cpu *ps2_vu1_regs;
 extern uint64_t ps2_vu1_code_version;  /* bumped when VIF1 MPG changes VU1 micro memory */
 extern int ps2_vu1_native_mode;  /* -1: DHD_VU1_NATIVE decides; 0 or 1 forces the native kernels off or on (tests) */
+extern int ps2_vu0_native_mode;  /* same override for DHD_VU0_NATIVE */
+extern unsigned long long ps2_vu0_native_runs;
 extern void (*ps2_vu1_regs_sync)(void);
 void ps2_vu0_vu1_file(ps2_q128 file[64]);
 
@@ -101,6 +103,9 @@ typedef void (*ps2_vu_kick_trace_fn)(unsigned pc, unsigned clip, unsigned qword)
 void ps2_vu1_set_kick_trace(ps2_vu_kick_trace_fn trace);
 int ps2_vu1_run(ps2_cpu *cpu, unsigned addr, unsigned top, unsigned itop,
                 ps2_vu_kick_fn kick, void *opaque);
+/* Native-loop coverage, indexed by the dispatch kind's bit number. */
+enum { PS2_VU1_NATIVE_KINDS = 12 };
+extern unsigned long long ps2_vu1_native_runs[PS2_VU1_NATIVE_KINDS];
 
 
 /* One instruction of statically recompiled MIPS code (port/tools/recomp.py), e.g.

@@ -115,6 +115,7 @@ static void image_data(Gs *g, const uint8_t *data, unsigned bytes)
     unsigned psm = field(blt, 56, 63), bp = field(blt, 32, 0x3FFF), bw = field(blt, 48, 63);
     unsigned width = field(size, 0, 4095), height = field(size, 32, 4095), bits = gs_bits_per_pixel(psm);
     if ((g->reg[GS_TRXDIR] & 3) != 0 || !width || !height) return;
+    if (g->flush_draw) g->flush_draw(g);
     if (!g->sync_range) sync_memory(g);
     unsigned total = width * height;
     if (!g->transfer_have && g->transfer_count < total && !image_reference) {
@@ -472,8 +473,18 @@ void gs_feed(Gs *g, unsigned path, const uint32_t *words, size_t count)
     if (path < 1 || path > 3) return;
     g->source_path = path;
     GsPath *p = &g->path[path - 1];
-    for (size_t i = 0; i < count; i++) {
-        p->words[p->have++] = words[i];
+    /* Keep the word-at-a-time semantics if input aliases the path state. */
+    uintptr_t input = (uintptr_t)words, state = (uintptr_t)p;
+    int bulk = input < state ? count <= (state - input) / sizeof *words
+                             : input - state >= sizeof *p;
+    for (size_t i = 0; i < count;) {
+        if (bulk && !p->have && count - i >= 4) {
+            memcpy(p->words, words + i, sizeof p->words);
+            p->have = 4;  /* the transfer callback observes a completed qword */
+            i += 4;
+        } else {
+            p->words[p->have++] = words[i++];
+        }
         if (p->have == 4) {
             if (g->record_transfer) g->record_transfer(path, p->words);
             p->have = 0; gif_qword(g, path, p);

@@ -100,7 +100,10 @@ typedef struct {
     int reported;
     int bad; /* unparsable or not runnable here: skipped */
     int quad_reported;
+    int fast_kind; /* selected once from the complete parsed instruction sequence */
 } Prog;
+
+static int select_fast_program(const Prog *p);
 
 static int problems;
 int ps2_asm_problems(void) { return problems; }
@@ -467,7 +470,9 @@ static Prog *lookup(const char *tmpl, const char *cons, int n)
     }
     table[h].tmpl = tmpl;
     table[h].cons = cons;
-    return table[h].prog = compile(tmpl, cons, n);
+    Prog *p = table[h].prog = compile(tmpl, cons, n);
+    if (!p->bad) p->fast_kind = select_fast_program(p);
+    return p;
 }
 
 /* ---- execution ---- */
@@ -922,6 +927,8 @@ static void run(Prog *p, ps2_op *ops)
     }
 }
 
+#include "ps2asm_fast.h"
+
 int ps2_asm_check(const char *tmpl, const char *constraints, int n)
 {
     int before = problems;
@@ -964,7 +971,7 @@ void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops)
     if (p->bad)
         return; /* reported when parsed */
     asm_caller = __builtin_return_address(0);
-    run(p, ops);
+    if (!run_fast_program(p, ops)) run(p, ops);
     for (k = 0; k < p->n_ops; k++) { /* write outputs back */
         unsigned size = ops[k].size;
         if (!p->out[k])

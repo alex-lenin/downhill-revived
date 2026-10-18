@@ -109,6 +109,37 @@ static void gif(void)
     CHECK(gs_xgkick(&gs, vu, 1023) == 0 && gs.reg[GS_FOGCOL] == 0x123);
 }
 
+static const uint32_t staging_words[] = {0x8001, 1u << 28, GS_RGBAQ, 0, 0x11, 0x22, 0x33, 0x44};
+static unsigned staging_qwords;
+static void staging_transfer(unsigned path, const uint32_t *words)
+{
+    CHECK(path == 1 && words == gs.path[0].words && gs.path[0].have == 4 && gs.source_path == 1);
+    if (staging_qwords < 2) CHECK(!memcmp(words, staging_words + staging_qwords * 4, 16));
+    else CHECK(staging_qwords < 2);
+    staging_qwords++;
+}
+
+static void gif_staging(void)
+{
+    /* A transfer hook sees complete staged qwords, including across a split. */
+    for (unsigned split = 0; split <= 8; split++) {
+        gs_reset(&gs); staging_qwords = 0; gs.record_transfer = staging_transfer;
+        gs_feed(&gs, 1, staging_words, split);
+        gs_feed(&gs, 1, staging_words + split, 8 - split);
+        CHECK(staging_qwords == 2 && gs.path[0].have == 0 && gs.path[0].left == 0);
+        CHECK(gs.reg[GS_RGBAQ] == (UINT64_C(0x3F800000) << 32 | 0x44332211));
+    }
+    /* The source may be the same path's staging storage. */
+    gs_reset(&gs); staging_qwords = 0; gs.record_transfer = staging_transfer;
+    memcpy(gs.path[0].words, staging_words, 16);
+    gs_feed(&gs, 1, gs.path[0].words, 4);
+    memcpy(gs.path[0].words, staging_words + 4, 16);
+    gs_feed(&gs, 1, gs.path[0].words, 4);
+    CHECK(staging_qwords == 2 && gs.path[0].have == 0 && gs.path[0].left == 0);
+    CHECK(gs.reg[GS_RGBAQ] == (UINT64_C(0x3F800000) << 32 | 0x44332211));
+    gs.record_transfer = NULL;
+}
+
 static void palette(void)
 {
     gs_reset(&gs);
@@ -257,7 +288,7 @@ static void upload_fuzz(void)
 
 int main(void)
 {
-    swizzles(); gif(); palette(); upload_fuzz();
+    swizzles(); gif(); gif_staging(); palette(); upload_fuzz();
     uint32_t pixels[16]; unsigned w = 0, h = 0;
     gs_priv_write(&gs, GS_PMODE, 2);
     gs_priv_write(&gs, GS_DISPFB2, 1 | 1 << 9 | UINT64_C(63) << 32 | UINT64_C(31) << 43);
