@@ -12,6 +12,7 @@
 #include "gpu_win32.h"
 #include "capture.h"
 #include "../hle/hle.h"
+#include "../hle/text_input.h"
 
 static HWND window;
 static ID3D11Device *device;
@@ -34,6 +35,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     /* Flip chains need ResizeBuffers after window/fullscreen transitions,
        even when the game's scanout dimensions have not changed. */
+    if (msg == WM_CHAR && text_input_active()) { text_input_character((unsigned)wp); return 0; }
+    if (msg == WM_KILLFOCUS) text_input_clear();
     if (msg == WM_SIZE) resize_pending = 1;
     if (msg == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -326,7 +329,21 @@ static void capture(unsigned width, unsigned height, int gpu_frame)
         snprintf(numbered, sizeof numbered, "%s-f%06llu.bmp", path, (unsigned long long)kernel_vsync_count);
         path = numbered;
     } else if (getenv("DHD_RACE_SYNC")) {
-        if (!path || !race_sync_capture(path, numbered, sizeof numbered)) return;
+        if (!path) return;
+        if (!race_sync_capture(path, numbered, sizeof numbered)) {
+            /* Survey-only periodic pictures alongside the named race windows.
+               DHD_CAPTURE_FRAME is otherwise intentionally ignored in race
+               mode. Named consecutive captures always have priority. */
+            const char *period = getenv("DHD_RACE_CAPTURE_INTERVAL");
+            if (!period || strtoul(period, NULL, 10) == 0) return;
+            static unsigned long long next;
+            unsigned long long step = strtoul(period, NULL, 10);
+            const char *first = getenv("DHD_RACE_CAPTURE_FROM");
+            if (!next) next = first ? strtoull(first, NULL, 10) : step;
+            if (kernel_vsync_count < next) return;
+            next = (kernel_vsync_count / step + 1) * step;
+            snprintf(numbered, sizeof numbered, "%s-f%06llu.bmp", path, (unsigned long long)kernel_vsync_count);
+        }
         if (!grab(gpu_frame, &image, &width, &height)) return;
         path = numbered;
     } else {

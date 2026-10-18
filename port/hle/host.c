@@ -1,3 +1,4 @@
+#include "text_input.h"
 /* The Windows calls of the native PS2 system (hle.h), apart from its code because the PS2
    kernel's names (CreateThread, ExitThread ...) are Windows' too. */
 #include "hle.h"
@@ -637,7 +638,7 @@ static void keyboard_merge(HostPad *out)
                 UINT here = MapVirtualKeyExA(us_scan[vk - 'A'], MAPVK_VSC_TO_VK, layout);
                 if (here) vk = here;
             }
-            if (GetAsyncKeyState((int)vk) & 0x8000) down[keys[i]] = 1;
+            if (text_input_key_allowed(vk) && (GetAsyncKeyState((int)vk) & 0x8000)) down[keys[i]] = 1;
         }
     }
     keyboard_pad(down, riding_controls(), host_seconds(), out);
@@ -901,6 +902,7 @@ static void setting(const char *name, const char *value)
 
 static void apply_setting(const char *key, const char *value)
 {
+    if (!_stricmp(key, "game_options")) return; /* read after the game's own boot/load */
     static const struct { const char *key, *name; } plain[] = {
         {"iso", "DHD_ISO"}, {"skip_movies", "DHD_SKIP_MOVIES"}, {"window", "DHD_WINDOW"},
         {"width", "DHD_WINDOW_WIDTH"}, {"height", "DHD_WINDOW_HEIGHT"}, {"monitor", "DHD_MONITOR"},
@@ -1114,6 +1116,27 @@ static int settings_save(const char *key, const char *value)
 }
 
 int host_setting_save(const char *key, const char *value) { return settings_save(key, value); }
+
+/* Read afresh after each game-data load; these values never become DHD_* overrides. */
+int host_game_options_read(char *value, size_t size)
+{
+    char path[MAX_PATH], line[1024];
+    settings_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = trim(line), *eq = strchr(s, '=');
+        if (!eq || *s == ';' || *s == '#' || *s == '[') continue;
+        *eq = 0;
+        if (!_stricmp(trim(s), "game_options")) {
+            snprintf(value, size, "%s", setting_value(trim(eq + 1)));
+            found = 1; break;
+        }
+    }
+    fclose(f);
+    return found;
+}
 
 /* ---- the disc image (first start) ---- */
 

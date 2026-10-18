@@ -54,12 +54,20 @@ static bool DhdRaceSync()
     const s32 menu = *reinterpret_cast<const s32*>(eeMem->Main + 0x29DED8);
     const s32 phase = *reinterpret_cast<const s32*>(eeMem->Main + 0x43F348);
     const s32 clock = *reinterpret_cast<const s32*>(eeMem->Main + 0x43EEC8);
+    const bool unlocked_survey = std::getenv("DHD_COMPARE_RACE_UNLOCKED") != nullptr;
+    const bool active_menu = menu == 9 || (unlocked_survey && menu == 2);
+    if (unlocked_survey && !started[0] &&
+        (*reinterpret_cast<const u32*>(eeMem->Main + 0x4346B4) != 0x035FFFFF ||
+         *reinterpret_cast<const u32*>(eeMem->Main + 0x2B6E68) != 0 ||
+         *reinterpret_cast<const u32*>(eeMem->Main + 0x2B6E6C) != 0 ||
+         *reinterpret_cast<const u32*>(eeMem->Main + 0x2B6E70) != 0))
+        return false; // Let NAV finish the bootstrap and reload first.
     if (g_FrameCount % 600 == 0) {
         std::fprintf(stderr, "DHD_COMPARE_PROGRESS input_index=%u menu=%d phase=%d\n", g_FrameCount, menu, phase);
         std::fflush(stderr);
     }
     for (int which = 0; which < 2; ++which)
-        if (!started[which] && menu == 9 && phase == which + 1) {
+        if (!started[which] && active_menu && phase == which + 1) {
             started[which] = true;
             std::fprintf(stderr, "DHD_COMPARE_RACE anchor=%c field=%u clock=%d\n", which ? 'g' : 'c', g_FrameCount, clock);
         }
@@ -70,7 +78,7 @@ static bool DhdRaceSync()
         char* end = nullptr;
         const int which = *cursor == 'g';
         const long value = std::strtol(cursor + 1, &end, 10);
-        const bool in = started[which] && menu == 9 && (which ? phase == 2 || phase == 3 : phase == 1);
+        const bool in = started[which] && active_menu && (which ? phase == 2 || phase == 3 : phase == 1);
         if (!crossed[i] && in && clock >= value) {
             crossed[i] = true;
             // This field's VSync packet is already queued; capture from the next.
@@ -111,11 +119,31 @@ static bool DhdRaceSync()
         VMManager::SetState(VMState::Stopping);
     static const std::array<u8, 18> neutral = {0xff, 0xff, 128, 128, 128, 128};  // as write_movie
     static u16 previous = 0xffff;
-    const bool racing = started[1] && menu == 9 && (phase == 2 || phase == 3);
+    const bool racing = started[1] && active_menu && (phase == 2 || phase == 3);
     for (unsigned port = 0; port < 2; ++port) {
         std::optional<PadData> pad;
         if (race_open && racing && clock >= 0 && u32(clock) < race.getTotalFrames())
             pad = race.readPadData(u32(clock), port, 0);
+        // Opt-in stopped-clock results/replay exploration. A short-lived file
+        // contains a hexadecimal active-high PS2 button mask; absent/invalid
+        // files leave the recorded movie unchanged. No window focus required.
+        if (const char* live = std::getenv("DHD_COMPARE_LIVE_PAD"); live && port == 0) {
+            if (std::FILE* f = std::fopen(live, "rb")) {
+                unsigned mask = 0;
+                if (std::fscanf(f, "%x", &mask) == 1 && mask <= 0xffff) {
+                    auto data = neutral;
+                    data[0] = u8(~mask);
+                    data[1] = u8(~(mask >> 8));
+                    // Same pressure-byte order as the upstream p2m2 format and
+                    // compare_pcsx2.write_movie, not just compact digital flags.
+                    static constexpr unsigned bits[] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
+                    for (unsigned i = 0; i < 12; ++i)
+                        data[6 + i] = (mask & (1u << bits[i])) ? 255 : 0;
+                    pad.emplace(port, 0, data);
+                }
+                std::fclose(f);
+            }
+        }
         if (!pad) pad.emplace(port, 0, neutral);
         pad->OverrideActualController();
         if (port == 0) {
@@ -173,6 +201,14 @@ static void DhdComparisonInput()
                      *reinterpret_cast<const s32*>(ee + 0x29DED8), *reinterpret_cast<const s32*>(ee + 0x43F348),
                      *reinterpret_cast<const s32*>(ee + 0x43EEC8));
     }
+    if (std::getenv("DHD_COMPARE_SWEEP_STATE") && g_FrameCount % 30 == 0) {
+        const u8* ee = eeMem->Main;
+        std::fprintf(stderr, "DHD_SWEEP_STATE field=%u unlocks=%08X track=%d finished=%u checkpoint=%d modal=%08X\n",
+            g_FrameCount, *reinterpret_cast<const u32*>(ee + 0x4346B4),
+            *reinterpret_cast<const s32*>(ee + 0x4B2840), ee[0x43EF18],
+            *reinterpret_cast<const s32*>(ee + 0x2B6C50),
+            *reinterpret_cast<const u32*>(ee + 0x3F5420));
+    }
     if (DhdRaceSync()) return;
     // DHD_COMPARE_NAV: the menus by the screen shown (menu_nav.h, pasted above), the same rule as
     // the port's DHD_NAV. The pad bytes are laid out as compare_pcsx2.write_movie's.
@@ -195,8 +231,14 @@ static void DhdComparisonInput()
         for (int i = 0; i < 12; ++i)
             data[6 + i] = (buttons >> pressures[i]) & 1 ? 255 : 0;
         static const std::array<u8, 18> neutral = {0xff, 0xff, 128, 128, 128, 128};
+        // Opt-in two-player survey: both connected pads confirm the same NAV
+        // steps, as the port's host_pad_script already does. Default stays P1.
+        static const bool both = []() {
+            const char* value = std::getenv("DHD_COMPARE_NAV_PLAYERS");
+            return value && std::atoi(value) == 2;
+        }();
         for (unsigned port = 0; port < 2; ++port) {
-            PadData pad(port, 0, port == 0 ? data : neutral);
+            PadData pad(port, 0, (port == 0 || both) ? data : neutral);
             pad.OverrideActualController();
         }
         if (buttons != previous) {

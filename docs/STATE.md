@@ -605,7 +605,6 @@ exceptions and the retained scratch-alignment patch.
 and list iteration share it with rider nodes. Full image MATCH, all 19 touched
 native units compile; flags 1,066 and permutations 119 unchanged. Finding 023.
 
-
 Port race round 2 (finding 021): the EE float lead is confirmed. Shared port
 helpers clamp recompiled/EE/VU0 macro arithmetic and repair the bounding
 sentinel subtraction in 00119AD0. 00117A10 now uses saturating EE float-to-int
@@ -988,7 +987,6 @@ accepted. Defaults remain unchanged while paired speed trials run.
 Late-window VIF utilization is about 52%, both with exact Z reads and with
 the diagnostic bypass; B0078/1040 costs 2.29-2.35 ms/frame. The 43 fps plateau
 is not explained by a continuously saturated VIF worker alone.
-
 
 Round 26 complete for review (finding 031): Huffman table entries now have
 fully defined bytes (a93db02a); no comparison exclusions were added. Flip-model
@@ -1385,7 +1383,6 @@ Clean build 00c53232 (all 3,797 units compile) passes the unchanged default r40-
 all EE moments match, 1,168 readback records / Z reads match through virtual GS field 9051.
 Proof and lossless diffs: build/port/r44jitter/. Exact rendering stays unchanged; no benchmarks.
 
-
 Round 45, pickup flare (finding 061): both native and exact sustained an oversized pickup glow.
 The port data converter relocated a packed duration word (0x00780000 -> 0x08780000), making
 particle template 16's duration 2168 instead of 120. Its intensity envelope stayed bright;
@@ -1422,6 +1419,71 @@ comparisons, 1,121 matching Z readbacks through GS field 9042. Release zip and
 latest.json are in build/release; clean retail scan and icon verified. Extracted
 zip reaches Alpine; real 0.2.2 updater installs/restarts 0.2.3 with ini/save
 unchanged. Temporary test folders deleted.
+
+Round 48, visual sweep **partial / open** (finding 063): added `port/tools/visual_sweep.py`,
+a sequential retail/native/exact capture runner with settled-menu checks, five-field race
+sequences, preserved retries, aspect-correct contact sheets, offline coverage reporting and
+an instance guard. Ten front-end screens have retail/native captures; five also have exact
+captures. No clear new player-visible rendering bug was established and no game/renderer fix
+was made. Shop fade and lost cursor presses exposed capture-route issues; corrected routes
+still need live verification. Proof: build/port/r48sweep/. - Clean build 5760505b: all 3,797
+units compile, link succeeds; executable build/port/clean/5760505b/dhd.exe. Later changes
+are tools/docs only. - Default r46-plain gate **INCOMPLETE**: stopped the agent's own
+exact-arm process when a player-owned game appeared; the player's process was untouched. The
+interrupted attempt also requested native widescreen in error; the retry helper uses normal
+gate state plus scale 2 and remains blocked by that game. No comparison exclusions or
+reference recording changed; no MATCH claimed. - Remaining OPTIONS subpages, track
+selection/all tracks and effects, pause, results/loading/replay and split screen are
+explicitly open in finding 063. Resume on an idle PC with `--retry-blocked`, verify
+corrected routes visually, and run the unchanged default gate on the clean executable.
+
+Round 48 continuation (2026-10-18, idle PC; **in progress**): reviewed all selected
+retail/native images for AUDIO/OTHER, VIDEO CLIPS, load/save/replay-load dialogs, rider
+statistics, career selection and track confirmation, plus ordinary pause. No clear
+player-visible renderer defect established. The built-in unlock input now works on both arms
+(mask 0x035FFFFF); unlocked pause, NEW LEVEL list, Japan and FOG EDITOR are reviewed as
+exploratory setup evidence. A targeted read using PCSX2's EEmem debugger export found Always
+Stoked survives a level reload; the next routes toggle it off through input and require
+three zero ordinary flag words before arming race-clock capture. Default comparisons remain
+unchanged. - Clean runtime **044170e8**: 3,797 units compile with zero errors, link
+succeeds; `build/port/clean/044170e8/dhd.exe`. Plain default **r46-plain gate MATCH**:
+eight reference and six paired EE checks, 1,124 readbacks/Z reads through GS field 9045;
+native used, no widescreen on either arm. No exclusions or reference changed. Later commits
+are tools/docs; concurrent changes excluded. - Full-pedal retail: no finish by ten game
+minutes (checkpoint 19/28 at clock 27797). Native finishes at tick 23551, 28/28 checkpoints.
+Results pictures now have native evidence: results and live-input replay pictures reviewed;
+retail finish/replay parity remains open. The initial periodic request was ignored in race
+mode. A dedicated opt-in periodic capture branch and finished-byte detector are committed in
+044170e8; clean build/gate pass, live verification is next. - Two-player widescreen race:
+all 60 retail/native screenshots reviewed through GO+3000; both riders move, both
+HUDs/viewports render, no clear new defect. The separate close-rider combat probe now has
+all 80 screenshots reviewed; both arms show PUNCH! 50 PTS and the contact effect. Every
+readable saved frame in the initial 18 front-end cases is reviewed (incomplete trailing
+files excluded). Dense boot probes establish a low-severity native-only loading-card
+defect: exact retains the full card while native alternates black/partial output. Earlier GS
+history is queued to isolate its cause; no speculative fix. Native finish/results/replay:
+all 375 screenshots reviewed. Remaining tracks, effect parity and menu branches remain open
+until captured and reviewed. Live jobs/evidence are local under build/port/r48sweep/. See
+finding 063 for intermediate build IDs, successful navigation, failed-route evidence and
+current limitations.
+
+Round 49, settings persistence (finding 064; **done**): fresh release 0.2.3, first-start
+disc chooser and generated ini, no DHD tool environment. SendInput changes and EXIT
+GAME/restart confirm original audio/stereo, four control schemes and difficulty reset; all
+ten PC SETTINGS rows persist. Preferences now have an independent versioned ini record,
+accepted-page hooks, boot/load restore and validation, without invoking a career save.
+Enabling vibration also exposed and fixed an unimplemented SDK direct actuator DMA path.
+Focused C round-trip/career-isolation/malformed-input/tool-bypass tests pass, including a
+32-bit run. Clean build feae225f compiles all 3,797 units and links;
+`build/port/clean/feae225f/dhd.exe`. Default r46-plain gate MATCH: all 14 EE comparisons and
+1,143 matching Z reads through field 9,064, unchanged checker and exclusions. Full settings
+/ EXIT GAME / restart PASS: all original options, all four live vibration flags, and all ten
+actual PC page row strings retained; both quits exit 0. First start without a career save
+PASS; preference changes create no career files. Real Super Career event/save/load PASS:
+rider/track records load byte-identically. A later music edit leaves the career file SHA
+unchanged and survives both boot loading and manual LOAD GAME DATA despite the older value
+on the card. Manual saves do include music (correcting finding 050); the bug was the missing
+automatic options write.
 
 ## Online play (plan: docs/ONLINE-PLAN.md)
 2026-10-16 step 1, server (finding 039): `online/server/` is the Cloudflare Workers + Durable
@@ -1474,3 +1536,59 @@ it into the launcher. Lag at the start of a race is 0.03-0.25 s, mostly 0.1-0.2 
 on one PC run slower than real time, so later lag on this PC isn't meaningful. Next: a real
 4-PC race; check the game's own results screen against the host's order, the host leaving,
 and a kick or throw by a puppet.
+
+Round 50, keyboard text and lobby (finding 065, in progress): online name/code
+fields accept layout-translated WM_CHAR typing, Backspace, Enter, Esc and
+validated clipboard paste while suppressing keyboard pad mappings during entry.
+Focused field regressions pass. Live SendInput and lobby work remain pending;
+no clean-build or renderer-gate result claimed yet.
+
+Round 50 continuation (finding 065): physical SendInput typing/paste, Enter,
+Backspace and Esc verified in two real instances, including a loaded French
+AZERTY layout. Retail rider and outfit/bike-colour previews work; readiness
+counts 2 -> 1 -> 0 and host start work. Both PCs receive identical selected
+outfit/bike records, and retain the online grid fix. Part 1 clean c22335b2
+compiled all 3,797 units and linked. Camera handoff polish, after-race control
+and final lobby clean build/default renderer gate are still being validated.
+
+Round 50 lobby implementation complete, acceptance checks pending (finding 065):
+retail rider/shop/outfit previews, host level selection, explicit READY, room
+occupancy/readiness/waiting count, change and leave are implemented and exercised.
+Two real instances race with identical selected triples and the preserved grid.
+Physical results/NEW LEVEL input returns both to offline play. The shop-camera
+handoff now restores the stock shell backdrop. Final plain clean build and
+unchanged r46-plain gate are next; no final MATCH claimed yet.
+
+Round 50 complete, keyboard text and retail online lobby (finding 065): name/code
+accept physical typing, Backspace/Enter/Esc/paste with text-only key capture.
+Two real local instances passed SendInput and French AZERTY checks, retail 3D
+rider/outfit/bike-colour selection, host track selection, waiting counts,
+ready/change/leave/rejoin, identical setup triples and preserved grid. Actual
+results/NEW LEVEL input returned both to offline play. Protocol/server unchanged;
+raise MIN_VERSION at release, no deployment. Text/net tests and 34 server tests
+pass. Plain clean 719ea8a2: 3,797 units, zero errors, successful link;
+build/port/clean/719ea8a2/dhd.exe (3fe65eb385707ef7...). Unchanged default r46-plain
+gate MATCH: 14 EE comparisons, 1,094 readbacks through GS field 9,015, no failures.
+Proof/captures in build/port/r65/; detailed paths and decisions in finding 065.
+
+Round 48 guarded handoff (2026-10-18 03:36, finding 063): **partial / open**. Full
+incidental review now includes pause/unlocked cases (3,302 readable files, 909 newly
+distinct RGB images plus exact pixel aliases) and Career Freeride (245 readable, two
+truncated files excluded). Japan energy pickup and sun/dust are visible, but the exploratory
+route stalls at a fence. Native Japan loading also has a brief mosaic candidate. Boot
+loading is confirmed native-only against exact; root/fix remains open. Local tasks retain
+Russia as deferred-guard and the remaining work pending; captures under build/port/r48sweep.
+Remaining menus, 23 track tours, actual all-track near-finish, weather/water/snow parity and
+retail results/replay are explicitly incomplete. No player-visible fix or game-state change
+claimed. Pinned own clean 044170e8 and plain unchanged r46-plain gate MATCH remain valid:
+3,797 units, zero errors, 14 EE comparisons, 1,124 readbacks/Z checks, no failures;
+build/port/clean/044170e8/dhd.exe. Later concurrent runtime changes are outside this
+validation.
+
+Release 0.2.4 prepared, not published (2026-10-18, finding 053 section 10): R 8a6f6e18,
+version header only over 9177a74d. Plain clean build: 3,797 units, zero errors, successful
+link. Unchanged default r46-plain gate MATCH: 14 EE comparisons, 1,087 readbacks/Z reads
+through GS field 9,008, failures empty. Release zip + latest.json in build/release, retail
+scan clean and icon present. Extracted-zip physical-key smoke, music preference EXIT
+GAME/restart, typed join code, two-instance local online selection/READY/race and real 0.2.3
+-> 0.2.4 updater preservation checks PASS. Test temp folders deleted; only own PIDs stopped.

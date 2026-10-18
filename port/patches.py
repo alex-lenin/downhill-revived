@@ -532,3 +532,61 @@ PATCHES['unsorted/00223BB0.c'] = [
 import patches_exit, patches_widescreen  # noqa: E402
 patches_widescreen.add(PATCHES)
 patches_exit.add(PATCHES)
+import patches_options
+patches_options.add(PATCHES)
+
+# Online's retail preview flow (finding 065). These hooks return immediately offline.
+_ONLINE_SELECT_BEGIN = r"""
+extern void func_001F67F0_online(int) asm("func_001F67F0");
+void port_online_choose_begin(void) {
+    func_001F67F0_online(0);
+    D_004B25A0__cED5B8.x288 = 1;
+    D_0029DED8__cED5B8 = 32;
+    D_0029DEEC__cED5B8 = 15;
+    D_0029DF50__cED5B8 = 2;
+    func_00203590((struct AnimationHandle *)(void *)(D_004C6370__cED5B8), 0x2330, 0, 2);
+    func_002038E0__cED5B8(D_004C6370__cED5B8, 1);
+    func_001F50F0__cED5B8(0x2330, 2);
+    func_001F57D0__cED5B8(0x2329, 0);
+    D_0029DF44__cED5B8 = 0;
+    D_0029DF40__cED5B8 = 210;
+    func_001F5578__cED5B8();
+    func_001C58A8__cED5B8(D_004B25A0__cED5B8.x4F0);
+    func_001C5960__cED5B8(D_004B25A0__cED5B8.x4F0);
+    func_001C5940__cED5B8(D_004B25A0__cED5B8.x4F0);
+    func_001F6A08__cED5B8(1);
+}
+"""
+PATCHES['unsorted/001EB1D8.cpp'] += [
+    ('text', 'int func_001EB4D0(void)\n{',
+     'extern "C" int port_online_shell(void);\nint func_001EB4D0(void)\n{'),
+    ('text', '        switch (D_0029DED8__target) {',
+     '        if (!port_online_shell()) switch (D_0029DED8__target) {'),
+    ('text', 'void func_001ED5B8__cED5B8(void) {\n    u8__cED5B8 disabled[5];',
+     _ONLINE_SELECT_BEGIN + '\nvoid func_001ED5B8__cED5B8(void) {\n    u8__cED5B8 disabled[5];'),
+    ('text', '            port_main_row = port_online_menu() ? 0 : 3;\n'
+             '            func_001F57D0__cED5B8(0x2329, 1);',
+     '            int online_action = port_online_menu();\n'
+     '            port_main_row = online_action ? 0 : 3;\n'
+     '            if (online_action == 2) port_online_choose_begin();\n'
+     '            else func_001F57D0__cED5B8(0x2329, 1);'),
+]
+
+PATCHES['unsorted/001EB1D8.cpp'] += [
+    ('text', 'void func_001EF0E0__c8(void) {',
+     'extern int port_online_single_race(void);\nvoid func_001EF0E0__c8(void) {'),
+    ('text', '    func_001F4A98__c8();\n    if (D_0029DF87__c8)',
+     '    func_001F4A98__c8();\n'
+     '    if (port_online_single_race()) { D_004C6DF8__c8.x10 = 0; D_0029DF8B__c8 = 1; D_0029DF87__c8 = D_0029DF86__c8 = 0; }\n'
+     '    if (D_0029DF87__c8)'),
+]
+
+# The stock level chooser accepts the host's track only; guests retain the same shop exit.
+PATCHES['unsorted/001F8920.c'] = PATCHES.get('unsorted/001F8920.c', []) + [
+    ('text', 'void func_001F8920(struct Race *race)\n{',
+     'extern int port_online_guest_track(void);\n'
+     'extern void func_001F8A08(void *);\nvoid func_001F8920(struct Race *race)\n{'),
+    ('text', '        func_0018E1C0(race);',
+     '        func_0018E1C0(race);\n'
+     '        if (port_online_guest_track()) func_001F8A08(race);'),
+]

@@ -19,7 +19,7 @@ lobbies.
 | Empty slots | AI riders, as in the original. |
 | Disconnect | The puppet stops getting snapshots; the host's AI can take the slot over. |
 | Modes | Single races only. |
-| Lobby | A PC lobby screen picks the track, riders and bikes, then the race starts directly, skipping the game's menus. |
+| Lobby | The room uses the game's own rider/bike/outfit previews, then an explicit READY/waiting screen. The host picks the level and starts when everyone present is ready (minimum two). Finding 065. |
 | Connecting | Public lobby list, private lobbies and join codes, through a small relay. |
 | Server | Cloudflare Workers and Durable Objects: lobbies, join codes, relay. |
 | Chat | None (players use Discord). |

@@ -88,6 +88,22 @@ static void fill(Pad *p, PadFrame *f, int player)
 /* The player a (port, slot) pad belongs to: the slot with a multitap, else the port. */
 static int player_of(int port, int slot) { return pads_multitap() ? slot : port; }
 
+/* This SDK version sends actuator bytes by SIF DMA rather than the RPC above.
+   Deliver them to the same host motors; there is no IOP padman DMA buffer. */
+int scePadSetActDirect(int port, int slot, const unsigned char *data) RETAIL(func_00245688);
+int scePadSetActDirect(int port, int slot, const unsigned char *data)
+{
+    if (port < 0 || port >= 2 || slot < 0 || slot >= 4 || !data || !pads[port][slot].open) return 0;
+    Pad *p = &pads[port][slot];
+    int light = 0, heavy = 0;
+    for (int i = 0; i < 6; i++) {
+        if (p->align[i] == 0 && data[i]) light = 1;
+        if (p->align[i] == 1) heavy = data[i];
+    }
+    host_pad_vibrate(player_of(port, slot), light, heavy);
+    return 1;
+}
+
 static int connected(int port, int slot)
 {
     int n = pads_connected();

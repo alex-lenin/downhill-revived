@@ -180,6 +180,12 @@ with open(cmd, 'w') as f:
             % (rt, hle, hle, autopad_exe))
     f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % autopad_exe)
 
+    options_exe = os.path.join(OUT, 'test_game_options.exe')
+    f.write('@if errorlevel 1 exit /b 1\n')
+    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations /I"%s" "%s\\game_options.c" "%s\\test_game_options.c" /Fe:"%s"\n'
+            % (hle, hle, hle, options_exe))
+    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % options_exe)
+
     keyboard_exe = os.path.join(OUT, 'test_keyboard.exe')  # keyboard layout and steering ramp (finding 059)
     f.write('@if errorlevel 1 exit /b 1\n')
     f.write('clang-cl -m32 /nologo /O2 /I"%s" "%s\\keyboard.c" "%s\\test_keyboard.c" /Fe:"%s"\n'

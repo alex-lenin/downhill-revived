@@ -1,27 +1,10 @@
-/* ONLINE: the main menu's fourth row (port/patches.py patches func_001ED5B8), online races in
-   the game's own popup menu style (menu_page.c, finding 050), over the online client
-   (port/net, docs/online-protocol.md):
-   - HOME: the player's name, the public races, create a public or a private race, join one
-     with its code;
-   - PUBLIC RACES: the server's list (GET /v1/lobbies, in a thread); Cross joins one;
-   - NAME and CODE: text entry with the pad: left/right pick the letter, Cross adds it,
-     Triangle deletes the last one (on an empty entry: back);
-   - the room: its join code, the track (the host's left/right), this player's rider
-     (left/right), the players with their ping, and the host's Start The Race once everyone is
-     ready (every player is ready once in, as with DHD_NET_*).
-   When the room's race starts the page closes and online.c takes over as for DHD_NET_*
-   (hle_online_from_menu): the menu script from SINGLE PLAYER to the race, the riders, the
-   start together.
-   The server is DHD_NET_SERVER: dhd.ini's server = ..., else the official public server
-   (host.c host_settings_load). The
-   ISO must be the USA disc, as the online launcher checks (port/online/Online.ps1): its SHA-256
-   is worked out in a thread when the page opens, remembered in iso-check.txt beside dhd.exe in
-   the launcher's format. The name and the rider are saved to dhd.ini (name, rider).
-   A server that refuses this release as too old (client_outdated, finding 054) gets the
-   message "A new version is out. Update to play online." and HOME an Update Now row:
-   the game ends and the first dhd.exe updates it and starts it again (update.c). */
+/* Online rooms in the game's SharedMenu style, with physical keyboard text entry.
+   A connected member chooses in the retail rider/bike/outfit screens, then returns
+   here to ready up. The host chooses the level and starts when everyone is ready.
+   The existing online.c setup event carries each complete preview choice. */
 #include "hle.h"
 #include "menu_page.h"
+#include "text_input.h"
 #include "../net/net.h"
 
 #include <stdio.h>
@@ -53,6 +36,17 @@ enum { NAME_MAX = 12, CODE_LENGTH = 6, ROW_TEXT = 96, MAX_ROWS = 12, LIST_MAX = 
 enum { HOME, LIST, NAME, CODE, ROOM };
 static MenuPage page;
 static int screen, race;
+static int choosing, selected, selection_requested, room_pending, room_focus;
+static int chosen_rider, chosen_bike, ready_track;
+static int32_t chosen_outfit[3], chosen_cycle[3];
+#define SHELL_WORD(a) (*(int32_t *)(uintptr_t)(0x08000000u + (a)))
+#define SETUP_WORD(offset) SHELL_WORD(0x4B25A0 + (offset))
+void port_online_choose_begin(void);
+void func_0023D898(int view, float *distance, float *aspect);
+void func_0023D8D8(int view, float distance, float aspect);
+static float shell_distance, shell_aspect;
+void hle_online_selected_ride(int rider, const int32_t *outfit, const int32_t *bike);
+
 static char text[MAX_ROWS][ROW_TEXT], status[128], footer[128];
 static int outdated;  /* the server refused this release: HOME offers Update Now (row 5) */
 /* 44 characters: the footer fits about 45 at 640 wide (0.1.0 shows the server's copy there too) */
@@ -212,7 +206,10 @@ static int home_row;  /* HOME's row last chosen: the cursor goes back to it */
 
 static void go(int to)
 {
+    text_input_end();
     screen = to;
+    if (to == NAME || to == CODE) text_input_begin();
+    if (to == ROOM) room_focus = selected;
     status[0] = 0;
     menu_page_rebuild_at(&page, to == HOME ? home_row : 0);
 }
@@ -240,6 +237,8 @@ static void enter_room(int create, const char *code)
         snprintf(status, sizeof status, "That code can't be one");
         return;
     }
+    selected = choosing = 0;
+    selection_requested = 1;
     public_room = create == 2;
     room_settings_sent = room_ready_sent = 0;
     hle_log("online menu: %s %s\n", create ? "creating a room" : "joining", create ? (public_room ? "(public)" : "(private)") : code);
@@ -285,9 +284,9 @@ static void page_build(MenuPage *p)
         break;
     case ROOM:
         p->title = "RACE ROOM";
-        for (int i = 0; i < 3 + MEMBER_ROWS + 1; i++) {
+        for (int i = 0; i < 11; i++) {
             text[i][0] = 0;
-            menu_page_row(p, text[i], i == 1 || i == 2);
+            menu_page_row(p, text[i], i == 2 || i == 8 || i == 9 || i == 10);
         }
         break;
     }
@@ -327,32 +326,53 @@ static void room_update(MenuPage *p, NetLobby *l)
     }
     if (in && !room_ready_sent) {
         hle_log("online menu: room %s%s, version %s\n", l->code, l->is_host ? " (host)" : "", version);
-        net_pick(-1, riders[rider].index + 1, 1);  /* the lobby keeps index + 1 */
-        net_set_ready(1);
+        net_set_ready(0);
         room_ready_sent = 1;
     }
-    if (in && !l->is_host)
+    if (in)
         for (int k = 0; k < COUNT(tracks); k++)
             if (tracks[k].index == l->track) room_track = k;
     if (l->started || l->state == NET_RACING) {
         hle_log("online menu: room %s: the race starts\n", l->code);
         race = 1;
+        hle_online_selected_ride(chosen_rider, chosen_outfit, chosen_cycle);
         hle_online_from_menu();
         menu_page_close(p);
         return;
     }
+    int self_ready = 0;
+    for (int i = 0; i < l->nmembers; i++)
+        if (l->member[i].id == l->member_id) self_ready = l->member[i].ready;
+    /* Wait for the server to acknowledge unready before handing input to the picker.
+       If a start won the race, the earlier started branch loads the committed selection. */
+    if (in && selection_requested && !self_ready) {
+        selection_requested = 0;
+        choosing = 1;
+        race = 2;
+        menu_page_close(p);
+        return;
+    }
+    int own_ready = 0, conflict = 0;
+    for (int i = 0; i < l->nmembers; i++) {
+        if (l->member[i].id == l->member_id) { own_ready = l->member[i].ready; break; }
+        if (selected && l->member[i].rider == chosen_rider / 32) conflict = 1;
+    }
+    if (own_ready && (conflict || ready_track != l->track)) net_set_ready(0);
     int ready = 0;
     for (int i = 0; i < l->nmembers; i++) ready += l->member[i].ready;
     int can_start = in && l->is_host && l->nmembers >= 2 && ready == l->nmembers;
-    if (in) snprintf(text[0], ROW_TEXT, "Code:\t\t%s%s", l->code, l->is_public ? " (public)" : "");
+    if (in) snprintf(text[0], ROW_TEXT, "Code: %s\t\t%d/%d PLAYERS", l->code, l->nmembers, l->max_players);
     else snprintf(text[0], ROW_TEXT, "Connecting...");
-    snprintf(text[1], ROW_TEXT, "Track:\t\t%s", tracks[room_track].name);
-    snprintf(text[2], ROW_TEXT, "Rider:\t\t%s", riders[rider].name);
+    const char *track_name = NULL;
+    for (int k = 0; k < COUNT(tracks); k++) if (tracks[k].index == l->track) track_name = tracks[k].name;
+    if (track_name) snprintf(text[1], ROW_TEXT, "Track:\t\t%s", track_name);
+    else snprintf(text[1], ROW_TEXT, "Track:\t\t%d", l->track);
+    snprintf(text[2], ROW_TEXT, "%s", selected ? "Change Rider / Bike / Outfit" : "Choose Rider / Bike / Outfit");
     for (int i = 0; i < MEMBER_ROWS; i++) {
         const NetMember *m = &l->member[i];
         char who[16];
         if (!in || i >= l->nmembers) {
-            snprintf(text[3 + i], ROW_TEXT, "%s", in && i == l->nmembers ? "-" : "");
+            text[3 + i][0] = 0;
             continue;
         }
         snprintf(who, sizeof who, "%.12s", m->name);
@@ -363,22 +383,47 @@ static void room_update(MenuPage *p, NetLobby *l)
         else
             snprintf(text[3 + i], ROW_TEXT, "%s%s\t\t%s", who, m->id == l->host_id ? " (host)" : "", m->ready ? "READY" : "");
     }
-    snprintf(text[7], ROW_TEXT, "%s", !in ? "" : l->is_host ? "Start The Race" : "The host starts the race");
-    if (in && !l->is_host && menu_page_cursor(p) == 1) menu_page_set_cursor(p, 2);  /* the host's track */
-    menu_page_enable(p, 1, in && l->is_host);
+    int missing = (l->nmembers < 2 ? 2 : l->nmembers) - ready;
+    if (missing > 0)
+        snprintf(text[7], ROW_TEXT, "Waiting for %d more player%s", missing, missing == 1 ? "" : "s");
+    else
+        snprintf(text[7], ROW_TEXT, "%s", l->is_host ? "Everyone is ready" : "Waiting for the host to start");
+    snprintf(text[8], ROW_TEXT, "%s", own_ready ? "Not Ready / Change Selection" : "READY");
+    snprintf(text[9], ROW_TEXT, "%s", l->is_host ? "Start The Race" : "The host starts the race");
+    snprintf(text[10], ROW_TEXT, "Leave Room");
+    menu_page_enable(p, 1, 0);
     menu_page_enable(p, 2, in);
-    menu_page_enable(p, 7, can_start);
+    menu_page_enable(p, 8, in && selected && !conflict);
+    menu_page_enable(p, 9, can_start);
+    menu_page_enable(p, 10, 1);
+    if (room_focus) {
+        menu_page_set_cursor(p, conflict ? 2 : 8);
+        room_focus = 0;
+    }
     if (status[0]) p->footer = status;
-    else if (!in) p->footer = NULL;
-    else if (!l->is_host) p->footer = "Waiting for the host to start";
+    else if (conflict) p->footer = "Rider taken: change your selection";
+    else if (!selected) p->footer = "Choose your rider, bike and outfit first";
     else if (l->nmembers < 2) {
         snprintf(footer, sizeof footer, "Friends join with the code %s", l->code);
         p->footer = footer;
-    } else p->footer = can_start ? NULL : "Waiting for everyone to be ready";
+    } else if (missing == 0) p->footer = l->is_host ? "Everyone is ready - start when you like" : "Waiting for the host to start";
+    else p->footer = own_ready ? "Waiting for the other players" : "READY when you like your selection";
 }
+
+static void page_accept(MenuPage *p, int row);
 
 static void page_update(MenuPage *p, int cursor)
 {
+    if (getenv("DHD_ONLINE_MENU_TRACE")) {
+        static char last[160];
+        char trace[160];
+        snprintf(trace, sizeof trace, "view=%d row=%d entry=%s", screen, cursor,
+                 screen == NAME || screen == CODE ? entry : "");
+        if (strcmp(last, trace)) {
+            snprintf(last, sizeof last, "%s", trace);
+            hle_log("online menu: %s\n", trace);
+        }
+    }
     p->footer = status[0] ? status : NULL;
     switch (screen) {
     case HOME:
@@ -389,9 +434,15 @@ static void page_update(MenuPage *p, int cursor)
         break;
     case NAME:
     case CODE:
+        {
+            int action = text_input_edit(entry, (screen == NAME ? NAME_MAX : CODE_LENGTH) + 1,
+                                         screen == NAME ? name_letters : code_letters);
+            if (action < 0) { go(HOME); return; }
+            if (action > 0) { page_accept(p, 1); return; }
+        }
         entry_text();
         if (!status[0])
-            p->footer = cursor == 0 ? GLYPH_LEFT GLYPH_RIGHT " LETTER  " GLYPH_CROSS " ADD  " GLYPH_TRIANGLE " DELETE" : NULL;
+            p->footer = screen == CODE ? "TYPE/CTRL+V - ENTER JOIN - ESC BACK" : "TYPE OR PAD - ENTER DONE - ESC CANCEL";
         break;
     case ROOM: {
         static NetLobby l;
@@ -457,12 +508,23 @@ static void page_accept(MenuPage *p, int row)
             snprintf(status, sizeof status, "A code has %d letters and digits", CODE_LENGTH);
         break;
     }
-    case ROOM:
-        if (row == 7) {
-            hle_log("online menu: starting the race\n");
-            net_start_race();
+    case ROOM: {
+        NetLobby l;
+        net_get_lobby(&l);
+        if (row == 2 || (row == 8 && selected && room_ready_sent &&
+            /* The row label reflects the last room snapshot. */
+            !strcmp(text[8], "Not Ready / Change Selection"))) {
+            net_set_ready(0);
+            selection_requested = 1;
+        } else if (row == 8) { ready_track = l.track; net_set_ready(1); }
+        else if (row == 9 && l.is_host) net_start_race();
+        else if (row == 10) {
+            net_leave();
+            choosing = selected = selection_requested = 0;
+            go(HOME);
         }
         break;
+    }
     }
 }
 
@@ -485,6 +547,7 @@ static void page_back(MenuPage *p)
     case ROOM:
         hle_log("online menu: leaving the room\n");
         net_leave();
+        choosing = selected = selection_requested = 0;
         go(HOME);
         break;
     }
@@ -495,22 +558,6 @@ static void page_step(MenuPage *p, int row, int by)
     if ((screen == NAME || screen == CODE) && row == 0) {
         int n = screen == NAME ? (int)sizeof name_letters - 1 : (int)sizeof code_letters - 1;
         entry_pick = (entry_pick + by + n) % n;
-        menu_page_sound(by > 0);
-    } else if (screen == ROOM && row == 1) {
-        NetLobby l;
-        net_get_lobby(&l);
-        if (!l.is_host) return;
-        room_track = (room_track + by + COUNT(tracks)) % COUNT(tracks);
-        NetRoomSettings s = {tracks[room_track].index, -1, -1, -1, -1, NULL};
-        net_set_room(&s);
-        menu_page_sound(by > 0);
-    } else if (screen == ROOM && row == 2) {
-        char value[8];
-        rider = (rider + by + COUNT(riders)) % COUNT(riders);
-        net_pick(-1, riders[rider].index + 1, 1);
-        net_set_ready(1);
-        snprintf(value, sizeof value, "%d", riders[rider].index);
-        save("rider", "DHD_NET_RIDER", value);
         menu_page_sound(by > 0);
     }
     (void)p;
@@ -524,6 +571,7 @@ static void page_right(MenuPage *p, int row) { page_step(p, row, 1); }
 int port_online_menu(void)
 {
     load_player();
+    func_0023D898(0, &shell_distance, &shell_aspect);
     start_iso_check();
     page.build = page_build;
     page.update = page_update;
@@ -537,6 +585,7 @@ int port_online_menu(void)
     race = 0;
     status[0] = 0;
     menu_page_run(&page);
+    text_input_end();
     return race;
 }
 
@@ -545,3 +594,77 @@ int port_main_label(const int *table, int index)
 {
     return index < 3 ? table[index] : (int)(uintptr_t)"ONLINE";
 }
+
+/* Only online selection enters here. The retail shell draws/animates its own screens;
+   reaching GET READY opens the room instead of loading a race before everyone is ready. */
+int port_online_shell(void)
+{
+    if (!choosing) return 0;
+    int menu = SHELL_WORD(0x29DED8);
+    if (menu == 16) {
+        /* Single races only: bypass the career's NEW / CONTINUE and mode menus. */
+        SHELL_WORD(0x29DED8) = 11;
+        SHELL_WORD(0x29DEEC) = 1;
+        SETUP_WORD(0x10C) = 12;
+        SETUP_WORD(0x110) = 0;
+        return 0;
+    }
+    if (room_pending) {
+        if (menu != 3) return 0; /* let the retail camera transition finish in the shell */
+        room_pending = 0;
+    } else if (menu != 9 && menu != 15 && menu != 0) return 0;
+    if (menu == 9) {
+        chosen_rider = SETUP_WORD(0x290);
+        chosen_bike = SETUP_WORD(0x11C);
+        for (int i = 0; i < 3; i++) {
+            chosen_outfit[i] = SETUP_WORD(0x1B8 + 4 * i);
+            chosen_cycle[i] = SETUP_WORD(0x11C + 4 * i);
+        }
+        selected = 1;
+        net_pick(-1, chosen_rider / 32, chosen_bike);
+        net_set_ready(0);
+        NetLobby l;
+        net_get_lobby(&l);
+        if (l.is_host) {
+            NetRoomSettings settings = {SETUP_WORD(0x2A0), -1, -1, -1, -1, NULL};
+            net_set_room(&settings);
+        }
+        hle_log("online menu: selection rider %d, outfit %d %d %d, bike %d %d %d\n",
+                chosen_rider, chosen_outfit[0], chosen_outfit[1], chosen_outfit[2],
+                chosen_cycle[0], chosen_cycle[1], chosen_cycle[2]);
+    }
+    /* Return from a cancelled picker too: the room remains connected, unready. */
+    if (menu != 3) {
+        /* SharedMenu freezes the shell camera. Settle its normal rider transition first. */
+        func_0023D8D8(0, shell_distance, shell_aspect);
+        port_online_choose_begin();
+        room_pending = 1;
+        return 0;
+    }
+    go(ROOM);
+    race = 0;
+    menu_page_run(&page);
+    if (race == 2) port_online_choose_begin();
+    else if (race == 1) {
+        choosing = 0;
+        SHELL_WORD(0x29DED8) = 9;
+        SHELL_WORD(0x29DEEC) = 8;
+        SHELL_WORD(0x29DF40) = 120;
+        SHELL_WORD(0x29DF44) = 0;
+    } else {
+        choosing = 0;
+        SHELL_WORD(0x29DED8) = 15;
+    }
+    return 1;
+}
+
+/* Guests use the same retail handoff into the shop, without choosing a competing track. */
+int port_online_guest_track(void)
+{
+    if (!choosing) return 0;
+    NetLobby lobby;
+    net_get_lobby(&lobby);
+    return !lobby.is_host;
+}
+
+int port_online_single_race(void) { return choosing; }

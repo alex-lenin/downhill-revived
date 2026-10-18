@@ -43,6 +43,16 @@ enum { LOAD_MENU = 9, FLYBY_PHASE = 5 };  /* on the race screen: 5 the flight ov
 /* ---- the pads ---- */
 
 static int npads = -1, online = -1;
+static int selected_ride;
+static int32_t selected_rider, selected_outfit[3], selected_bike[3];
+void hle_online_selected_ride(int rider, const int32_t *outfit, const int32_t *bike)
+{
+    selected_ride = 1;
+    selected_rider = rider;
+    memcpy(selected_outfit, outfit, sizeof selected_outfit);
+    memcpy(selected_bike, bike, sizeof selected_bike);
+}
+
 static int from_menu;  /* the ONLINE menu (online_menu.c) made the connection and the room */
 
 static int online_mode(void)
@@ -396,6 +406,12 @@ static void choose_riders(const NetLobby *lobby)
     int taken[16] = {0};
     for (int j = 0; j < on.nslots; j++) {
         int want = lobby->racer[j].rider - 1, k = 0;
+        if (selected_ride && want >= 0 && want < 16) {
+            on.pick[j] = want;
+            snprintf(on.name[j], sizeof on.name[j], "%s", lobby->racer[j].name);
+            fprintf(stderr, "online: player %d %s rides %s (preview choice)\n", j, on.name[j], rider_name[want]);
+            continue;
+        }
         while (k < 10 && regular[k] != want) k++;
         if (k == 10) k = j % 10;  /* none or not one of the ten: a default */
         for (int tries = 0; tries < 10 && taken[regular[k]]; tries++) k = (k + 1) % 10;
@@ -906,6 +922,7 @@ static void race_over(void)
     set_env("DHD_RACE_SEED", saved_seed);
     memset(&on, 0, sizeof on);
     online = 0, from_menu = 0, connected = 0;
+    selected_ride = 0;
     gs_window_title("Downhill Revived");
 }
 
@@ -931,6 +948,13 @@ void pads_begin_field(void)
     }
     if (!on.setup_done && EE32(MENU) == LOAD_MENU) {
         write_setup(&on.setup);
+        if (selected_ride) {
+            EE32(SETUP + 0x290) = selected_rider;
+            for (int k = 0; k < 3; k++) {
+                EE32(SETUP + 0x1B8 + 4 * k) = selected_outfit[k];
+                EE32(SETUP + 0x11C + 4 * k) = selected_bike[k];
+            }
+        }
         exchange_rides();
         on.setup_done = 1;
     }

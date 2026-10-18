@@ -370,6 +370,92 @@ Local proof: `build/port/release023/` holds the build/link, gate, scan, icon,
 packaging, smoke and updater logs and JSON results. These and all game-derived
 artifacts stay ignored. The zip and manifest were published afterwards as release v0.2.3.
 
+## 10. Release 0.2.4
+
+Prepared 2026-10-18; **not published**. Release revision **R =
+8a6f6e1818b4bb535f57496b9667b1f56e3b07bc** (`8a6f6e18`), `Version 0.2.4`,
+changes only `port/include/version.h` on main `9177a74d`. Includes the independent
+`dhd.ini` preferences (finding 064) and physical keyboard text entry / retail
+online selection and race room (finding 065).
+
+- Plain clean build: `python port/tools/build_clean.py --rev HEAD --tree
+  build/port/clean/tree-release024 -j 4`, launched with HEAD exactly R. The
+  resulting manifest pins the full R above. All 3,797 units compile, zero
+  errors (69 s); link exit 0 (644 s), including SDL3 3.4.18 built in that tree.
+  VU1 AOT enabled, no recompilation basis or uncommitted checkout source.
+- Executable: `build/port/clean/8a6f6e18/dhd.exe`, SHA-256
+  `123fb3aa283e6d35a963a89512daf5c70ae61976167075b7c75b7550d867e2e7`.
+- Unchanged default gate: `python port/tools/gate_native_renderer.py --exe
+  build/port/clean/8a6f6e18/dhd.exe --out build/port/release024/gate`.
+  **NATIVE RENDERER GAME-STATE GATE MATCH**, result PASS, failures empty.
+  All 14 EE comparisons match: both arms against r46-plain at GO+0/+2/+12/+16,
+  and all six paired moments through GO+4,500. Both final capture fields 7,715;
+  **1,087 readback records / Z reads MATCH through virtual GS field 9,008**.
+  Native rendering exercised. No extra gate options, reference/checker/exclusion
+  changes, or differing-word waiver.
+- Package: `python port/tools/package_release.py --exe
+  build/port/clean/8a6f6e18/dhd.exe`. `build/release/DownhillRevived-0.2.4-win.zip`,
+  **2,879,370 bytes**, SHA-256
+  `b8a23ced13566c2b3702ca318965642a8720710cb257854a8c855a9d2464fd0d`.
+  Packaging checks pass; the four-file archive's executable equals R byte for
+  byte. `scan_retail.py`: 14 runs of 64+ bytes, all SOURCE, zero disallowed
+  runs. `llvm-readobj --coff-resources`: ICON 1-7 and GROUP_ICON 1 present.
+- Player smoke: extracted the actual zip into a new temporary folder, with no
+  ini initially. Cleared inherited `DHD_*`/`ROUND_*`; only `DHD_WINDOW=windowed`
+  and `DHD_LOG=1` supplied. No scripted pad/navigation, seed, renderer, sound,
+  memory-card, movie-skip or ISO variables. Selected the local disc through the
+  actual first-start chooser, which wrote `dhd.ini`. Window title is Downhill
+  Revived; title/main menu, original rider/shop screens, Alpine countdown and
+  running race (00:19 HUD) reached with physical SendInput keys. AUDIO / OTHER
+  music raw 512 -> 408, accepted, EXIT GAME, restart: raw 408 restored and the
+  actual page shows 39. No manual memory-card save needed. ONLINE > Join With
+  A Code accepts physically typed lowercase `xsaqz2`, displayed as `XSAQZ2`;
+  Esc cancels. Read-only process memory confirms values; no game RAM writes.
+- Online quick check: two instances of the same packaged R, local Wrangler
+  4.151.0 dev server, `--local`, 127.0.0.1:30785, command-line
+  `MIN_VERSION:0.2.4` override only. Host creates private VP2AM4; guest types
+  lowercase `vp2am4` with real SendInput keys and Enter joins. Retail rider,
+  bike and jersey screens exercised: Cosmo host, Mai guest, Entry Outfit 2
+  visibly selected. Both READY, host Start The Race, both Alpine races running
+  (phase 3, clocks 1,077/1,085 at read-only observation; screenshots show 00:17).
+  Each sees the other rider; both log `online grid kept (no random start swap)`.
+  This is a quick local check, not a multi-PC latency/performance test.
+- Real updater: original `DownhillRevived-0.2.3-win.zip` extracted separately,
+  `auto_update = on`, local latest.json and the real 0.2.4 zip served by
+  `python -m http.server`. Logs: `0.2.4 is available (this is 0.2.3)`, downloaded
+  2,879,370 bytes with the package SHA-256, `installed over 0.2.3; starting it`,
+  then `0.2.4 is the newest`. Installed executable equals R; old executable and
+  update work folder removed. `dhd.ini`, including the valid new `game_options`
+  line plus font/textures preferences, and synthetic `saves/card1/save.bin`
+  stay byte-identical. The updater test folder and server were removed/stopped.
+
+`build/release/latest.json`:
+
+```json
+{
+ "name": "Downhill Revived",
+ "version": "0.2.4",
+ "url": "https://github.com/skuza-oss/downhill-revived/releases/download/v0.2.4/DownhillRevived-0.2.4-win.zip",
+ "sha256": "b8a23ced13566c2b3702ca318965642a8720710cb257854a8c855a9d2464fd0d",
+ "size": 2879370,
+ "page": "https://github.com/skuza-oss/downhill-revived/releases/tag/v0.2.4"
+}
+```
+
+Evidence and harnesses: `build/port/release024/` (clean recipe and detailed
+build/link logs, gate method/result, packaging, retail scan, icon resources,
+player/online captures and logs, smoke/online/updater result JSON). All stay
+ignored. The Computer Use native pipe returned unavailable twice, so the live
+checks reused finding 065's local SendInput/PrintWindow approach. An early
+input during a shop transition was ignored and repeated after observing the
+settled screen. The offline route helper expected the tool harness's menu/phase
+values; player mode kept menu 9 and race phase 3, so the live race screenshot and
+read-only state established completion and only that helper PID was stopped.
+No product changes were needed for these harness issues.
+
+Stopped only recorded task-owned game/server/helper PIDs. Deleted all three smoke, online
+guest and updater temporary folders. No third-party implementation copied.
+
 ## Open
 
 - A save writes `saves\card1` on demand; the first run above made none.

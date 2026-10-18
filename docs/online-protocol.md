@@ -268,3 +268,13 @@ show only rooms whose `version` matches their own.
 - Text frames: at most 4 KB. Binary frames: at most 256 bytes.
 - A room with no members is deleted.
 - No reconnect in version 1: a dropped racer is handed to AI for the rest of the race.
+
+## Retail preview flow (finding 065)
+
+The UI uses retail selection screens before READY. Rider/bike indexes still use
+`pick`; the complete outfit and bike records still travel in EVENT_SETUP v2 when
+the race loads. There is no new wire message or protocol revision. The host starts
+when all present members are ready, with at least two members. Choosing again
+clears readiness; a changed track requires guests to ready again. Exact executable
+identity in `hello.version` refuses mixed builds. Raise MIN_VERSION to the release
+that includes this UI at release time; no deployment is part of this change.

@@ -87,6 +87,24 @@ static int race_started[2], race_clock;
 static unsigned long long race_field = ~0ull;
 static volatile unsigned long long race_pad_field;
 
+/* Opt-in visual survey: NEW LEVEL retains shell menu 2. Arm the existing
+   race-clock input/capture only after the built-in unlock bootstrap has
+   loaded a fresh rider with its ordinary cheat flags cleared. Default
+   comparisons still arm on their first menu-9 countdown, unchanged. */
+static int race_sync_menu(void)
+{
+    return RACE_MENU == 9 || (getenv("DHD_RACE_SYNC_UNLOCKED") && RACE_MENU == 2);
+}
+
+static int race_sync_ready(void)
+{
+    if (!getenv("DHD_RACE_SYNC_UNLOCKED")) return 1;
+    return *(volatile uint32_t *)0x084346B4 == 0x035FFFFFu &&
+           *(volatile uint32_t *)0x082B6E68 == 0 &&
+           *(volatile uint32_t *)0x082B6E6C == 0 &&
+           *(volatile uint32_t *)0x082B6E70 == 0;
+}
+
 #ifdef _WIN32
 /* Every 30 s of wall time, where the run is: the virtual field, the game's menu, race phase
    and clock, and the field of the last pad read. The comparison drivers stop on a stalled
@@ -173,12 +191,13 @@ int autopad_nav(const char *script, unsigned long long field, uint16_t *buttons)
 static int race_in(int which)
 {
     int phase = RACE_PHASE;
-    return race_started[which] && RACE_MENU == 9 && (which ? phase == 2 || phase == 3 : phase == 1);
+    return race_started[which] && race_sync_menu() && (which ? phase == 2 || phase == 3 : phase == 1);
 }
 
 void race_sync_vsync(unsigned long long field)
 {
     if (!getenv("DHD_RACE_SYNC") || field == race_field) return;
+    if (!race_started[0] && !race_sync_ready()) return;
 #ifdef _WIN32
     static int heartbeat;
     if (!heartbeat++) {
@@ -198,7 +217,7 @@ void race_sync_vsync(unsigned long long field)
         fprintf(stderr, "compare: frame field=%llu frame=%d loadbar=%d menu=%d phase=%d clock=%d\n", field,
                 *(volatile int32_t *)0x0829E10C, *(volatile int32_t *)0x08663108, RACE_MENU, RACE_PHASE, race_clock);
     for (int i = 0; i < 2; i++)
-        if (!race_started[i] && RACE_MENU == 9 && RACE_PHASE == i + 1) {
+        if (!race_started[i] && race_sync_menu() && RACE_PHASE == i + 1) {
             race_started[i] = 1;
             fprintf(stderr, "compare: race anchor=%c field=%llu clock=%d\n", "cg"[i], field, race_clock);
         }

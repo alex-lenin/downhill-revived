@@ -67,8 +67,10 @@ def frame_script(events):
     return ','.join(f'{a}:{b-a}:{chord}' for a, b, _, chord in events)
 
 
-def write_movie(path, events, fields):
+def write_movie(path, events, fields, players=1):
     """Independent serializer for PCSX2's documented v1 POWER_ON p2m2 format."""
+    if players not in (1, 2):
+        raise ValueError('p2m2 comparison supports one or two recorded pads')
     header = struct.pack('<B50s255s255sIIB', 1, b'PCSX2-2.8.2', b'DHD comparison',
                          b'Downhill Domination', fields, 0, 0)
     neutral = bytes([255, 255, 128, 128, 128, 128] + [0] * 12)
@@ -81,7 +83,7 @@ def write_movie(path, events, fields):
                     mask |= bits
             pad = struct.pack('<H', mask ^ 65535) + bytes([128] * 4)
             pad += bytes(255 if mask & BUTTONS[name] else 0 for name in PRESSURES)
-            f.write(pad + neutral)
+            f.write(pad + (pad if players == 2 else neutral))
 
 
 def sha256(path):

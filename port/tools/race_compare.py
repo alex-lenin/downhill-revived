@@ -119,7 +119,9 @@ def launch_retail(args, directory, race_events, moments):
     data = retail.config(directory, bios, args.retail_renderer)
     navigation = compare.parse_pad(NAVIGATION)
     compare.write_movie(directory / 'navigation.p2m2', navigation, compare.field_at(620))
-    compare.write_movie(directory / 'race.p2m2', race_events, max(o for _, _, o in moments) + 2 * CLOCK)
+    compare.write_movie(directory / 'race.p2m2', race_events,
+                        max(max(o for _, _, o in moments) + 2 * CLOCK, getattr(args, 'race_movie_fields', 0)),
+                        players=getattr(args, 'race_players', 1))
     (directory / 'retail').mkdir()
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DHD_', 'ROUND_'))}
     if getattr(args, 'nav', NAV):
@@ -139,6 +141,7 @@ def launch_retail(args, directory, race_events, moments):
     if getattr(args, 'gsdump', False):
         (directory / 'retail-gs').mkdir()
         env['DHD_COMPARE_RACE_GSDUMP'] = str(directory / 'retail-gs')
+    env.update(getattr(args, 'retail_env', {}))
     command = [str(runtime / emulator.name), '-datapath', str(data), '-batch', '-nogui', '-fastboot',
                '-unlimited', '-logfile', str(directory / 'pcsx2.log'), '--', str(Path(iso).resolve())]
     log = (directory / 'retail-stdout.log').open('wb')
