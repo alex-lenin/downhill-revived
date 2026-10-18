@@ -746,6 +746,8 @@ void gs_gpu_destroy(Gs *g)
 #undef RELEASE
     free(p->bin_data); free(p); g->backend = NULL; g->draw = NULL; g->sync = NULL; g->sync_range = NULL;
     g->local_copy = NULL; g->stage_pages = NULL; g->fetch_pages = NULL;
+    g->flush_draw = NULL;
+    g->write_high = NULL;
 }
 
 int gs_gpu_display(Gs *g, unsigned *width, unsigned *height)

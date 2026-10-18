@@ -589,6 +589,16 @@ float4 native_blit(float4 position : SV_Position) : SV_Target {
     return blit_source.Load(int3((int2)floor((position.xy / blit_map.z + blit_map.xy) * blit_map.w), 0));
 }
 
+// R holds uploaded alpha bits, G their mask; the scaled RGB and remaining alpha
+// bits come from an unchanged copy of this page of the target.
+float4 native_upload_alpha(float4 position : SV_Position) : SV_Target {
+    int2 local = (int2)floor(position.xy / blit_map.z - blit_map.xy);
+    uint2 upload = (uint2)round(blit_source.Load(int3(local, 0)).rg * 255);
+    float4 previous = native_source.Load(int3((int2)position.xy, 0));
+    uint alpha = (uint)round(previous.a * 255);
+    return float4(previous.rgb, ((alpha & ~upload.y) | upload.x) / 255.0);
+}
+
 // A texture over GS memory some of which native surfaces drew, in a layout the draw can't sample
 // from a surface directly (gpu_native.inc, native_convert_texture): a 32-bit target read as
 // 16-bit, frame buffer alpha read as a 4-bit texture, a texture page partly drawn over. Each texel

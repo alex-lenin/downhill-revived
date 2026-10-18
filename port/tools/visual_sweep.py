@@ -274,10 +274,7 @@ def require_idle(owned_pid=None):
             active.append((pid, name))
         elif name.lower() == 'dhd.exe':
             path = process_executable(pid)
-            # Other dhd.exe instances inside this checkout may run concurrently.
-            # An unknown path cannot prove that a game belongs to an agent.
-            if path is None or ROOT.resolve() not in path.parents:
-                active.append((pid, name, str(path) if path else 'path unavailable'))
+            active.append((pid, name, str(path) if path else 'path unavailable'))
     if active:
         raise RuntimeError(f'live capture deferred: another game/emulator is running: {active}')
 

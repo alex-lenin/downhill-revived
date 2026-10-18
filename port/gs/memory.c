@@ -105,6 +105,8 @@ static inline __attribute__((always_inline)) void write_pixel(Gs *g, unsigned ps
     unsigned page = a / (8192 * 8), bit = 1u << (page & 31);
     if (!(g->host_dirty[page / 32] & bit) && g->sync_range)
         g->sync_range(g, page * 8192, 8192);
+    if ((psm == GS_PSMT8H || psm == GS_PSMT4HL || psm == GS_PSMT4HH) && g->write_high)
+        g->write_high(g, a, value, mask);
     g->host_dirty[page / 32] |= bit;
     g->page_writes[page & 511]++;
     uint32_t *word = &g->vram[a >> 5];

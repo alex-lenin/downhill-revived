@@ -1,5 +1,13 @@
 # Visual sweep (round 48)
 
+Follow-up implementation: [finding 068](068-visual-sweep-fixes.md). The boot loading-card cause is
+isolated and corrected (masked high-byte uploads); fresh native pictures, identical-stream replay
+and retail confirm the card. The Fog Editor grey bar is confirmed as retail behavior, with its
+matching source and GS vertex colours identified. Dense Japan captures and replay establish the same
+high-byte ownership bug there; the correction preserves its loading card too. Final gate/delivery
+are recorded in that follow-up; historical open statements below describe the survey's original
+handoff.
+
 ## Autonomous idle-PC continuation (2026-10-18)
 
 The runner now waits up to three minutes for a foreign instance before deferring a launch.

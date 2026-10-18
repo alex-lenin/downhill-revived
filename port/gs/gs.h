@@ -73,6 +73,10 @@ struct Gs {
     uint64_t vram_epoch; /* counts draws and local copies; with pixels_written, any VRAM change */
     /* CPU pixel writes per 8 KB page, for host caches. Last, so earlier offsets stay fixed. */
     uint32_t page_writes[512];
+    /* Finish recording earlier draws before a host upload changes their pages. */
+    void (*flush_draw)(Gs *gs);
+    /* Optional native high-byte overlay, before the CPU word/page version changes. */
+    void (*write_high)(Gs *gs, unsigned bit_address, uint32_t value, uint32_t mask);
 };
 extern Gs gs;
 

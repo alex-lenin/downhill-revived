@@ -33,6 +33,7 @@
 #include <intrin.h>
 #include "texpack.h"
 #include "font_sharp.h"
+#include "native_frontend.h"
 
 double host_wall_seconds(void); /* port/hle/host.c */
 
@@ -75,7 +76,7 @@ typedef struct {
     ID3D11ShaderResourceView *srv;
 } NativeSurface;
 
-enum { NATIVE_DRAW, NATIVE_COPY, NATIVE_IMPORT };
+enum { NATIVE_DRAW, NATIVE_COPY, NATIVE_IMPORT, NATIVE_ALPHA_UPLOAD };
 typedef struct {
     uint8_t kind, depth_key, color_mask, pad;
     int16_t target, depth, texture_surface;
@@ -175,6 +176,7 @@ typedef struct {
 } NativeUsage;
 
 typedef struct Native {
+    NativeExactCache exact_state;
     Gpu *exact;
     ID3D11Device *device;
     ID3D11DeviceContext *context;
@@ -196,6 +198,9 @@ typedef struct Native {
     volatile LONG surface_count;
     int16_t owner[512];
     uint32_t owner_writes[512];
+    uint64_t upload_epoch, alpha_epoch[512];
+    unsigned alpha_command[512];
+    uint16_t color_pixel[2048];       /* GS word within a page -> row-major colour pixel */
     int16_t top_owner[512];          /* the colour surface that last drew a page, for a Z24 buffer's top byte */
     uint32_t top_writes[512];
     uint64_t page_hash[512];
@@ -259,6 +264,7 @@ typedef struct Native {
        "match window" has seen the window. Narrow ones (the shadow and its blur) stay at 1x. */
     unsigned scale_setting, scale;
     ID3D11PixelShader *blit_pixel;
+    ID3D11PixelShader *alpha_upload_pixel;
     ID3D11Buffer *blit_constants;
     ID3D11Texture2D *import;           /* a 1x page, drawn into an upscaled surface */
     ID3D11ShaderResourceView *import_view;
@@ -419,6 +425,42 @@ static void native_claim(Native *n, Gs *g, int surface, unsigned psm, int x0, in
 }
 
 /* ---- textures ---- */
+
+/* Font uploads share the framebuffer's high byte. Keep the RGB owner and queue
+   only the written alpha bits; importing the CPU's whole page would erase RGB
+   drawn exclusively on the native GPU. The mask also preserves the other nibble
+   and untouched pixels of partial uploads. Called before page_writes increments. */
+static void native_write_high(Gs *g, unsigned address, uint32_t value, uint32_t mask)
+{
+    Native *n = ((Gpu *)g->backend)->native;
+    unsigned page = address / (8192 * 8);
+    int owner = native_owner(n, g, page), x, y;
+    if (owner < 0) return;
+    NativeSurface *s = &n->surfaces[owner];
+    if (s->depth || s->wide || !native_page_origin(s, page, &x, &y) || x + 64 > 2048 || y + 32 > 2048) return;
+    NativeFrame *f = n->recording;
+    NativeCommand *c;
+    if (n->alpha_command[page] && n->alpha_epoch[page] == n->upload_epoch) {
+        c = &f->commands[n->alpha_command[page] - 1];
+    } else {
+        c = native_command(n);
+        c->kind = NATIVE_ALPHA_UPLOAD; c->target = (int16_t)owner;
+        c->x = x; c->y = y; c->w = 64; c->h = 32;
+        c->pixels = calloc(2048, 4);
+        if (!c->pixels) native_oom("alpha upload");
+        n->alpha_command[page] = f->command_count;
+        n->alpha_epoch[page] = n->upload_epoch;
+        if (x + 64 > s->extent[0]) InterlockedExchange(&s->extent[0], x + 64);
+        if (y + 32 > s->extent[1]) InterlockedExchange(&s->extent[1], y + 32);
+    }
+    unsigned shift = (address & 31) - 24;
+    mask <<= shift; value = (value << shift) & mask;
+    unsigned pixel = n->color_pixel[(address >> 5) & 2047];
+    uint32_t old = c->pixels[pixel];
+    c->pixels[pixel] = ((old & 255) & ~mask) | value | ((old >> 8 | mask) & 255) << 8;
+    n->owner_writes[page] = g->page_writes[page] + 1;
+    n->top_owner[page] = (int16_t)owner; n->top_writes[page] = g->page_writes[page] + 1;
+}
 
 static uint64_t native_mix(uint64_t h, uint64_t v)
 {
@@ -772,6 +814,7 @@ static void native_reserve(NativeFrame *f, unsigned more)
 
 static void native_open(Native *n)
 {
+    n->upload_epoch++;
     NativeFrame *f = n->recording;
     NativeCommand *c = native_command(n);
     *c = n->current;
@@ -1180,11 +1223,14 @@ static void native_watch_cover(Native *n, const NativeLogDraw *d, const uint64_t
 static void native_exact(Native *n, Gs *g, unsigned type, const GsVertex *v, unsigned count, unsigned prim, unsigned ctxt)
 {
     uint64_t zbuf = g->reg[GS_ZBUF_1 + ctxt], test = g->reg[GS_TEST_1 + ctxt], frame = g->reg[GS_FRAME_1 + ctxt];
-    if (test >> 16 & 1 && !(test >> 17 & 3)) return;               /* ZTST NEVER: nothing is written */
-    unsigned zbp = (unsigned)zbuf & 511, fbp = (unsigned)frame & 511, fbw = (unsigned)(frame >> 16) & 63;
+    unsigned abe = (unsigned)((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) >> 6 & 1);
+    const NativeExactState *state = native_exact_state(&n->exact_state, zbuf, test, frame, abe);
+    if (state->never) return;                                   /* ZTST NEVER: nothing is written */
+    unsigned zbp = state->zbp, fbp = state->fbp, fbw = state->fbw;
     uint64_t offset = g->reg[GS_XYOFFSET_1 + ctxt], scissor = g->reg[GS_SCISSOR_1 + ctxt];
-    unsigned zpsm = 48 | ((unsigned)(zbuf >> 24) & 15), fpsm = (unsigned)(frame >> 24) & 63;
-    int zwrite = !(zbuf >> 32 & 1), colour = (uint32_t)(frame >> 32) != 0xFFFFFFFFu;
+    unsigned zpsm = state->zpsm, fpsm = state->fpsm;
+    int zwrite = state->zwrite, colour = state->colour;
+    int z_full = state->z_full, colour_eligible = state->colour_full;
     if (zwrite) {
         n->zbase[zbp] = 1;
         /* The page row after the Z buffer's last scissored row. */
@@ -1241,12 +1287,7 @@ static void native_exact(Native *n, Gs *g, unsigned type, const GsVertex *v, uns
     if (zwrite || alias) {
         /* Unconditional: the written value never depends on what memory held before. Z24
            writes leave the top byte, which nothing else changes in a Z buffer. */
-        unsigned ztst = test >> 16 & 1 ? (unsigned)(test >> 17) & 3 : 1, ate = test & 1, atst = (unsigned)(test >> 1) & 7;
-        unsigned afail = (unsigned)(test >> 12) & 3, date = (unsigned)(test >> 14) & 1;
-        unsigned abe = (unsigned)((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) >> 6 & 1);
-        int z_full = zwrite && ztst == 1 && !date && (!ate || atst == 1 || afail == 2) && !psm_wide(zpsm);
-        int colour_full = alias && ztst == 1 && !date && (!ate || atst == 1) && !abe &&
-                          ((unsigned)(frame >> 24) & 63) == GS_PSMCT32 && !(uint32_t)(frame >> 32);
+        int colour_full = alias && colour_eligible;
         native_log(n, g, type, v, count, zwrite ? zbp : NATIVE_NO_PAGE, alias ? fbp : NATIVE_NO_PAGE,
                    zwrite ? z_full : colour_full, box);
         if (alias) n->stats.z_alias_draws++;
@@ -1393,12 +1434,22 @@ static void native_draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
     n->stats.draws++;
 }
 
+/* A host upload must not become the starting content of an earlier pending draw. */
+static void native_flush_draw(Gs *g)
+{
+    Gpu *gpu = g->backend;
+    native_close(gpu->native, g);
+}
+
 /* TRXDIR 2. Between rendered surfaces it is a GPU copy; otherwise the CPU copies GS memory
    (as gs.c would), so later texture decodes see it. */
 static int native_local_copy(Gs *g)
 {
     Gpu *gpu = g->backend;
     Native *n = gpu->native;
+    n->upload_epoch++;
+    /* Claim the pending source draw before deciding where the copy reads. */
+    native_close(n, g);
     uint64_t b = g->reg[GS_BITBLTBUF], p = g->reg[GS_TRXPOS], r = g->reg[GS_TRXREG];
     unsigned width = (unsigned)r & 4095, height = (unsigned)(r >> 32) & 4095;
     unsigned spsm = (unsigned)(b >> 24) & 63, sbp = (unsigned)b & 0x3FFF, sbw = (unsigned)(b >> 16) & 63;
@@ -1412,7 +1463,6 @@ static int native_local_copy(Gs *g)
         if (native_page_origin(&n->surfaces[source], sbp / 32, &ox, &oy)) {
             int target = native_surface(n, dbp / 32, dbw, dpsm, 0);
             if (target >= 0) {
-                native_close(n, g);
                 native_claim(n, g, target, dpsm, (int)dx, (int)dy, (int)(dx + width - 1), (int)(dy + height - 1));
                 NativeCommand *c = native_command(n);
                 c->kind = NATIVE_COPY; c->source = (int16_t)source; c->target = (int16_t)target;
@@ -1647,6 +1697,44 @@ static void native_copy(Native *n, NativeSurface *s, NativeSurface *t, int sx, i
         ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)t->texture, 0, (UINT)(x * S), (UINT)(y * S), 0, (ID3D11Resource *)s->texture, 0, &box);
 }
 
+/* Apply a page of masked alpha bits without resampling its existing scaled RGB. */
+static void native_alpha_upload(Native *n, const NativeCommand *k)
+{
+    NativeSurface *s = &n->surfaces[k->target];
+    ID3D11DeviceContext *c = n->context;
+    unsigned S = s->scale;
+    D3D11_BOX box = {(UINT)k->x * S, (UINT)k->y * S, 0,
+                    (UINT)(k->x + 64) * S, (UINT)(k->y + 32) * S, 1};
+    if (!s->texture || !native_scratch(n, box.right, box.bottom)) return;
+    ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+    ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)n->scratch, 0, box.left, box.top, 0,
+                                             (ID3D11Resource *)s->texture, 0, &box);
+    D3D11_BOX page = {0, 0, 0, 64, 32, 1};
+    ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)n->import, 0, &page, k->pixels, 64 * 4, 0);
+    float map[4] = {(float)k->x, (float)k->y, (float)S, 0};
+    D3D11_VIEWPORT viewport = {(float)box.left, (float)box.top,
+                              (float)(64 * S), (float)(32 * S), 0, 1};
+    D3D11_RECT rect = {(LONG)box.left, (LONG)box.top, (LONG)box.right, (LONG)box.bottom};
+    ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)n->blit_constants, 0, NULL, map, 0, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &s->rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(c, NULL, NULL, ~0u);
+    ID3D11DeviceContext_OMSetDepthStencilState(c, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_VSSetShader(c, n->present_vertex, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, n->alpha_upload_pixel, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(c, 5, 1, &n->blit_constants);
+    ID3D11DeviceContext_PSSetShaderResources(c, 5, 1, &n->scratch_view);
+    ID3D11DeviceContext_PSSetShaderResources(c, 7, 1, &n->import_view);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &viewport);
+    ID3D11DeviceContext_RSSetScissorRects(c, 1, &rect);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(c, 5, 1, &none);
+    ID3D11DeviceContext_PSSetShaderResources(c, 7, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+    native_bind_pipeline(n);
+}
+
 /* Rebuilds conversion i of the frame into its texture; returns the view to sample, or NULL. */
 static ID3D11ShaderResourceView *native_run_convert(Native *n, const NativeFrame *f, unsigned i)
 {
@@ -1734,6 +1822,11 @@ static void native_render(Native *n, NativeFrame *f, const NativeVertex *vertice
     int bound_target = -2, bound_depth = -2, last_convert = -1;
     for (unsigned i = 0; i < f->command_count; i++) {
         NativeCommand *k = &f->commands[i];
+        if (k->kind == NATIVE_ALPHA_UPLOAD) {
+            native_alpha_upload(n, k);
+            bound_target = bound_depth = -2; last_convert = -1;
+            continue;
+        }
         if (k->kind == NATIVE_IMPORT) {
             NativeSurface *s = &n->surfaces[k->target];
             D3D11_BOX box = {(UINT)k->x, (UINT)k->y, 0, (UINT)(k->x + k->w), (UINT)(k->y + k->h), 1};
@@ -2437,6 +2530,7 @@ void gs_native_vsync(Gs *g, IDXGISwapChain *swapchain, unsigned *width, unsigned
     }
     Gpu *gpu = g->backend;
     Native *n = gpu->native;
+    n->upload_epoch++;
     NativeFrame *f = n->recording;
     native_close(n, g);
     /* The display circuit, as gs_gpu_display reads it. */
@@ -2777,6 +2871,7 @@ static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceCont
             for (unsigned y = 0; y < 32; y++)
                 for (unsigned x = 0; x < 64; x++)
                     inverse[layout * 2048 + (gs_pixel_address(layout ? GS_PSMZ32 : GS_PSMCT32, 0, 1, x, y) >> 5 & 2047)] = x | y << 8;
+        for (unsigned i = 0; i < 2048; i++) n->color_pixel[i] = (uint16_t)((inverse[i] & 255) + (inverse[i] >> 8) * 64);
         D3D11_BUFFER_DESC ib = {sizeof inverse, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0,
                                 D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4};
         D3D11_SUBRESOURCE_DATA id = {inverse, 0, 0};
@@ -2798,6 +2893,10 @@ static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceCont
     ID3DBlob *blit = native_compile("native_blit", "ps_5_0");
     if (SUCCEEDED(hr)) hr = blit ? ID3D11Device_CreatePixelShader(device, ID3D10Blob_GetBufferPointer(blit), ID3D10Blob_GetBufferSize(blit), NULL, &n->blit_pixel) : E_FAIL;
     if (blit) ID3D10Blob_Release(blit);
+    ID3DBlob *alpha_upload = native_compile("native_upload_alpha", "ps_5_0");
+    if (SUCCEEDED(hr)) hr = alpha_upload ? ID3D11Device_CreatePixelShader(device,
+        ID3D10Blob_GetBufferPointer(alpha_upload), ID3D10Blob_GetBufferSize(alpha_upload), NULL, &n->alpha_upload_pixel) : E_FAIL;
+    if (alpha_upload) ID3D10Blob_Release(alpha_upload);
     D3D11_BUFFER_DESC bb = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
     if (SUCCEEDED(hr)) hr = ID3D11Device_CreateBuffer(device, &bb, NULL, &n->blit_constants);
     D3D11_TEXTURE2D_DESC t = {0};
@@ -2831,6 +2930,8 @@ static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceCont
     exact->clip_on = 1;
     g->draw = native_draw;
     g->local_copy = native_local_copy;
+    g->flush_draw = native_flush_draw;
+    g->write_high = native_write_high;
     g->stage_pages = native_stage_pages;
     n->trace_probes = getenv("DHD_NATIVE_PROBES") != NULL;
     if (getenv("DHD_NATIVE_SURFACES") && !(n->usage = calloc(NATIVE_SURFACES, sizeof *n->usage))) native_oom("usage");
