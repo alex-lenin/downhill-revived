@@ -57,6 +57,7 @@ def build(aot=False, isa="sse2", thinlto=False, pgo_use=None):
     reference = []
     if aot:
         subprocess.run(flags + ['/DPS2_VU_REFERENCE', '/Dps2_vu0_run=ps2_vu0_reference', '/Dps2_vu1_run=ps2_vu1_reference',
+                                '/Dps2_vu_aot_load=ps2_vu_aot_reference_load',
                                 '/c', str(ROOT / 'port/runtime/vu0_interp.c'), '/Foreference.obj'],
                        cwd=OUT, check=True)
         reference = ['reference.obj']

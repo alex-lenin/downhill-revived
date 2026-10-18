@@ -25,6 +25,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--exe', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
+    ap.add_argument('--external-out', action='store_true',
+                    help='allow private artifacts outside the checkout; comparisons and reference are unchanged')
     # r46-plain: a plain build_clean.py executable after the data-fixup audit.
     # All changes from r40-plain are enumerated and checked against independent
     # retail RAM in finding 062 (including round 45's pickup timing correction).
@@ -48,8 +50,8 @@ def main():
         if ROOT / 'build' not in reference.parents or reference.exists():
             ap.error('--record writes a new --reference folder under build/')
     out = args.out.resolve()
-    if ROOT / 'build' not in out.parents:
-        ap.error('output must stay below build/')
+    if ROOT / 'build' not in out.parents and (not args.external_out or out == ROOT or ROOT in out.parents):
+        ap.error('output must stay below build/, or outside the checkout with --external-out')
     if not os.environ.get('DHD_ISO'):
         ap.error('DHD_ISO must reference the local game image')
     out.mkdir(parents=True, exist_ok=False)

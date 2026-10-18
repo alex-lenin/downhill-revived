@@ -24,24 +24,39 @@ static volatile LONG written, consumed, stopping;
    frame) cost a kernel call and a thread wake each. */
 static volatile LONG sleeping, waiting;
 static int initialized;
+static int adaptive_waits;
 
-static uint32_t position(volatile LONG *p) { return (uint32_t)InterlockedCompareExchange(p, 0, 0); }
+/* Reads only acquire ownership published by the other side. A locked RMW here
+   unnecessarily takes exclusive ownership of its cache line on every poll.
+   Keep the interlocked publications and sleep announcements below: their full
+   barriers also order each publication before the subsequent waiter check. */
+static uint32_t position(volatile LONG *p) { return (uint32_t)__atomic_load_n(p, __ATOMIC_ACQUIRE); }
 
 /* Spin briefly before sleeping until *p moves away from at. *flag announces the sleep;
    the interlocked store and reread pair with the other side's publish-then-read. */
-static void idle_wait(volatile LONG *p, uint32_t at, volatile LONG *flag, HANDLE event, DWORD timeout)
+static void idle_wait(volatile LONG *p, uint32_t at, volatile LONG *flag, HANDLE event, DWORD timeout, unsigned *budget)
 {
-    for (unsigned spin = 0; spin < 4096; spin++) {
-        if (position(p) != at) return;
+    unsigned limit = budget && adaptive_waits ? *budget : 4096;
+    for (unsigned spin = 0; spin < limit; spin++) {
+        if (position(p) != at) {
+            if (budget && adaptive_waits) {
+                unsigned next = spin * 2 + 128;
+                *budget = next < 4096 ? next : 4096;
+            }
+            return;
+        }
         _mm_pause();
     }
+    /* Only empty consumer waits adapt. Retired/full waits keep their original
+       budget and timeout. Publication and lost-wakeup handshake are unchanged. */
+    if (budget && adaptive_waits) *budget = limit > 256 ? limit / 2 : 128;
     InterlockedIncrement(flag);
     if (position(p) == at) WaitForSingleObject(event, timeout);
     InterlockedDecrement(flag);
 }
 
 /* Retired-side waits share one auto-reset event; the short timeout covers two waiters. */
-static void wait_retired(void) { idle_wait(&consumed, position(&consumed), &waiting, retired, 1); }
+static void wait_retired(void) { idle_wait(&consumed, position(&consumed), &waiting, retired, 1, NULL); }
 
 #include "graphics_timeline.h"
 
@@ -72,12 +87,13 @@ static DWORD WINAPI consume(void *unused)
 {
     (void)unused;
     host_thread_name("vu");
+    unsigned idle_budget = 1024;
     for (;;) {
         uint32_t at = position(&consumed);
         if (at == position(&written)) {
             if (position(&stopping)) return 0;
             LONG64 idle = tl_begin();
-            idle_wait(&written, at, &sleeping, available, INFINITE);
+            idle_wait(&written, at, &sleeping, available, INFINITE, &idle_budget);
             tl_add(TL_VU_IDLE, idle);
             continue;
         }
@@ -136,6 +152,9 @@ int graphics_threaded(void)
 static void initialize(void)
 {
     initialized = 1;
+    /* DHD_FIFO_ADAPTIVE=0 keeps the fixed 4096-spin budget for the consumers' empty waits (finding 069). */
+    const char *adaptive = getenv("DHD_FIFO_ADAPTIVE");
+    adaptive_waits = !adaptive || strcmp(adaptive, "0");
     if (!graphics_threaded()) return;
 #ifdef GRAPHICS_QUEUE_TEST
     /* Cross the 32-bit publication counter rollover during the stress test. */

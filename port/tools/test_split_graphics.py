@@ -16,5 +16,11 @@ def main():
         exe=out/(name+'.exe')
         subprocess.run(common+[str(ROOT/'port'/s) for s in sources]+['/Fe:'+str(exe)],
                        cwd=out,check=True,timeout=120)
-        subprocess.run([str(exe)],env=dict(os.environ,DHD_GS_WORKER='1'),check=True,timeout=60)
+        for adaptive in ('0', '1'):
+            env=dict(os.environ,DHD_GS_WORKER='1',DHD_FIFO_ADAPTIVE=adaptive)
+            subprocess.run([str(exe)],env=env,check=True,timeout=60)
+            if name == 'queue':
+                result=subprocess.run([str(exe),'negative'],env=env,timeout=60)
+                if result.returncode != 1:
+                    raise RuntimeError('full-state negative control did not fail')
 if __name__=='__main__':main()

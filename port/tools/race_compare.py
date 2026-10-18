@@ -168,7 +168,8 @@ def launch_port(args, directory, race_events, moments):
         (directory / 'port-ee').mkdir()
         env['DHD_RACE_DUMP'] = str(directory / 'port-ee')
     (directory / 'port-gs').mkdir()  # the renderer check replays these
-    env['DHD_RACE_GSDUMP'] = str(directory / 'port-gs')
+    if not getattr(args, 'no_gsdump', False):
+        env['DHD_RACE_GSDUMP'] = str(directory / 'port-gs')
     env.update(getattr(args, 'port_env', {}))
     log = (directory / 'port.log').open('wb')
     # Above normal: a game or build sharing the machine otherwise starves the port's EE thread, and a

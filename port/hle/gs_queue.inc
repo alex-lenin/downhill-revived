@@ -16,7 +16,7 @@ static HANDLE gs_worker, gs_available, gs_retired;
 static volatile LONG gs_written, gs_consumed, gs_stopping, gs_sleeping, gs_waiting;
 static uint32_t gs_position(volatile LONG *p)
 {
-    return (uint32_t)InterlockedCompareExchange(p, 0, 0);
+    return position(p);
 }
 static void gs_execute(unsigned path, const uint32_t *words, unsigned count, const GraphicsProvenance *p)
 {
@@ -76,6 +76,7 @@ static DWORD WINAPI gs_consume(void *unused)
 {
     (void)unused;
     host_thread_name("gs");
+    unsigned idle_budget = 1024;
     _mm_setcsr((_mm_getcsr() | 0x1f80u) & ~(63u | 0xe040u));
     for (;;) {
         uint32_t at = gs_position(&gs_consumed);
@@ -83,7 +84,7 @@ static DWORD WINAPI gs_consume(void *unused)
             if (gs_position(&gs_stopping))
                 return 0;
             LONG64 idle = tl_begin();
-            idle_wait(&gs_written, at, &gs_sleeping, gs_available, INFINITE);
+            idle_wait(&gs_written, at, &gs_sleeping, gs_available, INFINITE, &idle_budget);
             tl_add(TL_GS_IDLE, idle);
             continue;
         }
@@ -105,7 +106,7 @@ void graphics_gs_wait(void)
         return;
     uint32_t target = gs_position(&gs_written);
     while ((int32_t)(gs_position(&gs_consumed) - target) < 0)
-        idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1);
+        idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1, NULL);
 }
 static void gs_queue_shutdown(void)
 {
@@ -158,7 +159,7 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
         if (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap) {
             LONG64 full = tl_begin();
             while (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap)
-                idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1);
+                idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1, NULL);
             tl_add(TL_VU_FULL, full);
         }
         if (wrap) {

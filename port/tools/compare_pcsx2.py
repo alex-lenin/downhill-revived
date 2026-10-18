@@ -109,9 +109,14 @@ def snapshot_exe(source, directory):
 def stop(process):
     if process.poll() is None:
         if os.name == 'nt':
-            # The native fixed-address reservation launcher can spawn a child.
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # The reservation launcher can spawn a same-image child. Verify
+            # every executable PID before stopping it; never tree-kill an
+            # unchecked descendant.
+            from owned_process import stop_verified
+            if not isinstance(process.args, (list, tuple)) or not process.args:
+                raise RuntimeError('cannot verify the comparison executable')
+            stop_verified(process, process.args[0])
+            return
         process.terminate()
         try:
             process.wait(timeout=10)

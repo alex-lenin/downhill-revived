@@ -22,10 +22,35 @@ def generate(destination, early_flags=True):
     selected=[p for p in sorted(pairs) if 0x1948<=p*8<=0x1ad8 or 0x1cc0<=p*8<=0x2730]
     lines=['/* Generated locally; do not commit. */']+WORDS_MACRO
     entries=[]
-    for name,start,end in [('loop',0x170,0x260),('zero',0x270,0x280),('zero1638',0x17c0,0x17e0),('zero17e0',0x1938,0x1948),('loop20c',0x1110,0x11d8),('loop260',0x13a0,0x1420),('loop1638',0x1708,0x17b0),('loop17e0',0x18b0,0x1928),('loop800',0x8b0,0x938),('loop468',0x468,0x578),('clip1',0x1948,0x1ae0),('clip2',0x1cc0,0x2738)]:
+    for name,start,end in [
+        ('loop',0x170,0x260),
+        ('zero',0x270,0x280),
+        ('zero1638',0x17c0,0x17e0),
+        ('zero17e0',0x1938,0x1948),
+        ('loop20c',0x1110,0x11d8),
+        ('loop260',0x13a0,0x1420),
+        ('loop1638',0x1708,0x17b0),
+        ('loop17e0',0x18b0,0x1928),
+        ('loop800',0x8b0,0x938),
+        ('loop468',0x468,0x578),
+        ('loop1430',0x1510,0x1638),
+        ('loop2dc8',0x2f00,0x2fc8),
+        ('tail2dc8',0x2fc8,0x2fd8),
+        ('giftail',0xff8,0x1040),
+        ('clip1',0x1948,0x1ae0),
+        ('clip2',0x1cc0,0x2738),
+    ]:
         words=[w for p in range(start//8,end//8) for w in pairs[p]]
         lines+=[f'AOT_WORDS(native_{name}_words, {len(words)}, '+','.join(f'0x{w:08x}u' for w in words)+')']
         entries+=fills(f'native_{name}_words',data,[where[p] for p in range(start//8,end//8)],words)
+    # Particle overlay A uses its own word provenance; keep overlay B's pairs
+    # below for the directly threaded clipping emitter.
+    particle_pairs,particle_where=program(data,0x265c00)
+    for name,start,end in [('loop0e10',0xee0,0xfd0),('tail0e10',0xfd0,0x1010),
+                           ('loop2e48',0x2f90,0x30c0),('tail2e48',0x30c0,0x30f8)]:
+        words=[w for p in range(start//8,end//8) for w in particle_pairs[p]]
+        lines+=[f'AOT_WORDS(native_{name}_words, {len(words)}, '+','.join(f'0x{w:08x}u' for w in words)+')']
+        entries+=fills(f'native_{name}_words',data,[particle_where[p] for p in range(start//8,end//8)],words)
     lines+=fill_function('native_words',entries)
     # This closed clip program only reads MAC at 1970 (SUBA at 1950, four
     # issue slots earlier), and CLIP at 1A58/68/78/88/98 and 2600. The newest

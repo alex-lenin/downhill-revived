@@ -337,10 +337,13 @@ ps2_cpu *ps2_vu1_regs;
 uint64_t ps2_vu1_code_version;
 int ps2_vu1_native_mode = -1;
 int ps2_vu0_aot_mode = -1;
+int ps2_vu0_native_mode = -1;
+unsigned long long ps2_vu0_native_runs;
+static unsigned long long vu0_native_entries[5];
 #ifdef PS2_VU_COVERAGE  /* tests: VU1 pairs run by the interpreter, by pc, and pairs run in blocks */
 unsigned long long ps2_vu1_interpreted[2048], ps2_vu1_translated;
 #endif  /* tests: 0/1 force the VU0 blocks off/on, else DHD_VU0_AOT */
-unsigned long long ps2_vu1_native_runs[8];  /* native kernel runs by kind bit (tests read it) */
+unsigned long long ps2_vu1_native_runs[PS2_VU1_NATIVE_KINDS];
 void (*ps2_vu1_regs_sync)(void);
 
 void ps2_vu0_vu1_file(ps2_q128 file[64])
@@ -955,11 +958,20 @@ static inline void trace_pair(Vu *u, unsigned pc)
    code buffer (the replay tests) is compared each time. */
 static int native_code_compare(const uint8_t *code, unsigned kind, unsigned start, unsigned end)
 {
-    const uint32_t *words = kind == 128 ? native_loop468_words : kind == 64 ? native_loop800_words : kind == 16 ? native_loop20c_words :
+    const uint32_t *words = kind == 2048 ? native_loop2e48_words : kind == 1024 ? native_loop0e10_words : kind == 512 ? native_loop2dc8_words : kind == 256 ? native_loop1430_words : kind == 128 ? native_loop468_words : kind == 64 ? native_loop800_words : kind == 16 ? native_loop20c_words :
                             kind == 32 ? native_loop260_words : kind == 4 ? native_loop1638_words :
                             kind == 8 ? native_loop17e0_words : native_loop_words;
-    if (memcmp(code + start, words, end - start)) return 0;
-    if (kind >= 64) return 1;  /* no clipping path */
+    /* 1430's signature includes its short exit through 1630. Bulk flags have
+       already retired: neither that tail nor the common GIF tail may gain an
+       earlier MAC/status read without making this kernel decline. */
+    size_t bytes = kind == 256 ? sizeof native_loop1430_words : end - start;
+    if (memcmp(code + start, words, bytes)) return 0;
+    if ((kind == 256 || kind == 512) && memcmp(code + 0xff8, native_giftail_words, sizeof native_giftail_words)) return 0;
+    /* 2DC8 also carries a pending Q through its own branch and delay slot. */
+    if (kind == 512 && memcmp(code + 0x2fc8, native_tail2dc8_words, sizeof native_tail2dc8_words)) return 0;
+    if (kind == 1024 && memcmp(code + 0xfd0, native_tail0e10_words, sizeof native_tail0e10_words)) return 0;
+    if (kind == 2048 && memcmp(code + 0x30c0, native_tail2e48_words, sizeof native_tail2e48_words)) return 0;
+    if (kind == 64 || kind == 128 || kind == 1024 || kind == 2048) return 1;  /* no clipping path */
     if (kind <= 8 && (kind == 4 ? memcmp(code + 0x17c0, native_zero1638_words, sizeof native_zero1638_words) :
                       kind == 8 ? memcmp(code + 0x1938, native_zero17e0_words, sizeof native_zero17e0_words) :
                       memcmp(code + 0x270, native_zero_words, sizeof native_zero_words)))
@@ -970,8 +982,8 @@ static int native_code_compare(const uint8_t *code, unsigned kind, unsigned star
 
 static int native_code_matches(const uint8_t *code, unsigned kind, unsigned start, unsigned end)
 {
-    static uint64_t checked[256];  /* ps2_vu1_code_version + 1 */
-    static uint8_t matched[256];
+    static uint64_t checked[4096];  /* ps2_vu1_code_version + 1 */
+    static uint8_t matched[4096];
     if ((uintptr_t)code != 0x11008000) return native_code_compare(code, kind, start, end);
     if (checked[kind] != ps2_vu1_code_version + 1) {
         matched[kind] = (uint8_t)native_code_compare(code, kind, start, end);
@@ -1022,7 +1034,7 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         const char *value = getenv("DHD_VU1_NATIVE");
         native_enabled = (!value || atoi(value)) && !getenv("DHD_VU_TRACE");
         const char *mask = getenv("DHD_VU1_NATIVE_MASK");
-        native_mask = mask ? (unsigned)strtoul(mask, NULL, 0) : 255;
+        native_mask = mask ? (unsigned)strtoul(mask, NULL, 0) : 4095;
     }
     unsigned native_kind = 0;
     if (use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && (addr == 0x1040 || addr == 0x1cb0)) {
@@ -1032,15 +1044,19 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         else if (cpu->vi[13] == 0x20c) native_kind = 16;
         else if (cpu->vi[13] == 0x260) native_kind = 32;
         else if (cpu->vi[13] == 0x100) native_kind = 64;
+        else if (cpu->vi[13] == 0x288) native_kind = 256;
+        else if (cpu->vi[13] == 0x5bd) native_kind = 512;
     }
     /* MSCAL 0010/0020 branch to the skinning setup at 03C8 (overlay 2), then its loop. */
     if (use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && (addr == 0x10 || addr == 0x20))
         native_kind = 128;
+    if (unit && use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && addr == 0xe10) native_kind = 1024;
+    if (unit && use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && addr == 0x2e48) native_kind = 2048;
     const int native_geometry = (native_kind & native_mask) != 0;
-    unsigned native_start = native_kind == 128 ? 0x468 : native_kind == 64 ? 0x8b0 : native_kind == 16 ? 0x1110 : native_kind == 32 ? 0x13a0 : native_kind == 4 ? 0x1708 : native_kind == 8 ? 0x18b0 : 0x170;
-    unsigned native_end = native_kind == 128 ? 0x578 : native_kind == 64 ? 0x938 : native_kind == 16 ? 0x11d8 : native_kind == 32 ? 0x1420 : native_kind == 4 ? 0x17b0 : native_kind == 8 ? 0x1928 : 0x260;
+    unsigned native_start = native_kind == 2048 ? 0x2f90 : native_kind == 1024 ? 0xee0 : native_kind == 512 ? 0x2f00 : native_kind == 256 ? 0x1510 : native_kind == 128 ? 0x468 : native_kind == 64 ? 0x8b0 : native_kind == 16 ? 0x1110 : native_kind == 32 ? 0x13a0 : native_kind == 4 ? 0x1708 : native_kind == 8 ? 0x18b0 : 0x170;
+    unsigned native_end = native_kind == 2048 ? 0x30c0 : native_kind == 1024 ? 0xfd0 : native_kind == 512 ? 0x2fc8 : native_kind == 256 ? 0x1628 : native_kind == 128 ? 0x578 : native_kind == 64 ? 0x938 : native_kind == 16 ? 0x11d8 : native_kind == 32 ? 0x1420 : native_kind == 4 ? 0x17b0 : native_kind == 8 ? 0x1928 : 0x260;
     static unsigned long long native_target_calls;
-    static unsigned long long native_key_targets[256], native_key_calls[256], native_key_vertices[256], native_key_clipped[256];
+    static unsigned long long native_key_targets[4096], native_key_calls[4096], native_key_vertices[4096], native_key_clipped[4096];
     if (native_geometry) native_target_calls++;
     if (native_geometry) native_key_targets[native_kind]++;
 #endif
@@ -1061,20 +1077,21 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
 #if defined(PS2_VU_AOT) && !defined(PS2_VU_GEOMETRY_BENCH) && !defined(PS2_VU_REFERENCE)
         unsigned long long before_vertices = native_vertices, before_clipped = native_clipped_vertices;
         unsigned native_count = 0;
-        if (native_geometry && pc == native_start / 8 && branch < 0 && !ending && steps < MAX_STEPS - 16384 &&
+        if (native_geometry && pc == native_start / 8 && branch < 0 && !ending &&
+            steps < MAX_STEPS - (native_kind >= 256 ? 262144 : 16384) &&
             native_code_matches(cpu->vu0_code, native_kind, native_start, native_end) &&
-            ((native_count = native_kind == 128 ? native_skin_468(&u) : native_kind == 64 ? native_geometry_800(&u) : native_kind == 16 ? native_geometry_20c(&u) :
+            ((native_count = native_kind == 2048 ? native_particles_2e48(&u) : native_kind == 1024 ? native_particles_0e10(&u) : native_kind == 512 ? native_geometry_2dc8(&u) : native_kind == 256 ? native_geometry_1430(&u) : native_kind == 128 ? native_skin_468(&u) : native_kind == 64 ? native_geometry_800(&u) : native_kind == 16 ? native_geometry_20c(&u) :
                              native_kind == 32 ? native_geometry_260(&u) : native_kind == 4 ? native_geometry_1638(&u) :
                              native_kind == 8 ? native_geometry_17e0(&u) : native_geometry_loop(&u)) ||
              native_kind < 64)) {  /* 08B0 and 0468 decline before writing anything: then they run pair by pair */
             unsigned count = native_count;
-            if (!count) {
+            if (!count || count > (unsigned)(MAX_STEPS - steps)) {
                 fprintf(stderr, "native geometry failed after direct writes\n");
                 return -1; /* No rollback after an unsupported direct-write path. */
             }
             static unsigned long long native_calls;
             native_calls++;
-            ps2_vu1_native_runs[__builtin_ctz(native_kind) & 7]++;
+            ps2_vu1_native_runs[__builtin_ctz(native_kind)]++;
             native_key_calls[native_kind]++;
             native_key_vertices[native_kind] += native_vertices-before_vertices;
             native_key_clipped[native_kind] += native_clipped_vertices-before_clipped;
@@ -1218,6 +1235,10 @@ static void vu0_stats(unsigned addr, unsigned long long ticks)
     if (!every) return;
     calls[addr / 8 & 511]++; spent[addr / 8 & 511] += ticks;
     if (++total % every) return;
+#ifndef PS2_VU_REFERENCE
+    fprintf(stderr, "vu0 native after %llu: 0000=%llu 02E0=%llu 05E8=%llu 07B8=%llu 0808=%llu\n", total,
+            vu0_native_entries[0], vu0_native_entries[1], vu0_native_entries[2], vu0_native_entries[3], vu0_native_entries[4]);
+#endif
     unsigned long long all = 0;
     for (unsigned i = 0; i < 512; i++) all += spent[i];
     for (unsigned i = 0; i < 512; i++)
@@ -1226,16 +1247,68 @@ static void vu0_stats(unsigned addr, unsigned long long ticks)
                     calls[i], 100.0 * spent[i] / all, (double)spent[i] / calls[i]);
 }
 
+#if defined(PS2_VU_AOT) && !defined(PS2_VU_REFERENCE)
+#include "vu0_native.h"
+#endif
+
 int ps2_vu0_run(ps2_cpu *cpu, unsigned addr)
 {
     capture(cpu, addr);
-    unsigned long long start = __rdtsc();
+    /* Timing is a launch-time diagnostic. Avoid two timestamp reads around
+       short native routines when no statistics have been requested. */
+    static int timing = -1;
+    if (timing < 0) {
+        const char *value = getenv("DHD_VU0_STATS");
+        timing = value && atoll(value) != 0;
+    }
+    unsigned long long start = timing ? __rdtsc() : 0;
     /* VU0 micro mode rounds like VU1 (PCSX2's default VU0FPCR is toward zero, FTZ/DAZ). */
     unsigned control = _mm_getcsr();
     _mm_setcsr((control & ~0x603F) | 0xFFC0);
-    int result = run(cpu, addr, 0, 0, 0, NULL, NULL);
+    int result;
+#if defined(PS2_VU_AOT) && !defined(PS2_VU_REFERENCE)
+    /* Native VU0 routines (vu0_native.h, finding 066). DHD_VU0_NATIVE=0, DHD_VU_INTERPRETER
+       or DHD_VU_TRACE keep every program on the interpreter. */
+    static int native = -1;
+    if (native < 0) {
+        const char *value = getenv("DHD_VU0_NATIVE");
+        native = (!value || atoi(value)) && !getenv("DHD_VU_INTERPRETER") && !getenv("DHD_VU_TRACE");
+    }
+    if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0 && !cpu->vi[0] && vu0_cull_words[0] &&
+        !memcmp(cpu->vu0_code, vu0_cull_words, sizeof vu0_cull_words)) {
+        native0_cull(cpu);
+        ps2_vu0_native_runs++;
+        vu0_native_entries[0]++;
+        result = 0;
+    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x5e8 && !cpu->vi[0] && vu0_basis_words[0] &&
+               !memcmp(cpu->vu0_code + 0x5e8, vu0_basis_words, sizeof vu0_basis_words)) {
+        native0_transform_basis(cpu);
+        ps2_vu0_native_runs++;
+        vu0_native_entries[2]++;
+        result = 0;
+    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x2e0 && !cpu->vi[0] && vu0_bounds_words[0] &&
+               !memcmp(cpu->vu0_code + 0x2e0, vu0_bounds_words, sizeof vu0_bounds_words)) {
+        native0_bounds(cpu);
+        ps2_vu0_native_runs++;
+        vu0_native_entries[1]++;
+        result = 0;
+    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x7b8 && !cpu->vi[0] && vu0_length_words[0] &&
+               !memcmp(cpu->vu0_code + 0x7b8, vu0_length_words, sizeof vu0_length_words)) {
+        native0_length_squared(cpu);
+        ps2_vu0_native_runs++;
+        vu0_native_entries[3]++;
+        result = 0;
+    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x808 && !cpu->vi[0] && vu0_direction_words[0] &&
+               !memcmp(cpu->vu0_code + 0x808, vu0_direction_words, sizeof vu0_direction_words)) {
+        native0_transform_direction(cpu);
+        ps2_vu0_native_runs++;
+        vu0_native_entries[4]++;
+        result = 0;
+    } else
+#endif
+        result = run(cpu, addr, 0, 0, 0, NULL, NULL);
     _mm_setcsr(control);
-    vu0_stats(addr, __rdtsc() - start);
+    if (timing) vu0_stats(addr, __rdtsc() - start);
     return result;
 }
 

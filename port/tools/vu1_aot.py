@@ -213,6 +213,25 @@ def generate(destination):
     # VU0 micro memory can be written by any EE store as well as VIF0 MPG, so the words are
     # compared on every dispatch (blocks are short) instead of being remembered.
     pairs0, where0 = program(data, 0x26CF80)
+    # The complete native VU0 culling entry, including its E-bit delay slot.
+    # VU0 code has no version counter: compare this signature on every call.
+    cull = [pairs0[pc] for pc in range(0xc0 // 8)]
+    lines += ['AOT_WORDS(vu0_cull_words, 48, ' + ','.join(f'0x{w:08X}u' for pair in cull for w in pair) + ')']
+    entries += fills('vu0_cull_words', data, [where0[pc] for pc in range(0xc0 // 8)],
+                     [w for pair in cull for w in pair])
+    basis = [pairs0[pc] for pc in range(0x5e8 // 8, 0x760 // 8)]
+    lines += ['AOT_WORDS(vu0_basis_words, 94, ' + ','.join(f'0x{w:08X}u' for pair in basis for w in pair) + ')']
+    entries += fills('vu0_basis_words', data, [where0[pc] for pc in range(0x5e8 // 8, 0x760 // 8)],
+                     [w for pair in basis for w in pair])
+    bounds = [pairs0[pc] for pc in range(0x2e0 // 8, 0x4f0 // 8)]
+    lines += ['AOT_WORDS(vu0_bounds_words, 132, ' + ','.join(f'0x{w:08X}u' for pair in bounds for w in pair) + ')']
+    entries += fills('vu0_bounds_words', data, [where0[pc] for pc in range(0x2e0 // 8, 0x4f0 // 8)],
+                     [w for pair in bounds for w in pair])
+    for name, start, end in (('length', 0x7b8, 0x808), ('direction', 0x808, 0x830)):
+        native_pairs = [pairs0[pc] for pc in range(start // 8, end // 8)]
+        words = [w for pair in native_pairs for w in pair]
+        lines += [f'AOT_WORDS(vu0_{name}_words, {len(words)}, ' + ','.join(f'0x{w:08X}u' for w in words) + ')']
+        entries += fills(f'vu0_{name}_words', data, [where0[pc] for pc in range(start // 8, end // 8)], words)
     tables0 = (blocks(pairs0), delay_slots(pairs0))
     found0 = {}
     for table in tables0:

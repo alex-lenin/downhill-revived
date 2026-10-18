@@ -32,6 +32,14 @@ static __m128 native_madd(NativeFlags *f, __m128 acc, __m128 a, __m128 b, int d)
 {
     return native_result(f, _mm_add_ps(operand4(acc), _mm_mul_ps(operand4(a), operand4(b))), d);
 }
+/* acc must have all four lanes written by a preceding FMAC under the VU1
+   FTZ/DAZ, toward-zero environment. Such results are finite normals or zeros.
+   Keep the optimizer barrier even though the exceptional-value clamp is dead. */
+static __m128 native_madd_clean_acc(NativeFlags *f, __m128 acc, __m128 a, __m128 b, int d)
+{
+    __asm__("" : "+x"(acc));
+    return native_result(f, _mm_add_ps(acc, _mm_mul_ps(operand4(a), operand4(b))), d);
+}
 static __m128 native_itof(__m128 value, float scale)
 { return _mm_mul_ps(_mm_cvtepi32_ps(_mm_castps_si128(value)), _mm_set1_ps(scale)); }
 static __m128 native_ftoi(__m128 value, float scale)
@@ -86,7 +94,7 @@ static unsigned native_geometry_loop(Vu *u)
 #define NADD(a,b,d) native_add(&flags,(a),(b),(d))
 #define NSUB(a,b,d) native_sub(&flags,(a),(b),(d))
 #define NMUL(a,b,d) native_mul(&flags,(a),(b),(d))
-#define NMADD(a,b,c,d) native_madd(&flags,(a),(b),(c),(d))
+#define NMADD_CLEAN_ACC(a,b,c,d) native_madd_clean_acc(&flags,(a),(b),(c),(d))
 #define SET(r,x,d) v[r] = native_merge(v[r], (x), (d))
 #define LOAD(a) _mm_loadu_ps(memory[(a) & 1023].f)
 #define STORE(a,x,d) store_fields(memory[(a) & 1023].f, _mm_castps_si128(x), (d))
@@ -113,8 +121,9 @@ static unsigned native_geometry_loop(Vu *u)
         unsigned backface = (_mm_movemask_ps(flags.last) & 4) ? 0x20 : 0;
         clip = ((clip << 6) | native_clip(v[5], lane4(v[13], 3))) & 0xffffff;
         vi[1] = q_flags;
+        /* All ACC lanes overwritten here; the earlier XYZ cross-product is not clean in W. */
         acc = NMUL(v[0], v[22], 15); STORE(index, v[8], 14);
-        v[23] = NMADD(acc, v[26], _mm_set1_ps(q), 15);
+        v[23] = NMADD_CLEAN_ACC(acc, v[26], _mm_set1_ps(q), 15);
         v[14] = NMUL(v[16], lane4(v[6], 0), 15); vi[3] = backface;
         if(q_flags) { SET(8, NADD(v[7],lane4(v[0],0),14),14); }
         else { SET(8, NMUL(v[7], _mm_set1_ps(q), 14), 14); } vi[1] = (clip & 0x02fbef) != 0;
@@ -135,14 +144,15 @@ static unsigned native_geometry_loop(Vu *u)
             clip=u->clip;entry_status=u->status;q_flags=u->status&0x30;
             memset(&flags,0,sizeof flags);
         }
+        /* Reestablish all-lane provenance after any clipping-path state reload. */
         acc = NMUL(v[4], lane4(v[0],3),15); v[11] = v[7];
         v[7] = native_itof(v[9], 1.0f/4096.0f); v[15] = LOAD(4 + index);
         SET(23, minmax4(v[23], lane4(v[0],0),1),1); index = (index + 3) & 0xffff; vi[8] = (uint16_t)index;
         SET(30,native_ftoi(v[24],16.0f),14); SET(24,v[23],14);
-        acc = NMADD(acc,v[1],lane4(v[20],0),15); v[29] = v[28];
+        acc = NMADD_CLEAN_ACC(acc,v[1],lane4(v[20],0),15); v[29] = v[28];
         v[15] = native_itof(v[15],1.0f); v[6] = LOAD(1014);
-        acc = NMADD(acc,v[2],lane4(v[20],1),15); memory[(index-1)&1023].w[3] = vi[7];
-        v[26] = NMADD(acc,v[3],lane4(v[20],2),15);
+        acc = NMADD_CLEAN_ACC(acc,v[2],lane4(v[20],1),15); memory[(index-1)&1023].w[3] = vi[7];
+        v[26] = NMADD_CLEAN_ACC(acc,v[3],lane4(v[20],2),15);
         SET(23,NADD(v[23],lane4(v[11],3),1),1); STORE(index-1,v[30],14);
         pairs += 29 + !!backface;
     } while (index != end);
@@ -153,7 +163,7 @@ static unsigned native_geometry_loop(Vu *u)
 #undef NADD
 #undef NSUB
 #undef NMUL
-#undef NMADD
+#undef NMADD_CLEAN_ACC
 #undef SET
 #undef LOAD
 #undef STORE

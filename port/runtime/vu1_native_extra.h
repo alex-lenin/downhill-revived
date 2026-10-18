@@ -1,4 +1,6 @@
 /* Additional mesh loops sharing the native clipping routine. */
+#include "vu1_native_1430.h"
+#include "vu1_native_2dc8.h"
 static unsigned native_geometry_1638(Vu *u)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
@@ -497,3 +499,7 @@ static unsigned native_skin_468(Vu *u)
 #undef STORE
 #undef LANE_BITS
 }
+
+#include "vu1_native_0e10.h"
+
+#include "vu1_native_2e48.h"

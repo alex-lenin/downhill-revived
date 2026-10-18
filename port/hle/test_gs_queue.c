@@ -11,6 +11,8 @@ volatile uint32_t gs_presented_frames;
 double vif_gs_seconds;
 static uint32_t actual, expected, callbacks, failures;
 static DWORD main_thread, consumer_thread;
+static Gs reference;
+static uint32_t actual_words[12000][6], expected_words[12000][6], expected_count;
 void hle_log(const char *fmt, ...)
 {
     (void)fmt;
@@ -36,6 +38,10 @@ static void record(unsigned path, const uint32_t *words)
     if (!consumer_thread)
         consumer_thread = thread;
     failures += consumer_thread != thread || thread == main_thread;
+    if (callbacks >= 12000) { failures++; return; }
+    actual_words[callbacks][0] = path;
+    actual_words[callbacks][1] = gs.vu_program;
+    memcpy(actual_words[callbacks]+2, words, 16);
     actual = hash(actual, path);
     actual = hash(actual, gs.vu_program);
     for (unsigned i = 0; i < 4; i++)
@@ -46,18 +52,23 @@ static void record(unsigned path, const uint32_t *words)
 static void expect(unsigned path, unsigned program, const uint32_t *words, unsigned count)
 {
     for (unsigned n = 0; n < count; n += 4) {
+        expected_words[expected_count][0] = path;
+        expected_words[expected_count][1] = program;
+        memcpy(expected_words[expected_count++]+2, words+n, 16);
         expected = hash(expected, path);
         expected = hash(expected, program);
         for (unsigned i = 0; i < 4; i++)
             expected = hash(expected, words[n + i]);
     }
 }
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argv;
     main_thread = GetCurrentThreadId();
     _putenv("DHD_MTVU=1");
     _putenv("DHD_GS_WORKER=1");
     gs_reset(&gs);
+    gs_reset(&reference);
     gs.record_transfer = record;
     uint32_t packet[8] = {0x8001, 0x10000000, 14, 0, 0, 0, GS_RGBAQ, 0};
     for (unsigned n = 0; n < 3000; n++) {
@@ -80,6 +91,16 @@ int main(void)
     graphics_wait();
     failures += actual != expected || callbacks != 12000;
     graphics_shutdown();
+    for (unsigned n = 0; n < 6000; n++) {
+        packet[4] = n;
+        reference.vu_program = n;
+        gs_feed(&reference, n < 3000 ? 3 : 1, packet, 8);
+    }
+    gs.record_transfer = NULL; /* same callback configuration for byte comparison */
+    if (argc > 1) gs.reg[GS_RGBAQ] ^= 1; /* negative control must fail */
+    failures += memcmp(actual_words, expected_words, sizeof actual_words) != 0;
+    failures += memcmp(&gs, &reference, sizeof gs) != 0;
+    printf("full GS state/VRAM and 12000 exact callback records: %s\n", failures ? "DIFF" : "MATCH");
     printf("split GS FIFO, wrap, copy ownership, provenance and fences: %u failures\n", failures);
     return failures != 0;
 }

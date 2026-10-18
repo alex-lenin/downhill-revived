@@ -20,7 +20,6 @@ typedef struct { unsigned header[8]; ps2_cpu cpu; ps2_q128 data[1024]; } Run;
 enum { GIF_MAX = 1 << 20 };
 typedef struct { ps2_cpu cpu; ps2_q128 data[1024]; uint8_t gif[GIF_MAX]; unsigned gif_bytes, kicks; } Result;
 
-extern unsigned long long ps2_vu1_native_runs[8];
 static ps2_q128 *data;
 static Result *recording;
 
@@ -127,7 +126,7 @@ int main(int argc, char **argv)
     static Run run;
     static Result exact, native;
     unsigned n = 0, differing = 0;
-    unsigned long long native_before[8], coverage[8] = {0};
+    unsigned long long native_before[PS2_VU1_NATIVE_KINDS], coverage[PS2_VU1_NATIVE_KINDS] = {0};
     while (n < max && fread(&run, sizeof run, 1, f) == 1) {
         if (run.header[3] != sizeof(ps2_cpu)) { fprintf(stderr, "capture register size %u, this build %u\n", run.header[3], (unsigned)sizeof(ps2_cpu)); return 2; }
         load_code(run.header[4]);
@@ -136,7 +135,7 @@ int main(int argc, char **argv)
         memcpy(native_before, ps2_vu1_native_runs, sizeof native_before);
         ps2_vu1_native_mode = 1;
         execute(&run, &native);
-        for (unsigned i = 0; i < 8; i++) coverage[i] += ps2_vu1_native_runs[i] - native_before[i];
+        for (unsigned i = 0; i < PS2_VU1_NATIVE_KINDS; i++) coverage[i] += ps2_vu1_native_runs[i] - native_before[i];
         long cpu = first_difference(&exact.cpu, &native.cpu, sizeof exact.cpu);
         long mem = first_difference(exact.data, native.data, sizeof exact.data);
         long gif = exact.gif_bytes != native.gif_bytes || exact.kicks != native.kicks ? 0 :
@@ -165,7 +164,7 @@ int main(int argc, char **argv)
                k->exact * 1e6 / k->runs, k->native * 1e6 / k->runs, k->native ? k->exact / k->native : 0);
     }
     fprintf(stderr, "%u runs, %u differing; native kernel runs:", n, differing);
-    for (unsigned i = 0; i < 8; i++) fprintf(stderr, " %u=%llu", 1u << i, coverage[i]);
+    for (unsigned i = 0; i < PS2_VU1_NATIVE_KINDS; i++) fprintf(stderr, " %u=%llu", 1u << i, coverage[i]);
     if (repeat) fprintf(stderr, "; replay time exact %.3f ms, native %.3f ms (%.3fx)", exact_total * 1e3, native_total * 1e3,
                         exact_total / native_total);
     fprintf(stderr, "\n");
