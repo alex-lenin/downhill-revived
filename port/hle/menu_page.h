@@ -29,6 +29,7 @@ struct MenuPage {
     void (*left)(MenuPage *, int row), (*right)(MenuPage *, int row);
     int rebuild;               /* set by menu_page_rebuild: rows again at the next update */
     int rebuild_row;           /* and the cursor's row then */
+    int armed;                 /* the buttons were all released since the page opened */
 } __attribute__((aligned(16)));  /* the game stores a u128 at +0x490 with aligned SSE moves */
 
 void menu_page_run(MenuPage *p);       /* modally, until it closes */

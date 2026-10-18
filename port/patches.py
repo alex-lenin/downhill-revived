@@ -344,8 +344,16 @@ PATCHES = {
          'extern void func_0011B030(World *world, Racer *a, Racer *b);\nextern int hle_puppet_keep_grid(void);'),
         ('text', '        if (i != r) {', '        if (i != r && !hle_puppet_keep_grid()) {')],
     'unsorted/001B7198.cpp': [
-        ('text', 'extern void func_001B87F8(void *);', 'extern void func_001B87F8(void *);\nextern void hle_online_riders(void *);'),
-        ('text', '    func_001B74E8(game);\n', '    func_001B74E8(game);\n    hle_online_riders(game);\n')],
+        ('text', 'extern void func_001B87F8(void *);',
+         'extern void func_001B87F8(void *);\nextern void hle_online_riders(void *);\nextern int hle_online_ai_count(int);'),
+        ('text', '    func_001B74E8(game);\n', '    func_001B74E8(game);\n    hle_online_riders(game);\n'),
+        # Online: the AI count for the room (computer riders on or off, port/hle/online.c)
+        ('text', '    return D_004B25A0.xB174 == 0 ? result : 0;\n', '    return hle_online_ai_count(D_004B25A0.xB174 == 0 ? result : 0);\n')],
+    # Online: the other players' names over their riders (port/hle/online.c hle_online_names)
+    'unsorted/0012C9E0.c': [
+        ('text', 'extern void func_0012CF68(void *, int);',
+         'extern void func_0012CF68(void *, int);\nextern void hle_online_names(void *, int);'),
+        ('text', '    func_0012CF68(obj, saved);\n', '    func_0012CF68(obj, saved);\n    hle_online_names(obj, saved);\n')],
     'unsorted/0019F9B0.c': [
         ('text', 'extern void func_001614D8(void *, int);', 'extern void func_001614D8(void *, int);\nextern int hle_online_race_end(int);'),
         ('text', '        } else {\n            func_001B45F8(D_004B1F40, 1, time * 60);\n            if (!D_0043FA34[0]',
@@ -540,6 +548,11 @@ patches_fps.add(PATCHES)
 # Online's retail preview flow (finding 065). These hooks return immediately offline.
 _ONLINE_SELECT_BEGIN = r"""
 extern void func_001F67F0_online(int) asm("func_001F67F0");
+extern void func_00203B68_online(void *, int, float) asm("func_00203B68");
+void port_online_choose_end(void) {
+    port_main_row = 3;
+    D_004C6CA8__cED5B8.x4 = 0;
+}
 void port_online_choose_begin(void) {
     func_001F67F0_online(0);
     D_004B25A0__cED5B8.x288 = 1;
@@ -547,6 +560,10 @@ void port_online_choose_begin(void) {
     D_0029DEEC__cED5B8 = 15;
     D_0029DF50__cED5B8 = 2;
     func_00203590((struct AnimationHandle *)(void *)(D_004C6370__cED5B8), 0x2330, 0, 2);
+    /* The flight to the rider screen from its start: once played it stays at its end, and
+       playing it again would leave the camera where the last screen put it (the sky of the
+       GET READY screen, the title). */
+    func_00203B68_online(D_004C6370__cED5B8, 1, 0.0f);
     func_002038E0__cED5B8(D_004C6370__cED5B8, 1);
     func_001F50F0__cED5B8(0x2330, 2);
     func_001F57D0__cED5B8(0x2329, 0);
@@ -572,6 +589,20 @@ PATCHES['unsorted/001EB1D8.cpp'] += [
      '            port_main_row = online_action ? 0 : 3;\n'
      '            if (online_action == 2) port_online_choose_begin();\n'
      '            else func_001F57D0__cED5B8(0x2329, 1);'),
+]
+
+# Leaving an online room takes the rider screen's Back to the title; there the main menu chooses
+# ONLINE again by itself (port_online_resume), so the player is back on the ONLINE page.
+PATCHES['unsorted/001EB1D8.cpp'] += [
+    ('text', 'extern int port_online_menu(void);\n',
+     'extern int port_online_menu(void);\nextern int port_online_resume(void);\n'),
+    ('text', '    func_001F4A98__cED5B8();\n',
+     '    func_001F4A98__cED5B8();\n'
+     '    if (port_online_resume()) {\n'
+     '        D_004C6CA8__cED5B8.x10 = 3;\n'
+     '        D_0029DF87__cED5B8 = D_0029DF86__cED5B8 = 0;\n'
+     '        D_0029DF8B__cED5B8 = 1;\n'
+     '    }\n'),
 ]
 
 PATCHES['unsorted/001EB1D8.cpp'] += [

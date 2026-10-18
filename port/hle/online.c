@@ -39,6 +39,12 @@
 #define EE_PTR(a) ((void *)(uintptr_t)(0x08000000u + (a)))
 enum { MENU = 0x29DED8, PHASE = 0x43F348, SETUP = 0x4B25A0, LEVEL_NAME = 0x4BD4DC, TRACK_NAMES = 0x26EE50 };
 enum { LOAD_MENU = 9, FLYBY_PHASE = 5 };  /* on the race screen: 5 the flight over the track, 1 countdown, 2-4 race */
+/* The race screen's menus: D_0029E290 is 1 while riding, 0 in a menu; D_003F52D0.x150 the open
+   menu (a host pointer), each menu's first word its row. The pause menu's rows: RESUME, OPTIONS,
+   TRICK LIST, NEW LEVEL, RE-START, MUSIC PLAYLIST, QUIT; RE-START and QUIT ask first ("No,
+   Return" / "Yes"), NEW LEVEL opens the level list. */
+enum { RIDING = 0x29E290, OPEN_MENU = 0x3F5420, PAUSE_MENU = 0x38BC00, RESTART_ASK = 0x388990,
+       LEVEL_LIST = 0x386680, PAUSE_NEW_LEVEL = 3, PAUSE_RESTART = 4 };
 
 /* ---- the pads ---- */
 
@@ -237,6 +243,7 @@ void hle_puppet_event(int sender, const uint8_t *in, int n);
 int hle_puppet_lag(char *out, int size);
 int hle_puppet_hits_taken(void);
 int hle_puppet_global(int slot), hle_puppet_local(int global), hle_puppet_owned(int slot);
+void hle_puppet_rematch(void);
 extern int func_001FA7C0(int bike);                       /* a bike's sound kind */
 extern void func_001B45F8(void *timer, int kind, int ticks);  /* the race-end countdown */
 
@@ -244,7 +251,7 @@ extern void func_001B45F8(void *timer, int kind, int ticks);  /* the race-end co
    port/hle/puppet.c's. */
 enum {
     EVENT_VERSION = 2, EVENT_HIT = 1, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_START = 4, EVENT_GO = 5,
-    EVENT_FINISH = 6, EVENT_RESULTS = 7
+    EVENT_FINISH = 6, EVENT_RESULTS = 7, EVENT_REMATCH = 8
 };
 enum { SNAPSHOT_TICKS = 3 };  /* a snapshot every 3 race ticks: 20 a second */
 enum { NRIDERS = 10, START_LEAD_MS = 1500 };
@@ -294,6 +301,11 @@ static struct {
     int results[NRIDERS], nresults, have_results;
     double first_finish;        /* host_wall_seconds of the first human finish */
     int end_held, end_done;     /* the race-end countdown, held for the results */
+    int no_bots;                /* the room's computer riders off (its "laps" option 1) */
+    /* the host's next race after the results (EVENT_REMATCH): 1 TRY AGAIN, 2 NEW LEVEL on
+       rematch_track; rematch_fields: fields since this PC began choosing it on its menu */
+    int rematch_want, rematch_track, rematch_fields;
+    double end_done_at;
     double end_held_at;
 } on;
 
@@ -498,6 +510,7 @@ static void barrier(void)
     memcpy(on.code, lobby.code, sizeof on.code);
     choose_riders(&lobby);
     on.setup.track = lobby.race_track;
+    on.no_bots = lobby.race_laps & 1;
     on.setup.rider[0] = on.pick[on.local_slot];
     for (int i = 1; i < 4; i++) on.setup.rider[i] = -1;
     for (int i = 0; i < NRIDERS; i++) on.finish[i] = -1;
@@ -507,8 +520,8 @@ static void barrier(void)
     snprintf(seed, sizeof seed, "%u", lobby.race_seed ? lobby.race_seed : 1u);
     set_env("DHD_RACE_SEED", seed);  /* hle_race_seed: never 0, which falls back to the RTC */
     hle_puppet_online(on.local_slot, on.nslots, on.host_slot);
-    fprintf(stderr, "online: race starts: player %d of %d, track %d, seed %s\n", on.local_slot, on.nslots,
-            on.setup.track, seed);
+    fprintf(stderr, "online: race starts: player %d of %d, track %d, seed %s%s\n", on.local_slot, on.nslots,
+            on.setup.track, seed, on.no_bots ? ", no computer riders" : "");
 }
 
 static void send_event(const void *payload, int n)
@@ -584,6 +597,12 @@ static void receive_frames(void)
         case EVENT_RESULTS:
             if (sender == on.host_slot) read_results(e, n - 2);
             break;
+        case EVENT_REMATCH:
+            if (sender == on.host_slot && n - 2 >= 4 && e[3] < 26) {
+                on.rematch_want = e[2] ? 2 : 1, on.rematch_track = e[3], on.rematch_fields = 0;
+                fprintf(stderr, "online: the host chose %s (track %d)\n", e[2] ? "NEW LEVEL" : "TRY AGAIN", e[3]);
+            }
+            break;
         default:  /* EVENT_HIT */
             hle_puppet_event(sender, e, n - 2);
         }
@@ -622,6 +641,24 @@ static void exchange_rides(void)
     kernel_pace_slip(host_wall_seconds() - entered);
 }
 
+/* func_001B89C8's AI count for this PC's one-player race (patched there): online the other
+   players are puppets in AI slots, so there is one at least for each; with the room's computer
+   riders off, only those. Every PC gets the same count from the same room. */
+int hle_online_ai_count(int count)
+{
+    if (!online_mode() || !on.released) return count;
+    int others = on.nslots - 1;
+    return on.no_bots || count < others ? others : count;
+}
+
+/* The riders in the online race (the human, then the AI count func_001B74E8 kept), all ten offline. */
+int hle_online_race_riders(void)
+{
+    if (!online_mode() || !on.released) return NRIDERS;
+    int n = 1 + EE32(SETUP + 0x28C);
+    return n < 1 ? 1 : n > NRIDERS ? NRIDERS : n;
+}
+
 /* After func_001B74E8 chose the AI riders (patched into func_001B7198): the AI slots that are
    puppets of the other players wear what those players ride, and the host's AI riders are the
    same on every PC (the remaining ones of the ten, in the game's order from +0x368). A ride not
@@ -638,7 +675,7 @@ void hle_online_riders(void *game)
     next %= 10;
     for (int i = 0; i < 16; i++) *(int32_t *)(g + 0x2A8 + 4 * i) = -1;
     *(int32_t *)(g + 0x2A8 + 4 * ((*(int32_t *)(g + 0x290) / 32 - 1) & 15)) = 0;
-    for (int slot = 1; slot < NRIDERS; slot++) {
+    for (int slot = 1; slot < NRIDERS && slot <= *(int32_t *)(g + 0x28C); slot++) {
         int k = slot - 1, global = hle_puppet_global(slot), id, outfit[3] = {0, 0, 0}, bike[3];
         if (global < on.nslots) {
             const Ride *r = &on.ride[global];
@@ -698,6 +735,7 @@ static void start_together(void)
         Sleep(on.go_at && on.go_at - net_server_ms() < 20 ? 0 : 2);
     }
     kernel_pace_shared(1);  /* from the agreed moment the fields keep to it, catching up after a stall */
+    hle_puppet_rematch();  /* snapshots from before this start (of the race before, after a rematch) */
     fprintf(stderr, "online: countdown starts (waited %.3f s, %+.1f ms from the agreed moment)\n",
             host_wall_seconds() - entered, on.go_at ? net_server_ms() - on.go_at : 0.0);
 }
@@ -774,7 +812,8 @@ static void finish_step(void)
     static double test_finish = -1;  /* DHD_NET_TEST_FINISH=seconds: tests, this PC's rider finishes then */
     if (test_finish < 0) test_finish = getenv("DHD_NET_TEST_FINISH") ? atof(getenv("DHD_NET_TEST_FINISH")) : 0;
     if (test_finish > 0 && RACE_CLOCK > test_finish * 60 && !FINISHED(0) && !FINISH_NOW(0)) FINISH_NOW(0) = 1;
-    for (int slot = 0; slot < NRIDERS; slot++) {
+    int riders = hle_online_race_riders();
+    for (int slot = 0; slot < riders; slot++) {
         int global = hle_puppet_global(slot);
         if (hle_puppet_owned(slot)) {
             if (FINISHED(slot) && !on.reported[global]) {
@@ -797,19 +836,19 @@ static void finish_step(void)
         if (on.finish[j] < 0 && !lobby.racer[j].left && !on.gone[j]) waiting++;
     if (waiting && host_wall_seconds() - on.first_finish < 90) return;
     /* the order: the finished by time, then the others by the game's places */
-    uint8_t e[3 + 5 * NRIDERS] = {EVENT_VERSION, EVENT_RESULTS, NRIDERS};
+    uint8_t e[3 + 5 * NRIDERS] = {EVENT_VERSION, EVENT_RESULTS, (uint8_t)riders};
     int order[NRIDERS];
-    for (int i = 0; i < NRIDERS; i++) order[i] = i;
-    for (int i = 0; i < NRIDERS; i++)
-        for (int j = i + 1; j < NRIDERS; j++) {
+    for (int i = 0; i < riders; i++) order[i] = i;
+    for (int i = 0; i < riders; i++)
+        for (int j = i + 1; j < riders; j++) {
             int a = order[i], b = order[j], ta = on.finish[a], tb = on.finish[b];
             int a_first = ta >= 0 && tb >= 0 ? ta <= tb : ta >= 0 ? 1 : tb >= 0 ? 0
                           : PLACE(hle_puppet_local(a)) <= PLACE(hle_puppet_local(b));
             if (!a_first) order[i] = b, order[j] = a;
         }
-    for (int i = 0; i < NRIDERS; i++) e[3 + 5 * i] = (uint8_t)order[i], put32(e + 4 + 5 * i, on.finish[order[i]]);
-    send_event(e, sizeof e);
-    read_results(e, sizeof e);
+    for (int i = 0; i < riders; i++) e[3 + 5 * i] = (uint8_t)order[i], put32(e + 4 + 5 * i, on.finish[order[i]]);
+    send_event(e, 3 + 5 * riders);
+    read_results(e, 3 + 5 * riders);
 }
 
 /* ---- disconnects ---- */
@@ -860,6 +899,7 @@ static void state_sync(void)
         (on.have_results || host_wall_seconds() - on.end_held_at > 120)) {
         func_001B45F8(EE_PTR(0x4B1F40), 1, 4 * 60);  /* the results screen in 4 s */
         on.end_done = 1;
+        on.end_done_at = host_wall_seconds();
         /* tests (DHD_NET_SCRIPTED): DHD_NET_AFTER_RACE is the menu script from here, e.g. through
            the results and their menu to QUIT */
         const char *after = getenv("DHD_NET_AFTER_RACE");
@@ -871,7 +911,7 @@ static void state_sync(void)
     }
     if (EE32(PHASE) < 2 || clock < on.last_sent + SNAPSHOT_TICKS && clock >= on.last_sent) return;
     on.last_sent = clock - clock % SNAPSHOT_TICKS;
-    for (int slot = 0; slot < NRIDERS; slot++)
+    for (int slot = 0; slot < hle_online_race_riders(); slot++)
         if ((n = hle_puppet_pack(slot, payload, sizeof payload)) > 0) {
             if (net_send_frame(NET_FRAME_STATE, payload, n)) on.sent++;
             if (slot == 0) record(payload, n);
@@ -905,6 +945,159 @@ static void choose_view(void)
     gs_native_view = racing && EE32(SETUP + 0x288) >= 3 ? want : 0;
 }
 
+/* ---- the other players' names over their riders ---- */
+
+void func_00222D48(int view, float *pos, float *screen);  /* world point to the view's GS coordinates */
+void func_0023D618(int view, int *x, int *y);             /* the view's centre */
+void func_0023D650(int view, int *w, int *h);             /* its size */
+void func_0020FB80(int pen, int w, int h, int dw, int dh);
+void func_0020F518(int pen, int r, int g, int b, int a);
+void func_0020F420(int pen, int view);
+void func_0020F9F0(int pen, int view, int x, int y, const char *text);
+
+/* The stock rider markers (func_001797A0) establish world Z as up. Use the body
+   scene node with a lower offset for a label just above the head. Puppets update
+   that same node through func_0012DDC0.
+   Draw while the local rider's race text is built, then restore pen 0 and its
+   queued colour so later HUD text keeps its own size, alignment and colour. */
+enum { NAME_FAR = 150 };
+int func_0020F860(int pen, const char *text);  /* text width in sixteenths */
+extern float port_fov_x;  /* widescreen.c: glyph width scale, 1 when off */
+void hle_online_names(void *rider, int view)
+{
+    if (!online_mode() || !on.started || rider != RIDER(0) || EE32(PHASE) < 2) return;
+    uint8_t *pen = EE_PTR(0x4F3570), kept[0x20];
+    int cx, cy, w, h, drawn = 0;
+    func_0023D618(view, &cx, &cy);
+    func_0023D650(view, &w, &h);
+    memcpy(kept, pen, sizeof kept);
+    for (int slot = 1; slot < hle_online_race_riders(); slot++) {
+        int global = hle_puppet_global(slot);
+        if (global < 0 || global >= on.nslots || on.gone[global] || !on.name[global][0]) continue;
+        uintptr_t body = (uint32_t)*(int32_t *)(RIDER(slot) + 0x792C);
+        if (!body) continue;
+        float at[4] __attribute__((aligned(16))), screen[4] __attribute__((aligned(16)));
+        float base[4] __attribute__((aligned(16)));
+        memcpy(at, (void *)(body + 0x10), sizeof at);
+        func_00222D48(view, at, base);
+        at[2] += 3.25f;
+        func_00222D48(view, at, screen);
+        if (!(base[2] >= 1 && base[2] <= NAME_FAR && screen[2] >= 1)) continue;
+        /* Keep the label above the rider on screen: raising the world point also
+           shifts X outward in a pitched camera, especially at the start gate. */
+        float local_x = base[0] - (cx - w / 2), local_y = screen[1] - (cy - h / 2);
+        float base_y = base[1] - (cy - h / 2);
+        /* Check before converting, also rejecting non-finite projections. */
+        if (!(local_x >= 0 && local_x < w && base_y >= 0 && base_y < h && local_y >= 0 && local_y < h)) continue;
+        /* Text normally stays inside the middle 4:3 area. Undo that mapping for
+           this world anchor, while keeping the glyphs themselves in proportion. */
+        int x = (int)(w / 2 + (local_x - w / 2) / port_fov_x), y = (int)local_y - 16;
+        func_0020FB80(0, 320, 240, -102, -24);
+        int half_width = (func_0020F860(0, on.name[global]) + 31) / 32;
+        if (local_x - half_width * port_fov_x < 1 || local_x + half_width * port_fov_x >= w - 1 || y < 1) continue;
+        func_0020F518(0, 0, 0, 0, 128);
+        func_0020F9F0(0, view, x - 1, y, on.name[global]);
+        func_0020F9F0(0, view, x + 1, y, on.name[global]);
+        func_0020F9F0(0, view, x, y - 1, on.name[global]);
+        func_0020F9F0(0, view, x, y + 1, on.name[global]);
+        func_0020F518(0, 128, 128, 128, 128);
+        func_0020F9F0(0, view, x, y, on.name[global]);
+        drawn = 1;
+    }
+    memcpy(pen, kept, sizeof kept);
+    for (int i = 0; drawn && i < 4; i++) func_0020F420(0, i);
+}
+
+/* ---- the next race in the same room ---- */
+
+/* Someone else still in the race, so the host's next race is theirs too. */
+static int others_here(void)
+{
+    NetLobby lobby;
+    net_get_lobby(&lobby);
+    if (!net_racing()) return 0;
+    for (int j = 0; j < lobby.nslots && j < NET_MAX_SLOTS; j++)
+        if (j != on.local_slot && !lobby.racer[j].left && !on.gone[j]) return 1;
+    return 0;
+}
+
+/* The host's TRY AGAIN or NEW LEVEL after the results: the game starts the next race on the race
+   screen (race phase back to the countdown, or to the flight over a new track), on every PC. The
+   race's own online state starts again; the room, the players and their rides stay. The new start
+   is agreed again (start_together), and the puppets drop what they had (hle_puppet_rematch). */
+static void rematch_reset(int track)
+{
+    fprintf(stderr, "online: the next race in room %s: track %d\n", on.code, track);
+    on.started = on.go_sent = 0;
+    on.go_at = on.go_server = 0;
+    memset(on.their_go, 0, sizeof on.their_go);
+    memset(on.loaded, 0, sizeof on.loaded);
+    on.last_sent = 0;
+    for (int i = 0; i < NRIDERS; i++) on.finish[i] = -1;
+    memset(on.reported, 0, sizeof on.reported);
+    on.nresults = on.have_results = 0;
+    on.first_finish = 0;
+    on.end_held = on.end_done = 0;
+    on.end_held_at = on.end_done_at = 0;
+    on.rematch_want = on.rematch_fields = 0;
+    on.setup.track = track;
+    kernel_pace_shared(0);
+    hle_puppet_rematch();
+}
+
+/* A guest on the results while the host is in the room: the host chooses the next race, the
+   guest's controller waits. When the host has chosen, the guest's menu makes the same choice: X on
+   TRY AGAIN (the menu's first row), or DOWN to NEW LEVEL, X, and X on the level list (the host's
+   track goes into the setup block before it loads, pads_begin_field). 1: out is this field's pad. */
+static int rematch_pad(HostPad *out)
+{
+    if (on.local_slot == on.host_slot || !on.end_done || EE32(PHASE) != 3 || !others_here()) return 0;
+    neutral(out);
+    if (!on.rematch_want || host_wall_seconds() - on.end_done_at < 6) return 1;  /* the menu shows first */
+    int f = on.rematch_fields++ % 240;  /* again after 4 s if the race hasn't restarted */
+    if (on.rematch_want == 1) {
+        if (f < 4) out->buttons = PAD_CROSS;
+    } else if (f < 4)
+        out->buttons = PAD_DOWN;
+    else if ((f >= 20 && f < 24) || (f >= 70 && f < 74))
+        out->buttons = PAD_CROSS;
+    return 1;
+}
+
+static int menu_open(int menu)
+{
+    return EE32(RIDING) == 0 && EE32(OPEN_MENU) == (int32_t)(uintptr_t)EE_PTR(menu);
+}
+
+/* The host's RE-START or NEW LEVEL from the pause menu during the race: a guest's pause menu makes
+   the same choice (START, the row, X; "Yes" on RE-START's question; X on the level list, whose
+   track is the host's, pads_begin_field). Every 12 fields one press of 4, chosen from what is on
+   the screen then; another menu (options, the quit question) goes back. 1: out is this field's pad. */
+static int follow_pad(HostPad *out)
+{
+    static uint16_t press;
+    if (on.local_slot == on.host_slot || on.end_done || !on.rematch_want || !others_here()) return 0;
+    neutral(out);
+    int f = on.rematch_fields++ % 12, row = on.rematch_want == 1 ? PAUSE_RESTART : PAUSE_NEW_LEVEL;
+    if (f == 0) {
+        if (EE32(RIDING)) press = PAD_START;
+        else if (menu_open(PAUSE_MENU)) press = EE32(PAUSE_MENU) < row ? PAD_DOWN : EE32(PAUSE_MENU) > row ? PAD_UP : PAD_CROSS;
+        else if (menu_open(RESTART_ASK)) press = EE32(RESTART_ASK) ? PAD_CROSS : PAD_DOWN;
+        else if (menu_open(LEVEL_LIST)) press = PAD_CROSS;
+        else press = PAD_TRIANGLE;
+    }
+    if (f < 4) out->buttons = press;
+    return 1;
+}
+
+/* A guest with others in the room can't start the race again alone (the others ride on in the old
+   one): X on the pause menu's NEW LEVEL and RE-START does nothing. The host's choice is everyone's. */
+static void guest_pad(HostPad *out)
+{
+    if (on.local_slot == on.host_slot || !others_here() || !menu_open(PAUSE_MENU)) return;
+    if (EE32(PAUSE_MENU) == PAUSE_NEW_LEVEL || EE32(PAUSE_MENU) == PAUSE_RESTART) out->buttons &= ~PAD_CROSS;
+}
+
 /* The online race is over: the game left the race screen (QUIT to the title, or a quit from the
    pause menu), or after the results the player chose TRY AGAIN or NEW LEVEL, which start another
    race on the same screen (race phase back to the flight or the countdown). This PC leaves the
@@ -917,6 +1110,7 @@ static void race_over(void)
     fprintf(stderr, "online: the race is over; back to offline play\n");
     net_leave();
     hle_puppet_offline();
+    port_online_relock();
     kernel_pace_shared(0);
     set_env("DHD_NAV", saved_nav);  /* "" unsets it */
     set_env("DHD_RACE_SEED", saved_seed);
@@ -954,6 +1148,9 @@ void pads_begin_field(void)
                 EE32(SETUP + 0x1B8 + 4 * k) = selected_outfit[k];
                 EE32(SETUP + 0x11C + 4 * k) = selected_bike[k];
             }
+            /* the outfit's first word is the rider (as write_setup and hle_online_riders have it): the
+               selection can leave the rider screen's first rider there, who would then ride */
+            EE32(SETUP + 0x1B8) = selected_rider / 32 - 1;
         }
         exchange_rides();
         on.setup_done = 1;
@@ -963,6 +1160,34 @@ void pads_begin_field(void)
         on.started = 1;
     }
     if (on.started) state_sync();
+    /* the host's new level, in the setup block once this PC is in its menus (not mid-race) */
+    if (on.rematch_want == 2 && EE32(SETUP + 0x2A0) != on.rematch_track &&
+        (EE32(RIDING) == 0 || EE32(PHASE) < 2 || EE32(PHASE) == FLYBY_PHASE)) {
+        RaceSetup s = {on.rematch_track, {-1, -1, -1, -1}};
+        write_setup(&s);
+    }
+    /* the race started again: after the results (TRY AGAIN, NEW LEVEL), or during it from the
+       pause menu (RE-START, NEW LEVEL; past GO, the race phase back to the countdown or the flight) */
+    if (on.started && (on.end_done || on.go_sent) && EE32(MENU) == LOAD_MENU &&
+        (EE32(PHASE) < 2 || EE32(PHASE) == FLYBY_PHASE)) {
+        int track = EE32(SETUP + 0x2A0);
+        if (on.rematch_want) {  /* this guest's menu followed the host */
+            rematch_reset(track);
+            return;
+        }
+        if (on.local_slot == on.host_slot && others_here()) {
+            uint8_t e[4] = {EVENT_VERSION, EVENT_REMATCH, (uint8_t)(track != on.setup.track), (uint8_t)track};
+            send_event(e, sizeof e);
+            fprintf(stderr, "online: %s for everyone (track %d)\n", track != on.setup.track ? "NEW LEVEL" : "TRY AGAIN",
+                    track);
+            rematch_reset(track);
+            return;
+        }
+        if (!on.end_done) {  /* alone in the room: the next race is this PC's */
+            rematch_reset(track);
+            return;
+        }
+    }
     if (on.started && (EE32(MENU) != LOAD_MENU ||
                        (on.end_done && (EE32(PHASE) < 2 || EE32(PHASE) == FLYBY_PHASE))))
         race_over();
@@ -975,7 +1200,8 @@ void pads_read(int player, HostPad *out)
     if (online_mode()) {
         /* the race, and after it the results and their menu (Try Again ... Quit, race phase 0) */
         int race = EE32(MENU) == LOAD_MENU && (on.started || (EE32(PHASE) >= 1 && EE32(PHASE) != FLYBY_PHASE));
-        if (player == 0 && race && !getenv("DHD_NET_SCRIPTED")) host_pad_device(0, out);
+        if (player == 0 && race && (rematch_pad(out) || follow_pad(out))) {
+        } else if (player == 0 && race && !getenv("DHD_NET_SCRIPTED")) host_pad_device(0, out), guest_pad(out);
         else if (!on.released || !host_pad_script(player, out)) neutral(out);
         for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;
         return;

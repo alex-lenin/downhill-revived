@@ -211,3 +211,105 @@ failures empty, native renderer use verified. Proof:
 reference/exclusion/checker changes or nondefault gate options. All task-owned lobby
 game/server processes stopped; the gate completed and cleaned up its own runs. No
 screenshots or game data were staged.
+## Online back/cancel lifecycle repair (2026-10-18)
+
+The popup manager restores the view descriptor only when it began with multiple views
+(func_001B4AF8/001B4CD0); the shell has one. Online pages now save and restore view 0's camera
+binding, render mode and projection around every modal run, including public-list/code/name
+cancellation and repeated entry.
+
+The selection hook previously returned to menu 15 by writing its ID alone. That bypassed the rider
+Back cleanup: shop camera/object visibility, camera animation, rider labels, fades and sound ducking
+remained live. Completing or cancelling a selection now runs the stock rider Back cleanup, disables
+the shop camera, restores the shell projection, and opens the room on the title scene. It no longer
+starts another rider transition just to open a freezing popup. Stock Back within the
+outfit/bike/colour screens remains available; cancelling all the way out returns to the connected
+room, unready. Connection failure while a picker is active follows the same cleanup and displays the
+failure.
+
+Leaving or failing a room clears selection/readiness requests; a new room starts fresh. Exiting
+online after selection restores the pre-online mode/submode and player count and reinitialises the
+main menu with ONLINE focused. No protocol, server, matching-source or renderer changes; no
+third-party code copied. Sources: original shell func_001F24B8/001F67F0, popup manager
+func_001B4AF8/001B4CD0, and the existing finding-065 hooks.
+
+Validation: the transformed shell translation unit compiled with zero errors; the modified host menu
+compiled for i686 Windows. The repository's local SendInput/PrintWindow harness launched the
+previous clean executable and captured its memory-card screen, but injected Back/Start/Cross did not
+advance it, so live navigation is not claimed. No full suites, renderer gates, PCSX2 comparisons or
+benchmarks were run. Clean committed build is recorded by the manifest beside
+build/port/clean/<commit>/dhd.exe; final handoff gives its path.
+
+## Lobby flow rework (2026-10-18)
+
+The room is now a page over the rider screen (menu 3), never over the sky:
+- the shop's exit (menu 18) is caught once its camera take D_00275CB0[rider] ends, before
+  retail's level chooser (func_00139BF8) takes the camera; the choice is kept, the rider
+  screen's Back cleanup runs, the black exit fade is lifted (func_001F79D8(0, 0x3C)) and the
+  flight to the rider screen (take 2, rewound to 0 first) plays; the room opens 45 frames
+  after menu 3 so the rider model is back;
+- Triangle on the rider screen opens the room (held buttons, not func_001F4A98, whose latch
+  would eat the screen's own presses); Change Rider closes it on the rider screen and blocks
+  that screen until the press is released;
+- leaving or losing the room goes to the title and the main menu reopens ONLINE
+  (port_online_resume, patched into func_001EF0E0);
+- popup pages act only after every button was released since they opened (no leaked X);
+- the host changes the track in the room (row 1, left/right or X); Ready is a plain toggle;
+  a guest who becomes host keeps the room's settings; without a connection the room says so.
+Live-tested with two local instances against `wrangler dev`: create, join by code, rider
+conflict, change rider, ready, start, host leave (guest becomes host), server loss.
+A test pad (DHD_TEST_PAD names a shared-memory word merged into pad 1) drives the harness.
+
+## Computer riders off, and the host's next race for everyone (2026-10-18)
+
+- The room's options travel in its "laps" byte (bit 0: computer riders off). func_001B89C8's
+  AI count is patched through hle_online_ai_count: the other players' puppets only, or at least
+  one AI slot per other player. The snapshot, finish and results loops cover 1 + the AI count.
+- EVENT_REMATCH (8): the host's next race, [changed track, track]. The host sends it when its
+  race phase drops back (to the countdown or the flight) after GO or after the results.
+  - After the results a guest's controller waits; on the event its menu presses TRY AGAIN, or
+    NEW LEVEL and X on the level list, while the host's track is written to the setup block.
+  - During the race a guest's pause menu does the same: D_0029E290 (1 riding, 0 menus),
+    D_003F52D0.x150 the open menu (pause 0x38BC00, RE-START question 0x388990, level list
+    0x386680), each menu's first word its row; pause rows 3 NEW LEVEL, 4 RE-START.
+  - Guests with others in the room can't pick NEW LEVEL or RE-START themselves.
+  - Each PC then resets the race's online state and agrees a new start (start_together).
+Live-tested with two instances: TRY AGAIN and NEW LEVEL from the results and from the pause
+menu; both PCs start within 0.1 ms.
+
+## Everything unlocked online (2026-10-18)
+
+From the room's first rider choice until the player is back offline, every rider, bike and track is
+open, as retail's unlock-all code (func_001F0780) sets them: D_004325A0.x2180 riders, x2188 bikes,
+x2114 tracks (all but 21 and 23), D_004225A0.x12190 23 flags. The rider screen's pros need one more:
+their statues come alive from the save's rider bits D_004225A0.x12110 (bits 0-13, func_00193FE8),
+which func_001BB670 copies into the screen's table D_004B25A0.x3C; the port sets the bits and calls
+it. Leaving (the room's Leave, a lost room, or the end of the online race) restores the saved words
+and calls func_001BB670 again. Meanwhile the memory card's writes are held (mc.c opens NUL for
+writing), so the card keeps the player's own progress. Tested: all 16 riders selectable online, a
+pro rider shown on the other PC, the player's own unlocks back after leaving.
+
+## Names above online riders (2026-10-18)
+
+`hle_online_names`, called after the local rider's cheat-message text in `func_0012C9E0`, draws the
+other connected humans' lobby names. AI, the local rider and departed players have no tag. Text is
+larger, white with a black outline; the entire 32-byte pen 0 is restored and its saved colour
+re-emitted in all four text contexts, preserving subsequent HUD text.
+
+The axis evidence is `func_001797A0`: retail's rider markers copy the scene node at rider +0x792C,
+position +0x10, and add five on Z. The live orientation rows confirm Z is up; negative X moves
+toward the camera, not above the head. `func_0012DDC0` and puppet.c confirm puppets update that same
+scene node. Names use a lower 3.25-unit Z offset and the projected base's X to avoid the raised
+point drifting sideways in a pitched camera. The centred font's widescreen X mapping is inverted for
+the anchor, preserving glyph proportions. Behind-camera points, depth beyond 150, off-screen
+bases/raised points and labels crossing the view edges are rejected before drawing. No debug log
+remains.
+
+Verification: harness build with `UNITS="0012C9E0.c"`, then targeted O2 host rebuilds/relinks of
+online.c; no compile/link errors (23 existing SDK stubs). A temporary standalone helper check passes
+human/local/offline/gone filters, projection bounds including an off-screen base with an on-screen
+raised point, far/behind-camera rejection, widescreen/narrow aspect anchor mapping, and exact
+pen/colour restoration. Two live clients on the local relay used Rider Alpha and Rider Bravo. Tags
+follow the moving remote riders; the race HUD and pause menu retain their text styling. Only the
+test instances' PIDs were stopped. Matching sources, game data and screenshots are not added to this
+change. 

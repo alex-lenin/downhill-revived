@@ -377,6 +377,7 @@ int host_relaunch_reserving(uintptr_t at, size_t size)
         return -1;
     }
     AssignProcessToJobObject(job, pi.hProcess);
+    AllowSetForegroundWindow(pi.dwProcessId);  /* the start window has the foreground: the game's takes it */
     if (VirtualAllocEx(pi.hProcess, (void *)at, size, MEM_RESERVE, PAGE_NOACCESS) != (void *)at)
         fprintf(stderr, "can't reserve %08lX-%08lX for PS2 RAM (error %lu)\n", (unsigned long)at,
                 (unsigned long)(at + size), GetLastError());
@@ -773,6 +774,21 @@ static void direct_pad(int port, HostPad *out)
     }
 }
 
+/* DHD_TEST_PAD=<name>: a test tool's buttons, one 16-bit word in shared memory of that name,
+   merged into player 1's pad, so a tool can drive a window that doesn't have focus. */
+static void test_pad_merge(HostPad *out)
+{
+    static volatile uint16_t *word;
+    static int opened;
+    if (!opened) {
+        const char *name = getenv("DHD_TEST_PAD");
+        opened = 1;
+        HANDLE map = name && *name ? CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, name) : NULL;
+        if (map) word = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, 4);
+    }
+    if (word) out->buttons |= *word;
+}
+
 /* Player `port`'s controller (SDL, gamepad.c, else XInput and the Sony pads directly: one of the
    two, never both, so a pad isn't read twice), and for player 1 the keyboard as well, merged. */
 void host_pad_device(int port, HostPad *out)
@@ -781,7 +797,7 @@ void host_pad_device(int port, HostPad *out)
     out->right_x = out->right_y = out->left_x = out->left_y = 128;
     if (gamepad_start()) gamepad_read(port, out);
     else direct_pad(port, out);
-    if (port == 0) keyboard_merge(out);
+    if (port == 0) keyboard_merge(out), test_pad_merge(out);
 }
 
 void *host_fiber_main(void) { return ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH); }

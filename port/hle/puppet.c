@@ -37,6 +37,7 @@
 #define RIDERS ((uint8_t *)0x082AF2C0)          /* D_002AF2C0: 10 riders */
 #define RIDER_SIZE 0x7BD0
 #define NRIDERS 10
+int hle_online_race_riders(void);  /* online.c: the riders in the online race (computer riders off: fewer) */
 #define RACE_CLOCK (*(volatile int32_t *)0x0843EEC8)  /* ticks since GO in phase 2 */
 #define RACE_PHASE (*(volatile int32_t *)0x0843F348)  /* on the race screen: 1 countdown, 2-4 race */
 #define MENU (*(volatile int32_t *)0x0829DED8)        /* 9: the race screen */
@@ -353,6 +354,17 @@ void hle_puppet_online(int local, int nslots, int host)
     fprintf(stderr, "\n");
 }
 
+/* The next online race in the same room (online.c rematch_reset), and again at its start: what the
+   puppets had is of the race before (its clock started again). */
+void hle_puppet_rematch(void)
+{
+    for (int i = 1; i < NRIDERS; i++) {
+        Puppet *p = &pp.p[i];
+        p->count = 0, p->have_offset = 0, p->offset = 0, p->remote_crash = 0, p->sent_any = 0;
+    }
+    pp.hits_taken = 0, pp.nevents = 0;
+}
+
 /* The online race is over (online.c, back at the menus): no puppets, the next race is the game's own. */
 void hle_puppet_offline(void)
 {
@@ -437,7 +449,7 @@ static uint8_t *put(uint8_t *o, const void *v, size_t n) { memcpy(o, v, n); retu
    relay keeps order and loses nothing; last tick's actions don't travel). 0: not owned. */
 int hle_puppet_pack(int slot, uint8_t *out, int max)
 {
-    if (!pp.online || slot < 0 || slot >= NRIDERS || !owned(slot) || !RACING || max < 128) return 0;
+    if (!pp.online || slot < 0 || slot >= hle_online_race_riders() || !owned(slot) || !RACING || max < 128) return 0;
     Puppet *p = &pp.p[slot];
     Snapshot s;
     take(&s, rider(slot));
@@ -476,7 +488,7 @@ void hle_puppet_receive(int sender, const uint8_t *in, int n)
 {
     if (!pp.online || n < STATE_FIXED || in[0] != WIRE_VERSION || sender == pp.local) return;
     int slot = to_local(in[1]);
-    if (slot <= 0 || slot >= NRIDERS || !pp.p[slot].on) return;
+    if (slot <= 0 || slot >= hle_online_race_riders() || !pp.p[slot].on) return;
     Puppet *p = &pp.p[slot];
     const uint8_t *i = in + 2, *end = in + n;
     uint16_t state;

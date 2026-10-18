@@ -29,6 +29,10 @@
 enum { MC_NOENTRY = -4, MC_NOCARD = -10, MC_TOTAL_KB = 8000 };
 enum { O_READ = 1, O_WRITE = 2, O_CREATE = 0x200, O_TRUNCATE = 0x400, O_DIRECTORY = 0x40 };
 
+/* Online with everything unlocked (online_menu.c): the game saves as usual, but nothing reaches
+   the card, which keeps the player's own progress. */
+int hle_mc_hold;
+
 static int mc_enabled(void)
 {
     static int on = -1;
@@ -139,6 +143,7 @@ static int mc_open(int port, int slot, int flags, const char *name)
     make_root(port);
     if (flags & O_DIRECTORY) {
         if (is_dir(path) || GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return MC_NOENTRY;
+        if (hle_mc_hold) return 0;
         return CreateDirectoryA(path, NULL) ? 0 : MC_NOENTRY;
     }
     if (is_dir(path)) return MC_NOENTRY;
@@ -149,7 +154,7 @@ static int mc_open(int port, int slot, int flags, const char *name)
     for (fd = 0; fd < MC_FILES && files[fd]; fd++)
         ;
     if (fd == MC_FILES) return -7;  /* sceMcResUpLimitHandle */
-    files[fd] = fopen(path, mode);
+    files[fd] = fopen(hle_mc_hold && (flags & O_WRITE) ? "NUL" : path, mode);  /* held: the write goes nowhere */
     if (!files[fd]) return MC_NOENTRY;
     if (hle_verbose) hle_log("memory card: open %s (%x) = %d\n", path, flags, fd);
     return fd;

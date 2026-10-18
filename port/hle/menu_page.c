@@ -25,6 +25,12 @@ void func_00190108(void *manager, void *menu);  /* run modally */
 void func_001B5AF0(void *manager, int a, int b);
 void func_0023D650(int view, int *width, int *height);
 void port_menu_sound(int next);       /* S_NEXT or S_PREVIOUS (patched into 001EB1D8.cpp) */
+int func_00220230(int port);          /* the buttons held on a pad (0 when none is there) */
+
+/* A page opened by a press (the X that chose a row of the menu below, or the screen before)
+   would take that same press as its own while the button is still down: a page acts on
+   buttons only once they have all been released. */
+static int buttons_held(void) { return (func_00220230(0) | func_00220230(1)) & 0xFFFF; }
 
 enum { VTABLE_SLOTS = 17, ITEM_SIZE = 16 };
 enum { X_CURSOR = 0x0, X_ITEMS = 0x18, X_COUNT = 0x418, X_TITLE = 0x438, X_FOOTER = 0x448, X_ROW_Y = 0x460,
@@ -89,6 +95,7 @@ static void slot_build(void *menu)  /* slot 1, as func_0015F0C8 */
 static void slot_update(void *menu)  /* slot 5, as func_0015E750: the page, then the base */
 {
     MenuPage *p = menu;
+    if (!p->armed && !buttons_held()) p->armed = 1;
     if (p->rebuild) {
         p->rebuild = 0;
         rows(p);
@@ -103,6 +110,7 @@ static void slot_update(void *menu)  /* slot 5, as func_0015E750: the page, then
 static void slot_accept(void *menu, int index)  /* slot 7, Cross */
 {
     MenuPage *p = menu;
+    if (!p->armed) return;
     if (p->accept) p->accept(p, index);
     else menu_page_close(p);
 }
@@ -110,6 +118,7 @@ static void slot_accept(void *menu, int index)  /* slot 7, Cross */
 static void slot_back(void *menu)  /* slot 8, Triangle */
 {
     MenuPage *p = menu;
+    if (!p->armed) return;
     if (p->back) p->back(p);
     else menu_page_cancel(p);
 }
@@ -117,19 +126,20 @@ static void slot_back(void *menu)  /* slot 8, Triangle */
 static void slot_left(void *menu, int index)  /* slot 9 */
 {
     MenuPage *p = menu;
-    if (p->left) p->left(p, index);
+    if (p->armed && p->left) p->left(p, index);
 }
 
 static void slot_right(void *menu, int index)  /* slot 10 */
 {
     MenuPage *p = menu;
-    if (p->right) p->right(p, index);
+    if (p->armed && p->right) p->right(p, index);
 }
 
 /* ---- the page's calls ---- */
 
 void menu_page_run(MenuPage *p)
 {
+    p->armed = 0;
     if (!p->constructed) {
         memcpy(p->vtable, D_00287218, sizeof p->vtable);  /* {delta, function} pairs, slot 1 on */
         p->vtable[1 * 2 + 1] = (uint32_t)(uintptr_t)slot_build;

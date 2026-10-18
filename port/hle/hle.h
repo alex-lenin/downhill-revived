@@ -154,6 +154,9 @@ void pads_begin_field(void);                /* each vsync, before the pads are r
 void pads_read(int player, HostPad *out);   /* player i's controller for this field */
 int pads_online(void);      /* an online race: started with DHD_NET_* or from the ONLINE menu */
 void hle_online_from_menu(void);            /* the ONLINE menu's room started its race */
+int hle_online_race_riders(void);           /* riders in the online race (10 offline) */
+void port_online_relock(void);              /* online_menu.c: the player's own unlocks again */
+extern int hle_mc_hold;                     /* mc.c: card writes held (online, all unlocked) */
 void hle_online_version(char *out, size_t size);  /* the build's identity for the lobby */
 void kernel_pace_slip(double seconds);      /* kernel.c: the frame clock waited this long */
 void kernel_pace_shared(int on);            /* kernel.c: online, fields keep to the shared race clock */
