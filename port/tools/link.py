@@ -165,7 +165,7 @@ def runtime():
                  'runtime/memory.c', 'hle/host.c', 'hle/autopad.c', 'hle/timer.c', 'hle/kernel.c', 'hle/boot.c', 'hle/sif.c', 'hle/cdvd.c', 'hle/game_data.c',
                  'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/vif.c', 'hle/graphics.c', 'hle/graphics_queue.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/online_menu.c', 'hle/online.c', 'hle/puppet.c', 'hle/sound.c', 'gs/memory.c', 'gs/gs.c', 'gs/display.c', 'gs/present.c', 'gs/gpu.c', 'gs/texpack.c', 'gs/font_sharp.c', 'gs/capture.c',
                  # the auto-updater (finding 054)
-                 'hle/update.c', 'hle/game_options.c', 'hle/fps.c',
+                 'hle/update.c', 'hle/game_options.c', 'hle/fps.c', 'hle/splash.c',
                  # the game's movies (finding 055)
                  'hle/movie.c',
                  # online races (port/net, finding 042)

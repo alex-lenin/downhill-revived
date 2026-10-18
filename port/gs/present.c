@@ -13,6 +13,7 @@
 #include "capture.h"
 #include "../hle/hle.h"
 #include "../hle/text_input.h"
+#include "../hle/splash.h"
 
 static HWND window;
 static ID3D11Device *device;
@@ -207,8 +208,11 @@ static int init(void)
             IDXGIDevice_Release(dx);
         }
     }
+    splash_step(75, "Preparing the graphics...");
     if (!gs_gpu_init(&gs, device, context)) return 0;
     ShowWindow(window, SW_SHOW);
+    SetForegroundWindow(window);
+    splash_close();
     if (fullscreen) {
         DXGI_MODE_DESC target = {0};
         target.Width = (UINT)(monitor.rcMonitor.right - monitor.rcMonitor.left);

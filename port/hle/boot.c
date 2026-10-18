@@ -9,6 +9,7 @@
 #include "hle.h"
 #include "ps2asm.h"
 #include "fp_trap.h"
+#include "splash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,11 +54,17 @@ int main(int argc, char **argv)
     host_console_init();  /* no console window: where the log goes */
     update_save_environment();  /* as started, for starting an updated dhd.exe (update.c) */
     host_settings_load();  /* before the relaunch, so the child inherits the variables */
+    splash_show();  /* the start window, until the game's window shows (splash.c) */
+    if (!getenv("DHD_RELAUNCHED")) splash_step(4, "Checking for updates...");
     update_at_start();  /* first process: a newer release offered (dhd.ini auto_update) */
+    if (!getenv("DHD_RELAUNCHED")) splash_step(25, "Checking your disc image...");
     if (host_disc_ready())  /* the disc image: asked once, here in the first process */
         return 0;  /* the player cancelled */
-    if (!ps2_low_view_reserved())  /* first run: again, with the RAM's own addresses kept free */
+    if (!ps2_low_view_reserved()) {  /* first run: again, with the RAM's own addresses kept free */
+        splash_step(40, "Starting the game...");
         return update_after_game(host_relaunch_reserving(PS2_LOW_VIEW, PS2_RAM_SIZE - PS2_LOW_VIEW));
+    }
+    splash_step(50, "Reading the game's data from your disc...");
     if (!ps2_memory_init() || !game_data_load())  /* the data image, from the player's disc */
         return 1;
     host_widescreen_init();  /* data patches, once the data image is in place */

@@ -2777,8 +2777,7 @@ static ID3DBlob *native_compile(const char *entry, const char *target)
 {
     static const D3D_SHADER_MACRO defines[] = {{"DHD_NATIVE", "1"}, {NULL, NULL}};
     ID3DBlob *code = NULL, *errors = NULL;
-    HRESULT hr = D3DCompile(gs_shader, sizeof gs_shader - 1, gs_shader_path, defines, NULL, entry, target,
-                            D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &errors);
+    HRESULT hr = shader_compile(defines, entry, target, D3DCOMPILE_ENABLE_STRICTNESS, &code, &errors);
     if (errors) { fprintf(stderr, "%s", (const char *)ID3D10Blob_GetBufferPointer(errors)); ID3D10Blob_Release(errors); }
     return SUCCEEDED(hr) ? code : NULL;
 }

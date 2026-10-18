@@ -80,6 +80,84 @@ typedef struct {
     int clip_on, clip[4];
 } Gpu;
 
+/* raster.hlsl's shaders, compiled once and kept: D3DCompile takes seconds for each of them, at
+   every start. The bytecode is kept in %LOCALAPPDATA%\DownhillRevived\shaders under a name made
+   of everything the compile depends on: the source, the entry point, the target, the defines, the
+   flags and the system's d3dcompiler_47.dll (its size and date). Without that folder (or with
+   DHD_NO_SHADER_CACHE): compiled each time, as before. Same arguments as D3DCompile's. */
+static uint64_t fnv(uint64_t h, const void *data, size_t size)
+{
+    const unsigned char *p = data;
+    for (size_t i = 0; i < size; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static int shader_cache_path(char *out, size_t size, const D3D_SHADER_MACRO *defines, const char *entry,
+                             const char *target, UINT flags)
+{
+    const char *base = getenv("LOCALAPPDATA");
+    char dll[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    HMODULE compiler = GetModuleHandleA("d3dcompiler_47.dll");
+    if (!base || !*base || getenv("DHD_NO_SHADER_CACHE") || !compiler || !GetModuleFileNameA(compiler, dll, sizeof dll) ||
+        !GetFileAttributesExA(dll, GetFileExInfoStandard, &info))
+        return 0;
+    uint64_t h = 0xCBF29CE484222325ull;
+    h = fnv(h, gs_shader, sizeof gs_shader - 1);
+    h = fnv(h, entry, strlen(entry) + 1);
+    h = fnv(h, target, strlen(target) + 1);
+    for (const D3D_SHADER_MACRO *d = defines; d && d->Name; d++)
+        h = fnv(fnv(h, d->Name, strlen(d->Name) + 1), d->Definition, strlen(d->Definition) + 1);
+    h = fnv(h, &flags, sizeof flags);
+    h = fnv(h, &info.nFileSizeLow, sizeof info.nFileSizeLow);
+    h = fnv(h, &info.ftLastWriteTime, sizeof info.ftLastWriteTime);
+    snprintf(out, size, "%s\\DownhillRevived", base);
+    CreateDirectoryA(out, NULL);
+    snprintf(out, size, "%s\\DownhillRevived\\shaders", base);
+    CreateDirectoryA(out, NULL);
+    snprintf(out, size, "%s\\DownhillRevived\\shaders\\%s-%016llx.cso", base, entry, (unsigned long long)h);
+    return 1;
+}
+
+static HRESULT shader_compile(const D3D_SHADER_MACRO *defines, const char *entry, const char *target, UINT flags,
+                              ID3DBlob **code, ID3DBlob **errors)
+{
+    char path[MAX_PATH];
+    int cached = shader_cache_path(path, sizeof path, defines, entry, target, flags);
+    *code = NULL;
+    if (errors) *errors = NULL;
+    if (cached) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (size > 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)size, code)) &&
+                fread(ID3D10Blob_GetBufferPointer(*code), 1, (size_t)size, f) == (size_t)size) {
+                fclose(f);
+                return S_OK;
+            }
+            if (*code) ID3D10Blob_Release(*code);
+            *code = NULL;
+            fclose(f);
+        }
+    }
+    HRESULT hr = D3DCompile(gs_shader, sizeof gs_shader - 1, gs_shader_path, defines, NULL, entry, target, flags, 0,
+                            code, errors);
+    if (SUCCEEDED(hr) && cached) {
+        char temp[MAX_PATH + 16];
+        snprintf(temp, sizeof temp, "%s.%lu", path, GetCurrentProcessId());
+        FILE *f = fopen(temp, "wb");
+        if (f) {
+            size_t n = ID3D10Blob_GetBufferSize(*code);
+            int ok = fwrite(ID3D10Blob_GetBufferPointer(*code), 1, n, f) == n;
+            ok = fclose(f) == 0 && ok;
+            if (!ok || !MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(temp);
+        }
+    }
+    return hr;
+}
+
 static void flush(Gpu *gpu);
 static int native_capture(struct Native *n, uint32_t *pixels);
 static void native_profile(struct Native *n);
@@ -891,24 +969,21 @@ static int exact_init(Gs *g, ID3D11Device *device, ID3D11DeviceContext *context)
         {"DHD_EXCLUSIVE_WORD_STORE", !store_option || atoi(store_option) ? "1" : "0"},
         {NULL, NULL}
     };
-    HRESULT hr = D3DCompile(gs_shader, sizeof gs_shader - 1, gs_shader_path, raster_defines, NULL, "main", "cs_5_0",
-                            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+    HRESULT hr = shader_compile(raster_defines, "main", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS, &code, &errors);
     if (errors) { fprintf(stderr, "%s", (const char *)ID3D10Blob_GetBufferPointer(errors)); ID3D10Blob_Release(errors); }
     if (FAILED(hr)) goto fail;
     hr = ID3D11Device_CreateComputeShader(device, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &p->shader);
     ID3D10Blob_Release(code);
     if (FAILED(hr)) goto fail;
     code = errors = NULL;
-    hr = D3DCompile(gs_shader, sizeof gs_shader - 1, gs_shader_path, raster_defines, NULL, "scanout", "cs_5_0",
-                   D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+    hr = shader_compile(raster_defines, "scanout", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS, &code, &errors);
     if (errors) { fprintf(stderr, "%s", (const char *)ID3D10Blob_GetBufferPointer(errors)); ID3D10Blob_Release(errors); }
     if (FAILED(hr)) goto fail;
     hr = ID3D11Device_CreateComputeShader(device, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &p->display_shader);
     ID3D10Blob_Release(code);
     if (FAILED(hr)) goto fail;
     code = errors = NULL;
-    hr = D3DCompile(gs_shader, sizeof gs_shader - 1, gs_shader_path, raster_defines, NULL, "local_copy", "cs_5_0",
-                   D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+    hr = shader_compile(raster_defines, "local_copy", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS, &code, &errors);
     if (errors) { fprintf(stderr, "%s", (const char *)ID3D10Blob_GetBufferPointer(errors)); ID3D10Blob_Release(errors); }
     if (FAILED(hr)) goto fail;
     hr = ID3D11Device_CreateComputeShader(device, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &p->copy_shader);

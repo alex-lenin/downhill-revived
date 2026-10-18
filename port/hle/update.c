@@ -27,6 +27,7 @@
 #include "hle.h"
 #include "../include/version.h"
 #include "../net/json.h"
+#include "splash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -682,6 +683,7 @@ void update_at_start(void)
         return;
     }
     fprintf(stderr, "update: %s is available (this is %s)\n", found.version, DHD_VERSION);
+    splash_close();  /* the question and the update's own progress instead */
     if (m == 1 && !ask(&found)) return;
     char why[600];
     install(&found, why, sizeof why);

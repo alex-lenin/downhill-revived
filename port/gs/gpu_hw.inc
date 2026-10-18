@@ -112,16 +112,14 @@ static void hardware_init(Gpu *p, const D3D_SHADER_MACRO *raster_defines)
     memcpy(defines,raster_defines,3*sizeof *defines);
     defines[3].Name="DHD_HARDWARE_PIXEL"; defines[3].Definition="0";
     defines[4].Name=defines[4].Definition=NULL;
-    hr=D3DCompile(gs_shader,sizeof gs_shader-1,gs_shader_path,defines,NULL,"hardware_vertex","vs_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_IEEE_STRICTNESS,0,&code,&errors);
+    hr=shader_compile(defines, "hardware_vertex", "vs_5_0", D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_IEEE_STRICTNESS, &code, &errors);
     if (errors) { fprintf(stderr,"%s",(const char *)ID3D10Blob_GetBufferPointer(errors)); ID3D10Blob_Release(errors); errors=NULL; }
     if (FAILED(hr)) goto unavailable;
     hr=ID3D11Device_CreateVertexShader(p->device,ID3D10Blob_GetBufferPointer(code),ID3D10Blob_GetBufferSize(code),NULL,&p->hardware_vertex);
     ID3D10Blob_Release(code); code=NULL;
     if (FAILED(hr)) goto unavailable;
     defines[3].Definition="1";
-    hr=D3DCompile(gs_shader,sizeof gs_shader-1,gs_shader_path,defines,NULL,"hardware_pixel","ps_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_IEEE_STRICTNESS,0,&code,&errors);
+    hr=shader_compile(defines, "hardware_pixel", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_IEEE_STRICTNESS, &code, &errors);
     if (errors) { fprintf(stderr,"%s",(const char *)ID3D10Blob_GetBufferPointer(errors)); ID3D10Blob_Release(errors); errors=NULL; }
     if (FAILED(hr)) goto unavailable;
     hr=ID3D11Device_CreatePixelShader(p->device,ID3D10Blob_GetBufferPointer(code),ID3D10Blob_GetBufferSize(code),NULL,&p->hardware_pixel);
