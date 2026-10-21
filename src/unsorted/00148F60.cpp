@@ -2155,7 +2155,174 @@ void func_0014BF50(Obj *obj) {
 }
 }
 
+#ifdef NONMATCHING
+/* Non-matching: saved matrix / up-axis pointers get s1/s3 swapped by global-alloc and the
+   matrix copy (daddu s3,s1) is gone (built 0x434 vs 0x438); best diff 14 aligned rows */
+namespace u14C800 {
+struct Vec { float x, y, z, w; } __attribute__((aligned(16)));
+struct Body { char pad0[0x10]; Vec pos; };
+struct Rider { char pad0[0x792C]; Body *body; };
+/* Orbit camera: x0/x10/x20 = right/forward/up basis, x80 = position. */
+struct Obj {
+    Vec x0, x10, x20;
+    char pad30[0x50];
+    Vec x80;
+    char pad90[0x70];
+    Vec x100;
+    char pad110[0x1A0];
+    void *x2B0;
+    Rider *x2B4;
+    char pad2B8[0x30];
+    float x2E8, x2EC; /* min / max orbit distance */
+    char pad2F0[0x24];
+    int x314, x318, x31C, x320; /* input ids: yaw -, yaw +, pitch +, pitch - */
+    char pad324[0x10];
+    int x334, x338;             /* input ids: zoom out, zoom in */
+};
+extern void func_00221F50(Vec *, Vec *);
+extern int func_00220618(int, int);
+extern void func_00222E80(Vec *, Vec *, float);
+extern void func_002232C8(Vec *, Vec *);
+extern void func_00221888(Vec *, Vec *, Vec *);
+#define COPY_VECTOR(dst, src) __asm__ volatile ("lq $2, 0x0(%1)\n\tsq $2, %0" : "=m"(dst) : "r"(src) : "$2")
+
+/* out.xyz = in.xyz / |in.xyz| */
+static inline void Normalize(Vec *out, Vec *in) {
+    float length,inv,x=in->x,y=in->y,z=in->z;
+    __asm__ volatile ("mula.s %2,%2\n\tmadda.s %3,%3\n\tmadd.s %1,%4,%4\n\tsqrt.s %1,%1\n\tlui $2,0x3f80\n\tmtc1 $2,%0\n\tnop\n\tdiv.s %0,%0,%1" : "=&f"(inv), "=&f"(length) : "f"(x), "f"(y), "f"(z) : "$2");
+    out->x=x*inv;out->y=y*inv;out->z=z*inv;
+}
+/* Same as Normalize (z passed twice: register-allocation form only). */
+static inline void NormalizeCross(Vec *out, Vec *in) {
+    float length,inv,x=in->x,y=in->y,z=in->z;
+    __asm__ volatile ("mula.s %2,%2\n\tmadda.s %3,%3\n\tmadd.s %1,%4,%5\n\tsqrt.s %1,%1\n\tlui $2,0x3f80\n\tmtc1 $2,%0\n\tnop\n\tdiv.s %0,%0,%1" : "=&f"(inv), "=&f"(length) : "f"(x), "f"(y), "f"(z), "f"(z) : "$2");
+    out->x=x*inv;out->y=y*inv;out->z=z*inv;
+}
+/* Scales x and y by 1/|in.xyz|; z is left untouched. */
+static inline void NormalizeXY(Vec *out, Vec *in) {
+    float length,inv,x=in->x,y=in->y,z=in->z;
+    __asm__ volatile ("mula.s %2,%2\n\tmadda.s %3,%3\n\tmadd.s %1,%4,%4\n\tsqrt.s %1,%1\n\tlui $2,0x3f80\n\tmtc1 $2,%0\n\tnop\n\tdiv.s %0,%0,%1" : "=&f"(inv), "=&f"(length) : "f"(x), "f"(y), "f"(z) : "$2");
+    out->x=x*inv;out->y=y*inv;
+}
+/* out.xyz = in.xyz * scale (VU0) */
+static inline void Scale(Vec *out, Vec *in, float scale) {
+    __asm__ volatile ("lqc2 $vf11,0(%1)\n\tmfc1 $2,%2\n\tqmtc2.ni $2,$vf12\n\tvmulx.xyz $vf11,$vf11,$vf12x\n\tsqc2 $vf11,%0" : "=m"(*out) : "r"(in), "f"(scale) : "$2");
+}
+/* The game's Abs helper (docs/findings/013). */
+static inline float Abs(float x)
+{
+    float r;
+    __asm__ volatile ("abs.s %0,%1" : "=&f"(r) : "f"(x));
+    return r;
+}
+static inline float Sqrt(float value) {
+    float result;
+    __asm__ volatile ("sqrt.s %0,%1" : "=f"(result) : "f"(value));
+    return result;
+}
+/* out.xyz = a.xyz - b.xyz (VU0) */
+#define VSUB(dst, a, b) __asm__ volatile ("lqc2 $vf11,0(%1)\n\tlqc2 $vf12,0(%2)\n\tvsub.xyz $vf11,$vf11,$vf12\n\tsqc2 $vf11,%0" : "=m"(dst) : "r"(a), "r"(b))
+/* out.xyz = a.xyz + b.xyz (VU0) */
+#define VADD(dst, a, b) __asm__ volatile ("lqc2 $vf11,0(%1)\n\tlqc2 $vf12,0(%2)\n\tvadd.xyz $vf11,$vf11,$vf12\n\tsqc2 $vf11,%0" : "=m"(dst) : "r"(a), "r"(b))
+/* out.xyz = a.xyz x b.xyz (VU0 outer product) */
+#define VCROSS(dst, a, b) __asm__ volatile ("lqc2 $vf11,0(%1)\n\tlqc2 $vf12,0(%2)\n\tvopmula.xyz ACC,$vf11,$vf12\n\tvopmsub.xyz $vf11,$vf12,$vf11\n\tsqc2 $vf11,%0" : "=m"(dst) : "r"(a), "r"(b))
+
+/* Orbit camera update: yaw/pitch the offset to the rider with the input
+   buttons, zoom the distance (clamped to [x2E8, x2EC]), keep the view
+   direction away from straight up/down, rebuild the basis and place the
+   camera at body->pos - distance * forward. */
+void func_0014C800(Obj *obj) {
+    Vec quat;
+    Vec matrix[4];
+    Vec delta;
+    Vec limited;
+    Body *body;
+    Vec *pos, *zeroVec, *matrixOrAxis, *savedMatrix, *forward;
+    float distance, angle, z, dy, shifted;
+    if (!obj->x2B0 || !obj->x2B4) return;
+    dy = 0.0f;
+    zeroVec = &obj->x100;
+    zeroVec->x = dy;
+    zeroVec->y = dy;
+    zeroVec->z = dy;
+    func_00221F50(matrix, zeroVec);
+    body = obj->x2B4->body;
+    pos = &obj->x80;
+    VSUB(delta, &body->pos, pos);
+    __asm__ volatile ("mula.s %1,%1\n\tmadda.s %2,%2\n\tmadd.s %0,%3,%3\n\tsqrt.s %0,%0"
+        : "=&f"(distance) : "f"(delta.x), "f"(delta.y), "f"(delta.z));
+    matrixOrAxis = matrix;
+    savedMatrix = matrixOrAxis;
+    angle = dy;
+    obj->x2EC = 40.0f;
+    obj->x2E8 = 5.0f;
+    /* yaw around the up axis (x20), 2 degrees per frame */
+    if (func_00220618(obj->x318, 0)) angle = 0.034906585f;
+    else if (func_00220618(obj->x314, 0)) angle = -0.034906585f;
+    matrixOrAxis = &obj->x20;
+    if (angle != 0.0f) {
+        func_00222E80(&quat, matrixOrAxis, angle);
+        func_002232C8(savedMatrix, &quat);
+        func_00221888(savedMatrix, &delta, &delta);
+    }
+    /* pitch around the right axis (x0) */
+    angle = 0.0f;
+    if (func_00220618(obj->x31C, 0)) angle = 0.034906585f;
+    else if (func_00220618(obj->x320, 0)) angle = -0.034906585f;
+    if (angle != 0.0f) {
+        func_00222E80(&quat, &obj->x0, angle);
+        func_002232C8(savedMatrix, &quat);
+        func_00221888(savedMatrix, &delta, &delta);
+    }
+    /* zoom */
+    if (func_00220618(obj->x334, 0)) dy = 0.5f;
+    else if (func_00220618(obj->x338, 0)) dy = -0.5f;
+    shifted = distance + dy;
+    shifted = shifted >? obj->x2E8;
+    distance = shifted <? obj->x2EC;
+    Normalize(&obj->x80, &delta);
+    /* keep |forward.z| <= 0.9 */
+    z = obj->x80.z;
+    if (Abs(z) > 0.9f) {
+        float maxed, clamped, scale, root;
+        maxed = z >? -0.9f;
+        clamped = maxed <? 0.9f;
+        scale = 1.0f - clamped * clamped;
+        root = Sqrt(scale);
+        if (z == 1.0f) {
+            limited.x = 0.0f;
+            limited.y = root;
+            limited.z = 0.0f;
+        } else {
+            COPY_VECTOR(limited, &obj->x80);
+            limited.z = 0.0f;
+            NormalizeXY(&limited, &limited);
+            Scale(&limited, &limited, root);
+        }
+        limited.z = clamped;
+        COPY_VECTOR(obj->x80, &limited);
+    }
+    forward = &obj->x10;
+    COPY_VECTOR(*forward, &obj->x80);
+    float unitZ = 1.0f;
+    obj->x20.x = 0.0f;
+    matrixOrAxis->z = unitZ;
+    matrixOrAxis->y = 0.0f;
+    VCROSS(obj->x0, forward, matrixOrAxis);
+    NormalizeCross(&obj->x0, &obj->x0);
+    VCROSS(obj->x20, &obj->x0, forward);
+    float negativeDistance = -distance;
+    Scale(&obj->x80, &obj->x80, negativeDistance);
+    VADD(obj->x80, &obj->x80, &body->pos);
+}
+#undef VSUB
+#undef VADD
+#undef VCROSS
+#undef COPY_VECTOR
+}
+#else
 INCLUDE_ASM("asm/nonmatchings/text", func_0014C800);
+#endif
 
 /* ---- 0014CC38.c ---- */
 namespace u14CC38 {

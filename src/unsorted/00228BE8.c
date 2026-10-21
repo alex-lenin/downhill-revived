@@ -1349,7 +1349,137 @@ void func_0022B1F0__c6(struct Object__c6 *obj, int arg1, float velocityScale, fl
         func_00223628__c6((char *)obj + 0x2610, (char *)obj + 0x2620);
     }
 }
+#ifdef NONMATCHING
+/* Non-matching: loop-carried outVel pointer and its +0x10 successor swap $s1/$s2 (local-alloc priority);
+   best diff 5/187 words */
+/* Particle pool of a D_0067E180 emitter (stride 0x2860), cap = x2854 slots:
+ *   x2830[k]            position, .f[3] = normalised age (>= 1.0 means expired)
+ *   x2830[cap+1+k]      orientation axis A
+ *   x2830[2*(cap+1)+k]  orientation axis B
+ *   x2834[k]            velocity (.z gets gravity * dt added each update)
+ *   x2834 + 16*cap + 8k { float cos, float sin } spin step; the int view of
+ *                       .sin selects which axis is rotated */
+typedef struct ParticlePool__b258 {
+    char pad0[0x2610];
+    Vec boundsMin;              /* 0x2610 */
+    Vec boundsMax;              /* 0x2620 */
+    char pad2630[0xF0];
+    int x2720;                  /* flags */
+    short x2724;                /* update delay counter */
+    char pad2726[0x3A];
+    float x2760;                /* accumulated time */
+    float x2764;                /* time scale */
+    char pad2768[0x28];
+    float x2790;                /* gravity */
+    char pad2794[0x9C];
+    Vec *x2830;                 /* positions (+ axis vectors after x2854 entries) */
+    Vec *x2834;                 /* velocities (+ spin pairs after x2854 entries) */
+    char pad2838[0x18];
+    int x2850;                  /* live particle count */
+    int x2854;                  /* capacity */
+} ParticlePool__b258;
+
+/* func_0022B258: advance all particles by `steps` ticks, drop expired ones and
+ * compact the survivors to the front; then recompute the bounding box. */
+void func_0022B258(ParticlePool__b258 *obj, int steps) {
+    int cap, n;
+    float dt;
+    Vec *pos, *axisA, *axisB, *outPos, *outAxisA, *outAxisB;
+    float *spinIn, *vel, *outVel, *spinOut;
+    int *spinSel;
+
+    if (obj->x2724 >= 2) {
+        obj->x2724 = (unsigned short)obj->x2724 - 1;
+        return;
+    }
+
+    cap = obj->x2854;
+    pos = obj->x2830;
+    vel = (float *)obj->x2834;
+    spinIn = vel + 4 * cap;
+    dt = (float)steps;
+    obj->x2760 = obj->x2760 + obj->x2764 * dt;
+    axisA = pos + cap + 1;
+    axisB = pos + 2 * (cap + 1);
+    outPos = pos;
+    outAxisA = axisA;
+    outAxisB = axisB;
+    outVel = vel;
+    spinOut = spinIn;
+    VU_SETX("$vf18", obj->x2790 * dt);
+    __asm__ volatile ("lqc2 $vf30, 0x0(%0)\n\tlqc2 $vf31, 0x0(%0)" : : "r"(pos));
+    n = obj->x2850;
+
+    while (n) {
+        if (pos->f[3] >= 1.0f) {
+            /* expired: drop it */
+            obj->x2850--;
+            if (obj->x2720 & 0x20000000)
+                obj->x2720 = (obj->x2720 & 0xDFFFFFFF) | 0x01000000;
+        } else {
+            spinSel = (int *)spinIn;
+            spinSel++;
+            __asm__ volatile ("lqc2 $vf11, 0x0(%0)\n\tlqc2 $vf12, 0x0(%1)" : : "r"(axisA), "r"(axisB));
+            __asm__ volatile ("lqc2 $vf14, 0x0(%0)" : : "r"(pos));
+            __asm__ volatile ("lqc2 $vf15, 0x0(%0)" : : "r"(vel));
+            VU_SETX("$vf16", spinIn[0]);
+            VU_SETX("$vf17", spinIn[1]);
+            /* pos += vel; vel.z += gravity * dt */
+            __asm__ volatile ("vadd.xyzw $vf14, $vf14, $vf15\n\tvaddx.z $vf15, $vf15, $vf18x");
+            if (*spinSel > 0) {
+                /* rotate axisB: b = b*cos + (a x b)*sin, `steps` times */
+                { int j = steps;
+                if (steps) do {
+                    __asm__ volatile ("vopmula.xyz ACC, $vf11, $vf12\n\tvopmsub.xyz $vf13, $vf12, $vf11\n\tvmulax.xyz ACC, $vf12, $vf16x\n\tvmaddx.xyz $vf12, $vf13, $vf17x");
+                } while (--j);
+                }
+                if (outPos != pos) {
+                    COPY_QUAD(*outAxisA, axisA);
+                    spinOut[0] = spinIn[0];
+                    spinOut[1] = spinIn[1];
+                }
+                __asm__ volatile ("sqc2 $vf12, 0x0(%0)" : : "r"(outAxisB) : "memory");
+            } else {
+                /* rotate axisA: a = a*cos + (a x b)*sin, `steps` times */
+                { int j = steps;
+                if (j) do {
+                    __asm__ volatile ("vopmula.xyz ACC, $vf11, $vf12\n\tvopmsub.xyz $vf13, $vf12, $vf11\n\tvmulax.xyz ACC, $vf11, $vf16x\n\tvmaddx.xyz $vf11, $vf13, $vf17x");
+                } while (--j);
+                }
+                if (outPos != pos) {
+                    COPY_QUAD(*outAxisB, axisB);
+                    spinOut[0] = spinIn[0];
+                    spinOut[1] = spinIn[1];
+                }
+                __asm__ volatile ("sqc2 $vf11, 0x0(%0)" : : "r"(outAxisA) : "memory");
+            }
+            __asm__ volatile ("sqc2 $vf14, 0x0(%0)" : : "r"(outPos) : "memory");
+            __asm__ volatile ("sqc2 $vf15, 0x0(%1)" : "=m"(*(Vec *)outVel) : "r"(outVel) : "memory");
+            /* grow the bounding box */
+            __asm__ volatile ("vmini.xyzw $vf30, $vf30, $vf14\n\tvmax.xyzw $vf31, $vf31, $vf14");
+            outPos++;
+            outAxisA++;
+            outAxisB++;
+            outVel += 4;
+            spinOut += 2;
+        }
+        /* triple nesting kept: it fixes sched2's decrement order */
+        do {
+            do {
+                do { n--; } while (0);
+            } while (0);
+        } while (0);
+        pos++;
+        axisA++;
+        axisB++;
+        vel += 4;
+        spinIn += 2;
+    }
+    func_00223628(&obj->boundsMin, &obj->boundsMax);
+}
+#else
 INCLUDE_ASM("asm/nonmatchings/text", func_0022B258);
+#endif
 typedef struct VecB__c13 {float x,y,z; unsigned int flags;} VecB__c13 __attribute__((aligned(16)));
 typedef struct Obj__c13 {
  char p0[0x2610];Vec x2610,x2620;

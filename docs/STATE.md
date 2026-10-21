@@ -38,6 +38,12 @@ matched all eight checked sections.
 00228BE8), including two translation-unit merges. The rebuilt image matches all eight
 checked retail sections.
 
+2026-10-21 (finding 074): the 25 functions no worker matched have behaviour-equivalent C under
+`#ifdef NONMATCHING` next to their `INCLUDE_ASM` (18 new single-function units). The default build
+keeps the asm and still matches; `python tools/configure.py --nonmatching` builds the C into
+build-nonmatching/ (links, not checked; sizes and the moved ranges are in the finding).
+func_00220DA0 is now listed in config/handwritten.txt (trapping adds, pmfhi/pmflo).
+
 Open items:
 - `engine` region 0x201000–0x243000 (1,202 functions): same toolchain and flags as game code;
   what it is (engine/middleware) is still open.

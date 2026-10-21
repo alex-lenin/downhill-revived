@@ -258,7 +258,127 @@ void func_0023EFB8(Obj *obj, int amount) {
     obj->x2850 = m < obj->x285C ? obj->x285C : m;
 }
 
+#ifdef NONMATCHING
+/* Non-matching: ring index lives in t9 instead of t3 (t3/t9/t0 rotated), D_002694D0/0xFFFFFF00 mask setup scheduled differently, one commutative mul.s operand order; best diff 44/325 words */
+/* x27F0 / x27F4 (speed and life scales of the middle ring x285D and of the two side
+   rings x285C/x285E) are not named in ParticleSprayEmitter (they sit in its pad27DC),
+   so they are read through this overlay of the same object. */
+typedef struct ParticleSprayScales {
+    char pad0[0x27F0];
+    float x27F0;
+    float x27F4;
+} ParticleSprayScales;
+#define SPRAY_MID_SCALE(o)  (((ParticleSprayScales *)(o))->x27F0)
+#define SPRAY_SIDE_SCALE(o) (((ParticleSprayScales *)(o))->x27F4)
+
+/* Spawns one particle into each of the three rings (middle ring x285D first, then the
+   side rings x285C and x285E) at *pos, and resets the bounding box to x2630. */
+void func_0023F138(Obj *obj, Vec *pos) {
+    Vec p, mid, q;
+    Vec *pp = &p;
+    int i, n, count, color, slot;
+    short *d;
+    float c, s, lo, range, inv, scale, rawScale, invlen, duration, one, minusEight, tmp;
+    float nx, ny, nz, normSq;
+    union { unsigned int i; float f; } bits;
+    Vec *bD, *bC, *aC, *aE, *qDst, *dir, *side, *meta;
+
+    p = *pos;
+    duration = (float)obj->x27DA;
+    obj->x285A = 1;
+    one = 1.0f;
+    minusEight = -8.0f;
+    tmp = obj->x2730;
+    c = one - (tmp + tmp);
+    __asm__ volatile ("sqrt.s %0,%1" : "=&f"(s) : "f"(one - c * c));
+    i = obj->x285D;
+    count = (int)(obj->x273C * obj->x2740 / obj->x272C) & 0xFC;
+    if (i) {
+        count = D_0029DCBC < count ? D_0029DCBC : count;
+    } else {
+        count = 0;
+    }
+    inv = 1.0f / duration;
+    bits.f = minusEight * inv;
+    obj->x2630.i[3] = (bits.i & 0xFFFFFF00) | count;
+    color = D_002694D0[obj->x281C];
+    dir = &obj->x2640;
+    COPY_VECTOR(q, dir);
+    q.f[2] = 0.0f;
+    nx = q.f[0];
+    ny = q.f[1];
+    nz = q.f[2];
+    __asm__ volatile ("mula.s %1,%1\n\tmadda.s %2,%2\n\tmadd.s %0,%3,%3"
+                      : "=f"(normSq) : "f"(nx), "f"(ny), "f"(nz));
+    __asm__ volatile ("rsqrt.s %0,%1,%2"
+                      : "=&f"(invlen) : "f"(1.0f), "f"(normSq));
+    q.f[0] = nx * invlen;
+    q.f[1] = ny * invlen;
+
+    /* middle ring (x285D): sections at x2834[42..], x2830[84..], x283C[48..], x2838[42..] */
+    bD = &obj->x2834[i + 42];
+    q.f[2] = Rand01();
+    q.f[3] = Rand01();
+    lo = obj->x2740;
+    range = obj->x2744 - lo;
+    scale = lo + Rand01() * range;
+    VNEG(*pp, pp);
+
+    side = &obj->x2660;
+    rawScale = SPRAY_MID_SCALE(obj);
+    rawScale = scale * rawScale;
+    pp->f[3] = inv * SPRAY_MID_SCALE(obj);
+    VMadd(bD, pp, side, rawScale);
+    meta = &obj->x2630;
+    slot = i * 2;
+    VMadd(&obj->x2830[slot + 86], meta, bD, minusEight);
+    qDst = &obj->x2830[slot + 85];
+    *qDst = q;
+    obj->x283C[i + 48] = color;
+    d = (short *)(slot + (int)obj->x2838);
+    d[42] = (short)(duration * SPRAY_MID_SCALE(obj));
+    obj->x285D = i + 1;
+
+    /* first side ring (x285C), sideways by +s */
+    q.f[2] = Rand01();
+    q.f[3] = Rand01();
+    i = obj->x285C;
+    scale = (lo + Rand01() * range) * SPRAY_SIDE_SCALE(obj);
+    bC = &obj->x2834[i];
+    VMadd(&mid, pp, dir, s * scale);
+    VMadd(bC, &mid, side, c * scale);
+    slot = i * 2;
+    VMadd(&obj->x2830[slot + 1], meta, bC, minusEight);
+    aC = (Vec *)(slot * 16 + (int)obj->x2830);
+    aC[0] = q;
+    obj->x283C[i] = color;
+    d = (short *)(slot + (int)obj->x2838);
+    d[0] = (short)(duration * SPRAY_SIDE_SCALE(obj));
+    obj->x285C = i + 1;
+
+    /* second side ring (x285E), sideways by -s: sections at x2834[84..], x2830[170..], x283C[96..], x2838[84..] */
+    q.f[2] = Rand01();
+    q.f[3] = Rand01();
+    i = obj->x285E;
+    scale = (lo + Rand01() * range) * SPRAY_SIDE_SCALE(obj);
+    bC = &obj->x2834[i + 84];
+    VMadd(&mid, pp, dir, -s * scale);
+    VMadd(bC, &mid, side, c * scale);
+    slot = i * 2;
+    VMadd(&obj->x2830[slot + 171], meta, bC, minusEight);
+    aE = (Vec *)(slot * 16 + (int)obj->x2830);
+    aE[170] = q;
+    obj->x283C[i + 96] = color;
+    obj->x2838[i + 84] = (short)(duration * SPRAY_SIDE_SCALE(obj));
+    n = (signed char)(i + 1);
+    obj->x285E = i + 1;
+    if (n < obj->x285D) n = obj->x285D;
+    obj->x2850 = n < obj->x285C ? obj->x285C : n;
+    __asm__ volatile ("lqc2 $vf30,0(%0)\n\tlqc2 $vf31,0(%0)" : : "r"(&obj->x2630));
+}
+#else
 INCLUDE_ASM("asm/nonmatchings/text", func_0023F138);
+#endif
 
 void func_0023F650(Obj *obj, Vec *pos) {
     Vec p, side, up, fwd, down, mid, q;

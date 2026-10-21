@@ -1073,7 +1073,182 @@ float func_00204E48__c38(struct Fade__c38 *fade)
     }
 }
 }
+#ifdef NONMATCHING
+/* Non-matching: sched2 loads the TO pose fields before FROM, sched1 puts movz before the tail-mask andi;
+   best diff 8/286 words */
+extern "C" {
+/* A pose blend between two keyframes; channels flagged as angles blend the short way round. */
+struct Blend {
+    char pad0[5]; unsigned char type; char pad6[2];
+    float *values; unsigned char *flags; char pad10[12];
+    struct Node *track; char pad20[32];
+    float weight, duration, start, x4C;
+};
+struct PoseHeader { unsigned short x0, count; short x4, angleOffset; };
+struct BlendOwner { char pad[32]; struct PoseHeader *header; };
+struct Pose { float *values; unsigned char *flags; };
+struct Bits64 { unsigned long value; } __attribute__((packed));
+struct BlendPool { Node__c2 nodes[128]; unsigned char free[128]; unsigned char count; };
+extern struct BlendPool D_004CD480__blend asm("D_004CD480");
+extern int D_0029E160__blend asm("D_0029E160");
+extern void func_00205D10__blend(Blend *, BlendOwner *, Pose **) asm("func_00205D10");
+extern void func_00205F40__blend(Blend *, BlendOwner *, Pose **) asm("func_00205F40");
+extern void func_002061F0__blend(Blend *, BlendOwner *) asm("func_002061F0");
+
+/* abs.s kept in place: loads/stores don't move across it (docs/WORKER.md, finding 013) */
+static inline float Abs(float x)
+{
+    float r;
+    __asm__ volatile ("abs.s %0,%1" : "=&f"(r) : "f"(x));
+    return r;
+}
+
+/* wrap an angle into [-pi, pi] */
+#define WRAP_ANGLE(a) { \
+    if (!(Abs(a) < 3.1415927f)) { \
+        float turns = (a) * 0.15915494f; \
+        turns -= (float)(int)turns; \
+        if (turns > 0.5f) \
+            turns -= 1.0f; \
+        else if (turns <= -0.5f) \
+            turns += 1.0f; \
+        (a) = turns * 6.2831855f; \
+    } \
+}
+
+extern void func_00204F38__blend(Blend *, BlendOwner *) asm("func_00204F38");
+void func_00204F38__blend(Blend *blend, BlendOwner *owner)
+{
+    Pose *from = 0;
+    Pose *to = 0;
+    float elapsed = ((float)D_0029E160__blend - blend->start) * 16.66667f;
+    float t, ease, weight, a, b, diff;
+    struct PoseHeader *header;
+    unsigned char *angleBits, *fromFlags, *toFlags, *outFlags;
+    float *fromValues, *toValues, *out;
+    unsigned long fromBits, toBits, angles;
+    unsigned long fromBit, toBit, angleBit;
+    int tailBits;
+    int count, blocks, remaining, bytes, n;
+
+    if (elapsed < blend->duration) {
+        func_00205D10__blend(blend, owner, &from);
+        func_00205F40__blend(blend, owner, &to);
+        t = elapsed / blend->duration;
+        switch (D_0029D994) {
+        case 0:
+        default:
+            ease = t;
+            break;
+        case 1:
+            ease = t * ((t * -2.0f + 3.0f) * t);
+            break;
+        case 2:
+            ease = t * t;
+            break;
+        case 3:
+            ease = t * (2.0f - t);
+            break;
+        }
+        blend->weight = 1.0f - ease;
+
+        header = owner->header;
+        if (header->count > 16)
+            angleBits = (unsigned char *)header + header->angleOffset;
+        else
+            angleBits = (unsigned char *)header + 6;
+        count = header->count;
+        toValues = to->values;
+        toFlags = to->flags;
+        fromValues = from->values;
+        blocks = (count >> 6) + 1;
+        weight = blend->weight;
+        do {} while (0); /* empty blocks only steer register allocation/scheduling */
+        fromFlags = from->flags;
+        do {} while (0);
+        outFlags = blend->flags;
+        out = blend->values;
+        /* 64 channels per block; the last block holds count & 63 */
+        while (blocks != 0) {
+            toBits = ((Bits64 *)toFlags)->value;
+            fromBits = ((Bits64 *)fromFlags)->value;
+            angles = ((Bits64 *)angleBits)->value;
+            do {} while (0);
+            int one = 1; /* constant 1; the named temporary only steers scheduling */
+            bytes = 8;
+            do {} while (0);
+            if (blocks <= one)
+                bytes = ((count >> 3) & 7) + 1;
+            do {} while (0);
+            one = 0;
+            remaining = blocks - 1;
+            tailBits = count & 63;
+            do {} while (0);
+            angleBits += 8;
+            while (bytes != 0) {
+                *outFlags++ = *toFlags++ | *fromFlags++;
+                bytes--;
+            }
+            n = blocks > 1 ? 64 : tailBits;
+            while (n != 0) {
+                fromBit = fromBits & 1;
+                toBit = toBits & 1;
+                if (fromBit & toBit) {
+                    angleBit = angles & 1;
+                    a = *fromValues;
+                    b = *toValues;
+                    if (angleBit) {
+                        WRAP_ANGLE(a);
+                        WRAP_ANGLE(b);
+                        diff = a - b;
+                        WRAP_ANGLE(diff);
+                    } else {
+                        diff = a - b;
+                    }
+                    *out = b + diff * weight;
+                } else if (fromBit) {
+                    *out = *fromValues;
+                } else if (toBit) {
+                    *out = *toValues;
+                }
+                n--;
+                toBits >>= 1;
+                fromBits >>= 1;
+                angles >>= 1;
+                out++;
+                toValues++;
+                fromValues++;
+            }
+            blocks = remaining;
+        }
+    } else {
+        int freeCount;
+
+        func_002061F0__blend(blend, owner);
+        to = (Pose *)&blend->values;
+        func_00205F40__blend(blend, owner, &to);
+        if (blend->type == 7) {
+            AnimationHandle handle;
+
+            handle.x0 = (AnimationOwner *)owner;
+            handle.x8 = 0;
+            handle.x4 = (AnimationTrack *)blend->track;
+            handle.xC = blend->track->x4->x10;
+            func_00203B68(&handle, 1, blend->x4C);
+            func_00203D18(&handle);
+        }
+        /* give the blend node back to the pool */
+        freeCount = D_004CD480__blend.count - 1;
+        D_0029D998 = 1;
+        D_004CD480__blend.count = freeCount;
+        D_004CD480__blend.free[freeCount & 255] = (Node__c2 *)blend - D_004CD480__blend.nodes;
+    }
+}
+#undef WRAP_ANGLE
+}
+#else
 INCLUDE_ASM("asm/nonmatchings/text", func_00204F38);
+#endif
 /* ---- decompiled func_002053B0 ---- */
 /* Blend the second channel set (pair) into obj's values by the fade weight:
    64 values per block, srcMask bits select which ones; the mask bytes are OR-ed in. */

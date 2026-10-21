@@ -9,3 +9,4 @@ func_0021CB98  VU0/scratchpad setup between two hand-written routines: filler no
 func_0021CC44  VU0 routine: 18 trapping adds, filler nops, VU0 macro code (lqc2/sqc2/vmul) interleaved by hand
 func_0021D194  trapping add, dead por immediately overwritten, raw cvt.w.s word, filler nops
 func_0022B028  VU/MMI filter: 27 trapping adds used as register moves (gcc uses daddu/move), no stack frame
+func_00220DA0  2 trapping adds (00220EF8, 00220F7C) summing pmulth halves read back with pmfhi/pmflo, VU0 macro code; no C form (finding 074)

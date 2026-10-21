@@ -24,6 +24,7 @@ expected/
 # --- Build outputs ---------------------------------------------------------------------
 build/
 build-try/
+build-nonmatching/
 build.ninja
 .ninja_log
 .ninja_deps

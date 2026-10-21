@@ -270,6 +270,24 @@ non-obvious facts you established (e.g. "bit 14 of flags = visible").
 Offsets you find in outside notes (e.g. rider `+0x40C0`) hold in our build only where the struct
 layout is the same; trust only what your matching code confirms, and check against the asm.
 
+## NONMATCHING C (functions that never matched)
+
+The last functions that no worker matched have behaviour-equivalent C next to their original asm
+(finding 074). The default build keeps the asm, so it still matches byte for byte; the C is built
+only with `-DNONMATCHING` (`python tools/configure.py --nonmatching && python -m ninja -f
+build-nonmatching/build.ninja`, a separate build dir that links but is not checked):
+
+    #ifdef NONMATCHING
+    /* Non-matching: <what differs>; best diff N/M words; notes: build-try/<dir>/FUNC.notes.md */
+    <declarations the function needs, extern only (never define data here), then the function>
+    #else
+    INCLUDE_ASM("asm/nonmatchings/text", FUNC);
+    #endif
+
+The function still counts as asm everywhere (queue, report, promote: they look for its
+`INCLUDE_ASM`). Starting a new attempt, the C in the block is a good first candidate. When one
+matches, replace the whole block with the matching C.
+
 ## Report (one block per function)
 
     FUNC: func_0010B920

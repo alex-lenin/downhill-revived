@@ -721,7 +721,95 @@ void func_00217180(struct Obj217180 *obj,int index) {
 }
 
 
+#ifdef NONMATCHING
+/* Non-matching: obj/index saved registers swapped (s1/s2), x40/x44 loads swapped, x20 kept in f2 by a mov.s instead of loading it there; best diff 54/241 words */
+/* Animated scale/translate node (sibling of struct Obj217180): x10 = weight channel,
+   x12..x16 = scale channels, x18..x1C = translation channels (-1/negative = fixed). */
+struct Obj2173C0 {
+    int x0;
+    int x4;                         /* enabled */
+    char pad8[8];
+    short x10, x12, x14, x16, x18, x1A, x1C, x1E;
+    float x20, x24, x28, x2C;       /* scale */
+    float x30, x34, x38, x3C;       /* translation */
+    float x40, x44, x48, x4C;
+    float x50, x54, x58;
+};
+struct Anim2173C0 { int x0; float *x4; /* channel values */ };
+
+/* Returns 0 when the node is disabled or its weight is 0, else pushes the scaled
+   matrices for level index+1 (the four D_0029E1A0..AC stacks) and returns 1. */
+int func_002173C0(struct Obj2173C0 *obj, int index, struct Anim2173C0 *anim) {
+    int nextoff;
+    int next;
+    Mtx matrix;
+    float pos[4];
+    float **values;
+    float weight;
+    float scale;
+
+    values = anim ? &anim->x4 : 0;
+    if (obj->x10 == -1) {
+        weight = 1.0f;
+    } else {
+        weight = (*values)[obj->x10];
+    }
+
+    if (weight == 0.0f) return 0;
+    if (values == 0) return 0;
+    if (obj->x4 != 0) {
+        if (obj->x12 >= 0) obj->x20 = (*values)[obj->x12];
+        if (obj->x14 >= 0) obj->x24 = (*values)[obj->x14];
+        if (obj->x16 >= 0) obj->x28 = (*values)[obj->x16];
+        if (obj->x18 >= 0) obj->x30 = (*values)[obj->x18];
+        if (obj->x1A >= 0) obj->x34 = (*values)[obj->x1A];
+        if (obj->x1C >= 0) obj->x38 = (*values)[obj->x1C];
+
+        next = index + 1;
+        func_00221F20(&matrix);
+        index <<= 6;                /* byte offset of matrix [index] */
+        matrix.f[0] = obj->x20;
+        matrix.f[5] = obj->x24;
+        matrix.f[10] = obj->x28;
+        nextoff = next << 6;
+        func_00263B38(pos);
+        pos[0] = ((pos[0] + (obj->x30 + obj->x50)) / obj->x20) + obj->x40;
+        pos[1] = ((pos[1] + (obj->x34 + obj->x54)) / obj->x24) + obj->x44;
+        pos[2] = ((pos[2] + (obj->x38 + obj->x58)) / obj->x28) + obj->x48;
+        func_00263B28(pos);
+        func_00221A60((Mtx *)((unsigned int)D_0029E1A0 + nextoff), &matrix, (Mtx *)((unsigned int)D_0029E1A0 + index));
+
+        /* uniform scale: the other three stacks are copied unchanged */
+        scale = obj->x20;
+        weight = obj->x20;
+        weight -= obj->x24;
+        weight = __builtin_fabsf(weight);
+        if (weight < 0.001f) {
+            weight = __builtin_fabsf(scale - obj->x28);
+            if (weight < 0.001f) {
+                COPY_MATRIX_180((Mtx *)(nextoff + (unsigned int)D_0029E1A4), (Mtx *)(index + (unsigned int)D_0029E1A4));
+                COPY_MATRIX_180((Mtx *)(nextoff + (unsigned int)D_0029E1A8), (Mtx *)(index + (unsigned int)D_0029E1A8));
+                COPY_MATRIX_180((Mtx *)(nextoff + (unsigned int)D_0029E1AC), (Mtx *)(index + (unsigned int)D_0029E1AC));
+                return 1;
+            }
+        }
+        func_00221A60(D_0029E1A4 + next, &matrix, (Mtx *)((unsigned int)D_0029E1A4 + index));
+        func_00221A60(D_0029E1A8 + next, &matrix, (Mtx *)((unsigned int)D_0029E1A8 + index));
+        matrix.f[0] = 1.0f / obj->x20;
+        matrix.f[5] = 1.0f / obj->x24;
+        matrix.f[10] = 1.0f / obj->x28;
+        func_00221A60(D_0029E1AC + next, &matrix, (Mtx *)((unsigned int)D_0029E1AC + index));
+        func_00221CB8(D_0029E1A4 + next);
+        func_00221CB8(D_0029E1A8 + next);
+        func_00221CB8(D_0029E1AC + next);
+        func_00221C20(D_0029E1AC + next, D_0029E1AC + next, 32.0f);
+        return 1;
+    }
+    return 0;
+}
+#else
 INCLUDE_ASM("asm/nonmatchings/text", func_002173C0);
+#endif
 
 
 typedef struct Vec217788 { float x, y, z, w; } Vec217788 __attribute__((aligned(16)));

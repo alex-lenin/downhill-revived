@@ -5410,7 +5410,208 @@ void func_001D1C08(struct Obj001D1C08 *p,int a,int b,u128__c1 c,u128__c1 d) {
 }
 
 INCLUDE_ASM("asm/nonmatchings/text", func_001D1C50);
+#ifdef NONMATCHING
+/* Non-matching: retail builds the state base in $v0 then copies it to $t3, and cse reassociates
+   (state+0xB40)+i*4 / (state+0x240)+i*0x240 operand order and schedules the inner-loop setup differently;
+   best diff 14/347 words */
+/* Sound trigger for one object: looks for arg0->x4 in each rider's event list (D_00398C40), derives a pan
+   (`value`) from which riders found it, then starts/updates the arg0->x50 sound and may fire arg0->x40. */
+typedef struct {
+    char pad[0x30];
+} Sub1C58;
+
+typedef struct {
+    char pad0[0x40C0];
+    char x40C0;
+    char pad1[0x7AC0 - 0x40C1];
+    float x7AC0;
+} Racer1C58;
+
+typedef struct {
+    char pad[0x50130];
+    Racer1C58 *x50130[4];
+} Global1C58;
+
+typedef struct {
+    unsigned int x0;   /* sound handle */
+    int x4;            /* object id searched in the event lists */
+    char pad0[0x18];
+    int x20[4];        /* per-rider "skip" flag, cleared at the end */
+    int x30;           /* threshold compared with rider x7AC0 */
+    char pad1[0xC];
+    u128 x40;          /* one-shot sound name */
+    u128 x50;          /* loop sound name */
+    int x60[4];        /* per-rider "may trigger" latch */
+} Obj1C58;
+
+typedef struct {
+    char pad0[0xB40];
+    int counts[4];
+} StateCounts1C58;
+
+extern int D_00398EA0[];
+extern char D_004B25A0_chars_1C58[] asm("D_004B25A0");
+extern float func_001385A8(void *);
+extern void func_00201B00(int, int, u128, int, int, int, int);
+
+void func_001D1C58(Obj1C58 *arg0) {
+    int arr[4];
+    long found;
+    int even;
+    int odd;
+    int count;
+    int value;
+    float score;
+    Racer1C58 *r;
+    int flag2C;
+    int flag30;
+    int i;
+    int i2;
+    int i3;
+    int i4;
+    int j;
+    int k;
+    StateCounts1C58 *state;
+    Mode8380 *mode;
+    int offset;
+    int offset4;
+    Sub1C58 *sub;
+    int *cnt;
+    int *fld;
+    char *rp;
+
+    found = 0;
+    even = 0;
+    odd = 0;
+    value = 0;
+    score = 0.0f;
+    r = 0;
+    flag2C = 0;
+    flag30 = 0;
+
+    for (k = 3; k >= 0; k--) {
+        arr[k] = 0;
+    }
+
+    for (i = 0; i < ((Mode8380 *)D_004B25A0_chars_1C58)->x288; i++) {
+        offset4 = i * 4;
+        do { state = (StateCounts1C58 *)D_00398C40; } while (0);
+        if (((Obj1C58 *)((char *)arg0 + offset4))->x20[0] == 0) {
+            j = 0;
+            if (state->counts[i] > 0) {
+            offset = i * 0x240;
+            mode = &D_004B25A0__c1;
+            do {} while (0);
+            cnt = &state->counts[i];
+            sub = (Sub1C58 *)(offset + (unsigned int)((char *)state + 0x240));
+            fld = (int *)(offset + (unsigned int)D_00398EA0);
+            do {
+                if (*fld == arg0->x4) {
+                    found = 1;
+                    arr[i] = 1;
+                    if (mode->x288 >= 2) {
+                        if (!(i & 1)) {
+                            even = 1;
+                        } else {
+                            odd = 1;
+                        }
+                        break;
+                    }
+                    func_001DB6B0__c1(sub, 0x3E8, 0x5DC, &count, &value, 0);
+                    even = 1;
+                    odd = 1;
+                }
+                j++;
+                sub++;
+                fld += 0xC;
+            } while (j < *cnt);
+            }
+        }
+    }
+
+    if (found != 0) {
+        if (D_004B25A0__c1.x288 >= 2) {
+            if (even != 0) {
+                if (odd != 0) {
+                    value = 0;
+                } else {
+                    value = 0x10E;
+                }
+            } else if (odd != 0) {
+                value = 0x5A;
+            } else {
+                value = 0x10E;
+            }
+        }
+
+        for (i2 = 0; i2 < D_004B25A0__c1.x288; i2++) {
+            if (arr[i2] == 1) {
+                r = ((Global1C58 *)&D_002AF2C0)->x50130[i2];
+                if (r != 0) {
+                    rp = (char *)r + 0x40C0;
+                    if (func_001385A8(rp) > 0.008f) {
+                        if ((float)arg0->x30 < r->x7AC0) {
+                            flag2C = 1;
+                        } else if (func_00138580(rp) > D_0029D5DC && arg0->x60[i2] == 1) {
+                            flag30 = 1;
+                            score = func_001385A8(rp);
+                        }
+                    }
+                }
+                arg0->x60[i2] = 0;
+            } else {
+                arg0->x60[i2] = 1;
+            }
+        }
+
+        if (flag2C != 0) {
+            unsigned int handle = arg0->x0;
+            if (handle == 0) {
+                arg0->x0 = 0xFFFFFFFF;
+                func_00201BD0(D_004BD8A0[0], 0, arg0->x50, 0x400, value, 0, 0,
+                              func_00208C50, (SoundCallbackData)(long)arg0);
+            } else if (handle != 0xFFFFFFFF && handle != 0) {
+                arg0->x0 = 0xFFFFFFFF;
+                func_00201E08(handle, 5, 0x400, value, 0, 0, func_00208C50, (SoundCallbackData)(long)arg0);
+            }
+        } else {
+            do { func_00208BF8__c1(&D_004BD840, arg0); } while (0);
+        }
+
+        if (flag30 != 0) {
+            if (value >= 0xB && value <= 0xB3) {
+                value = 0x87;
+            } else {
+                if (value < 0xB5 || value > 0x15D) {
+                    goto end;
+                }
+                value = 0xE1;
+            }
+            rp = (char *)r + 0x40C0;
+            if (func_00138580(rp) < D_0029D5E0) {
+                count = (int)((func_00138580(rp) - (float)D_0029D5DC) /
+                              (float)(D_0029D5E0 - D_0029D5DC) * 1024.0f);
+            } else {
+                count = 0x400;
+            }
+            func_00201B00(D_004BD8A0[0], 0, arg0->x40, count, value, 0,
+                          (int)(score * 65535.0f + -32768.0f));
+        }
+    } else {
+        func_00208BF8__c1(&D_004BD840, arg0);
+        for (i3 = 0; i3 < D_004B25A0__c1.x288; i3++) {
+            arg0->x60[i3] = 1;
+        }
+    }
+
+end:
+    for (i4 = 0; i4 < D_004B25A0__c1.x288; i4++) {
+        arg0->x20[i4] = 0;
+    }
+}
+#else
 INCLUDE_ASM("asm/nonmatchings/text", func_001D1C58);
+#endif
 typedef struct {int x0,x4,x8; int ids[5]; u128__c1 name;} Row;
 typedef struct {char pad[0x14]; unsigned short x14; char pad16[4]; short x1a,x1c,x1e;} Info;
 extern char D_004BD8C0[];
@@ -5437,7 +5638,154 @@ void func_001D21C8__c1(unsigned int rows) {
  }while(i<count); }
 }
 
+#ifdef NONMATCHING
+/* Non-matching: global-alloc keeps rows in $s6 and spills i (retail spills rows, i in $s6), s4/s5 swapped,
+   mixer loop uses branches instead of beql chains, call-arg scheduling;
+   best diff 208/292 words */
+/* Positional loop sounds for the rows built by func_001D21C8: for every row, func_001D2AB8 gives each rider's
+   volume/pan against the node segments before and after the rider's node; these are mixed into one
+   volume/pan and the row's sound is started (func_00201BD0) or updated (func_00201E08), or stopped. */
+struct Obj001D28B8;
+extern void func_001D28B8(struct Obj001D28B8 *, int);
+extern void func_001D2AB8();
+
+typedef struct { char pad[0x50130]; char *riders[26]; } Race2428;
+typedef struct { int volume, pan; } Pair2428;
+
+/* same layout as Row (func_001D21C8) */
+typedef struct { unsigned int x0; int x4, x8; int ids[5]; u128 name; } Row2428;
+extern void func_001D2428__c1(Row2428 *rows) asm("func_001D2428");
+void func_001D2428__c1(Row2428 *rows)
+{
+    int count;
+    int before, beforePan, after, afterPan;
+    register int i = 0;
+
+    count = func_00163B70(D_004BD8C0);
+    before = 0;
+    beforePan = 0;
+    after = 0;
+    afterPan = 0;
+    {
+        int results[D_004B25A0__c1.x288 * 2]; /* per rider: volume, pan */
+        if (count > 0) {
+            do {
+                int next;
+                int j;
+                int volume, pan;
+                Row2428 *row;
+                func_001D28B8((struct Obj001D28B8 *)rows, i);
+                j = 0;
+                next = i + 1;
+                if (D_004B25A0__c1.x288 > 0) {
+                    int offset = 0;
+                    int *indexBase = rows[0].ids;
+                    int *curId = rows[i].ids;
+                    do {
+                        int *second;
+                        /* segment ending at the rider's current node (unless node flag bit 0) */
+                        if (!(func_00163D40(D_004BD8C0, *curId)->x14 & 1)) {
+                            char *rider = ((Race2428 *)&D_002AF2C0)->riders[j];
+                            void *position = *(char **)(rider + 0x792C) + 0x10;
+                            func_001D2AB8((void *)rows, position, func_00163D40(D_004BD8C0, *curId),
+                                func_00163D40(D_004BD8C0, *curId - 1), &before, &beforePan, rows[i].x4, rows[i].x8);
+                        } else {
+                            before = 0;
+                            beforePan = 0;
+                        }
+                        /* segment starting at the rider's current node (unless node flag bit 1) */
+                        second = (int *)((char *)indexBase + i * 48 + offset);
+                        if (!((func_00163D40(D_004BD8C0, *second)->x14 >> 1) & 1)) {
+                            char *rider = ((Race2428 *)&D_002AF2C0)->riders[j];
+                            void *position = *(char **)(rider + 0x792C) + 0x10;
+                            func_001D2AB8((void *)rows, position,
+                                func_00163D40(D_004BD8C0, *second),
+                                func_00163D40(D_004BD8C0, *second + 1),
+                                &after, &afterPan, rows[i].x4, rows[i].x8);
+                        } else {
+                            after = 0;
+                            afterPan = 0;
+                        }
+                        /* keep the louder of the two segments */
+                        results[j * 2] = before <= after ? after : before;
+                        { int chosenPan;
+                        int *panOut = &results[j * 2 + 1];
+                        if (after < before) {
+                            j++;
+                            chosenPan = beforePan;
+                        } else {
+                            j++;
+                            chosenPan = afterPan;
+                        }
+                        *panOut = chosenPan; }
+                        curId++;
+                        offset += 4;
+                    } while (j < D_004B25A0__c1.x288);
+                }
+                if (D_004B25A0__c1.x288 == 1) {
+                    volume = results[0];
+                    pan = results[1];
+                } else {
+                    /* several riders: the first rider's volume pans to 270, the loudest of the others to 90 */
+                    int first = 0;
+                    int firstCheck = 1;
+                    int rest = 0;
+                    if (D_004B25A0__c1.x288 > 0) {
+                        Pair2428 *p = (Pair2428 *)results;
+                        int remaining = D_004B2828[0];
+                        do {
+                            /* both operands are 0/1, so & == && here */
+                            if (firstCheck & (first < p->volume)) {
+                                first = p->volume;
+                            } else {
+                                if (p->volume > rest)
+                                    rest = p->volume;
+                            }
+                            firstCheck = 0;
+                            p++;
+                            remaining--;
+                        } while (remaining != 0);
+                    }
+                    volume = rest;
+                    pan = 90;
+                    if (first != 0) {
+                        if (rest == 0) {
+                            volume = first;
+                            pan = 270;
+                        } else if (rest < first) {
+                            volume = first;
+                            pan = (rest * 90 / first) + 270;
+                        } else {
+                            pan = 90 - (first * 90 / rest);
+                        }
+                    }
+                }
+                if (volume > 0) {
+                    unsigned int handle;
+                    row = &rows[i];
+                    handle = row->x0;
+                    if (handle == 0) {
+                        row->x0 = 0xffffffffU;
+                        func_00201BD0(D_004BD898__c1[2], 0, row->name, volume, pan, 0, 0,
+                                      func_00208C50, (SoundCallbackData)(long)row);
+                    } else {
+                        if (handle != 0xFFFFFFFF && handle != 0) {
+                        row->x0 = 0xffffffffU;
+                        func_00201E08(handle, 5, volume, pan, 0, 0,
+                                      func_00208C50, (SoundCallbackData)(long)row);
+                        }
+                    }
+                } else {
+                    func_00208BF8__c1(D_004BD840, &rows[i]);
+                }
+                i = next;
+            } while (i < count);
+        }
+    }
+}
+#else
 INCLUDE_ASM("asm/nonmatchings/text", func_001D2428);
+#endif
 typedef struct Vec { float x, y, z, w; } Vec;
 typedef struct Node { char pad0[0x14]; unsigned short x14; } Node;
 typedef struct Body { char pad0[0x10]; Vec pos; } Body;
