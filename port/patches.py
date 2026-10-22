@@ -108,6 +108,11 @@ PATCHES = {
          'float b=ps2_fmul(ps2_fadd(ps2_fsub(*hi, origin), radius), inv);'),
         ('text', 'origin<*lo-radius || *hi+radius<origin',
          'origin<ps2_fsub(*lo, radius) || ps2_fadd(*hi, radius)<origin')],
+    # The AI's next racing-line record when it has one: the matching C falls off the end, where the
+    # EE returns $v0, the x74 it just loaded (asm func_0010B8E8); clang returned the controller.
+    'unsorted/0010B8E8.c': [
+        ('text', '    if (a->x74 == 0) return func_00117828(D_0029EA20, a->x0->x792c + 0x10);\n}',
+         '    if (a->x74 == 0) return func_00117828(D_0029EA20, a->x0->x792c + 0x10);\n    return (void *)a->x74;\n}')],
     # Flat terrain can have a zero-height, zero-length interpolation segment.
     'unsorted/00111F98.c': [
         ('text', 'height=obj->x70->z-obj->x0->x792C->x18;',
