@@ -551,6 +551,44 @@ Stopped only task-owned game/server/helper processes by PID. No stash, FPS bench
 release, deployment, server/site change, game-data/capture commit or publication. No third-party
 implementation copied.
 
+## 12. Release 0.2.8: the AI's racing-line record
+
+The fix (`port/patches.py`): `func_0010B8E8` returns an AI controller's next
+racing-line record. Retail asm loads `x74` into `$v0` and returns it when it is non-zero
+(`lw $v0, 0x74($a0)`, `bnez $v0` to `jr $ra`); only a zero `x74` calls `func_00117828`. The
+matching C has no return on that path. On the EE that is harmless, but clang's build returned the
+controller pointer, so every AI rider read its racing line from the wrong memory. The PC build
+now returns `x74` there; the matching source is unchanged.
+
+Build and gate:
+- `build_clean.py` at the 0.2.8 version commit: `dhd.exe` SHA-256
+  `b8cf7d2d467e6c3f363a9e67618aa6981c1c55e1b35cae1e05ed7c37e2f405f4`.
+- Default gate against r46-plain: both arms match each other at all six moments through
+  GO+4500, but both differ from r46-plain from GO+2 on (63 words at GO+2, 53 at GO+12/16; GO+0
+  matches). Every word is accounted for:
+  - one word in each AI rider 1-9, the same field in all nine: `0x000000C0` (read from the
+    controller) becomes `0x40488DC8`, 3.13 (read from the record). The human rider 0 is
+    unchanged;
+  - nine words at 0x662FF0-0x6630A4 (zero, now saved return addresses) and the main thread's
+    stack at 0x93C5B8-0x93C9EC: stack left behind by the different call path.
+- Recorded `build/port/compare/r47-plain` with this executable (`--record`). Both arms matched
+  each other, with 1,141 readbacks. The gate against r47-plain then passed: **NATIVE RENDERER
+  GAME-STATE GATE MATCH**, all EE comparisons match, 1,144 readbacks and Z reads through virtual
+  GS field 9065. r47-plain is now the gate's default; no exclusion or check changed.
+
+Package: `package_release.py` first refused the executable. Its drive-path scan found `v:\@6;\@`
+in `.rdata` at file offset 0x7C8D80, which is a float table (3.4421, 3.4422, ...; 3.4421 is the
+bytes 76 3A 5C 40) that the new layout happened to put there. A drive-path match in the data
+sections is now skipped only when it is shorter than 16 bytes and not followed by a NUL. Every C
+string literal ends in a NUL, and a real path is long. Controls: a NUL-terminated path, a long
+unterminated path and a short NUL-terminated one are still refused. 0.2.7 had no match at all.
+`DownhillRevived-0.2.8-win.zip` is 2,933,382 bytes, SHA-256
+`a5e8cbad458ffdb1662ce4125aaa847393743d9cd1543c1018d6871586159a20`.
+
+Smoke: the zip was extracted into a new folder and run minimized with only the gate's menu and
+race scripts. The window title is "Downhill Revived", the disc is read, title, main menu, Alpine.
+The race runs with HUD and clock, and the AI riders pull ahead. The game was stopped by PID.
+
 ## Open
 
 - A save writes `saves\card1` on demand; the first run above made none.

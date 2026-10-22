@@ -27,6 +27,9 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--external-out', action='store_true',
                     help='allow private artifacts outside the checkout; comparisons and reference are unchanged')
+    # r47-plain: the plain build_clean.py executable of release 0.2.8. It differs from
+    # r46-plain only by the AI racing-line fix (func_0010B8E8): from GO+2, one word in each AI
+    # rider (1-9, never the human) and dead stack in two thread stacks (finding 053 section 12).
     # r46-plain: a plain build_clean.py executable after the data-fixup audit.
     # All changes from r40-plain are enumerated and checked against independent
     # retail RAM in finding 062 (including round 45's pickup timing correction).
@@ -35,7 +38,7 @@ def main():
     # 0x4F4454: EXIT GAME text left in the font packet buffer (finding 056; finding 053 section 6).
     # r39-plain differed from r38-reviewed (1499a7c4, the frozen object basis) only in 54 words of
     # dead main-thread stack; r38-reviewed came after the 65 words of finding 050 were traced.
-    ap.add_argument('--reference', type=Path, default=ROOT / 'build/port/compare/r46-plain')
+    ap.add_argument('--reference', type=Path, default=ROOT / 'build/port/compare/r47-plain')
     ap.add_argument('--env', action='append', default=[], help='additional NAME=VALUE for the native arm')
     # A contributor's own reference: run the gate once with --record on a plain build_clean.py
     # executable of a revision known to be good (a release commit). Its exact arm becomes

@@ -113,12 +113,22 @@ def without_code(data):
     return bytes(out)
 
 
+def chance_bytes(data, m):
+    """True for an ASCII drive-path match that can't be a string: a C string literal ends in a NUL,
+    and a real path is long. A short run (under 16 bytes) followed by another byte is numbers that
+    spell a path by chance, like the float table in 0.2.8's .rdata (3.4421 is the bytes 76 3A 5C 40)."""
+    return len(m.group(0)) < 16 and m.end() < len(data) and data[m.end()] != 0
+
+
 def exe_problems(exe, servers):
     data = exe.read_bytes()
     problems = []
     for text, kind in ((data, 'ASCII'), (utf16_strings(data), 'UTF-16')):
         # drive paths: in the data sections only (see without_code); every other check reads it all
-        for m in ABSOLUTE.finditer(without_code(text) if kind == 'ASCII' else text):
+        scanned = without_code(text) if kind == 'ASCII' else text
+        for m in ABSOLUTE.finditer(scanned):
+            if kind == 'ASCII' and chance_bytes(scanned, m):
+                continue
             problems.append('%s absolute path %r' % (kind, m.group(0)[:120].decode('ascii', 'replace')))
         for host in other_hosts(text):
             problems.append('%s server host %r' % (kind, host.decode('ascii', 'replace')))
