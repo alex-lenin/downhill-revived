@@ -24,6 +24,11 @@ static unsigned buffer_width, buffer_height;
 static uint32_t pixels[1024 * 1024];
 static int initialized, disabled, resize_pending;
 static volatile LONG window_closed;
+/* Laptops with two graphics chips run a program they don't know on the integrated one, which may
+   lack what the renderers need (double-precision shaders, gpu.c); these exports ask the NVIDIA and
+   AMD drivers for the dedicated chip, as most PC games do. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 /* Presentation for low latency and variable refresh (round 38, finding 052): a flip-model chain
    that may tear (G-SYNC/FreeSync show each picture when presented; the port's own limiter paces
    them, kernel.c) and holds at most one frame (the frame-latency waitable object, else the
@@ -95,16 +100,18 @@ static int init(void)
     wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));  /* port/res/dhd.rc */
     if (!RegisterClassA(&wc)) return 0;
     /* DHD_WINDOW: windowed (default; DHD_WINDOW_WIDTH x DHD_WINDOW_HEIGHT inside, 896x672),
-       borderless (the whole monitor) or fullscreen (exclusive, the monitor's current mode). */
+       borderless (the whole monitor) or fullscreen (exclusive, the monitor's current mode). A
+       fullscreen window starts borderless: when Windows refuses exclusive mode at the start, or
+       drops it as the start window goes, the game still fills the monitor, as gs_window_apply's does. */
     const char *mode = getenv("DHD_WINDOW"), *width = getenv("DHD_WINDOW_WIDTH"), *height = getenv("DHD_WINDOW_HEIGHT");
     int borderless = mode && !strcmp(mode, "borderless"), fullscreen = mode && !strcmp(mode, "fullscreen");
     MONITORINFO monitor = {sizeof monitor};
     POINT origin = {0, 0};
     GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor);
     RECT rect = {0, 0, width && atoi(width) > 0 ? atoi(width) : 896, height && atoi(height) > 0 ? atoi(height) : 672};
-    DWORD style = borderless ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+    DWORD style = borderless || fullscreen ? WS_POPUP : WS_OVERLAPPEDWINDOW;
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
-    if (borderless) {
+    if (borderless || fullscreen) {
         rect = monitor.rcMonitor;
         x = rect.left; y = rect.top;
     } else AdjustWindowRect(&rect, style, FALSE);
@@ -196,13 +203,16 @@ static int init(void)
     latency_armed = latency_waitable != NULL;  /* the first wait takes the chain's initial frame */
     hle_log("gs: tearing %s, frame latency 1 (%s)\n", swap_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING ? "allowed" : "off",
             latency_waitable ? "waitable object" : "device");
-    if (getenv("DHD_GPU_TRACE")) {
+    {  /* the graphics chip, in every log: the first thing a player's report needs */
         static const GUID dxgi_iid = {0x54ec77fa,0x1377,0x44e6,{0x8c,0x32,0x88,0xfd,0x5f,0x44,0xc8,0x4c}};
         IDXGIDevice *dx = NULL; IDXGIAdapter *adapter = NULL; DXGI_ADAPTER_DESC ad;
         if (SUCCEEDED(ID3D11Device_QueryInterface(device, &dxgi_iid, (void **)&dx))) {
             if (SUCCEEDED(IDXGIDevice_GetAdapter(dx, &adapter))) {
-                if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)))
-                    fprintf(stderr, "gpu trace adapter: %ls vendor=%04X device=%04X dedicated=%llu\n", ad.Description, ad.VendorId, ad.DeviceId, (uint64_t)ad.DedicatedVideoMemory);
+                if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad))) {
+                    hle_log("gs: adapter %ls\n", ad.Description);
+                    if (getenv("DHD_GPU_TRACE"))
+                        fprintf(stderr, "gpu trace adapter: %ls vendor=%04X device=%04X dedicated=%llu\n", ad.Description, ad.VendorId, ad.DeviceId, (uint64_t)ad.DedicatedVideoMemory);
+                }
                 IDXGIAdapter_Release(adapter);
             }
             IDXGIDevice_Release(dx);
@@ -220,7 +230,7 @@ static int init(void)
         target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         IDXGISwapChain_ResizeTarget(swapchain, &target);
         hr = IDXGISwapChain_SetFullscreenState(swapchain, TRUE, NULL);
-        if (FAILED(hr)) hle_log("gs: exclusive fullscreen unavailable (%08lX), windowed\n", hr);
+        if (FAILED(hr)) hle_log("gs: exclusive fullscreen unavailable (%08lX), borderless\n", hr);
         else atexit(leave_fullscreen);
         resize_pending = 1;
     }
@@ -519,6 +529,26 @@ static void bench_vsync(void)
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height);  /* port/hle/movie.c */
 
+/* The graphics didn't start. The game would go on with no window (heard, never seen) behind a
+   start window stuck on its graphics step: instead the start window closes, a message says why
+   and the game ends. Tools that want no window set DHD_HEADLESS and never get here. */
+static void graphics_failed(void)
+{
+    D3D11_FEATURE_DATA_DOUBLES doubles = {0};
+    int no_doubles = device && (FAILED(ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_DOUBLES, &doubles, sizeof doubles)) ||
+                                !doubles.DoublePrecisionFloatShaderOps);
+    hle_log("gs: the graphics didn't start%s\n", no_doubles ? " (no double-precision shaders)" : "");
+    splash_close();
+    char message[1024];
+    snprintf(message, sizeof message, "Downhill Revived couldn't start its graphics on this PC.\n\n%s"
+             "On a laptop with two graphics chips, open Windows Settings > System > Display > Graphics, "
+             "add dhd.exe and choose High performance.\n\nThe details are in dhd.log, next to dhd.exe.",
+             no_doubles ? "Its renderer needs DirectX 11 with double-precision shaders, and this graphics "
+                          "chip doesn't offer them.\n\n" : "");
+    MessageBoxA(NULL, message, "Downhill Revived", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    exit(1);
+}
+
 void gs_vsync(void)
 {
     static int profile, gpu_trace;
@@ -528,7 +558,7 @@ void gs_vsync(void)
     if (!initialized) {
         initialized = 1;
         disabled = getenv("DHD_HEADLESS") != NULL;
-        if (!disabled && !init()) disabled = 1;
+        if (!disabled && !init()) graphics_failed();
         profile = getenv("DHD_PROFILE") != NULL;
         gpu_trace = getenv("DHD_GPU_TRACE") != NULL;
         cpu_scanout = getenv("DHD_GS_CPU_SCANOUT") != NULL;
