@@ -12,6 +12,8 @@
   "vars": { "MIN_VERSION": "0.3.0" },
   // The official server's address (port/hle/host.c OFFICIAL_SERVER).
   "routes": [{ "pattern": "dhd.skuza.app", "custom_domain": true }],
+  // Usage stats (src/room.ts stat): joins and races, no addresses or names. Optional.
+  "analytics_engine_datasets": [{ "binding": "STATS", "dataset": "dhd_online" }],
   "durable_objects": {
     "bindings": [
       { "name": "ROOM", "class_name": "Room" },

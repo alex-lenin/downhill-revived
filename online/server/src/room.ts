@@ -88,6 +88,15 @@ interface SocketInfo {
   create: boolean;
   /** Left or refused; only its close is still to come. */
   gone?: boolean;
+  /** Two-letter country of the connection (Cloudflare's), for the usage stats only. */
+  country?: string;
+}
+
+/** FNV-1a: a player name becomes a number, so the stats can count players without names. */
+function nameHash(name: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < name.length; i++) h = Math.imul(h ^ name.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(16);
 }
 
 type Msg = Record<string, unknown> & { type: string };
@@ -156,6 +165,7 @@ export class Room extends DurableObject<Env> {
       memberId: null,
       connectedAt: Date.now(),
       create: request.headers.get("x-dhd-create") === "1",
+      country: (request.cf?.country as string | undefined) ?? request.headers.get("cf-ipcountry") ?? "",
     };
     server.serializeAttachment(info);
     if ((await this.ctx.storage.getAlarm()) === null)
@@ -277,6 +287,15 @@ export class Room extends DurableObject<Env> {
   }
 
   // ---- Race relay (hot path: no awaits, no allocation beyond the frame) ----
+
+  /** Usage stats: one Workers Analytics Engine point (dataset dhd_online; wrangler.jsonc STATS).
+      Joins carry the release, the country and a hash of the name; races the player count, track
+      and laps. No addresses or names. A server without the binding keeps none. */
+  private stat(blobs: string[], doubles: number[]): void {
+    try {
+      this.env.STATS?.writeDataPoint({ indexes: [blobs[0]], blobs, doubles });
+    } catch {}
+  }
 
   private relay(ws: WebSocket, data: ArrayBuffer): void {
     let slot = this.slotOf.get(ws);
@@ -405,6 +424,7 @@ export class Room extends DurableObject<Env> {
     info.memberId = member.id;
     ws.serializeAttachment(info);
     this.sockets.set(member.id, ws);
+    this.stat(["join", clientVersion, info.country ?? "", nameHash(name), asHost ? "host" : "guest"], [st.members.length]);
     this.send(ws, {
       type: "welcome",
       protocol: PROTOCOL,
@@ -487,6 +507,8 @@ export class Room extends DurableObject<Env> {
     this.rebuildRace();
     await this.save();
     const race = st.race;
+    const hostInfo = ws.deserializeAttachment() as SocketInfo | null;
+    this.stat(["race", "", hostInfo?.country ?? ""], [racers.length, race.track, race.laps]);
     const players = racers.map((x, slot) => ({ slot, memberId: x.id, name: x.name, rider: x.rider, bike: x.bike }));
     racers.forEach((x, slot) => {
       const s = this.sockets.get(x.id);
