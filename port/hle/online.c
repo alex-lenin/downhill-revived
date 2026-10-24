@@ -567,9 +567,11 @@ static void receive_frames(void)
     while ((n = net_receive_frame(frame, sizeof frame)) > 0) {
         int sender = frame[1];
         const uint8_t *e = frame + 2;
-        if (frame[0] == NET_FRAME_STATE) {
-            hle_puppet_receive(sender, e, n - 2);
-            on.received++;
+        if (frame[0] == NET_FRAME_STATE) {  /* the sender's riders: [size][snapshot]... */
+            for (const uint8_t *end = frame + n; e < end && e + 1 + e[0] <= end; e += 1 + e[0]) {
+                hle_puppet_receive(sender, e + 1, e[0]);
+                on.received++;
+            }
             continue;
         }
         if (frame[0] != NET_FRAME_EVENT || n < 4 || e[0] != EVENT_VERSION || sender >= NET_MAX_SLOTS) continue;
@@ -918,11 +920,18 @@ static void state_sync(void)
     }
     if (!race_running() || clock < on.last_sent + SNAPSHOT_TICKS && clock >= on.last_sent) return;
     on.last_sent = clock - clock % SNAPSHOT_TICKS;
-    for (int slot = 0; slot < hle_online_race_riders(); slot++)
-        if ((n = hle_puppet_pack(slot, payload, sizeof payload)) > 0) {
-            if (net_send_frame(NET_FRAME_STATE, payload, n)) on.sent++;
-            if (slot == 0) record(payload, n);
+    /* All our riders in one frame (the host's AI riders too): one message to the server a
+       snapshot, not one a rider. Each is [size][snapshot]; a snapshot stays within 255 bytes. */
+    int at = 0, riders = 0;
+    for (int slot = 0; slot < hle_online_race_riders(); slot++) {
+        int room = (int)sizeof payload - at - 1;
+        if ((n = hle_puppet_pack(slot, payload + at + 1, room < 255 ? room : 255)) > 0) {
+            payload[at] = (uint8_t)n;
+            if (slot == 0) record(payload + at + 1, n);
+            at += 1 + n, riders++;
         }
+    }
+    if (at && net_send_frame(NET_FRAME_STATE, payload, at)) on.sent += riders;
     while ((n = hle_puppet_take_event(payload, sizeof payload)) > 0) send_event(payload, n);
     static double last_title;
     if (host_wall_seconds() - last_title > 1) {

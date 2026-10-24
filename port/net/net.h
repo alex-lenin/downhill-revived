@@ -127,7 +127,9 @@ uint32_t net_waiting_for(void);   /* slot mask */
 /* Binary frames the relay forwards as they are to every other racer: a snapshot of riders this
    PC owns, an event it decided for another PC's rider. A frame is type, slot (the server sets
    it), payload. */
-enum { NET_FRAME_STATE = 5, NET_FRAME_EVENT = 6, NET_FRAME_MAX = 256, NET_RELAY_QUEUE = 128 };
+/* NET_FRAME_MAX: a STATE frame carries all of a player's riders (up to ten snapshots of at most
+   255 bytes); the server's MAX_BINARY_BYTES is the same. */
+enum { NET_FRAME_STATE = 5, NET_FRAME_EVENT = 6, NET_FRAME_MAX = 3072, NET_RELAY_QUEUE = 128 };
 /* Sends type and payload (at most NET_FRAME_MAX - 2 bytes); 0 when not racing. */
 int net_send_frame(int type, const void *payload, size_t n);
 /* The oldest frame received, whole (out[0] type, out[1] sender's slot); its size, 0 if none. */

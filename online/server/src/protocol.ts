@@ -5,7 +5,8 @@ export const PROTOCOL = 1;
 export const MAX_MEMBERS = 8;
 export const DEFAULT_MAX_PLAYERS = 4;
 export const MAX_TEXT_BYTES = 4096;
-export const MAX_BINARY_BYTES = 256;
+/** A STATE frame carries all of a player's riders (port/net/net.h NET_FRAME_MAX). */
+export const MAX_BINARY_BYTES = 3072;
 
 /** One NTSC field in milliseconds (59.94 Hz). */
 export const FIELD_MS = 16.68;
