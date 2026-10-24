@@ -191,7 +191,7 @@ progress table in `README.md`.
 `online/server/` is a Cloudflare Workers project. Its
 [README](../online/server/README.md) covers tests, a local server (`wrangler dev`) and
 deployment. The game's built-in default is the official server,
-`wss://dhd-online.downhill-revived.workers.dev` (`port/hle/host.c`, `OFFICIAL_SERVER`), used when
+`wss://dhd.skuza.app` (`port/hle/host.c`, `OFFICIAL_SERVER`), used when
 `dhd.ini`'s `server =` is empty and `DHD_NET_SERVER` is unset. Self-hosting is optional: a
 `server = wss://...` line in `dhd.ini`, or the `DHD_NET_SERVER` environment variable, points the
 game at another server. Don't commit any other deployed address; `package_release.py` refuses

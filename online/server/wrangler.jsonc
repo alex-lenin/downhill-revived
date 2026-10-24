@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "dhd-online",
+  "name": "dhd-revived-online",
+  "workers_dev": false,
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "upload_source_maps": true,
@@ -8,7 +9,9 @@
   // The oldest game release that may play online ("X.Y.Z"). Older clients are refused with
   // "A new version is available. Update to play online." Raise it to each new release once that
   // release is published; a self-hosted server can keep an older one.
-  "vars": { "MIN_VERSION": "0.2.9" },
+  "vars": { "MIN_VERSION": "0.3.0" },
+  // The official server's address (port/hle/host.c OFFICIAL_SERVER).
+  "routes": [{ "pattern": "dhd.skuza.app", "custom_domain": true }],
   "durable_objects": {
     "bindings": [
       { "name": "ROOM", "class_name": "Room" },

@@ -21,7 +21,7 @@ The zip is refused if dhd.exe:
   - holds an absolute path (a builder's folder, C:\\Users\\..., the repository's own path), in
     ASCII or UTF-16 (a drive path "X:\\..." in ASCII: in the data sections, where strings are; in
     machine code such bytes are an instruction's operand);
-  - holds a server address other than the official one (dhd-online.downhill-revived.workers.dev,
+  - holds a server address other than the official one (dhd.skuza.app,
     the built-in default): another workers.dev host, DHD_NET_SERVER when set, or the server line of a
     dhd.ini named by --settings;
 or if a packaged file name looks like game data, or any packaged file holds a run of 64 bytes or
@@ -59,7 +59,7 @@ GAME_DATA = re.compile(r'\.(iso|bin|img|elf|irx|mc2|ps2|raw|vpk|vag|pss)$|^SCUS_
 # an absolute Windows path: a drive letter, a separator, then at least two printable characters
 ABSOLUTE = re.compile(rb'(?<![A-Za-z0-9])[A-Za-z]:[\\/][\x20-\x7e]{2,}')
 # The official public race server (port/hle/host.c): the one server address a release may name.
-OFFICIAL_HOST = b'dhd-online.downhill-revived.workers.dev'
+OFFICIAL_HOST = b'dhd.skuza.app'
 # any workers.dev host (other_hosts allows only the official one)
 WORKERS_HOST = re.compile(rb'[A-Za-z0-9.-]*workers\.dev', re.I)
 # user folders, and the builder's own account name and checkout folders

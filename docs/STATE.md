@@ -1226,7 +1226,7 @@ Round 39 (finding 053): the first public release, "Downhill Revived".
   dhd.ini; the game writes it on the first start. Gate passes against r39-plain unchanged.
 - Contributors record their own gate reference: `gate_native_renderer.py --record`.
 - Online out of the box (finding 053, section 5): the official server
-  `wss://dhd-online.downhill-revived.workers.dev` is the built-in default when dhd.ini's
+  `wss://dhd.skuza.app` is the built-in default when dhd.ini's
   `server =` is empty and `DHD_NET_SERVER` unset; either still overrides it. `package_release.py`
   allows that host only. From the 0.1.0 zip: a public race created, listed by a second instance,
   joined with its code by a third.

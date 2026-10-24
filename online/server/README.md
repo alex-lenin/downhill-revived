@@ -42,7 +42,7 @@ the nearest Cloudflare location.
 
 ## Deploy
 
-The official server is `wss://dhd-online.downhill-revived.workers.dev`; the game uses it
+The official server is `wss://dhd.skuza.app`; the game uses it
 when `dhd.ini` names no other. Running your own is optional. You need a Cloudflare account
 (the free plan supports Durable Objects with SQLite storage):
 

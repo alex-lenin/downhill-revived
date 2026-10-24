@@ -13,7 +13,7 @@ Cloudflare Workers + Durable Objects). The plan behind it is `docs/ONLINE-PLAN.m
 ## Endpoints
 
 `BASE` is `wss://<worker host>` (the official server, the client's default:
-`wss://dhd-online.downhill-revived.workers.dev`; your own deployment:
+`wss://dhd.skuza.app`; your own deployment:
 `wss://dhd-online.<account>.workers.dev`; local `wrangler dev`: `ws://127.0.0.1:8787`). HTTP endpoints use `https://` / `http://` on the same
 host.
 

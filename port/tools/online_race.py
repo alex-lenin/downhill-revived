@@ -9,7 +9,7 @@ each puppet, hits, finishes and results.
     python port/tools/online_race.py [--seconds 420] [--out DIR] [--capture g+600,g+1200]
                                      [--bots N --replay FILE] [--kill-guest-at SECONDS]
 
-Needs DHD_ISO, DHD_NET_SERVER (the official wss://dhd-online.downhill-revived.workers.dev or
+Needs DHD_ISO, DHD_NET_SERVER (the official wss://dhd.skuza.app or
 your own; never write any other deployed address into a tracked file) and the
 build (python port/tools/link.py). At most two dhd.exe of its own run; all are stopped by PID."""
 import argparse, hashlib, os, re, subprocess, sys, time

@@ -13,7 +13,7 @@ Read `docs/STATE.md` first: it says where each part of the project stands. Findi
 - Never commit game data: no ISO, executable, IRX modules, extracted assets, generated asm,
   captures, saves or BIOS files.
 - Never commit a key or other secret, or a server address other than the official server
-  (`wss://dhd-online.downhill-revived.workers.dev`, the game's default). Any other server lives
+  (`wss://dhd.skuza.app`, the game's default). Any other server lives
   only in a player's `dhd.ini` or the `DHD_NET_SERVER` environment variable.
 - Readable code is the goal: real names, structs and types once understood.
 - Port changes go in `port/` and apply at build time; `src/` must keep matching.

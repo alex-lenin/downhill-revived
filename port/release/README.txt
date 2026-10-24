@@ -86,7 +86,7 @@ In dhd.ini:
 Online races (experimental)
 Choose ONLINE in the main menu: create a public or private race, or join one from the list or
 with its code. It works out of the box, on the project's official server
-(wss://dhd-online.downhill-revived.workers.dev). Every player needs the same USA disc image,
+(wss://dhd.skuza.app). Every player needs the same USA disc image,
 and the newest version of the game: an older one is told "A new version is out. Update to play
 online." and offered Update Now.
 Running your own server is optional: put its address on the "server =" line of dhd.ini, e.g.

@@ -998,7 +998,7 @@ int host_setting_locked(const char *name)
 
 /* The official public race server (online/server, deployed by the project). DHD_NET_SERVER or
    a "server =" line with an address replaces it, for anyone running their own. */
-#define OFFICIAL_SERVER "wss://dhd-online.downhill-revived.workers.dev"
+#define OFFICIAL_SERVER "wss://dhd.skuza.app"
 
 static int settings_has(const char *key);
 
@@ -1075,7 +1075,7 @@ static const char settings_template[] =
     "; Online always uses 60. Frame rate changes apply at the next start.\n"
     "fps = 60\n"
     "\n"
-    "; Online races use the official server, wss://dhd-online.downhill-revived.workers.dev, when\n"
+    "; Online races use the official server, wss://dhd.skuza.app, when\n"
     "; server is empty. To use a server of your own, put its address here, for example\n"
     ";   server = wss://races.example.org\n"
     "server =\n"
