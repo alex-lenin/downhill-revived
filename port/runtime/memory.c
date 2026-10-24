@@ -50,9 +50,21 @@ int ps2_low_view_reserved(void)
            && m.AllocationBase == (void *)PS2_LOW_VIEW && m.RegionSize >= PS2_RAM_SIZE - PS2_LOW_VIEW;
 }
 
+/* Fixed memory at its PS2 address: in the parent's reservation (host_relaunch_reserving), else
+   free space. If something else is there (a DLL), the log says what. */
 static int alloc_at(uintptr_t at, size_t size)
 {
-    return VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) == (void *)at;
+    if (VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) == (void *)at
+        || VirtualAlloc((void *)at, size, MEM_COMMIT, PAGE_READWRITE) == (void *)at)
+        return 1;
+    DWORD error = GetLastError();
+    MEMORY_BASIC_INFORMATION m = {0};
+    char owner[MAX_PATH] = "";
+    VirtualQuery((void *)at, &m, sizeof m);
+    if (m.Type == MEM_IMAGE) GetModuleFileNameA((HMODULE)m.AllocationBase, owner, sizeof owner);
+    fprintf(stderr, "ps2_memory_init: %08lX is taken (error %lu; state %lX, type %lX, from %p%s%s)\n",
+            (unsigned long)at, error, m.State, m.Type, m.AllocationBase, *owner ? ", " : "", owner);
+    return 0;
 }
 
 int ps2_memory_init(void)

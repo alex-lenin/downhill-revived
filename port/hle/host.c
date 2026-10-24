@@ -381,6 +381,13 @@ int host_relaunch_reserving(uintptr_t at, size_t size)
     if (VirtualAllocEx(pi.hProcess, (void *)at, size, MEM_RESERVE, PAGE_NOACCESS) != (void *)at)
         fprintf(stderr, "can't reserve %08lX-%08lX for PS2 RAM (error %lu)\n", (unsigned long)at,
                 (unsigned long)(at + size), GetLastError());
+    /* The scratchpad, the EE registers, VU memory and the GS registers too (memory.c alloc_at
+       commits them): a DLL that loads later (an overlay, an antivirus) can't land there. */
+    static const uintptr_t fixed[] = {0x70000000, 0x10000000, 0x11000000, 0x12000000};
+    for (int i = 0; i < 4; i++)
+        if (VirtualAllocEx(pi.hProcess, (void *)fixed[i], 0x10000, MEM_RESERVE, PAGE_NOACCESS) != (void *)fixed[i])
+            fprintf(stderr, "can't reserve %08lX for the PS2's fixed memory (error %lu)\n", (unsigned long)fixed[i],
+                    GetLastError());
     ResumeThread(pi.hThread);
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
