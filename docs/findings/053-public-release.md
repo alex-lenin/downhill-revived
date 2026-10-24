@@ -589,6 +589,28 @@ Smoke: the zip was extracted into a new folder and run minimized with only the g
 race scripts. The window title is "Downhill Revived", the disc is read, title, main menu, Alpine.
 The race runs with HUD and clock, and the AI riders pull ahead. The game was stopped by PID.
 
+## 13. Release 0.2.9: high frame rates and fullscreen
+
+Player reports on 0.2.8: at 120/144 fps everything animated ran far too fast (even the menu sky),
+and Display: Fullscreen came up as a small window at every start. 0.2.9 is 0.2.8 with two fixes:
+- The readable C of func_00204F38 (the animation blend), added before 0.2.8, put a sixth
+  `* 16.66667f` in `unsorted/00202E00.cpp`; the FPS patch still expected five, so the transform
+  rejected the unit and 0.2.8 ran its recompiled asm without any of its port patches (the
+  animation clock among them). The patch now expects six.
+- A fullscreen window starts borderless before exclusive mode; a renderer that can't start closes
+  the start window with a message instead of running unseen; Optimus/PowerXpress exports; the
+  adapter in the log.
+
+Gate: the default gate against r47-plain: both arms match each other at all six moments, but
+differ from r47-plain (63 words at GO+0/+2, 53 at GO+12/16). Against r46-plain (0.2.7) the same
+run matches at GO+0/+2/+12/+16, and at GO+3600/4500 differs only in 5-7 words: AI riders'
+racing-line record words (0.2.7 held the controller pointer, 0x0432E9xx; 0.2.9 the record,
+0x10/0x4/0) and one stack word. So section 12's attribution was partly wrong: the nine rider
+words at +0x1EC (0xC0 -> 3.13) and the stack words at 0x662FF0-0x6630A4 were 00202E00's asm,
+not the AI fix; the AI fix only shows later in the race. Recorded `build/port/compare/r48-plain`
+from 0.2.9 (`--record`), now the gate's default; the gate against it: **NATIVE RENDERER
+GAME-STATE GATE MATCH**, 1,159 readbacks through GS field 9080.
+
 ## Open
 
 - A save writes `saves\card1` on demand; the first run above made none.
