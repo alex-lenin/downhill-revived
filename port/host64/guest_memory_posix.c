@@ -6,7 +6,7 @@
    Written for this task; no third-party code. */
 #define _GNU_SOURCE
 #include <errno.h>
-#include <execinfo.h>
+#include "../host/backtrace_posix.h"  /* <execinfo.h>, or Android's own (API < 33) */
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -94,9 +94,16 @@ static void fault(int sig,siginfo_t *info,void *ctx) {
     void *frames[24];
     int n=backtrace(frames,24);
     backtrace_symbols_fd(frames,n,STDERR_FILENO);
-    /* Report and exit with the signal, as an unhandled fault would. */
+    /* Report and exit with the signal, as an unhandled fault would. Android: the handler that
+       was there (the system's crash dump, debuggerd) gets the fault when it happens again. */
+#ifdef __ANDROID__
+    { void android_log_drain(void); android_log_drain(); }  /* the report reaches logcat first */
+    sigaction(sig,sig==SIGBUS ? &old_bus : &old_segv,NULL);
+    return;
+#else
     sigaction(sig,&dfl,NULL);
     raise(sig);
+#endif
 }
 int os_fault_install(void) {
     if (installed) return 1;

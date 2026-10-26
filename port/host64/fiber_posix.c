@@ -69,28 +69,44 @@ __asm__(
 "  ud2\n"
 );
 #elif defined(__aarch64__)
-/* x0=&save_sp, x1=new_sp. New fibers enter through fiber_trampoline with
-   x19 holding their Fiber; fiber_entry never returns. */
+/* x0=&save_sp, x1=new_sp. AAPCS64's callee-saved state: x19-x28, the frame
+   pointer x29, the link register x30 (where ret goes) and d8-d15 (the low
+   halves of v8-v15), in one 160-byte frame:
+     [sp+0]   x19 x20   [sp+16]  x21 x22   [sp+32]  x23 x24   [sp+48] x25 x26
+     [sp+64]  x27 x28   [sp+80]  x29 x30   [sp+96]  d8 d9     [sp+112] d10 d11
+     [sp+128] d12 d13   [sp+144] d14 d15
+   New fibers enter through fiber_trampoline (their x30) with x19 holding
+   their Fiber; fiber_entry never returns. */
 __asm__(
 ".text\n"
 ".globl fiber_switch_asm\n"
 ".type fiber_switch_asm,@function\n"
 "fiber_switch_asm:\n"
-"  stp x29, x30, [sp,#-16]!\n"
-"  stp x19, x20, [sp,#-16]!\n"
-"  stp x21, x22, [sp,#-16]!\n"
-"  stp x23, x24, [sp,#-16]!\n"
-"  stp x25, x26, [sp,#-16]!\n"
-"  stp x27, x28, [sp,#-16]!\n"
+"  sub sp, sp, #160\n"
+"  stp x19, x20, [sp,#0]\n"
+"  stp x21, x22, [sp,#16]\n"
+"  stp x23, x24, [sp,#32]\n"
+"  stp x25, x26, [sp,#48]\n"
+"  stp x27, x28, [sp,#64]\n"
+"  stp x29, x30, [sp,#80]\n"
+"  stp d8, d9, [sp,#96]\n"
+"  stp d10, d11, [sp,#112]\n"
+"  stp d12, d13, [sp,#128]\n"
+"  stp d14, d15, [sp,#144]\n"
 "  mov x2, sp\n"
 "  str x2, [x0]\n"
 "  mov sp, x1\n"
-"  ldp x27, x28, [sp],#16\n"
-"  ldp x25, x26, [sp],#16\n"
-"  ldp x23, x24, [sp],#16\n"
-"  ldp x21, x22, [sp],#16\n"
-"  ldp x19, x20, [sp],#16\n"
-"  ldp x29, x30, [sp],#16\n"
+"  ldp x19, x20, [sp,#0]\n"
+"  ldp x21, x22, [sp,#16]\n"
+"  ldp x23, x24, [sp,#32]\n"
+"  ldp x25, x26, [sp,#48]\n"
+"  ldp x27, x28, [sp,#64]\n"
+"  ldp x29, x30, [sp,#80]\n"
+"  ldp d8, d9, [sp,#96]\n"
+"  ldp d10, d11, [sp,#112]\n"
+"  ldp d12, d13, [sp,#128]\n"
+"  ldp d14, d15, [sp,#144]\n"
+"  add sp, sp, #160\n"
 "  ret\n"
 ".globl fiber_trampoline\n"
 ".type fiber_trampoline,@function\n"
@@ -155,13 +171,14 @@ HostFiber host_fiber_create(void (*fn)(void *),void *arg) {
         slot[6]=fiber_trampoline;
         f->save_sp=(void *)base;
 #elif defined(__aarch64__)
-        /* Six popped register pairs, fp/lr, then the trampoline address;
-           the base stays 16-aligned as the ABI requires. */
-        uintptr_t base=((uintptr_t)map+NATIVE_STACK+NATIVE_GUARD-128)&~15ull;
+        /* fiber_switch_asm's 160-byte frame: x19 = the Fiber, x29 = 0 (the
+           end of the frame chain), x30 = the trampoline (ret goes there),
+           every other register 0. The base and the sp after the frame stay
+           16-aligned as the ABI requires. */
+        uintptr_t base=((uintptr_t)map+NATIVE_STACK+NATIVE_GUARD-256)&~15ull;
         void **slot=(void **)base;
-        for (int k=0;k<8;k++) slot[k]=NULL;
-        slot[8]=f; slot[9]=slot[10]=slot[11]=NULL;
-        slot[12]=fiber_trampoline;
+        for (int k=0;k<20;k++) slot[k]=NULL;
+        slot[0]=f; slot[11]=(void *)fiber_trampoline;
         f->save_sp=(void *)base;
 #endif
         f->active=1;

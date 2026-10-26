@@ -42,13 +42,26 @@ unsigned long host_last_error(void) { return (unsigned long)errno; }
 
 void host_error_box(const char *title, const char *message)
 {
+#ifdef __ANDROID__
+    void android_error_box(const char *title, const char *message);  /* android_main.c: logcat and a message box */
+    fprintf(stderr, "%s: %s\n", title, message);
+    android_error_box(title, message);
+#else
     /* No message boxes on a headless host: the log carries it. */
     fprintf(stderr, "%s: %s\n", title, message);
     fflush(stderr);
+#endif
 }
 
 unsigned host_exe_path(char *out, unsigned size)
 {
+#ifdef __ANDROID__
+    /* No executable of our own (the app is app_process with libmain.so): the app's files folder
+       stands for dhd.exe's (android_main.c), so dhd.ini, saves and dhd.log go there. */
+    const char *android_exe_path(void);
+    int k = snprintf(out, size, "%s", android_exe_path());
+    return k > 0 && (unsigned)k < size ? (unsigned)k : 0;
+#endif
     ssize_t n = readlink("/proc/self/exe", out, size ? size - 1 : 0);
     if (n < 0) {
         if (size) out[0] = 0;
@@ -58,9 +71,29 @@ unsigned host_exe_path(char *out, unsigned size)
     return (unsigned)n;
 }
 
-void host_exit(int code) { _exit(code); }
+void host_exit(int code)
+{
+#ifdef __ANDROID__
+    extern int __llvm_profile_write_file(void) __attribute__((weak));  /* --pgo-generate builds only */
+    if (__llvm_profile_write_file) __llvm_profile_write_file();
+    void android_log_drain(void);  /* android_main.c: the last lines reach logcat and dhd.log */
+    android_log_drain();
+#endif
+    _exit(code);
+}
 
 int host_display_hz(void) { return 0; }
+
+/* The callers (vu0_interp.c, ps2asm.c) speak MXCSR: they read the word, set rounding toward zero
+   with FTZ/DAZ ((c & ~0x603F) | 0xFFC0) and restore what they read. On arm64 the word is translated
+   to and from FPCR: MXCSR RC (bits 13-14: nearest, down, up, zero) is FPCR RMode (bits 22-23:
+   nearest, up, down, zero), FTZ or DAZ is FZ (bit 24, which flushes inputs and results), and every
+   exception reads as masked (arm64 has no FP traps here). Writing the MXCSR bits into FPCR as they
+   are (AND1) left RMode and FZ alone: VU1 on the vu thread (FPCR IEEE) then rounded to nearest with
+   denormals, unlike the PS2 and the x64 build. */
+#if defined(__aarch64__)
+static const unsigned rc_to_rmode[4] = {0, 2, 1, 3}, rmode_to_rc[4] = {0, 2, 1, 3};
+#endif
 
 unsigned host_fp_csr(void)
 {
@@ -69,7 +102,7 @@ unsigned host_fp_csr(void)
 #elif defined(__aarch64__)
     uint64_t v;
     __asm__ volatile("mrs %0, fpcr" : "=r"(v));
-    return (unsigned)v;
+    return 0x1F80u | rmode_to_rc[(v >> 22) & 3] << 13 | ((v >> 24) & 1 ? 0x8040u : 0);
 #endif
 }
 
@@ -78,8 +111,9 @@ void host_fp_set_csr(unsigned csr)
 #if defined(__x86_64__)
     _mm_setcsr(csr);
 #elif defined(__aarch64__)
-    uint64_t v = csr;
-    __asm__ volatile("msr fpcr, %0\n\tisb" :: "r"(v) : "memory");
+    uint64_t now, v = (uint64_t)rc_to_rmode[(csr >> 13) & 3] << 22 | (csr & 0x8040u ? 1ull << 24 : 0);
+    __asm__ volatile("mrs %0, fpcr" : "=r"(now));
+    if (now != v) __asm__ volatile("msr fpcr, %0\n\tisb" :: "r"(v) : "memory");
 #endif
 }
 
@@ -104,7 +138,15 @@ void host_putenv_s(const char *name, const char *value)
 
 void host_dpi_aware(void) {} /* pixels are real without asking */
 
-double host_monitor_aspect(void) { return 16.0 / 9.0; }
+double host_monitor_aspect(void)
+{
+#ifdef __ANDROID__
+    /* the screen's shape, from the activity (DhdActivity: DHD_MONITOR_ASPECT, the long side over the short) */
+    const char *aspect = getenv("DHD_MONITOR_ASPECT");
+    if (aspect && atof(aspect) >= 1.0 && atof(aspect) < 4.0) return atof(aspect);
+#endif
+    return 16.0 / 9.0;
+}
 
 /* ---- files: the disc image and the memory card's files ----
    A file is a C library FILE behind a small handle (1..FILE_SLOTS, 0 is none). */
@@ -113,8 +155,26 @@ static FILE *file_slot[FILE_SLOTS + 1];
 
 static FILE *file_of(HostFile h) { return h > 0 && h <= FILE_SLOTS ? file_slot[h] : NULL; }
 
+/* The game's own files (the memory card's saves\cardN folders, mc.c) are named with Windows
+   backslashes. On Android they become real folders: each path below has them turned into slashes
+   (other POSIX builds keep the names as they were). */
+#ifdef __ANDROID__
+static const char *posix_path(const char *path, char *buf, size_t size)
+{
+    if (!path || !strchr(path, '\\')) return path;
+    snprintf(buf, size, "%s", path);
+    for (char *c = buf; *c; c++)
+        if (*c == '\\') *c = '/';
+    return buf;
+}
+#define POSIX_PATH(path) char path##_buf[4096]; path = posix_path(path, path##_buf, sizeof path##_buf)
+#else
+#define POSIX_PATH(path) (void)0
+#endif
+
 HostFile host_file_open(const char *path, unsigned mode)
 {
+    POSIX_PATH(path);
     FILE *f;
     int slot;
     /* The module's WASI open shim has no preopened directories, so an absolute POSIX
@@ -240,6 +300,7 @@ HostDir host_dir_open(const char *path, HostDirEntry *first)
     struct dirent *fd;
     DIR *d;
     int slot;
+    POSIX_PATH(path);
     d = opendir(path);
     if (!d) return HOST_DIR_NONE;
     for (slot = 1; slot <= DIR_SLOTS && dir_slot[slot]; slot++)
@@ -281,16 +342,22 @@ void host_dir_close(HostDir d)
 int host_path_is_dir(const char *path)
 {
     struct stat st;
+    POSIX_PATH(path);
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 int host_path_exists(const char *path)
 {
     struct stat st;
+    POSIX_PATH(path);
     return stat(path, &st) == 0;
 }
 
-int host_dir_create(const char *path) { return mkdir(path, 0777) == 0 || errno == EEXIST ? 1 : 0; }
+int host_dir_create(const char *path)
+{
+    POSIX_PATH(path);
+    return mkdir(path, 0777) == 0 || errno == EEXIST ? 1 : 0;
+}
 
 /* ---- time and waiting: the wall clock (the game's own clock is virtual, kernel.c) ---- */
 double host_wall_seconds(void)
@@ -439,6 +506,7 @@ int host_thread_detach(void (*fn)(void *), void *arg)
 int host_path_info(const char *path, uint64_t *size, uint64_t *write_time)
 {
     struct stat st;
+    POSIX_PATH(path);
     if (stat(path, &st) != 0) return 0;
     *size = (uint64_t)st.st_size;
     *write_time = ((uint64_t)st.st_mtime + 11644473600ull) * 10000000ull;
@@ -454,7 +522,14 @@ void host_code_range(uintptr_t *lo, uintptr_t *hi)
     *lo = *hi = 0;
     if (!have) {
         char path[4096];
+#ifdef __ANDROID__
+        /* the code is libmain.so's, not the process's executable (app_process) */
+        Dl_info self;
+        ssize_t n = dladdr((void *)host_code_range, &self) && self.dli_fname
+                    ? snprintf(path, sizeof path, "%s", self.dli_fname) : -1;
+#else
         ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+#endif
         if (n > 0) {
             path[n] = 0;
             FILE *f = fopen(path, "rb");

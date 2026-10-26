@@ -41,7 +41,7 @@ HOST_UNITS = [
     'port/gs/texpack_linux.c', 'port/gs/capture.c',
     'port/hle/gamepad.c', 'port/hle/keyboard.c', 'port/hle/text_input.c', 'port/hle/movie.c',
     'port/hle/splash.c', 'port/hle/update.c', 'port/hle/fps.c',
-    'port/net/client.c', 'port/net/hash.c', 'port/net/json.c', 'port/net/lockstep.c', 'port/net/net.c',
+    'port/net/client.c', 'port/net/hash.c', 'port/net/json.c', 'port/net/net.c',
     'port/net/ws_posix.c',
 ] + ['port/third_party/libmpeg2/%s.c' % n for n in (
     'alloc', 'cpu_accel', 'cpu_state', 'decode', 'header', 'idct', 'motion_comp', 'slice')]

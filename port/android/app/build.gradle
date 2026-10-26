@@ -1,0 +1,44 @@
+// Downhill Revived's APK (finding 091). The native libraries are prebuilt by
+// port/tools/build_host64_android.py and copied into src/main/jniLibs by port/android/build_apk.py,
+// which also adds SDL's Java sources (org.libsdl.app) and the icons; Gradle only packages and signs.
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace = "app.downhillrevived"
+    compileSdk = 35
+    defaultConfig {
+        applicationId = "app.downhillrevived"
+        minSdk = 30
+        targetSdk = 35
+        versionCode = project.hasProperty('dhdVersionCode') ? project.dhdVersionCode.toInteger() : 1
+        versionName = project.hasProperty('dhdVersionName') ? project.dhdVersionName : "0.0"
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+    compileOptions {   // SDL's Java needs 8; 17 is what AGP 8.7 targets without warnings
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    buildTypes {
+        debug {
+            debuggable = true
+            jniDebuggable = true
+        }
+        release {
+            minifyEnabled = false
+        }
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false   // stored uncompressed and page-aligned: loaded from the APK
+            keepDebugSymbols += ['**/*.so']  // already stripped (build_host64_android.py keeps libmain.debug.so)
+        }
+    }
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
+}
