@@ -8,6 +8,7 @@
 #include "timer.h"
 #include "state_trace.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1312,7 +1313,158 @@ static double handed_due, handed_began;       /* the same for the picture being 
 static volatile float work_ms[WORK_SAMPLES];  /* pad read to picture ready, by the presenter */
 static volatile unsigned work_count;
 static volatile double shown_due, shown_at;   /* the presenter's last picture: its due (0 while written), when shown */
+static volatile int shown_late;               /* ... and whether it was late (ready after its due) */
 static FILE *pacing_log[2];  /* DHD_PACING_LOG=prefix: prefix-ee.csv, prefix-present.csv (each frame) */
+
+/* Pictures above 60 a second follow the display's refresh (finding 086, "Frame-time spikes at 144").
+   The requested grid (1/144 s) is exact on the QueryPerformanceCounter clock, but a "144 Hz" monitor
+   refreshes at its own rate (143.855 Hz by its mode on the test PC, 143.858 Hz on the QPC clock by
+   DWM's vblanks): every 1 / (144 - 143.858) = 7 s one refresh got two pictures, which drops one on a
+   fixed-refresh display and, with G-SYNC at its top rate, makes a present wait a whole refresh (a
+   frame-time spike every 7 s). With "monitor" (143, the whole hertz) the grid was slower than the
+   display: a repeated picture every 1.2 s.
+   Now, when the requested rate is within 2% of the primary display's refresh (or of a whole fraction
+   of it), a picture lasts n refreshes: the mode's exact rate (QueryDisplayConfig), refined from DWM's
+   vblanks (DwmGetCompositionTimingInfo's qpcVBlank) to the QPC clock, plus 20 ppm so that with a
+   variable refresh rate the pictures stay just under its top. (DWM's own qpcRefreshPeriod is a noisy
+   running estimate that falls back to 144.000 here, so it isn't used.) While DWM's new vblanks lie
+   on one fixed grid (two in a row: not a variable refresh rate, where the period alone is right),
+   each due also moves a quarter of its distance, at most 1% of a refresh, towards half a refresh
+   after a vblank, so presents keep clear of the compositor's latch. Only an on-time picture after
+   an on-time one may come that 1% sooner than a period after it; a late picture (the CPU behind),
+   and the one after it, wait the whole period, so late pictures never come faster than the refresh
+   and the first on-time one never falls back over the vblank after them (two in one refresh).
+   Late pictures still move the grid as before and never wait for a vblank. 60 a second (and
+   online, always 60) keeps its 59.94 grid; DHD_PACE_LOCK=0 turns this off. x64 only: i686 keeps
+   port_frame_period (FIELD_SECONDS). */
+static struct {
+    double next_query;         /* EE thread: when to ask again */
+    double nominal;            /* the display mode's refresh period (s); 0 unknown */
+    double refresh;            /* the refresh period on the QPC clock (nominal, refined from vblanks) */
+    double vblank, anchor;     /* the newest vblank DWM reported, and an older one on its grid (host_wall_seconds) */
+    unsigned long long vblank_qpc;
+    int fits, misfits;         /* new vblanks in a row on (off) the grid of the one before */
+    int frames;                /* refreshes per picture while the pictures follow the display; 0 not */
+    int logged;                /* the state last logged (-1 none) */
+} display = {0, 0, 0, 0, 0, 0, 0, 0, 0, -1};
+static volatile double pacing_slack;  /* how much sooner than a period an on-time (steered) picture may come */
+
+#if defined(_WIN64)
+#include <dwmapi.h>
+/* The primary display's refresh period by its mode (the path whose source is at 0,0), 0 unknown. */
+static double display_nominal(void)
+{
+    static DISPLAYCONFIG_PATH_INFO path[64];
+    static DISPLAYCONFIG_MODE_INFO mode[128];
+    UINT32 paths = 0, modes = 0;
+    double period = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) != ERROR_SUCCESS || !paths || paths > 64 ||
+        modes > 128 || QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths, path, &modes, mode, NULL) != ERROR_SUCCESS)
+        return 0;
+    for (UINT32 i = 0; i < paths; i++) {
+        UINT32 m = path[i].sourceInfo.modeInfoIdx;
+        int primary = m < modes && mode[m].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+                      mode[m].sourceMode.position.x == 0 && mode[m].sourceMode.position.y == 0;
+        DISPLAYCONFIG_RATIONAL r = path[i].targetInfo.refreshRate;
+        if ((primary || !period) && r.Numerator && r.Denominator) period = (double)r.Denominator / r.Numerator;
+        if (primary) break;
+    }
+    return period > 1.0 / 1000 && period < 1.0 / 20 ? period : 0;
+}
+
+/* EE thread, every 0.5 s while above 60 a second: the refresh period and DWM's newest vblank. */
+static void display_query(void)
+{
+    static HRESULT (WINAPI *timing)(HWND, DWM_TIMING_INFO *);
+    static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        timing = dwm ? (HRESULT (WINAPI *)(HWND, DWM_TIMING_INFO *))(void *)GetProcAddress(dwm, "DwmGetCompositionTimingInfo")
+                     : NULL;
+    }
+    if (!display.nominal || display.misfits >= 10) {  /* first, or the mode may have changed */
+        double nominal = display_nominal();
+        if (nominal != display.nominal) display.refresh = nominal, display.anchor = 0, display.fits = 0;
+        display.nominal = nominal;
+        display.misfits = 0;
+    }
+    DWM_TIMING_INFO info;
+    LARGE_INTEGER freq, qpc;
+    memset(&info, 0, sizeof info);
+    info.cbSize = sizeof info;
+    if (!display.nominal || !timing || FAILED(timing(NULL, &info)) || !QueryPerformanceFrequency(&freq) ||
+        !info.qpcVBlank || info.qpcVBlank == display.vblank_qpc)
+        return;
+    QueryPerformanceCounter(&qpc);
+    double refresh = display.refresh,
+           vblank = host_wall_seconds() - (double)((LONGLONG)qpc.QuadPart - (LONGLONG)info.qpcVBlank) / (double)freq.QuadPart;
+    if (display.vblank_qpc) {
+        double span = vblank - display.vblank, k = floor(span / refresh + 0.5);
+        int fit = k >= 1 && fabs(span - k * refresh) < 0.0002 + span * 5e-5;  /* 0.2 ms, plus 50 ppm of the span */
+        display.fits = fit ? display.fits + 1 : 0;
+        display.misfits = fit ? 0 : display.misfits + 1;
+        if (!fit) display.anchor = 0;
+        else if (!display.anchor) display.anchor = display.vblank;
+        else {  /* the period on the QPC clock: whole refreshes since the anchor (2 s and more) */
+            double whole = vblank - display.anchor, n = floor(whole / refresh + 0.5);
+            if (whole >= 2 && fabs(whole / n / display.nominal - 1) < 5e-4) display.refresh = whole / n;
+            if (whole > 600) display.anchor = vblank;
+        }
+    }
+    display.vblank_qpc = info.qpcVBlank;
+    display.vblank = vblank;
+}
+#endif
+
+/* host_pacing_config: the period the pictures keep (EE thread). */
+static double display_period(double period)
+{
+#if defined(_WIN64)
+    static int off = -1;
+    if (off < 0) {
+        const char *s = host_getenv("DHD_PACE_LOCK");
+        off = s && !atoi(s);
+    }
+    int frames = 0;
+    if (!off && period < 1.0 / 61) {  /* above 60 a second */
+        double now = host_wall_seconds();
+        if (now >= display.next_query) {
+            display.next_query = now + 0.5;
+            display_query();
+        }
+        double n = display.refresh ? floor(period / display.refresh + 0.5) : 0;
+        if (n >= 1 && fabs(n * display.refresh - period) <= 0.02 * period) frames = (int)n;
+        if (display.refresh && frames != display.logged) {
+            display.logged = frames;
+            /* (the EE thread rounds toward zero, so printf truncates the last digit) */
+            if (frames)
+                fprintf(stderr, "pacing: %.0f pictures/s follow the display's refresh, %.4f Hz (%d per picture)\n",
+                        1 / period, 1 / display.refresh, frames);
+            else
+                fprintf(stderr, "pacing: the display refreshes at %.4f Hz, not near %.0f pictures/s: they keep their own grid\n",
+                        1 / display.refresh, 1 / period);
+        }
+    }
+    display.frames = frames;
+    pacing_slack = frames ? 0.01 * display.refresh : 0;  /* display_steer's limit */
+    return frames ? frames * display.refresh * (1 + 2e-5) : period;
+#else
+    return period;
+#endif
+}
+
+/* How far to move a due towards half a refresh after a vblank (0 unless DWM's vblanks lie on a grid). */
+static double display_steer(double due)
+{
+    double refresh = display.refresh;
+    if (!display.frames || display.fits < 2 || due - display.vblank > 30) return 0;
+    double error = fmod(display.vblank + 0.5 * refresh - due, refresh), limit = 0.01 * refresh;
+    if (error > 0.5 * refresh) error -= refresh;
+    else if (error < -0.5 * refresh) error += refresh;
+    error *= 0.25;
+    return error > limit ? limit : error < -limit ? -limit : error;
+}
 
 static FILE *pacing_file(int which)
 {
@@ -1327,7 +1479,13 @@ static FILE *pacing_file(int which)
             if (pacing_log[i]) setvbuf(pacing_log[i], NULL, _IOFBF, 1 << 16);
         }
         if (pacing_log[0]) fprintf(pacing_log[0], "field,now,shown,due,start,work_ms,began\n");
-        if (pacing_log[1]) fprintf(pacing_log[1], "due,began,ready,presented\n");
+        if (pacing_log[1]) fprintf(pacing_log[1], "due,began,ready,presented,refresh_phase\n");
+#ifdef _WIN32
+        LARGE_INTEGER freq, qpc;  /* the logs' clock, to set them against other QPC timestamps (DWM's vblanks) */
+        if (prefix && QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&qpc))
+            fprintf(stderr, "pacing: log seconds = QueryPerformanceCounter / %lld - %.7f\n", (long long)freq.QuadPart,
+                    (double)qpc.QuadPart / (double)freq.QuadPart - host_wall_seconds());
+#endif
     }
     return pacing_log[which];
 }
@@ -1350,18 +1508,24 @@ void host_pacing_wait(void)
         if (longer * 10 <= n) work = worst / 1000.0 + 0.0015;
     }
     double now = host_wall_seconds(), shown = jit_due;
-    /* The presenter moved the grid if the picture handed now, or the one before it, was late. */
-    double last_due, last_at;
-    do last_due = shown_due, last_at = shown_at; while (last_due != shown_due);
+    /* The presenter moved the grid if the picture handed now, or the one before it, was late. Its
+       least spacing is the period, less pacing_slack while the pictures follow the display and both
+       are on time (this one isn't known yet: on time is the least it can wait). */
+    double last_due, last_at, spacing;
+    int last_late;
+    do last_due = shown_due, last_at = shown_at, last_late = shown_late; while (last_due != shown_due);
+    spacing = period - (last_late ? 0 : pacing_slack);
+    int previous = display.frames ? fabs(shown - last_due - period) < 0.03 * period  /* dues steered a little */
+                                  : last_due + period - shown < 1e-6 && shown - last_due - period < 1e-6;
     if (shown && last_due == shown && last_at > shown) shown = last_at;
-    else if (shown && last_due > 0 && last_due + period - shown < 1e-6 && shown - last_due - period < 1e-6 &&
-             last_at + period > shown) shown = last_at + period;
+    else if (shown && last_due > 0 && previous && last_at + spacing > shown) shown = last_at + spacing;
     double due = shown + period;
     if (!shown || now > due) {  /* the first field, or more than a field late: start again from now */
         jit_due = now + (work < period ? work : period);
         frame_began = now;
         return;
     }
+    due += display_steer(due);
     double start = due - work;
     if (start < shown) start = shown;  /* never two frames in one field */
     host_wait_wall(start);
@@ -1384,6 +1548,7 @@ void pacing_handed(double *due, double *began)
 void pacing_present(double due, double began)
 {
     static double last_at;
+    static int last_late;
     double now = host_wall_seconds(), target = due;
     if (due > 0) {
         if (began > 0 && now > began) {
@@ -1391,16 +1556,26 @@ void pacing_present(double due, double began)
             work_ms[i % WORK_SAMPLES] = (float)((now - began) * 1000);
             work_count = i + 1;
         }
-        if (last_at + FIELD_SECONDS > target) target = last_at + FIELD_SECONDS;
+        int late = now > due;  /* this or the last picture late: a whole period after the last */
+        double spacing = FIELD_SECONDS - (late || last_late ? 0 : pacing_slack);
+        if (last_at + spacing > target) target = last_at + spacing;
         if (target > now && target < now + 0.05)
             host_wait_wall(target);
         last_at = host_wall_seconds();
-        shown_due = 0;  /* x86 keeps stores in order: a reader sees due 0 or both values */
+        last_late = late;
+        shown_due = 0;  /* x86 keeps stores in order: a reader sees due 0 or all three values */
         shown_at = last_at;
+        shown_late = late;
         shown_due = due;
     }
     FILE *log = pacing_file(1);
-    if (log) fprintf(log, "%.6f,%.6f,%.6f,%.6f\n", due, began, now, host_wall_seconds());
+    if (log) {
+        /* where in the display's refresh this picture went, from DWM's newest vblank (-1 unknown) */
+        double at = host_wall_seconds(), refresh = display.refresh, phase = -1;
+        if (refresh > 0 && display.vblank) phase = fmod(at - display.vblank, refresh) / refresh;
+        if (refresh > 0 && display.vblank && phase < 0) phase += 1;  /* a vblank newer than the picture */
+        fprintf(log, "%.6f,%.6f,%.6f,%.6f,%.4f\n", due, began, now, at, phase);
+    }
     if (log && !(work_count % 60)) fflush(log), fflush(pacing_log[0]);  /* DHD_BENCH_EXIT ends with ExitProcess */
     /* DHD_PACING_STATS=1: every 600 pictures, how old the pad state was when each was presented. */
     static int stats = -1;
@@ -1419,7 +1594,7 @@ void pacing_present(double due, double began)
     }
 }
 
-void host_pacing_config(double period, uint64_t field) { pacing_period=period; pacing_field=field; }
+void host_pacing_config(double period, uint64_t field) { pacing_period=display_period(period); pacing_field=field; }
 void host_pacing_handoff(int fresh) { handed_due=fresh ? jit_due : 0; handed_began=frame_began; }
 void host_pacing_input(void) { frame_began=host_wall_seconds(); }
 

@@ -17,19 +17,28 @@
    Other names (regions "-rWxH-", mip levels "-mipN") are not ones PCSX2 loads; they are skipped.
 
    PNG alpha is GS alpha, as in PCSX2: 128 is opaque (a PNG without alpha gets 128). The
-   replacement is sampled over the same normalised texture space as the original (raster.hlsl,
-   flag 2048), with mipmaps made here, so a 4x pack draws 4x the detail.
+   replacement is sampled over the same normalised texture space as the original (native.wgsl's
+   replacement flag), with mipmaps made here, so a 4x pack draws 4x the detail.
 
    Loading: the folder's file names are indexed at start. A texture's replacement is decoded
    (WIC, part of Windows) and uploaded on loader threads the first time it is drawn; until then
    the original is drawn. Uploaded replacements count against a memory budget (DHD_TEXTURE_
    CACHE_MB, dhd.ini texture_cache_mb; default half the graphics card's memory, 512-2048 MB);
-   over it, those no field drew lately are released and loaded again when needed. */
+   over it, those no field drew lately are released and loaded again when needed. The renderer
+   that draws them makes the textures (replace_texture.h).
+
+   Outside a race the first draw waits for its replacement (texpack_view, up to PACK_WAIT_MS of
+   waiting a field; finding 086, F1). Some screens draw their picture once into each of the two
+   frame buffers and then only flip between them: the loading picture before the title draws it
+   for 4 frames and then just a fading overlay. A replacement that became ready between the last
+   draw into one buffer and the last into the other left the original in one of them, and the
+   screen flickered between the two pictures every field until the next screen (seen at 120 fps,
+   where those draws are 8 ms apart; possible at 60 on a slow disk). In a live race (the
+   countdown and the race, screen 9 phases 1-4) nothing waits, so a race never stalls on a
+   texture: its replacement takes over a few fields later, as before. */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <d3d11.h>
-#include <dxgi.h>
 #include <wincodec.h>
 #include <process.h>
 #include <stdio.h>
@@ -37,6 +46,8 @@
 #include <string.h>
 #include <wchar.h>
 #include "texpack.h"
+#include "memory.h"
+#include "../include/guest.h"
 
 #define XXH_INLINE_ALL
 #define XXH_STATIC_LINKING_ONLY
@@ -45,21 +56,20 @@
 void host_thread_name(const char *name);  /* port/hle/host.c */
 
 enum { PACK_IDLE, PACK_QUEUED, PACK_READY, PACK_FAILED };
-enum { PACK_LOADERS = 2, PACK_MAX_SIDE = 4096 };
+enum { PACK_LOADERS = 2, PACK_MAX_SIDE = 4096, PACK_WAIT_MS = 200 };
 
 struct TexPackEntry {
     uint64_t tex0_hash, clut_hash;
     uint32_t bits;
     wchar_t *path;
     volatile LONG state;
-    ID3D11Texture2D *texture;          /* loader thread, before state becomes READY */
-    ID3D11ShaderResourceView *view;
+    void *view;                        /* the renderer's (ReplaceDevice); loader thread, before state becomes READY */
     uint32_t bytes;
     uint64_t used;                     /* GS worker: the last field that drew it */
 };
 
 static struct {
-    ID3D11Device *device;
+    ReplaceDevice device;
     TexPackEntry *entries;
     unsigned count, capacity;
     int32_t *table;                    /* open addressing, entry index or -1 */
@@ -70,6 +80,9 @@ static struct {
     /* loading */
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE wake;
+    CONDITION_VARIABLE done;           /* a loader finished an entry (READY or FAILED) */
+    int64_t wait_us;                   /* waiting left this field (set at vsync, GS worker spends it) */
+    uint64_t waits, waited_us, wait_misses;
     TexPackEntry **queue;              /* a ring one longer than the index: each entry is queued once at most */
     unsigned head, tail;
     volatile LONG64 bytes;
@@ -304,26 +317,15 @@ static int pack_load(IWICImagingFactory *wic, TexPackEntry *e)
     if (FAILED(IWICFormatConverter_CopyPixels(converter, NULL, w * 4, w * h * 4, pixels))) goto done;
     if (!alpha)
         for (size_t i = 3; i < (size_t)w * h * 4; i += 4) pixels[i] = 0x80;  /* PCSX2: opaque in GS units */
-    D3D11_SUBRESOURCE_DATA data[16];
     uint8_t *level = pixels;
     unsigned lw = w, lh = h;
-    for (unsigned i = 0; i < levels; i++) {
-        data[i].pSysMem = level; data[i].SysMemPitch = lw * 4; data[i].SysMemSlicePitch = 0;
-        if (i + 1 < levels) {
-            uint8_t *next = level + (size_t)lw * lh * 4;
-            pack_halve(level, lw, lh, next);
-            level = next;
-            lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
-        }
+    for (unsigned i = 0; i + 1 < levels; i++) {
+        uint8_t *next = level + (size_t)lw * lh * 4;
+        pack_halve(level, lw, lh, next);
+        level = next;
+        lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
     }
-    D3D11_TEXTURE2D_DESC d = {0};
-    d.Width = w; d.Height = h; d.MipLevels = levels; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(ID3D11Device_CreateTexture2D(pack.device, &d, data, &e->texture))) { e->texture = NULL; goto done; }
-    if (FAILED(ID3D11Device_CreateShaderResourceView(pack.device, (ID3D11Resource *)e->texture, NULL, &e->view))) {
-        ID3D11Texture2D_Release(e->texture); e->texture = NULL; e->view = NULL;
-        goto done;
-    }
+    if (!(e->view = pack.device.create(pack.device.context, pixels, w, h, levels))) goto done;
     e->bytes = (uint32_t)total;
     ok = 1;
 done:
@@ -367,26 +369,17 @@ static unsigned __stdcall pack_loader(void *argument)
             fprintf(stderr, "textures: can't load %s\n", narrow);
         }
         InterlockedExchange(&e->state, ok ? PACK_READY : PACK_FAILED);  /* a full barrier */
+        EnterCriticalSection(&pack.lock);  /* texpack_view may wait for it */
+        WakeAllConditionVariable(&pack.done);
+        LeaveCriticalSection(&pack.lock);
     }
 }
 
 /* ---- opening ---- */
 
-static uint64_t pack_default_budget(ID3D11Device *device)
+static uint64_t pack_default_budget(uint64_t video_memory)
 {
-    static const GUID dxgi_device_iid = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
-    uint64_t budget = 1024ull << 20;
-    IDXGIDevice *dxgi = NULL;
-    IDXGIAdapter *adapter = NULL;
-    DXGI_ADAPTER_DESC desc;
-    if (SUCCEEDED(ID3D11Device_QueryInterface(device, &dxgi_device_iid, (void **)&dxgi))) {
-        if (SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter))) {
-            if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &desc)) && desc.DedicatedVideoMemory)
-                budget = (uint64_t)desc.DedicatedVideoMemory / 2;
-            IDXGIAdapter_Release(adapter);
-        }
-        IDXGIDevice_Release(dxgi);
-    }
+    uint64_t budget = video_memory ? video_memory / 2 : 1024ull << 20;
     if (budget < (512ull << 20)) budget = 512ull << 20;
     if (budget > (2048ull << 20)) budget = 2048ull << 20;  /* a 32-bit process */
     return budget;
@@ -397,7 +390,7 @@ static int pack_switch(const char *v)
     return !v || !*v || !(!_stricmp(v, "off") || !_stricmp(v, "0") || !_stricmp(v, "false") || !_stricmp(v, "no"));
 }
 
-int texpack_open(ID3D11Device *device)
+int texpack_open(const ReplaceDevice *device, uint64_t video_memory)
 {
     if (!pack_switch(getenv("DHD_TEXTURES"))) return 0;
     if (!pack_find_root(pack.root, 0)) return 0;
@@ -431,12 +424,12 @@ int texpack_open(ID3D11Device *device)
         while (pack.table[at] >= 0) at = (at + 1) & pack.mask;
         pack.table[at] = (int32_t)i;
     }
-    pack.device = device;
-    ID3D11Device_AddRef(device);
+    pack.device = *device;
     const char *mb = getenv("DHD_TEXTURE_CACHE_MB");
-    pack.budget = mb && atoi(mb) > 0 ? (uint64_t)atoi(mb) << 20 : pack_default_budget(device);
+    pack.budget = mb && atoi(mb) > 0 ? (uint64_t)atoi(mb) << 20 : pack_default_budget(video_memory);
     InitializeCriticalSection(&pack.lock);
     InitializeConditionVariable(&pack.wake);
+    InitializeConditionVariable(&pack.done);
     for (unsigned i = 0; i < PACK_LOADERS; i++) {
         HANDLE t = (HANDLE)_beginthreadex(NULL, 0, pack_loader, NULL, 0, NULL);
         if (t) CloseHandle(t);
@@ -607,22 +600,45 @@ static void pack_evict(uint64_t field)
             if (e->state == PACK_READY && e->used + 8 < field && (!oldest || e->used < oldest->used)) oldest = e;
         }
         if (!oldest) return;
-        ID3D11ShaderResourceView_Release(oldest->view);
-        ID3D11Texture2D_Release(oldest->texture);
-        oldest->view = NULL; oldest->texture = NULL;
+        pack.device.release(oldest->view);
+        oldest->view = NULL;
         InterlockedExchangeAdd64(&pack.bytes, -(LONG64)oldest->bytes);
         oldest->state = PACK_IDLE;
         pack.evicted++;
     }
 }
 
-ID3D11ShaderResourceView *texpack_view(TexPackEntry *e, uint64_t field)
+/* A queued entry's view once its loader has it, waiting while this field's waiting lasts (the file
+   comment); NULL when it isn't there by then. */
+static void *pack_wait(TexPackEntry *e, uint64_t field)
+{
+    if (pack.wait_us <= 0) return NULL;
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    int64_t spent = 0;
+    EnterCriticalSection(&pack.lock);
+    while (e->state == PACK_QUEUED && spent < pack.wait_us) {
+        SleepConditionVariableCS(&pack.done, &pack.lock, (DWORD)((pack.wait_us - spent + 999) / 1000));
+        QueryPerformanceCounter(&t1);
+        spent = (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;
+    }
+    LeaveCriticalSection(&pack.lock);
+    pack.wait_us -= spent;
+    pack.waits++, pack.waited_us += (uint64_t)spent;
+    if (e->state != PACK_READY) { pack.wait_misses++; return NULL; }
+    e->used = field;
+    return e->view;
+}
+
+void *texpack_view(TexPackEntry *e, uint64_t field)
 {
     LONG state = e->state;
     if (state == PACK_READY) {
         e->used = field;
         return e->view;
     }
+    if (state == PACK_QUEUED) return pack_wait(e, field);
     if (state != PACK_IDLE) return NULL;
     if (pack_bytes() > pack.budget) {
         if (pack.last_evict == field) return NULL;
@@ -637,12 +653,22 @@ ID3D11ShaderResourceView *texpack_view(TexPackEntry *e, uint64_t field)
     pack.tail = (pack.tail + 1) % (pack.count + 1);
     WakeConditionVariable(&pack.wake);
     LeaveCriticalSection(&pack.lock);
-    return NULL;
+    return pack_wait(e, field);
+}
+
+/* Screen 9 phases 1-4: the race's countdown and the race (finding 024: D_0029DED8 is the screen,
+   9 the race; D_0043F348 the race phase, 0 loading, 5 waiting for X, 1 countdown, 2-4 racing). */
+static int pack_live_race(void)
+{
+    int screen = *(volatile int32_t *)GUEST(PS2_RAM_BASE + 0x29DED8);
+    int phase = *(volatile int32_t *)GUEST(PS2_RAM_BASE + 0x43F348);
+    return screen == 9 && phase >= 1 && phase <= 4;
 }
 
 void texpack_field(uint64_t field)
 {
     pack_field = field;
+    pack.wait_us = pack_live_race() ? 0 : PACK_WAIT_MS * 1000;
     uint64_t bytes = pack_bytes();
     if (bytes > pack.peak) pack.peak = bytes;
     if (bytes > pack.budget && field % 30 == 0 && pack.last_evict != field) {
@@ -661,8 +687,15 @@ void texpack_report(void)
             pack.seen_mips, pack.loaded, pack.loaded ? (double)pack.load_us / 1000 / pack.loaded : 0.0, pack.failed,
             (unsigned long long)pack.evicted, (unsigned long long)(pack.peak >> 20),
             (unsigned long long)(pack.budget >> 20));
+    fprintf(stderr, "textures: %llu draws waited for a replacement (%.1f ms in all), %llu of them in vain\n",
+            (unsigned long long)pack.waits, (double)pack.waited_us / 1000, (unsigned long long)pack.wait_misses);
     for (unsigned psm = 0; psm < 64; psm++)
         if (pack.psm_seen[psm])
             fprintf(stderr, "textures: psm %u: %u drawn, %u in the pack\n", psm, pack.psm_seen[psm], pack.psm_hits[psm]);
     if (pack.log) fflush(pack.log);
 }
+
+/* Guest-address-only module services. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+int host_service_texpack_available(void) { return texpack_available(); }

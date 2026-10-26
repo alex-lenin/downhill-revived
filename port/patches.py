@@ -412,6 +412,10 @@ PATCHES['unsorted/00202760.c'] = [('text', 'extern int func_00247D28(int, int, i
 # then fill the x87 stack and later float returns overflow it (finding 038).
 PATCHES['unsorted/00174590.c'] = [('text', '} else if (fabsf(d) < bestDist) {', '} else if (__builtin_fabsf(d) < bestDist) {')]
 PATCHES['unsorted/00235F38.c'] = [('text', 'if (fabsf(step) < minStep) {', 'if (__builtin_fabsf(step) < minStep) {')]
+# The weather effect's packet builder writes the word before p as p[0x3fffffff], which wraps to p - 4
+# in 32-bit address arithmetic (EE, i686). wasm32 folds the index into the store's unsigned offset,
+# which never wraps: the 64-bit build wrote 4 GiB past p and crashed late in races; write p[-1].
+PATCHES['unsorted/00224CC8.c'] = [('text', '((float *)p)[0x3fffffff]=', '((float *)p)[-1]=')]
 # ONLINE (port/hle/online_menu.c): a fourth main menu row (func_001ED5B8) under OPTIONS that opens
 # the online pages, run by the game's popup menus as PC SETTINGS is. Its label is the host's (the
 # game's table has three). Back from the pages the cursor stays on ONLINE; when a room's race

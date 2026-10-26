@@ -192,8 +192,11 @@ def main():
         # which /MT already names; raw-dylib imports (d3d12, dxgi, ...) need no lib. dxguid.lib:
         # gpu_rust.c's IID_IDXGIFactory1 and IID_IDXGIDevice
         libs += [report['lib']] + [x for x in report['native_static_libs'] + ['dxguid.lib'] if x not in libs]
+        # the icon (port/res/dhd.rc), shown by Explorer, the taskbar and the game's windows
+        res = out/'dhd.res'
+        run([a.llvm/'llvm-rc.exe', '/fo', str(res), str(ROOT/'port/res/dhd.rc')])
         rsp = out/'link.rsp'
-        rsp.write_text('\n'.join('"'+str(x)+'"' for x in objects+[library]+libs))
+        rsp.write_text('\n'.join('"'+str(x)+'"' for x in objects+[library,res]+libs))
         link = [a.llvm/'lld-link.exe', '@'+str(rsp), '/out:'+str(out/'dhd64.exe'),
                 '/libpath:'+str(MSVC/'lib/x64'),
                 '/libpath:'+str(SDK/'Lib'/VERSION/'ucrt/x64'),

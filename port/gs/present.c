@@ -35,21 +35,23 @@ static SDL_Window *sdl_window;
 typedef struct { int x, y, w, h, borderless; } WindowSpec;
 static void display_of(SDL_Window *w, SDL_Rect *full, SDL_Rect *usable);
 
-/* The primary display's highest resolution: SDL lists its fullscreen modes largest first, else its
-   desktop mode. Pixels (host_dpi_aware). 0 x 0 when SDL knows none. */
+/* The primary display's resolution: its desktop mode, the one Windows runs it at (the largest
+   fullscreen mode can be bigger than the screen: NVIDIA DSR lists 2560x1440 on a 1080p monitor),
+   else SDL's largest fullscreen mode. Pixels (host_dpi_aware). 0 x 0 when SDL knows none. */
 static void monitor_mode(int *w, int *h)
 {
     SDL_DisplayID id = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode *desktop = SDL_GetDesktopDisplayMode(id);
+    *w = *h = 0;
+    if (desktop) *w = desktop->w, *h = desktop->h;
+    if (*w > 0 && *h > 0) return;
     int count = 0;
     SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(id, &count);
-    *w = *h = 0;
     if (modes && count > 0 && modes[0]) *w = modes[0]->w, *h = modes[0]->h;
     SDL_free(modes);
-    const SDL_DisplayMode *desktop = *w > 0 && *h > 0 ? NULL : SDL_GetDesktopDisplayMode(id);
-    if (desktop) *w = desktop->w, *h = desktop->h;
 }
 
-/* DHD_MONITOR_MODE: the monitor's highest resolution, for PC SETTINGS > Window Size's list. A window
+/* DHD_MONITOR_MODE: the monitor's resolution, for PC SETTINGS > Window Size's list. A window
    size of "monitor" (dhd.ini's default, host.c player_defaults) becomes that size, in numbers, so
    everything after (gs_window_apply, the settings page) reads the size it has. SDL thread, before
    the window is made: the EE thread waits in sdl_host_run. */
@@ -69,7 +71,7 @@ static void monitor_size(WindowSpec *s)
     snprintf(text, sizeof text, "%d", h);
     host_putenv_s("DHD_WINDOW_HEIGHT", text);
     s->w = w, s->h = h;
-    hle_log("gs: window size %dx%d, the monitor's highest resolution\n", w, h);
+    hle_log("gs: window size %dx%d, the monitor's resolution\n", w, h);
 }
 
 /* On the SDL thread: the window, hidden until init has its swap chain (sdl_host_run). */

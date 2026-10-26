@@ -236,6 +236,83 @@ def add(patches):
          'extern unsigned int func_00238F48(void);\nextern unsigned int func_00263AC8(void *);')
     edit('00236C60', 'if (now >= timer->due)',
          'if (now >= timer->due || (port_fps_high() && timer->callback == func_00263AC8))')
+    # Two per-field callbacks also queue a 2D draw for the frame, in lists the game empties
+    # every frame (func_002102A8): the screen fade (func_001F7840, started by func_001F79D8:
+    # the title's fade-in, menu changes, the bike shop) and the training hint box
+    # (func_002626B8 -> func_001E41A0, game mode 11). Run on whole fields only, they left
+    # the updates in between without the fade (pictures flashing at full brightness, about
+    # every other picture) or without the hint (finding 086, "Flicker at 144 (second look)").
+    # On an update that didn't advance the field clock, port_timer_hold queues the same draw
+    # again, as the callback's last run left it, and changes no state: the fade still moves
+    # once a field. port_between is never set at 60.
+    # The two nodes are told apart by what they do, not by their callback's address: the
+    # fade's starter (func_001F79D8) is recompiled MIPS, so the pointer it stores is its own
+    # ABI's (the wasm core's ()->void thunk of func_001F7840), not the one C code would take.
+    # The fade's callback is the one whose run queued the fade sprite (D_004C67C0) in view 0's
+    # list; the hint's node is the one with the hint object (D_004C5640) as its context.
+    edit('00236C60', 'extern unsigned int func_00263AC8(void *);',
+         'extern unsigned int func_00263AC8(void *);\n'
+         'extern int func_001E41A0(void *);\n'
+         'extern unsigned char D_0029D7F4;\n'
+         'extern unsigned int *D_0029DED4;\n'
+         'extern char D_00513B00[], D_004C67C0[], D_004C5640[];\n'
+         'extern void func_002103D8(void *, int, void *);\n'
+         'int port_timer_redraw = 0;  /* func_001E41A0 (port patch): draw as its last run did */\n'
+         'static unsigned int port_timer_now = 0xFFFFFFFFu;\n'
+         'static TimerCallback port_fade_callback;  /* the screen fade\'s, once a run queued its sprite */\n'
+         '/* view 0\'s list end: func_002103D8 leaves its end tag there */\n'
+         'static unsigned int *port_list_end(void) { return *(unsigned int **)D_00513B00; }\n'
+         'static void port_timer_learn(TimerNode *timer, unsigned int *before)\n'
+         '{\n'
+         '    unsigned int *end = port_list_end(), *q;\n'
+         '    for (q = before; q < end && q < before + 64 * 4; q += 4)\n'
+         '        if (q[0] == 0x50000000u &&\n'
+         '            !((q[1] ^ (unsigned int)(unsigned long)D_004C67C0) & 0x01FFFFFFu))\n'
+         '            port_fade_callback = timer->callback;\n'
+         '}\n'
+         'static void port_timer_hold(TimerNode *timer)\n'
+         '{\n'
+         '    if (port_fade_callback && timer->callback == port_fade_callback) {\n'
+         '        /* as func_001F7840 queues it (no run yet: as func_001F79D8 did) */\n'
+         '        if (D_0029D7F4 && D_0029DED4 && *D_0029DED4) func_002103D8(D_00513B00, 0, D_004C67C0);\n'
+         '    } else if (timer->context == (void *)D_004C5640) {\n'
+         '        port_timer_redraw = 1;\n'
+         '        func_001E41A0(timer->context);\n'
+         '        port_timer_redraw = 0;\n'
+         '    }\n'
+         '}')
+    edit('00236C60', '    now = func_00238F48();\n',
+         '    now = func_00238F48();\n'
+         '    int port_between = port_fps_high() && now == port_timer_now;\n'
+         '    port_timer_now = now;\n')
+    edit('00236C60', '            if (timer->context != 0) {\n',
+         '            unsigned int *port_before = port_fps_high() && !port_fade_callback ? port_list_end() : 0;\n'
+         '            if (timer->context != 0) {\n')
+    edit('00236C60', '                timer->due = ((TimerCallbackNoArg)timer->callback)();\n            }\n',
+         '                timer->due = ((TimerCallbackNoArg)timer->callback)();\n            }\n'
+         '            if (port_before) port_timer_learn(timer, port_before);\n')
+    edit('00236C60', '        } else {\n            timer = timer->next;\n        }',
+         '        } else {\n            if (port_between && timer->due == now + 1) port_timer_hold(timer);\n'
+         '            timer = timer->next;\n        }')
+    # The hint box's draw-only pass: what its last run drew (none if that run ended the hint
+    # or ran in an earlier field), with no counter or flag changed.
+    edit('001E41A0', 'extern void func_0020F9F0(int, int, int, int, char *);',
+         'extern void func_0020F9F0(int, int, int, int, char *);\n'
+         'extern int func_00238F48(void);\n'
+         'extern int port_timer_redraw;\n'
+         'static unsigned int port_hint_field = 0xFFFFFFFFu;  /* the field its last run drew in */')
+    edit('001E41A0', '    struct Rider *rider;\n\n',
+         '    struct Rider *rider;\n\n'
+         '    if (port_timer_redraw) {\n'
+         '        if (port_hint_field != (unsigned int)func_00238F48()) return 1;\n'
+         '        goto port_draw;\n'
+         '    }\n')
+    edit('001E41A0', '            p->x510 = -1;\n            return 1;',
+         '            p->x510 = -1;\n            port_hint_field = 0xFFFFFFFFu;\n            return 1;')
+    edit('001E41A0', '    func_0023D650(0, &width, &height);\n    half = width / 2;',
+         '    port_hint_field = (unsigned int)func_00238F48();\n'
+         'port_draw:\n'
+         '    func_0023D650(0, &width, &height);\n    half = width / 2;')
     # Disable recording and playback above 60: skipping the recorder alone
     # would leave its caller incrementing count over uninitialized samples.
     entry('001A8DE8', 'func_001A8DE8',
