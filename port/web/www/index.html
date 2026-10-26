@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Downhill Revived (browser)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 14px system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; }
+  header { padding: 10px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  #screen { width: min(100vw, calc((100vh - 90px) * 4 / 3)); aspect-ratio: 4 / 3; background: #000; display: block; }
+  #status { font: 12px ui-monospace, monospace; color: #9a9; padding: 4px; white-space: pre; }
+  #log { font: 11px ui-monospace, monospace; color: #888; max-height: 4.5em; overflow: auto; width: 90vw; white-space: pre-wrap; }
+  button { font: inherit; padding: 4px 12px; }
+</style>
+</head>
+<body>
+<header>
+  <label>Your Downhill Domination ISO (USA, SCUS-97177): <input type="file" id="iso" accept=".iso,.bin,.img"></label>
+  <button id="start" disabled>Start</button>
+  <span>Keys: arrows, X/Space = cross, C = circle, Z = square, S = triangle, Enter = start, Tab = select, A/D = L1/R1, Q/E = L2/R2. Gamepads work too.</span>
+</header>
+<canvas id="screen" width="1280" height="960"></canvas>
+<div id="status">The disc stays on this computer: the page reads it in place, nothing is uploaded.</div>
+<div id="log"></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

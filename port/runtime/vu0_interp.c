@@ -156,6 +156,54 @@ static __m128 arithmetic4(__m128 value)
    therefore the identity and is skipped (fuzzed against arithmetic4 for ADD/SUB/MUL/MADD/MSUB,
    test_vu1.c). The empty asm hides the operand from the compiler: it must not fold the
    operation (x * 1.0 = x would let a denormal through) or evaluate it under its own rounding. */
+#if defined(PS2_VU_IEEE)
+#ifdef PS2_VU_IEEE_PROBE
+/* Diagnostics: operand lanes flushed (denormal) and clamped (exponent 255); FMAC result lanes
+   written (fields in d) that underflowed to a denormal and overflowed to inf. */
+static double vu_ieee_probe[4];
+__attribute__((export_name("web_vu_ieee_probe"))) double web_vu_ieee_probe(int which) { return vu_ieee_probe[which & 3]; }
+static inline void vu_ieee_probe_result(__m128 v, int d)
+{
+    static const unsigned reverse[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
+    __m128i magnitude = _mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7fffffff));
+    __m128i denormal = _mm_andnot_si128(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128()),
+                                        _mm_cmplt_epi32(magnitude, _mm_set1_epi32(0x00800000)));
+    vu_ieee_probe[2] += __builtin_popcount(reverse[_mm_movemask_ps(_mm_castsi128_ps(denormal))] & d);
+    vu_ieee_probe[3] += __builtin_popcount(reverse[_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7f7fffff))))] & d);
+}
+#endif
+/* The browser's graphics reactor (port/web/build_graphics.py; never the core module, x64 or i686)
+   runs VU1 on plain IEEE float ops: round to nearest, no FTZ/DAZ, no VU MXCSR (the player's
+   picture only; no VU1 float result feeds game state). What the VU mode did is done here instead,
+   with ieee_clamp4 (arithmetic4 in fewer steps: a denormal becomes its signed zero, exponent 255
+   the largest finite magnitude). On an operand it is DAZ and the operand clamp. On an FMAC result
+   (fmac_flags4, native_result) it is FTZ and what toward-zero rounding makes of an overflow; the
+   race measured 53k denormal and 280k inf result lanes in 4000 fields (--vu-ieee-probe), and
+   80M denormal and 2.7M exponent-255 operand lanes, so neither clamp is dead. The only difference
+   left is the rounding of finite results (nearest instead of toward zero: the last bit). No
+   optimizer barrier: there is no host rounding mode for constant folding to disagree with. */
+static inline __attribute__((always_inline)) __m128 ieee_clamp4(__m128 value)
+{
+    __m128i bits = _mm_castps_si128(value), magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7fffffff));
+    __m128i small = _mm_cmplt_epi32(magnitude, _mm_set1_epi32(0x00800000));
+    __m128i large = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7f7fffff));
+    bits = _mm_andnot_si128(_mm_and_si128(small, _mm_set1_epi32(0x7fffffff)), bits);
+    return _mm_castsi128_ps(_mm_xor_si128(bits, _mm_and_si128(large, _mm_xor_si128(magnitude, _mm_set1_epi32(0x7f7fffff)))));
+}
+static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
+{
+#ifdef PS2_VU_IEEE_PROBE
+    {
+        __m128i magnitude = _mm_and_si128(_mm_castps_si128(value), _mm_set1_epi32(0x7fffffff));
+        __m128i denormal = _mm_andnot_si128(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128()),
+                                            _mm_cmplt_epi32(magnitude, _mm_set1_epi32(0x00800000)));
+        vu_ieee_probe[0] += __builtin_popcount(_mm_movemask_ps(_mm_castsi128_ps(denormal)));
+        vu_ieee_probe[1] += __builtin_popcount(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7f7fffff)))));
+    }
+#endif
+    return ieee_clamp4(value);
+}
+#else
 static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
 {
     __m128i bits = _mm_castps_si128(value), magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7fffffff));
@@ -164,6 +212,7 @@ static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
     PS2_OPAQUE_M128(result);
     return result;
 }
+#endif
 
 static __m128 minmax4(__m128 a, __m128 b, int maximum)
 {
@@ -254,6 +303,12 @@ static void drain_flags(Vu *u)
    (operand4), so the underflow (nonzero below FLT_MIN) and overflow (exponent 255) bits are 0. */
 static inline __attribute__((always_inline)) void fmac_flags4(Upper *out, __m128 v, int d)
 {
+#ifdef PS2_VU_IEEE_PROBE
+    vu_ieee_probe_result(v, d);
+#endif
+#ifdef PS2_VU_IEEE  /* FTZ and the overflow clamp of plain IEEE results (ieee_clamp4) */
+    v = ieee_clamp4(v);
+#endif
     {
         static const unsigned reverse[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
         __m128 zero = _mm_cmpeq_ps(v, _mm_setzero_ps());
@@ -1333,10 +1388,14 @@ int ps2_vu1_run(ps2_cpu *cpu, unsigned addr, unsigned top, unsigned itop,
 {
     /* VU arithmetic truncates rather than rounding to nearest. Keep this local
        to the VU so the EE/host and the native VU0 routines (vu0_micro.c) retain theirs. */
+#ifndef PS2_VU_IEEE
     unsigned control = host_fp_csr();
+#endif
     /* Its FMACs intentionally overflow before the existing bitwise clamp.
        Keep host exceptions masked here even during EE first-fault diagnostics. */
+#ifndef PS2_VU_IEEE  /* plain IEEE ops (operand4): no VU mode, and the shared FP word untouched */
     host_fp_set_csr((control & ~0x603F) | 0xFFC0); /* toward zero, FTZ/DAZ, host masks */
+#endif
 #if defined(PS2_VU_AOT) && !defined(PS2_VU_AOT_EMBED) && !defined(__wasm__) &&     (defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__))
     /* 64-bit host: ps2_image_load (memory.c) runs in the wasm module, whose copy of this file has
        no AOT, so it never fills this copy's block and kernel words. Take them from the same loaded
@@ -1349,6 +1408,8 @@ int ps2_vu1_run(ps2_cpu *cpu, unsigned addr, unsigned top, unsigned itop,
     }
 #endif
     int result = run(cpu, addr, 1, top, itop, kick, opaque);
+#ifndef PS2_VU_IEEE
     host_fp_set_csr(control);
+#endif
     return result;
 }

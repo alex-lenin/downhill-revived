@@ -13,6 +13,12 @@ static __m128 native_merge(__m128 old, __m128 value, int d)
 static __m128 native_result(NativeFlags *f, __m128 value, int d)
 {
     __m128i bits = _mm_castps_si128(value), mask = _mm_castps_si128(native_mask(d));
+#ifdef PS2_VU_IEEE_PROBE
+    vu_ieee_probe_result(value, d);
+#endif
+#ifdef PS2_VU_IEEE  /* FTZ and the overflow clamp of plain IEEE results (ieee_clamp4, vu0_interp.c) */
+    value = ieee_clamp4(value);
+#endif
     f->sign = _mm_or_si128(f->sign, _mm_and_si128(bits, mask));
     f->zero = _mm_or_si128(f->zero, _mm_and_si128(_mm_castps_si128(_mm_cmpeq_ps(value, _mm_setzero_ps())), mask));
     /* f->overflow stays 0: no result has exponent 255 (fmac_flags4). */
@@ -37,7 +43,9 @@ static __m128 native_madd(NativeFlags *f, __m128 acc, __m128 a, __m128 b, int d)
    Keep the optimizer barrier even though the exceptional-value clamp is dead. */
 static __m128 native_madd_clean_acc(NativeFlags *f, __m128 acc, __m128 a, __m128 b, int d)
 {
+#ifndef PS2_VU_IEEE  /* plain IEEE ops: no host rounding mode, and the clamped results keep acc clean */
     PS2_OPAQUE_M128(acc);
+#endif
     return native_result(f, _mm_add_ps(acc, _mm_mul_ps(operand4(a), operand4(b))), d);
 }
 static __m128 native_itof(__m128 value, float scale)
