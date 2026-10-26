@@ -214,11 +214,12 @@ def generate(destination):
               '    return found && found->count <= remaining ? found : NULL;', '}']
     # VU0 micro mode: the game's one VU0 package (finding 019: 426 instructions at 0x26CF80), run by
     # vcallms from the EE. The interpreter has no stall model for VU0; the blocks skip it too.
-    # VU0 micro memory can be written by any EE store as well as VIF0 MPG, so the words are
-    # compared on every dispatch (blocks are short) instead of being remembered.
+    # The blocks compare their words on every dispatch (blocks are short) instead of being
+    # remembered. The native VU0 routines' signatures below are compared once per change of VU0
+    # micro memory (ps2_vu0_code_version, bumped by VIF0 MPG; vu0_interp.c vu0_native_code): the
+    # game writes VU0 code only through VIF0 MPG (finding 090 OP2; DHD_VU0_CODE_CHECK=1 checks it).
     pairs0, where0 = program(data, 0x26CF80)
     # The complete native VU0 culling entry, including its E-bit delay slot.
-    # VU0 code has no version counter: compare this signature on every call.
     cull = [pairs0[pc] for pc in range(0xc0 // 8)]
     lines += ['AOT_WORDS(vu0_cull_words, 48, ' + ','.join(f'0x{w:08X}u' for pair in cull for w in pair) + ')']
     entries += fills('vu0_cull_words', data, [where0[pc] for pc in range(0xc0 // 8)],

@@ -158,6 +158,27 @@ int main(int argc,char **argv) {
                   m->data+0x08000000+offset);
     CHECK(host64_memory_address(m->data,0x29ffffff,2)==m->data+0x29ffffff);
     CHECK(host64_memory_address(m->data,0x39fffff0,32)==m->data+0x39fffff0);
+    /* The access adapter (MEM_ADDR_MEMOP, sizes 1..16) gives the full adapter's address around
+       every 4-MiB edge up to 8 GiB: the window edges, the low-view edges and the mod-64 window
+       wrap beyond 2 GiB. */
+    for (uint64_t edge=0;edge<=0x200000000ull;edge+=0x400000)
+        for (uint64_t a=edge<32?0:edge-32;a<=edge+32;a++)
+            for (uint64_t size=1;size<=16;size*=2)
+                CHECK(host64_access_address(m->data,a,size)==host64_memory_address(m->data,a,size));
+    /* The call-site split: host64_base_ok(base, offset) only where the plain address is the
+       adapter's, for every offset shape (small, at the 32-MiB limit, larger, above the views);
+       the cold arm always gives the adapter's address. */
+    static const uint64_t offsets[]={0,4,0x1ffff0,0x1fffff0,0x1fffff1,0x2000000,0x10000000,
+        0x39fffff0,0x3a000000,0x70100000,0xffffffffull};
+    for (uint64_t edge=0;edge<=0x100000000ull;edge+=0x400000)
+        for (uint64_t v=edge<32?0:edge-32;v<=edge+32 && v<=0xffffffffull;v++)
+            for (unsigned k=0;k<sizeof offsets/sizeof offsets[0];k++)
+                for (uint64_t size=1;size<=16;size*=2) {
+                    uint64_t a=v+offsets[k];
+                    if (host64_base_ok((uint32_t)v,offsets[k]))
+                        CHECK(host64_memory_address(m->data,a,size)==m->data+a);
+                    CHECK(host64_cold_address(m->data,a,size)==host64_memory_address(m->data,a,size));
+                }
     /* Committed: only the module's own memory, its --stack-first shadow stack
        above the null page, and the RAM views. */
     CHECK(*w2c_core_0x5F_stack_pointer(&core)==0x100000);

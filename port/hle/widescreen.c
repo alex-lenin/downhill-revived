@@ -115,6 +115,7 @@ void host_widescreen_init(void)
     host_putenv_s("DHD_WIDESCREEN_ASPECT", text);
     const char *shape = getenv("DHD_ASPECT");
     if (!shape || !*shape) host_putenv_s("DHD_ASPECT", "wide");
+    hle_env_changed();
     unsigned changed = 0;
     for (unsigned i = 0; i < sizeof words / sizeof *words; i++) {
         uint32_t *at = (uint32_t *)(uintptr_t)(PS2_RAM_BASE + words[i][0]);

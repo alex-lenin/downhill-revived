@@ -1,0 +1,383 @@
+"""Sampling CPU profiler for a running Windows x64 or i686 process (no admin, no WPR).
+
+    python port/tools/sample_profile.py --pid N --seconds 30 --out build/prof/x.json
+    python port/tools/sample_profile.py --run EXE --env K=V ... --seconds 30 --out ...
+
+Every --interval ms each thread of the process that used CPU cycles since the previous tick
+(QueryThreadCycleTime) is suspended, its instruction pointer read (GetThreadContext; Wow64 for
+i686) and resumed. Addresses are grouped by module; addresses inside the main exe are symbolized
+with llvm-symbolizer (needs a PDB beside the exe: build_host64.py --debug). The report lists
+self samples per function and per thread, and the inlined frames (llvm-symbolizer --inlines)
+are kept so a function inlined into its caller is still visible. Only the process given (or
+started here) is touched; a started process is stopped by PID at the end.
+"""
+import argparse
+import collections
+import ctypes
+import json
+import os
+import subprocess
+import sys
+import time
+from ctypes import wintypes
+from pathlib import Path
+
+k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+psapi = ctypes.WinDLL('psapi', use_last_error=True)
+winmm = ctypes.WinDLL('winmm')
+
+TH32CS_SNAPTHREAD = 4
+THREAD_ACCESS = 0x0002 | 0x0008 | 0x0040 | 0x0800  # suspend/resume, get context, query, query limited
+PROCESS_ACCESS = 0x0400 | 0x0010  # query information, vm read
+CONTEXT_AMD64_CONTROL = 0x00100001
+WOW64_CONTEXT_CONTROL = 0x00010001
+
+
+class THREADENTRY32(ctypes.Structure):
+    _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD), ('th32ThreadID', wintypes.DWORD),
+                ('th32OwnerProcessID', wintypes.DWORD), ('tpBasePri', wintypes.LONG),
+                ('tpDeltaPri', wintypes.LONG), ('dwFlags', wintypes.DWORD)]
+
+
+class MODULEINFO(ctypes.Structure):
+    _fields_ = [('lpBaseOfDll', ctypes.c_void_p), ('SizeOfImage', wintypes.DWORD), ('EntryPoint', ctypes.c_void_p)]
+
+
+user32 = ctypes.WinDLL('user32')
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def minimize_windows(pid):
+    """Minimise (without activating) every visible top-level window of the process."""
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 7)  # SW_SHOWMINNOACTIVE
+        return True
+    user32.EnumWindows(WNDENUMPROC(visit), 0)
+
+
+k32.OpenThread.restype = wintypes.HANDLE
+k32.OpenProcess.restype = wintypes.HANDLE
+k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+k32.SuspendThread.argtypes = [wintypes.HANDLE]
+k32.ResumeThread.argtypes = [wintypes.HANDLE]
+k32.GetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+k32.Wow64GetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+k32.QueryThreadCycleTime.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_ulonglong)]
+k32.GetThreadDescription.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+k32.CloseHandle.argtypes = [wintypes.HANDLE]
+k32.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+psapi.EnumProcessModulesEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD,
+                                       ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+psapi.GetModuleInformation.argtypes = [wintypes.HANDLE, wintypes.HMODULE, ctypes.POINTER(MODULEINFO), wintypes.DWORD]
+psapi.GetModuleBaseNameW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD), ('th32ProcessID', wintypes.DWORD),
+                ('th32DefaultHeapID', ctypes.c_void_p), ('th32ModuleID', wintypes.DWORD),
+                ('cntThreads', wintypes.DWORD), ('th32ParentProcessID', wintypes.DWORD),
+                ('pcPriClassBase', wintypes.LONG), ('dwFlags', wintypes.DWORD), ('szExeFile', ctypes.c_wchar * 260)]
+
+
+def child_of(pid):
+    """A child process of pid (dhd.exe relaunches itself with its fixed memory reserved), or None."""
+    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    entry = PROCESSENTRY32W(); entry.dwSize = ctypes.sizeof(entry)
+    found = None
+    ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+    while ok:
+        if entry.th32ParentProcessID == pid and entry.szExeFile.lower().endswith('.exe')                 and entry.szExeFile.lower() != 'conhost.exe':
+            found = entry.th32ProcessID
+        ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    k32.CloseHandle(snap)
+    return found
+
+
+def threads_of(pid):
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    entry = THREADENTRY32(); entry.dwSize = ctypes.sizeof(entry)
+    out = []
+    ok = k32.Thread32First(snap, ctypes.byref(entry))
+    while ok:
+        if entry.th32OwnerProcessID == pid:
+            out.append(entry.th32ThreadID)
+        ok = k32.Thread32Next(snap, ctypes.byref(entry))
+    k32.CloseHandle(snap)
+    return out
+
+
+def modules_of(process):
+    arr = (wintypes.HMODULE * 1024)(); need = wintypes.DWORD()
+    psapi.EnumProcessModulesEx(process, arr, ctypes.sizeof(arr), ctypes.byref(need), 3)
+    out = []
+    for i in range(need.value // ctypes.sizeof(wintypes.HMODULE)):
+        info = MODULEINFO(); name = ctypes.create_unicode_buffer(260)
+        if psapi.GetModuleInformation(process, arr[i], ctypes.byref(info), ctypes.sizeof(info)):
+            psapi.GetModuleBaseNameW(process, arr[i], name, 260)
+            out.append((info.lpBaseOfDll or 0, info.SizeOfImage, name.value))
+    return sorted(out)
+
+
+class Thread:
+    def __init__(self, tid, wow):
+        self.tid = tid
+        self.handle = k32.OpenThread(THREAD_ACCESS, False, tid)
+        self.cycles = 0
+        self.wow = wow
+        self.name = ''
+        self.sp = 0
+        if self.handle:
+            p = ctypes.c_wchar_p()
+            if k32.GetThreadDescription(self.handle, ctypes.byref(p)) >= 0 and p.value:
+                self.name = p.value
+        self.buf = ctypes.create_string_buffer(1232 + 16)
+        self.ctx = (ctypes.addressof(self.buf) + 15) & ~15
+
+    def busy(self):
+        c = ctypes.c_ulonglong()
+        if not k32.QueryThreadCycleTime(self.handle, ctypes.byref(c)):
+            return None
+        d = c.value - self.cycles; self.cycles = c.value
+        return d
+
+    def pc(self):
+        if k32.SuspendThread(self.handle) == 0xFFFFFFFF:
+            return None
+        try:
+            if self.wow:
+                ctypes.memset(self.ctx, 0, 716)
+                ctypes.c_uint32.from_address(self.ctx).value = WOW64_CONTEXT_CONTROL
+                if not k32.Wow64GetThreadContext(self.handle, self.ctx):
+                    return None
+                return ctypes.c_uint32.from_address(self.ctx + 0xB8).value  # Eip
+            ctypes.memset(self.ctx, 0, 1232)
+            ctypes.c_uint32.from_address(self.ctx + 0x30).value = CONTEXT_AMD64_CONTROL
+            if not k32.GetThreadContext(self.handle, self.ctx):
+                return None
+            self.sp = ctypes.c_uint64.from_address(self.ctx + 0x98).value  # Rsp
+            return ctypes.c_uint64.from_address(self.ctx + 0xF8).value  # Rip
+        finally:
+            k32.ResumeThread(self.handle)
+
+
+k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                  ctypes.POINTER(ctypes.c_size_t)]
+
+
+def return_chain(process, sp, exe_base, exe_size, cache, depth=4):
+    """Up to depth stack words above sp that look like return addresses: inside the exe and just
+    after a call instruction (E8 rel32, FF /2 with a register, or FF 15/FF 14 24-style forms). A
+    heuristic: stale words can appear, so read the result as a statistical caller chain."""
+    buf = (ctypes.c_uint64 * 512)(); got = ctypes.c_size_t()
+    if not k32.ReadProcessMemory(process, ctypes.c_void_p(sp), buf, ctypes.sizeof(buf), ctypes.byref(got)):
+        return ()
+    out = []
+    for q in buf[:got.value // 8]:
+        if not exe_base + 8 <= q < exe_base + exe_size:
+            continue
+        if q not in cache:
+            code = (ctypes.c_ubyte * 8)()
+            ok = k32.ReadProcessMemory(process, ctypes.c_void_p(q - 8), code, 8, ctypes.byref(got))
+            b = bytes(code) if ok else b''
+            cache[q] = bool(b) and (b[3] == 0xE8 or (b[6] == 0xFF and (b[7] & 0x38) == 0x10)
+                                    or (b[5] == 0xFF and (b[6] & 0x38) == 0x10)
+                                    or (b[2] == 0xFF and (b[3] & 0x38) == 0x10))
+        if cache[q]:
+            out.append(q)
+            if len(out) == depth:
+                break
+    return tuple(out)
+
+
+def sample(pid, seconds, interval, alive, minimize=False, callers=None):
+    process = k32.OpenProcess(PROCESS_ACCESS, False, pid)
+    wow = wintypes.BOOL()
+    k32.IsWow64Process(process, ctypes.byref(wow))
+    threads = {}
+    counts = collections.Counter()  # (thread name or id, pc)
+    caller_counts = collections.Counter()  # (callee rva, caller return rva)
+    exe_base = exe_size = 0
+    targets = set(); ret_cache = {}
+    if callers:
+        exe_base, exe_size, _ = next((m for m in modules_of(process) if m[2].lower().endswith('.exe')), (0, 0, ''))
+        targets = {exe_base + (c - 0x140000000) for c, _ in callers}
+    winmm.timeBeginPeriod(1)
+    end = time.perf_counter() + seconds
+    last_scan = 0
+    ticks = 0
+    try:
+        while time.perf_counter() < end and alive():
+            now = time.perf_counter()
+            if now - last_scan > 0.5:
+                if minimize:
+                    minimize_windows(pid)
+                for tid in threads_of(pid):
+                    if tid not in threads:
+                        t = Thread(tid, bool(wow.value))
+                        if t.handle:
+                            t.busy(); threads[tid] = t
+                last_scan = now
+            for t in list(threads.values()):
+                d = t.busy()
+                if d is None:
+                    del threads[t.tid]; continue
+                if d < 100000:  # under ~20 us of cycles since the last tick: idle
+                    continue
+                pc = t.pc()
+                if pc is not None:
+                    if not t.name:  # names are set after start
+                        p = ctypes.c_wchar_p()
+                        if k32.GetThreadDescription(t.handle, ctypes.byref(p)) >= 0 and p.value:
+                            t.name = p.value
+                    counts[(t.name or 'tid%d' % t.tid, pc)] += 1
+                    for start, size in callers or ():
+                        a = exe_base + (start - 0x140000000)
+                        if a <= pc < a + size:
+                            chain = return_chain(process, t.sp, exe_base, exe_size, ret_cache)
+                            caller_counts[(start, tuple(r - exe_base + 0x140000000 for r in chain))] += 1
+            ticks += 1
+            time.sleep(interval / 1000)
+        mods = modules_of(process)
+    finally:
+        winmm.timeEndPeriod(1)
+    sample.callers = caller_counts
+    return counts, mods, ticks
+
+
+def symbolize(exe, addresses, llvm):
+    """address -> list of frames (innermost first), via llvm-symbolizer --inlines."""
+    if not addresses:
+        return {}
+    tool = Path(llvm) / 'llvm-symbolizer.exe'
+    text = '\n'.join('0x%x' % a for a in addresses) + '\n'
+    r = subprocess.run([str(tool), '--obj=' + str(exe), '--inlines', '--functions=linkage', '--no-demangle'],
+                       input=text, capture_output=True, text=True)
+    blocks = r.stdout.strip('\n').split('\n\n')
+    out = {}
+    for a, block in zip(addresses, blocks):
+        lines = block.split('\n')
+        out[a] = [lines[i] for i in range(0, len(lines), 2)]
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--pid', type=int)
+    ap.add_argument('--run', type=Path, help='start this exe (cwd = its folder) and profile it')
+    ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for --run')
+    ap.add_argument('--delay', type=float, default=0, help='seconds before sampling starts')
+    ap.add_argument('--seconds', type=float, default=30)
+    ap.add_argument('--interval', type=float, default=1.0, help='ms between ticks')
+    ap.add_argument('--exe', type=Path, help='exe to symbolize (default: --run)')
+    ap.add_argument('--llvm', default=str(Path.home() / 'scoop/apps/llvm/current/bin'))
+    ap.add_argument('--out', type=Path, required=True)
+    ap.add_argument('--minimize', action='store_true', help='keep the windows of the process minimised')
+    ap.add_argument('--no-sample', action='store_true',
+                    help='only run (minimised) until exit or --seconds: a timing run without the sampler')
+    ap.add_argument('--callers', action='append', default=[],
+                    help='ADDR:SIZE (preferred-base VA of a function): attribute its samples to direct callers')
+    ap.add_argument('--child', action='store_true', help='sample the child the started process relaunches (i686)')
+    ap.add_argument('--top', type=int, default=60)
+    a = ap.parse_args()
+    proc = None
+    if a.run:
+        env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
+        for item in a.env:
+            k, _, v = item.partition('='); env[k] = v
+        a.out.parent.mkdir(parents=True, exist_ok=True)
+        log = open(str(a.out) + '.log', 'wb')
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 7  # SW_SHOWMINNOACTIVE (SDL may still show it; --minimize follows up)
+        proc = subprocess.Popen([str(a.run.resolve())], cwd=str(a.out.parent.resolve()), env=env,
+                                stdout=log, stderr=subprocess.STDOUT, startupinfo=startup)
+        pid = proc.pid
+    else:
+        pid = a.pid
+    exe = (a.exe or a.run).resolve()
+    alive = (lambda: proc.poll() is None) if proc else (lambda: True)
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < a.delay and alive():
+        if a.minimize:
+            minimize_windows(pid)
+            c = child_of(pid)
+            if c:
+                minimize_windows(c)
+        time.sleep(0.2)
+    if a.child:
+        child = child_of(pid)
+        if not child:
+            raise SystemExit('no child process of %d' % pid)
+        pid = child
+        print('sampling child process %d' % pid)
+    if a.no_sample:
+        end = time.perf_counter() + a.seconds
+        while time.perf_counter() < end and alive():
+            if a.minimize:
+                minimize_windows(pid)
+            time.sleep(0.25)
+        if proc and proc.poll() is None:
+            proc.kill(); proc.wait()
+        print('exit', proc.returncode if proc else None)
+        return
+    try:
+        callers = [tuple(int(x, 0) for x in c.split(':')) for c in a.callers]
+        counts, mods, ticks = sample(pid, a.seconds, a.interval, alive, a.minimize, callers)
+    finally:
+        if proc and proc.poll() is None:
+            proc.kill(); proc.wait()
+    exe_mod = next((m for m in mods if m[2].lower() == exe.name.lower()), None)
+    preferred = 0x140000000 if exe_mod and exe_mod[0] > 0xFFFFFFFF else 0x400000
+    in_exe = sorted({pc for (_, pc) in counts if exe_mod and exe_mod[0] <= pc < exe_mod[0] + exe_mod[1]})
+    syms = symbolize(exe, [pc - exe_mod[0] + preferred for pc in in_exe], a.llvm) if exe_mod else {}
+    self_fn = collections.Counter(); incl = collections.Counter(); per_thread = collections.Counter()
+    per_mod = collections.Counter(); outer = collections.Counter()  # outer: the non-inlined function
+    total = sum(counts.values())
+    for (thread, pc), n in counts.items():
+        per_thread[thread] += n
+        if exe_mod and exe_mod[0] <= pc < exe_mod[0] + exe_mod[1]:
+            frames = syms.get(pc - exe_mod[0] + preferred) or ['??']
+            self_fn[(thread, frames[0])] += n
+            for f in set(frames):
+                incl[(thread, f)] += n
+            outer[(thread, frames[-1])] += n
+            per_mod[exe.name] += n
+        else:
+            m = next((m for m in mods if m[0] <= pc < m[0] + m[1]), None)
+            name = m[2] if m else '?'
+            per_mod[name] += n
+            self_fn[(thread, '[' + name + ']')] += n
+    report = {'pid': pid, 'ticks': ticks, 'samples': total,
+              'threads': per_thread.most_common(), 'modules': per_mod.most_common(),
+              'self': [[t, f, n] for (t, f), n in self_fn.most_common()],
+              'outer': [[t, f, n] for (t, f), n in outer.most_common(400)],
+              'inlined_frames': [[t, f, n] for (t, f), n in incl.most_common(400)],
+              'hot_pcs': [[t, '0x%x' % (pc - exe_mod[0] + preferred), syms.get(pc - exe_mod[0] + preferred), n]
+                          for (t, pc), n in counts.most_common(400)
+                          if exe_mod and exe_mod[0] <= pc < exe_mod[0] + exe_mod[1]]}
+    cc = getattr(sample, 'callers', {})
+    if cc:
+        rets = sorted({r for (_, chain) in cc for r in chain})
+        rsyms = symbolize(exe, rets, a.llvm)
+        name = lambda r: (rsyms.get(r) or ['?'])[-1]
+        named = collections.Counter()
+        for (c, chain), n in cc.items():
+            named[('0x%x' % c,) + tuple(name(r) for r in chain)] += n
+        report['callers'] = [list(k) + [n] for k, n in named.most_common(300)]
+        for k, n in named.most_common(40):
+            print('caller %6d  %s <- %s' % (n, k[0], ' <- '.join(k[1:])))
+    a.out.write_text(json.dumps(report, indent=1))
+    print('samples %d in %d ticks' % (total, ticks))
+    for t, n in per_thread.most_common():
+        print('thread %-24s %6.2f%%' % (t, 100 * n / max(total, 1)))
+    for m, n in per_mod.most_common(8):
+        print('module %-24s %6.2f%%' % (m, 100 * n / max(total, 1)))
+    for (t, f), n in self_fn.most_common(a.top):
+        print('%6.2f%%  %-14s %s' % (100 * n / max(total, 1), t[:14], f))
+
+
+if __name__ == '__main__':
+    main()

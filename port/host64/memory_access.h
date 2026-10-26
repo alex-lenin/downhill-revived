@@ -26,8 +26,12 @@ static inline int host64_alias_crossing(uint64_t address,uint64_t size) {
 /* 32-MiB windows (address >> 25) that hold a RAM alias or a low view, where the code below may
    fold or treat a span as crossing: 0x00000000, 0x20000000, 0x28000000, 0x30000000, 0x38000000. */
 #define HOST64_ALIAS_WINDOWS 0x11110001u
-static inline uint8_t *host64_memory_address(uint8_t *base, uint64_t address,
-                                             uint64_t size) {
+/* Every view ends below this address: a span starting at or above it is never folded. */
+#define HOST64_VIEWS_END 0x3a000000ull
+/* The full adapter: any address, any size. Callers below inline it only for constant spans
+   (it folds away at compile time) and otherwise call it out of line, on the rare paths. */
+static inline __attribute__((always_inline)) uint8_t *
+host64_memory_address_full(uint8_t *base, uint64_t address, uint64_t size) {
     /* Fast path, the same result as the full test below: a span inside one 32-MiB window that
        is none of those five is neither folded nor crossing, so its host address is base +
        address. This covers canonical RAM (0x08000000) and the module's own data. A zero size
@@ -58,6 +62,74 @@ static inline uint8_t *host64_memory_address(uint8_t *base, uint64_t address,
          (address>=0x30400000 && address<0x32000000)))
         address=0x08000000+(address&0x1ffffffull);
     return base + address;
+}
+/* Out of line: the inlined fold was half of the executable and about 13% of the EE thread
+   (finding 089). Its memory barrier (crossing spans) still acts at the call: the call is opaque
+   to the caller's alias analysis, and so is the pointer it returns. */
+static __attribute__((noinline, cold)) uint8_t *
+host64_memory_address_slow(uint8_t *base, uint64_t address, uint64_t size) {
+    return host64_memory_address_full(base, address, size);
+}
+/* A span of any size (wasm2c's MEM_ADDR: memory.fill, data segments, memory.copy). */
+static inline uint8_t *host64_memory_address(uint8_t *base, uint64_t address,
+                                             uint64_t size) {
+    if (__builtin_constant_p(address) && __builtin_constant_p(size))
+        return host64_memory_address_full(base, address, size);
+    uint64_t window = address >> 25;
+    if (__builtin_expect(window == (address + size - 1) >> 25 &&
+                         (window >= 32 || !((HOST64_ALIAS_WINDOWS >> window) & 1)), 1))
+        return base + address;
+    return host64_memory_address_slow(base, address, size);
+}
+/* Windows (address >> 25, mod 64) where a span of at most 32 MiB may touch a view other than
+   canonical RAM: the five above, and the window below each of the upper four (a span starting
+   there may cross into it; the low view has none below). */
+#define HOST64_SLOW_WINDOWS ((1ull << 0) | (3ull << 15) | (3ull << 19) | (3ull << 23) | (3ull << 27))
+/* One scalar or SIMD access (wasm2c's MEM_ADDR_MEMOP: size 1..16). Same result as
+   host64_memory_address, with a cheaper inline test:
+   - a span starting in a window outside HOST64_SLOW_WINDOWS lies in that window and the next,
+     neither of which holds a view other than canonical RAM, so neither folds nor crosses into a
+     fold (a crossing there joins two uniquely mapped ranges and needs no barrier);
+   - windows are taken mod 64 (one bit test). Every in-bounds address is below 2 GiB (the
+     module's maximum memory) and so below window 64; an address beyond, whose window wraps onto
+     a slow bit, only takes the full test, which leaves it unchanged (it faults as before);
+   - an address the compiler proves at or above HOST64_VIEWS_END (the module's data: a memarg
+     offset >= 0x3a000000) or proves constant needs no test at run time. */
+static inline __attribute__((always_inline)) uint8_t *
+host64_access_address(uint8_t *base, uint64_t address, uint64_t size) {
+    if (!__builtin_constant_p(size) || size - 1 > 15)
+        return host64_memory_address(base, address, size);
+    if (__builtin_constant_p(address))
+        return host64_memory_address_full(base, address, size);
+    if (__builtin_constant_p(address >= HOST64_VIEWS_END) && address >= HOST64_VIEWS_END)
+        return base + address;
+    if (__builtin_expect(!((HOST64_SLOW_WINDOWS >> ((address >> 25) & 63)) & 1), 1))
+        return base + address;
+    return host64_memory_address_slow(base, address, size);
+}
+/* Accesses split at the call site (prepare_wasm2c.py split_accesses). wasm2c writes every access
+   address as (u64)base + offset, base a 32-bit value and offset the memarg constant; the site
+   becomes host64_base_ok(base, offset) ? NAME_hot(...) : NAME_cold(...). The hot access is
+   base + address with no test of its own, so the compiler sees the plain address (addressing
+   modes, alias analysis) and computes one test for every access through the same base value.
+   host64_base_ok(base, offset) true implies, for every size 1..16, that host64_access_address
+   gives base + address:
+   - offset >= HOST64_VIEWS_END: the span starts above every view;
+   - offset + 16 <= 32 MiB: the span lies in the base's window and the next, so the test of
+     host64_access_address holds for the base's window as it does for the address's;
+   - a larger offset (none in this module) tests the address itself, as host64_access_address.
+   The cold access gives the same result as host64_access_address, out of line. */
+static inline __attribute__((always_inline)) int host64_base_ok(uint32_t base, uint64_t offset) {
+    if (offset >= HOST64_VIEWS_END)
+        return 1;
+    uint64_t at = offset + 16 <= 0x2000000 ? base : base + offset;
+    return __builtin_expect(!((HOST64_SLOW_WINDOWS >> ((at >> 25) & 63)) & 1), 1);
+}
+static inline __attribute__((always_inline)) uint8_t *
+host64_cold_address(uint8_t *base, uint64_t address, uint64_t size) {
+    if (__builtin_constant_p(address))
+        return host64_memory_address_full(base, address, size);  /* folds at compile time */
+    return host64_memory_address_slow(base, address, size);
 }
 /* wasm memory.copy promises source-snapshot semantics. A crossing range may
    physically overlap a folded range even when their OS pointers look disjoint.

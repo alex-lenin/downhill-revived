@@ -77,14 +77,15 @@ static volatile unsigned long long race_pad_field;
    race-clock input/capture only after the built-in unlock bootstrap has
    loaded a fresh rider with its ordinary cheat flags cleared. Default
    comparisons still arm on their first menu-9 countdown, unchanged. */
+static HleEnv race_sync_env, race_unlocked_env;
 static int race_sync_menu(void)
 {
-    return RACE_MENU == 9 || (host_getenv("DHD_RACE_SYNC_UNLOCKED") && RACE_MENU == 2);
+    return RACE_MENU == 9 || (hle_env(&race_unlocked_env, "DHD_RACE_SYNC_UNLOCKED") && RACE_MENU == 2);
 }
 
 static int race_sync_ready(void)
 {
-    if (!host_getenv("DHD_RACE_SYNC_UNLOCKED")) return 1;
+    if (!hle_env(&race_unlocked_env, "DHD_RACE_SYNC_UNLOCKED")) return 1;
     return *(volatile uint32_t *)0x084346B4 == 0x035FFFFFu &&
            *(volatile uint32_t *)0x082B6E68 == 0 &&
            *(volatile uint32_t *)0x082B6E6C == 0 &&
@@ -170,7 +171,7 @@ static int race_in(int which)
 
 void race_sync_vsync(unsigned long long field)
 {
-    if (!host_getenv("DHD_RACE_SYNC") || field == race_field) return;
+    if (!hle_env(&race_sync_env, "DHD_RACE_SYNC") || field == race_field) return;
     if (!race_started[0] && !race_sync_ready()) return;
     static int heartbeat;
     if (!heartbeat++) host_callback_heartbeat(HOST_CALLBACK(race_heartbeat), 0);
@@ -195,9 +196,17 @@ void race_sync_vsync(unsigned long long field)
    input still applies. */
 int race_sync_pad(int player, uint16_t *buttons)
 {
-    char own[32];
-    snprintf(own, sizeof own, "DHD_RACE_PAD%d", player);
-    const char *script = player && host_getenv(own) ? host_getenv(own) : host_getenv("DHD_RACE_PAD");
+    static HleEnv all_env, own_env[4];
+    const char *own = NULL;
+    if (player > 0 && player < 4) {
+        static const char *const names[4] = {"", "DHD_RACE_PAD1", "DHD_RACE_PAD2", "DHD_RACE_PAD3"};
+        own = hle_env(&own_env[player], names[player]);
+    } else if (player) {
+        char name[32];
+        snprintf(name, sizeof name, "DHD_RACE_PAD%d", player);
+        own = getenv(name);
+    }
+    const char *script = own ? own : hle_env(&all_env, "DHD_RACE_PAD");
     race_pad_field = race_field;
     if (!race_started[0]) return 0;
     *buttons = 0;
@@ -286,7 +295,8 @@ static const uint16_t pressure_order[12]={PAD_RIGHT,PAD_LEFT,PAD_UP,PAD_DOWN,PAD
    keyboard's mapping; each change is logged with the steering the rider got from it. */
 static void keys_script(HostPad *out)
 {
-    const char *script = getenv("DHD_KEYS");
+    static HleEnv keys_env;
+    const char *script = hle_env(&keys_env, "DHD_KEYS");
     double seconds = race_sync_seconds();
     uint8_t down[256];
     if (!script || seconds < 0) return;
@@ -317,9 +327,10 @@ int host_pad_script(int player, HostPad *out)
     size_t i;
     memset(out, 0, sizeof *out);
     out->right_x = out->right_y = out->left_x = out->left_y = 128;
-    const char *script = getenv("DHD_AUTOPAD");
-    const char *frame_script = getenv("DHD_AUTOPAD_FRAMES");
-    const char *nav = getenv("DHD_NAV");  /* menus by the screen shown (autopad.c), else by time */
+    static HleEnv autopad_env, frames_env, nav_env;  /* online.c changes DHD_NAV (hle_env_changed) */
+    const char *script = hle_env(&autopad_env, "DHD_AUTOPAD");
+    const char *frame_script = hle_env(&frames_env, "DHD_AUTOPAD_FRAMES");
+    const char *nav = hle_env(&nav_env, "DHD_NAV");  /* menus by the screen shown (autopad.c), else by time */
     if (frame_script) script = frame_script;
     if (nav) script = nav;
     if (!script)

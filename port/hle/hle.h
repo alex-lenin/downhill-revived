@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "memory.h"
 #include "../include/guest.h"
@@ -19,6 +20,24 @@
 /* Logs to stderr; DHD_LOG set in the environment turns on the verbose messages. */
 void hle_log(const char *fmt, ...);
 extern int hle_verbose;
+
+/* getenv for a variable read every field (pads, the vsync). getenv crosses into the host, which
+   scans the whole environment: these read it once, and again only after the core changed its
+   environment (hle_env_changed, after every host_putenv of the core: online.c's set_env,
+   online_menu.c's save, pc_settings.c and widescreen.c).
+   The host's own writers (present.c's window size, host.c's settings before the core starts)
+   set none of the variables read through this. */
+extern unsigned hle_env_epoch;
+static inline void hle_env_changed(void) { hle_env_epoch++; }
+typedef struct { const char *value; unsigned epoch; } HleEnv;  /* epoch: hle_env_epoch + 1 when read */
+static inline const char *hle_env(HleEnv *cache, const char *name)
+{
+    if (cache->epoch != hle_env_epoch + 1) {
+        cache->value = getenv(name);
+        cache->epoch = hle_env_epoch + 1;
+    }
+    return cache->value;
+}
 
 /* ---- host.c ---- */
 void host_init(void);         /* the crash report */

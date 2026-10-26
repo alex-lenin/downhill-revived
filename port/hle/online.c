@@ -358,11 +358,13 @@ static void build_version(char *out, size_t size)
 
 void hle_online_version(char *out, size_t size) { build_version(out, size); }
 
+unsigned hle_env_epoch;  /* hle.h's hle_env */
 static void set_env(const char *name, const char *value)
 {
     char text[600];
     snprintf(text, sizeof text, "%s=%s", name, value);
     host_putenv(text);
+    hle_env_changed();
 }
 
 /* The menus to a single race, by the screen shown (port/hle/menu_nav.h; race_compare.py's NAV):
@@ -947,7 +949,8 @@ static void state_sync(void)
    split screen); online the default is this PC's player. Menus and loads stay whole. */
 static void choose_view(void)
 {
-    const char *v = getenv("DHD_VIEW");
+    static HleEnv view_env;
+    const char *v = hle_env(&view_env, "DHD_VIEW");
     int want = v && *v ? (*v >= '0' && *v <= '3' ? *v - '0' + 1 : 0) : online_mode() && on.released ? on.local_slot + 1 : 0;
     int phase = EE32(PHASE), racing = EE32(MENU) == LOAD_MENU && phase >= 1 && phase <= 3;
     host_service_gs_native_view(racing && EE32(SETUP + 0x288) >= 3 ? want : 0);
@@ -1226,13 +1229,14 @@ void pads_begin_field(void)
    still the script, DHD_RACE_PAD). */
 void pads_read(int player, HostPad *out)
 {
+    static HleEnv scripted_env;
     if (online_mode()) {
         /* the race, and after it the results and their menu (Try Again ... Quit, race phase 0) */
         /* Once setup has been exchanged, the flyby and its skip prompt belong to the
            player too. The boot script may already be spent after an earlier race. */
         int race = EE32(MENU) == LOAD_MENU && on.setup_done;
         if (player == 0 && race && (rematch_pad(out) || follow_pad(out))) {
-        } else if (player == 0 && race && !getenv("DHD_NET_SCRIPTED")) host_service_host_pad_device(0, GADDR(out)), guest_pad(out);
+        } else if (player == 0 && race && !hle_env(&scripted_env, "DHD_NET_SCRIPTED")) host_service_host_pad_device(0, GADDR(out)), guest_pad(out);
         else if (!on.released || !host_pad_script(player, out)) neutral(out);
         for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;
         return;

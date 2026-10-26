@@ -78,6 +78,68 @@ def specialize_dispatch(text, hot_functions=()):
     return re.sub(r'(?<![\w])CALL_INDIRECT\(([^\n]+)\)(?=;)', rewrite, text)
 
 
+# One scalar/SIMD access (size 1..16): memory_access.h's cheaper inline test, same result.
+MEMOP_DEFINE = '#define MEM_ADDR_MEMOP(mem, addr, n) host64_access_address(wasm_rt_local_memory_base, (addr), (n))'
+
+# WABT's scalar and SIMD access templates (DEFINE_LOAD(i32_load, u32, u32, u32, FORCE_READ_INT) ...).
+ACCESS_TEMPLATE = re.compile(r'^(DEFINE_(?:LOAD|STORE|SIMD_LOAD_FUNC|SIMD_LOAD_LANE|SIMD_STORE|SIMD_STORE_LANE))'
+                             r'\((\w+),([^\n]*)\)$', re.M)
+# One access of the default memory, as wasm2c writes every one: (u64)(base) [+ offset], then the
+# stored value or lane operands, if any.
+ACCESS_SITE = re.compile(r'\b(\w+)_default32\(wasm_rt_local_memory_base, wasm_rt_local_memory_size, '
+                         r'&instance->w2c_memory, \(u64\)\((\w+)\)(?: \+ (\d+)u)?(?=[,)])')
+
+
+def access_families(text):
+    """Beside each access template, its _hot and _cold copies (memory_access.h, "Accesses split
+    at the call site"): hot addresses base + address, cold calls the adapter out of line. The
+    copies sit in the template's own preprocessor branch."""
+    def add(m):
+        kind, name, rest = m[1], m[2], m[3]
+        if name.endswith(('_hot', '_cold')) or f'{kind}({name}_hot,' in text:
+            return m[0]
+        return '\n'.join([
+            m[0], '#pragma push_macro("MEM_ADDR_MEMOP")', '#undef MEM_ADDR_MEMOP',
+            '#define MEM_ADDR_MEMOP(mem, addr, n) (wasm_rt_local_memory_base + (addr))',
+            f'{kind}({name}_hot,{rest})', '#undef MEM_ADDR_MEMOP',
+            '#define MEM_ADDR_MEMOP(mem, addr, n) host64_cold_address(wasm_rt_local_memory_base, (addr), (n))',
+            f'{kind}({name}_cold,{rest})', '#pragma pop_macro("MEM_ADDR_MEMOP")'])
+    return ACCESS_TEMPLATE.sub(add, text)
+
+
+def split_accesses(text, path='unit'):
+    """Every access site NAME_default32(..., (u64)(base) + offset, ...) becomes
+    (host64_base_ok(base, offset) ? NAME_hot_default32(...) : NAME_cold_default32(...)), the
+    arguments copied verbatim (one of the two arms runs, so each is evaluated once). Refuses an
+    access of the default memory in any other shape. Idempotent."""
+    out, last = [], 0
+    for m in ACCESS_SITE.finditer(text):
+        if m[1].endswith(('_hot', '_cold')):
+            continue
+        depth, i = 0, m.start() + len(m[1]) + len('_default32')
+        while True:  # the call's closing parenthesis
+            c = text[i]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            elif c == '\n':
+                raise ValueError(f'{path}: access call across lines: {m[0]}')
+            i += 1
+        args = text[m.start() + len(m[1]) + len('_default32'):i + 1]
+        out += [text[last:m.start()], f'(host64_base_ok({m[2]}, {m[3] or 0}u) ? {m[1]}_hot_default32{args} : '
+                f'{m[1]}_cold_default32{args})']
+        last = i + 1
+    text = ''.join(out) + text[last:]
+    rest = [s for s in re.findall(r'\b(\w+)_default32\(wasm_rt_local_memory_base\b', text)
+            if not s.endswith(('_hot', '_cold'))]
+    if rest:
+        raise ValueError(f'{path}: unsupported wasm2c access shape ({len(rest)}, e.g. {rest[0]})')
+    return text
+
+
 def prepare(path, *, minimum_size=True, dispatch=True, hot_functions=()):
     text = path.read_text()
     if dispatch:
@@ -85,6 +147,7 @@ def prepare(path, *, minimum_size=True, dispatch=True, hot_functions=()):
     if minimum_size:
         text = re.sub(r'(\bwasm_rt_local_memory_size = )(?!host64_memory_size\()([^;\n]+);',
                       r'\1host64_memory_size(\2);', text)
+    text = split_accesses(text, path)
     marker = '#include "memory_access.h"'
     copy_old = 'memmove(MEM_ADDR(dest, dest_addr, n), MEM_ADDR(src, src_addr, n), n);'
     copy_new = 'host64_memory_copy(dest->data, dest_addr, src->data, src_addr, n);'
@@ -103,19 +166,21 @@ def prepare(path, *, minimum_size=True, dispatch=True, hot_functions=()):
             'host64_memory_address((mem)->data, (addr), (n))',
             'host64_memory_address(&wasm_rt_local_memory_base[(addr)])':
             'host64_memory_address(wasm_rt_local_memory_base, (addr), (n))',
+            '#define MEM_ADDR_MEMOP(mem, addr, n) host64_memory_address(wasm_rt_local_memory_base, (addr), (n))':
+            MEMOP_DEFINE,
         }
         for old, new in legacy.items():
             text = text.replace(old, new)
         if ('#define MEM_ADDR(mem, addr, n) host64_memory_address((mem)->data, (addr), (n))' not in text or
-            '#define MEM_ADDR_MEMOP(mem, addr, n) host64_memory_address(wasm_rt_local_memory_base, (addr), (n))' not in text):
+            MEMOP_DEFINE not in text):
             raise ValueError(f'{path}: unsupported prepared wasm2c memory template')
-        path.write_text(text)
+        path.write_text(access_families(text))
         return
     replacements = {
         '#define MEM_ADDR(mem, addr, n) &((mem)->data[addr])':
         '#define MEM_ADDR(mem, addr, n) host64_memory_address((mem)->data, (addr), (n))',
         '#define MEM_ADDR_MEMOP(mem, addr, n) (&wasm_rt_local_memory_base[(addr)])':
-        '#define MEM_ADDR_MEMOP(mem, addr, n) host64_memory_address(wasm_rt_local_memory_base, (addr), (n))',
+        MEMOP_DEFINE,
     }
     for old, new in replacements.items():
         if text.count(old) == 1:
@@ -124,7 +189,7 @@ def prepare(path, *, minimum_size=True, dispatch=True, hot_functions=()):
             pass  # a split part: its MEM_ADDR defines come from the prepared impl header
         else:
             raise ValueError(f'{path}: unsupported wasm2c memory template: {old}')
-    text = marker + '\n' + text
+    text = marker + '\n' + access_families(text)
     path.write_text(text)
 
 
@@ -175,7 +240,7 @@ def prepare_units(units, out, exact_f32=False):
         if '#define MEM_ADDR(mem' in source.read_text():
             prepare(source)
         else:
-            source.write_text(specialize_dispatch(source.read_text()))
+            source.write_text(split_accesses(specialize_dispatch(source.read_text()), source))
     for header in out.glob('*-impl.h'):
         if '#define MEM_ADDR(mem' in header.read_text():
             prepare(header)

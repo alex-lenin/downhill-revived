@@ -169,6 +169,7 @@ static void commit(Row *r, int apply)
         host_service_host_setting_save(GADDR(r->key), GADDR(c->value));
         if (apply) host_putenv_s(r->env, c->value);
     }
+    if (apply) hle_env_changed();
     if (!apply) return;
     r->running = r->selected;
     if (r == &rows[DISPLAY] || r == &rows[SIZE]) host_service_gs_window_apply();

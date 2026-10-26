@@ -315,6 +315,7 @@ static void save(const char *key, const char *env, const char *value)
 {
     host_service_host_setting_save(GADDR(key), GADDR(value));
     host_putenv_s(env, value);
+    hle_env_changed();
 }
 
 /* What stops this PC from joining a race, or NULL. */

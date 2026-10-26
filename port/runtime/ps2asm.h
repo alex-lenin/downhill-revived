@@ -89,6 +89,7 @@ void ps2_vu_aot_load(const void *vutext);
    the fence that makes them current, and that 1 KB view as VF0..31 then VI0..31 per quadword. */
 extern ps2_cpu *ps2_vu1_regs;
 extern uint64_t ps2_vu1_code_version;  /* bumped when VIF1 MPG changes VU1 micro memory */
+extern uint64_t ps2_vu0_code_version;  /* bumped when VIF0 MPG changes VU0 micro memory, or the native words load */
 extern int ps2_vu1_native_mode;  /* -1: DHD_VU1_NATIVE decides; 0 or 1 forces the native kernels off or on (tests) */
 extern int ps2_vu0_native_mode;  /* same override for DHD_VU0_NATIVE */
 extern unsigned long long ps2_vu0_native_runs;

@@ -393,6 +393,7 @@ static void set_ialu(Vu *u, int r, uint32_t v)
 #ifndef PS2_VU_REFERENCE
 ps2_cpu *ps2_vu1_regs;
 uint64_t ps2_vu1_code_version;
+uint64_t ps2_vu0_code_version;
 int ps2_vu1_native_mode = -1;
 int ps2_vu0_aot_mode = -1;
 int ps2_vu0_native_mode = -1;
@@ -1074,6 +1075,9 @@ void ps2_vu_aot_load(const void *vutext)
 #else
     (void)vutext;
 #endif
+#ifndef PS2_VU_REFERENCE
+    ps2_vu0_code_version++;  /* the native VU0 routines' words changed: match them again */
+#endif
 }
 
 static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr, unsigned unit, unsigned top, unsigned itop,
@@ -1320,6 +1324,35 @@ static void vu0_stats(unsigned addr, unsigned long long ticks)
 
 #if (defined(PS2_VU_AOT) || defined(PS2_VU0_NATIVE)) && !defined(PS2_VU_REFERENCE)
 #include "vu0_native.h"
+
+/* The native VU0 routines run only where micro memory holds the exact words they were written from
+   (a zero first word: the words never loaded). The game's VU0 micro memory (0x11000000) changes
+   only through VIF0 MPG (vif.c), which bumps ps2_vu0_code_version, as ps2_vu_aot_load does when
+   it fills the words; there each routine's answer is kept until the next change (finding 090
+   OP2), instead of a byte-wise memcmp of up to 528 bytes on every vcallms. Any other code buffer
+   (the tests) is compared each time. DHD_VU0_CODE_CHECK=1 compares every call as well and
+   reports a change that came another way (an EE store into micro memory). */
+static int vu0_native_code(const ps2_cpu *cpu, unsigned which, unsigned at, const uint32_t *words, size_t bytes)
+{
+    static uint64_t checked[5];  /* ps2_vu0_code_version + 1 */
+    static uint8_t matched[5];
+    static int verify = -1;
+    if (GADDR(cpu->vu0_code) != 0x11000000u) return words[0] && !memcmp(cpu->vu0_code + at, words, bytes);
+    if (checked[which] != ps2_vu0_code_version + 1) {
+        matched[which] = (uint8_t)(words[0] && !memcmp(cpu->vu0_code + at, words, bytes));
+        checked[which] = ps2_vu0_code_version + 1;
+    }
+    if (verify < 0) { const char *value = getenv("DHD_VU0_CODE_CHECK"); verify = value && atoi(value); }
+    if (verify) {
+        uint8_t now = (uint8_t)(words[0] && !memcmp(cpu->vu0_code + at, words, bytes));
+        if (now != matched[which]) {
+            fprintf(stderr, "vu0: micro memory at %04X changed without VIF0 MPG (native routine %u: %d -> %d)\n",
+                    at, which, matched[which], now);
+            matched[which] = now;
+        }
+    }
+    return matched[which];
+}
 #endif
 
 int ps2_vu0_run(ps2_cpu *cpu, unsigned addr)
@@ -1345,32 +1378,32 @@ int ps2_vu0_run(ps2_cpu *cpu, unsigned addr)
         const char *value = getenv("DHD_VU0_NATIVE");
         native = (!value || atoi(value)) && !getenv("DHD_VU_INTERPRETER") && !getenv("DHD_VU_TRACE");
     }
-    if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0 && !cpu->vi[0] && vu0_cull_words[0] &&
-        !memcmp(cpu->vu0_code, vu0_cull_words, sizeof vu0_cull_words)) {
+    const int use_native = ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native;
+    if (use_native && addr == 0 && !cpu->vi[0] && vu0_native_code(cpu, 0, 0, vu0_cull_words, sizeof vu0_cull_words)) {
         native0_cull(cpu);
         ps2_vu0_native_runs++;
         vu0_native_entries[0]++;
         result = 0;
-    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x5e8 && !cpu->vi[0] && vu0_basis_words[0] &&
-               !memcmp(cpu->vu0_code + 0x5e8, vu0_basis_words, sizeof vu0_basis_words)) {
+    } else if (use_native && addr == 0x5e8 && !cpu->vi[0] &&
+               vu0_native_code(cpu, 2, 0x5e8, vu0_basis_words, sizeof vu0_basis_words)) {
         native0_transform_basis(cpu);
         ps2_vu0_native_runs++;
         vu0_native_entries[2]++;
         result = 0;
-    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x2e0 && !cpu->vi[0] && vu0_bounds_words[0] &&
-               !memcmp(cpu->vu0_code + 0x2e0, vu0_bounds_words, sizeof vu0_bounds_words)) {
+    } else if (use_native && addr == 0x2e0 && !cpu->vi[0] &&
+               vu0_native_code(cpu, 1, 0x2e0, vu0_bounds_words, sizeof vu0_bounds_words)) {
         native0_bounds(cpu);
         ps2_vu0_native_runs++;
         vu0_native_entries[1]++;
         result = 0;
-    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x7b8 && !cpu->vi[0] && vu0_length_words[0] &&
-               !memcmp(cpu->vu0_code + 0x7b8, vu0_length_words, sizeof vu0_length_words)) {
+    } else if (use_native && addr == 0x7b8 && !cpu->vi[0] &&
+               vu0_native_code(cpu, 3, 0x7b8, vu0_length_words, sizeof vu0_length_words)) {
         native0_length_squared(cpu);
         ps2_vu0_native_runs++;
         vu0_native_entries[3]++;
         result = 0;
-    } else if ((ps2_vu0_native_mode >= 0 ? ps2_vu0_native_mode : native) && addr == 0x808 && !cpu->vi[0] && vu0_direction_words[0] &&
-               !memcmp(cpu->vu0_code + 0x808, vu0_direction_words, sizeof vu0_direction_words)) {
+    } else if (use_native && addr == 0x808 && !cpu->vi[0] &&
+               vu0_native_code(cpu, 4, 0x808, vu0_direction_words, sizeof vu0_direction_words)) {
         native0_transform_direction(cpu);
         ps2_vu0_native_runs++;
         vu0_native_entries[4]++;

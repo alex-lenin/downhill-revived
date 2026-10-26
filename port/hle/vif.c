@@ -621,6 +621,7 @@ void vif_feed(int unit, const uint32_t *words, uint32_t n)
 #if !defined(DHD_VIF0_ONLY)
                     if (unit) ps2_vu1_code_version++;
 #endif
+                    if (!unit) ps2_vu0_code_version++;  /* the native VU0 routines match again (vu0_interp.c) */
                 }
         } else if ((cmd & 0x60) == 0x60)
             unpack_run(v, words + i, take);
