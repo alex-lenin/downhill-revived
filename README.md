@@ -28,9 +28,10 @@ What works today:
 - **Native renderer** on Direct3D 12 or Vulkan, written in Rust on [wgpu](https://wgpu.rs). The
   original PS2 graphics hardware is reproduced on the GPU. An exact emulation path stays in the
   code as the reference it is tested against.
-- **60 fps with even frame pacing.** The game runs at its original 59.94 Hz, and each picture is
-  shown on a fixed 59.94 Hz grid, so frames don't come out long-short-long. Pad input is read as
-  late as possible before each frame.
+- **60 fps or more, with even frame pacing.** The game runs at its original 59.94 Hz, and each
+  picture is shown on a fixed grid, so frames don't come out long-short-long. PC SETTINGS > Frame
+  Rate also offers 120, 144, 165 or 240 fps, or the monitor's rate; online races stay at 60. Pad
+  input is read as late as possible before each frame.
 - **Higher resolution and widescreen.** Internal resolution 1x to 8x (or matched to the window).
   Widescreen at the monitor's shape (16:9, 21:9 or any other) is Hor+: a wider view with the same
   vertical framing, and the HUD, menus and 2D screens keep their shape. Windowed, borderless and
@@ -47,6 +48,8 @@ What works today:
   work unchanged with the native renderer (see [Texture packs](#texture-packs)).
 - **Automatic updates**: at start the game looks for a newer release and offers to install it;
   your settings and saves are never touched.
+- **The mouse in the menus**: hovering selects, a left click is X, a right click goes back and
+  the wheel scrolls a list or changes a value.
 - **EXIT GAME** in the main menu.
 - **Online races** for 2 to 4 players (experimental): an ONLINE entry in the main menu, a list of
   public races, private races joined with a 6-character code, and a race room where the host
@@ -67,7 +70,9 @@ Known gaps:
 - The 2-4 player split screens have not been checked in widescreen.
 - Online races have been tested with two games and two scripted players, not yet with four
   people on four PCs.
-- The browser build (built from source, `port/web`) is experimental and not yet at full speed.
+- The browser version (experimental) at <https://downhill-revived.pages.dev/play/> needs Chrome or
+  Edge 137 or later and a fast PC; online races are off there. It reads your `.iso` in place in
+  the browser and uploads nothing. Its source is `port/web`.
 - The game has only been tested on a few PCs. Please report problems.
 
 ## Playing
