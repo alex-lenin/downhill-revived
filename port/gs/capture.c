@@ -108,6 +108,8 @@ void gs_capture_request(const char *name)
     snprintf((char *)requested, sizeof requested, "%s", name);
 }
 
+void host_service_gs_capture_request(uint32_t name) { gs_capture_request(GUEST(name)); }
+
 void gs_capture_vsync(Gs *g)
 {
     static int initialized;

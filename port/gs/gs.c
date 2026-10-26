@@ -471,6 +471,7 @@ static void gif_qword(Gs *g, unsigned path, GsPath *p)
 void gs_feed(Gs *g, unsigned path, const uint32_t *words, size_t count)
 {
     if (path < 1 || path > 3) return;
+    if (g->record_packet) g->record_packet(g, path, words, count);
     g->source_path = path;
     GsPath *p = &g->path[path - 1];
     /* Keep the word-at-a-time semantics if input aliases the path state. */
@@ -500,4 +501,48 @@ int gs_xgkick(Gs *g, const uint32_t *memory, unsigned qword)
         if (!p->left && p->eop) return 0;
     }
     return -1;  /* malformed packet: don't let a missing EOP hang the host */
+}
+
+/* The GS instance and all its native callbacks belong to the host. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+unsigned host_service_gs_bits_per_pixel(unsigned a0) { return gs_bits_per_pixel(a0); }
+int host_service_gs_reads_pending(void) { return gs_reads_pending(&gs); }
+void host_service_gs_settle_reads(void) { gs_settle_reads(&gs); }
+void host_service_gs_reset(void) { gs_reset(&gs); }
+void host_service_gs_vblank(void) { gs_vblank(&gs); }
+uint64_t host_service_gs_priv_read(unsigned a0) { return gs_priv_read(&gs, a0); }
+void host_service_gs_priv_write(unsigned a0, uint64_t a1) { gs_priv_write(&gs, a0, a1); }
+uint32_t host_service_gs_read_image(uint32_t a0, uint32_t a1) { return gs_read_image(&gs, GUEST(a0), a1); }
+uint32_t host_service_gs_defer_read_image(uint32_t a0, uint32_t a1) { return gs_defer_read_image(&gs, GUEST(a0), a1); }
+uint64_t host_service_gs_register(unsigned reg) { return reg < 128 ? gs.reg[reg] : 0; }
+
+/* Trace packets are copied while their producer owns the bytes. The module
+   consumes them after graphics_wait, never from a VU/GS OS thread. */
+typedef struct TracePacket { struct TracePacket *next; uint32_t path, count; uint32_t words[]; } TracePacket;
+static TracePacket *trace_first, *trace_last;
+static void trace_record(Gs *g, unsigned path, const uint32_t *words, size_t count) {
+    (void)g;
+    if (count>UINT32_MAX/4) abort();
+    TracePacket *p=malloc(sizeof *p+count*4);
+    if (!p) abort();
+    p->next=NULL; p->path=path; p->count=(uint32_t)count;
+    memcpy(p->words,words,count*4);
+    if (trace_last) trace_last->next=p; else trace_first=p;
+    trace_last=p;
+}
+void host_service_gs_trace_begin(void) { gs.record_packet=trace_record; }
+uint32_t host_service_gs_trace_size(void) { return trace_first ? trace_first->count*4+8 : 0; }
+void host_service_gs_trace_pop(uint32_t address) {
+    TracePacket *p=trace_first;
+    if (!p) abort();
+    uint32_t *out=GUEST(address); out[0]=p->path; out[1]=p->count;
+    memcpy(out+2,p->words,p->count*4);
+    trace_first=p->next; if (!trace_first) trace_last=NULL;
+    free(p);
+}
+void host_service_gs_snapshot(uint32_t address, uint32_t bytes) {
+    /* The prefix before native callbacks contains only fixed-width PS2 state. */
+    if (bytes!=offsetof(Gs,sync)) abort();
+    memcpy(GUEST(address),&gs,bytes);
 }

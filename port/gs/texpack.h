@@ -2,13 +2,15 @@
 #ifndef PORT_GS_TEXPACK_H
 #define PORT_GS_TEXPACK_H
 #include "gs.h"
-#include <d3d11.h>
+#include "replace_texture.h"
 
 typedef struct TexPackEntry TexPackEntry;
 
 /* Reads DHD_TEXTURES and DHD_TEXTURE_PACK (dhd.ini "textures", "texture_pack"), indexes the
-   pack's file names and starts the loaders. 0: no pack, nothing else here may be called. */
-int texpack_open(ID3D11Device *device);
+   pack's file names and starts the loaders, which make their textures with device. The default
+   memory budget is half of the graphics card's dedicated memory, video_memory bytes (0, unknown:
+   1 GB). 0: no pack, nothing else here may be called. */
+int texpack_open(const ReplaceDevice *device, uint64_t video_memory);
 
 /* Whether a pack folder is named or beside dhd.exe (whatever DHD_TEXTURES says). */
 int texpack_available(void);
@@ -18,9 +20,9 @@ int texpack_available(void);
    (GS worker thread). */
 TexPackEntry *texpack_find(const Gs *g, unsigned ctxt);
 
-/* The replacement's view, if it is loaded; else NULL and its loading starts (once). The view
-   stays valid for at least 8 fields after the last call that returned it. */
-ID3D11ShaderResourceView *texpack_view(TexPackEntry *e, uint64_t field);
+/* The replacement (the ReplaceDevice's view), if it is loaded; else NULL and its loading starts
+   (once). It stays valid for at least 8 fields after the last call that returned it. */
+void *texpack_view(TexPackEntry *e, uint64_t field);
 
 /* Once a field (GS worker): replacements over the memory budget that no recent field drew are
    released. */

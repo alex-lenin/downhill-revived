@@ -9,19 +9,19 @@
    - the edges are then cut again, as a signed distance field's are when it is drawn: the
      coverage (alpha) and the fill (the position between the outline and the fill colour) each
      pass a narrow smoothstep around their middle, about one texel of the large texture wide.
-   The renderer draws it in place of the original with mipmaps (raster.hlsl flag 2048, as a
-   texture pack's replacement; a pack that has the font wins). Nothing is written to disk.
-   dhd.ini font = original keeps the game's texture. */
+   The renderer draws it in place of the original with mipmaps (as a texture pack's replacement;
+   a pack that has the font wins). Nothing is written to disk. dhd.ini font = original keeps the
+   game's texture. The renderer makes the texture (replace_texture.h). */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <d3d11.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "font_sharp.h"
 #include "memory.h"
+#include "../include/guest.h"
 
 #define SHARP_SCALE 8        /* magnification of the font texture */
 #define SHARP_MAX_SIDE 1024  /* largest side made: the 512x512 menu font, 32x32 cells, is doubled */
@@ -49,15 +49,16 @@ int font_sharp_match(uint64_t tex0)
        it is drawn. */
     const uint64_t mask = 0x3FFFFFFFFull | (0x7FFFFull << 37);
     for (unsigned i = 0; i < 4; i++) {
-        uint32_t command = *(volatile uint32_t *)PS2_PTR(TEXT_TEX0_COMMANDS + 4 * i);
+        uint32_t command = *(volatile uint32_t *)GUEST(PS2_RAM_BASE + ((TEXT_TEX0_COMMANDS + 4 * i) & 0x01FFFFFFu));
         if (!command) continue;
-        uint64_t font = *(volatile uint64_t *)PS2_PTR(command);
+        uint64_t font = *(volatile uint64_t *)GUEST(PS2_RAM_BASE + (command & 0x01FFFFFFu));
         if (((font ^ tex0) & mask) == 0) return 1;
     }
     return 0;
 }
 
-static struct { uint64_t key; ID3D11ShaderResourceView *view; unsigned long used; } cache[SHARP_CACHE];
+static struct { uint64_t key; void *view; unsigned long used; } cache[SHARP_CACHE];
+static void (*cache_release)(void *view);  /* the device the cached views came from */
 static unsigned long cache_clock;
 static SRWLOCK cache_lock = SRWLOCK_INIT;
 
@@ -165,7 +166,7 @@ static void halve(const uint8_t *src, unsigned w, unsigned h, uint8_t *dst)
             }
 }
 
-static ID3D11ShaderResourceView *make(ID3D11Device *device, const uint32_t *pixels, unsigned w, unsigned h)
+static void *make(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h)
 {
     unsigned f = SHARP_SCALE;
     while (f > 1 && (w * f > SHARP_MAX_SIDE || h * f > SHARP_MAX_SIDE)) f /= 2;
@@ -195,50 +196,38 @@ static ID3D11ShaderResourceView *make(ID3D11Device *device, const uint32_t *pixe
     if (!big) { free(src); return NULL; }
     sharpen(src, w, h, f, solid, big);
     free(src);
-    D3D11_SUBRESOURCE_DATA data[16];
     uint8_t *level = big;
     unsigned lw = W, lh = H;
-    for (unsigned i = 0; i < levels; i++) {
-        data[i].pSysMem = level; data[i].SysMemPitch = lw * 4; data[i].SysMemSlicePitch = 0;
-        if (i + 1 < levels) {
-            uint8_t *next = level + (size_t)lw * lh * 4;
-            halve(level, lw, lh, next);
-            level = next;
-            lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
-        }
+    for (unsigned i = 0; i + 1 < levels; i++) {
+        uint8_t *next = level + (size_t)lw * lh * 4;
+        halve(level, lw, lh, next);
+        level = next;
+        lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
     }
-    D3D11_TEXTURE2D_DESC d = {0};
-    d.Width = W; d.Height = H; d.MipLevels = levels; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    ID3D11Texture2D *texture = NULL;
-    ID3D11ShaderResourceView *view = NULL;
-    if (SUCCEEDED(ID3D11Device_CreateTexture2D(device, &d, data, &texture))) {
-        if (FAILED(ID3D11Device_CreateShaderResourceView(device, (ID3D11Resource *)texture, NULL, &view))) view = NULL;
-        ID3D11Texture2D_Release(texture);  /* the view holds it */
-    }
+    void *view = device->create(device->context, big, W, H, levels);
     free(big);
     return view;
 }
 
-ID3D11ShaderResourceView *font_sharp_view(ID3D11Device *device, const uint32_t *pixels, unsigned w, unsigned h,
-                                          uint64_t key)
+void *font_sharp_view(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h, uint64_t key)
 {
-    ID3D11ShaderResourceView *view = NULL;
+    void *view = NULL;
     AcquireSRWLockExclusive(&cache_lock);
     unsigned oldest = 0;
     for (unsigned i = 0; i < SHARP_CACHE; i++) {
         if (cache[i].view && cache[i].key == key) {
             cache[i].used = ++cache_clock;
             view = cache[i].view;
-            ID3D11ShaderResourceView_AddRef(view);
+            device->retain(view);
             break;
         }
         if (!cache[i].view || (cache[oldest].view && cache[i].used < cache[oldest].used)) oldest = i;
     }
     if (!view && (view = make(device, pixels, w, h))) {
-        if (cache[oldest].view) ID3D11ShaderResourceView_Release(cache[oldest].view);
+        if (cache[oldest].view) cache_release(cache[oldest].view);
         cache[oldest].key = key; cache[oldest].view = view; cache[oldest].used = ++cache_clock;
-        ID3D11ShaderResourceView_AddRef(view);
+        cache_release = device->release;
+        device->retain(view);
     }
     ReleaseSRWLockExclusive(&cache_lock);
     return view;

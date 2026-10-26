@@ -78,3 +78,6 @@ docs/private/
 .claude/
 .vscode/
 .idea/
+
+# Rust build output (cargo)
+port/render/**/target/

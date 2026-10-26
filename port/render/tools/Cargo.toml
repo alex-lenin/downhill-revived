@@ -1,0 +1,33 @@
+# The Rust GS renderer's replay tools (plan section 1.1).
+#
+# optrace_replay (R1a) replays a .optrace (OPTRACE.md) through dhd_render's exact ops and compares
+# every READ page; native_replay (R1b) replays a .ntrace (NTRACE.md) through its native renderer and
+# compares every picture. Both are x64 Windows tools: run them through
+#     python port/tools/rustgs.py run --target x86_64-pc-windows-msvc --bin <name> -- <args>
+# Each binary defines dhd_host_log (the C host's log line), as gpu_rust.c does for the game.
+[package]
+name = "dhd_render_tools"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+publish = false
+autobins = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "optrace_replay"
+path = "src/bin/optrace_replay.rs"
+
+[[bin]]
+name = "native_replay"
+path = "src/bin/native_replay.rs"
+
+[features]
+default = ["native"]
+native = ["dhd_render/native"]
+
+[dependencies]
+dhd_render = { path = "..", default-features = false }

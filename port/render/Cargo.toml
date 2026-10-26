@@ -1,0 +1,69 @@
+# The Rust GS renderer (plan section 1.1).
+#
+# Pins: wgpu-core, wgpu-hal, wgpu-types, naga and wgpu-naga-bridge are exactly the versions in
+# wgpu-native v29.0.1.1's Cargo.lock (the C path's renderer), so both paths run the same shader
+# translation and the same HAL. windows / windows-link likewise. wgpu (the safe front end, not used
+# by wgpu-native) is the 29.0 release of the same family. Every build runs --locked --offline.
+[workspace]
+members = [".", "tools"]
+resolver = "2"
+
+[package]
+name = "dhd_render"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+description = "The GS renderer of the PC port on wgpu (native: DX12/Vulkan; browser: WebGPU)"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+# crate type per build: cargo rustc --crate-type staticlib (native) | cdylib (wasm)
+
+[features]
+default = []
+native = ["wgpu/std", "wgpu/parking_lot", "wgpu/dx12", "wgpu/vulkan", "wgpu/wgsl", "dep:pollster"]
+web = ["wgpu/std", "wgpu/webgpu", "wgpu/wgsl", "wgpu/fragile-send-sync-non-atomic-wasm",
+       "dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures"]
+test-hooks = []
+no-fp-guard = []   # negative control only; rustgs refuses it outside its selftest
+
+[dependencies]
+wgpu = { version = "=29.0.3", default-features = false }
+wgpu-types = { version = "=29.0.3", default-features = false }
+raw-window-handle = { version = "=0.6.2", default-features = false }
+log = "=0.4.33"
+
+# The wgpu-native family, native only: the browser build must contain no wgpu-core, hal or naga.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu-core = { version = "=29.0.3", default-features = false }
+wgpu-hal = { version = "=29.0.3", default-features = false }
+naga = { version = "=29.0.3", default-features = false }
+wgpu-naga-bridge = { version = "=29.0.3", default-features = false }
+pollster = { version = "=1.0.1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", default-features = false }
+windows-link = { version = "=0.2.1", default-features = false }
+wgpu-core-deps-windows-linux-android = { version = "=29.0.3", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "=0.2.129", optional = true }
+js-sys = { version = "=0.3.106", optional = true }
+web-sys = { version = "=0.3.106", optional = true }
+wasm-bindgen-futures = { version = "=0.4.79", optional = true }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+debug = 0
+lto = "thin"
+opt-level = 3
+
+# Fix loops: GPU output does not depend on Rust LTO; every gate re-runs on release.
+[profile.fixloop]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

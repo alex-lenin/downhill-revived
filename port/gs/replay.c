@@ -1,6 +1,6 @@
 /* Diagnostic replay of our legacy GS captures, without running the EE/VU. */
-#define COBJMACROS
-#include "gpu_win32.h"
+#include <windows.h>
+#include "gpu.h"
 #include "present.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,10 +52,31 @@ static void freeze(void)
     for (unsigned c = 0; c < 2; c++) gs_write(&gs, GS_TEX0_1 + c, gs.reg[GS_TEX0_1 + c]);
 }
 
+/* DHD_GS_REPLAY_VRAM=1: each field's whole VRAM as a 64-bit FNV-1a hash in prefix-vram.txt, and
+   the last field's VRAM in prefix-vram.bin, to compare with the goldens (gs_golden.py compare replay). */
+static FILE *vram_log;
+static int no_pictures; /* DHD_GS_REPLAY_TIME: scan out each field but read nothing back */
+static void vram_hash(unsigned field)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    const uint8_t *p = (const uint8_t *)gs.vram;
+    if (!vram_log) return;
+    gs.sync(&gs);
+    for (size_t i = 0; i < GS_VRAM_SIZE; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    fprintf(vram_log, "%u %016llX\n", field, (unsigned long long)h);
+}
+
+/* DHD_RENDER=native: each field goes to the native renderer (gs_native_vsync) and its picture,
+   upscaled with DHD_SCALE, is read back (gs_native_picture), as present.c does for screenshots. */
 static void image(const char *prefix, unsigned field)
 {
-    static uint32_t pixels[1024 * 1024]; unsigned w, h;
-    if (!gs_gpu_display(&gs, &w, &h) || !gs_gpu_capture(&gs, pixels)) return;
+    static uint32_t storage[1024 * 1024]; unsigned w, h;
+    uint32_t *pixels = storage;
+    vram_hash(field);
+    if (gs_gpu_native(&gs)) {
+        gs_native_vsync(&gs, &w, &h, 0);
+        if (!(pixels = gs_native_picture(&gs, &w, &h))) return;
+    } else if (!gs_gpu_display(&gs, &w, &h) || no_pictures || !gs_gpu_capture(&gs, pixels)) return;
     char name[1024]; snprintf(name, sizeof name, "%s-%03u.ppm", prefix, field);
     FILE *f = fopen(name, "wb"); if (!f) { perror(name); exit(1); }
     fprintf(f, "P6\n%u %u\n255\n", w,h);
@@ -71,9 +92,17 @@ int main(int argc, char **argv)
     if (argc != 3) { fprintf(stderr, "Usage: replay.exe capture.gs output-prefix\n"); return 1; }
     input = fopen(argv[1], "rb"); if (!input) { perror(argv[1]); return 1; }
     gs_reset(&gs); freeze();
-    ID3D11Device *device; ID3D11DeviceContext *context; D3D_FEATURE_LEVEL level;
-    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
-        D3D11_SDK_VERSION, &device, &level, &context)) || !gs_gpu_init(&gs, device, context)) return 1;
+    if (!gs_gpu_init(&gs)) return 1;  /* the GPU (DXGI's first adapter, gpu_rust.c) */
+    char vram_name[1024];
+    if (getenv("DHD_GS_REPLAY_VRAM")) {
+        snprintf(vram_name, sizeof vram_name, "%s-vram.txt", argv[2]);
+        if (!(vram_log = fopen(vram_name, "w"))) { perror(vram_name); return 1; }
+    }
+    /* DHD_GS_REPLAY_TIME=1: time the replay from the first record until the GPU has finished
+       (a whole-VRAM sync), without reading pictures back. */
+    no_pictures = getenv("DHD_GS_REPLAY_TIME") != NULL;
+    LARGE_INTEGER started, ended, frequency;
+    QueryPerformanceCounter(&started);
     unsigned fields = 0; int type;
     while ((type = fgetc(input)) != EOF) {
         if (type == 0) {
@@ -91,7 +120,21 @@ int main(int argc, char **argv)
         } else if (type == 3) registers();
         else { fprintf(stderr, "Unknown GS record %d\n", type); return 1; }
     }
-    fclose(input); gs_gpu_destroy(&gs);
-    ID3D11DeviceContext_Release(context); ID3D11Device_Release(device);
-    printf("Replayed %u fields\n", fields); return 0;
+    fclose(input);
+    if (no_pictures) {
+        gs.sync(&gs);
+        QueryPerformanceCounter(&ended); QueryPerformanceFrequency(&frequency);
+        printf("Replay time %.2f ms\n", (ended.QuadPart - started.QuadPart) * 1000.0 / frequency.QuadPart);
+    }
+    const char *backend = gs_gpu_backend_name(&gs);
+    if (vram_log) {
+        gs.sync(&gs);
+        fclose(vram_log);
+        snprintf(vram_name, sizeof vram_name, "%s-vram.bin", argv[2]);
+        FILE *f = fopen(vram_name, "wb");
+        if (!f || fwrite(gs.vram, 1, GS_VRAM_SIZE, f) != GS_VRAM_SIZE) { perror(vram_name); return 1; }
+        fclose(f);
+    }
+    gs_gpu_destroy(&gs);
+    printf("Replayed %u fields (%s)\n", fields, backend); return 0;
 }

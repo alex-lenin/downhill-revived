@@ -11,3 +11,4 @@
 *.yaml text eol=lf
 *.txt text eol=lf
 *.json text eol=lf
+*.wgsl text eol=lf

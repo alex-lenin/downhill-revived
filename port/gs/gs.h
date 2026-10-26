@@ -57,6 +57,8 @@ struct Gs {
     void (*sync_range)(Gs *gs, unsigned byte_address, unsigned bytes);
     void (*draw)(Gs *gs, unsigned prim, const GsVertex *vertices, unsigned count);
     void (*record_transfer)(unsigned path, const uint32_t *qword);
+    /* Called by gs_feed for every packet, before it is parsed (the state trace, hle/state_trace.c). */
+    void (*record_packet)(Gs *g, unsigned path, const uint32_t *words, size_t count);
     /* Diagnostic provenance only; never serialized as PS2 state. */
     unsigned source_path, vu_entry, vu_top, vu_itop, vu_pc, vu_clip, vu_qword;
     unsigned vu_overlay; /* 1: particle/effect A; 2: mesh/screen B; 0: unknown */

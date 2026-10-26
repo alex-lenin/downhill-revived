@@ -1,0 +1,5 @@
+# The Rust GS renderer's cargo settings. NO rustflags here: every flag comes
+# from port/tools/rustgs.py through CARGO_ENCODED_RUSTFLAGS (the contract is in
+# port/tools/rustgs_selftest.py's docstring). A local .cargo/config.toml at the repository's root may add sccache.
+[net]
+offline = true

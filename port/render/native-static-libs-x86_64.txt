@@ -1,0 +1,4 @@
+# rustc --print native-static-libs for the x86_64-pc-windows-msvc static library (spike S1, rustc 1.97.1,
+# wgpu 29.0.3 with dx12+vulkan+wgsl, +crt-static). The allow-list for rustgs.py / check_rust_lib.py (A1a).
+# d3d12, dxgi, dxcore etc. are raw-dylib imports (windows-link) or loaded at run time, so they are not listed.
+kernel32.lib ntdll.lib userenv.lib ws2_32.lib dbghelp.lib /defaultlib:libcmt

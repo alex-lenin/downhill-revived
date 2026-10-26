@@ -1,4 +1,3 @@
-#define COBJMACROS
 #include "gpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +5,8 @@
 
 static unsigned failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL GPU line %d: %s\n", __LINE__, #c); failures++; } } while (0)
+int test_gpu_init(Gs *g);  /* test_gpu_stubs.c */
+int test_gpu_hardware(void);
 
 static void vertex(unsigned x, unsigned y, unsigned z)
 {
@@ -19,6 +20,25 @@ static void sprite(unsigned prim, uint32_t color, unsigned x, unsigned y, unsign
     gs.sync(&gs);
 }
 static uint32_t at(unsigned x, unsigned y) { return gs_read_pixel(&gs, 0, 0, 1, x, y); }
+
+/* DHD_GS_VRAM_LOG=file (test builds): the renderer's raw VRAM after each section, compared word for
+   word with the goldens (port/tools/test_gs_wgpu.py, gs_golden.py compare test-gpu). */
+static void checkpoint(const char *name)
+{
+#ifdef DHD_GS_TEST_BUILD
+    static uint32_t image[GS_VRAM_SIZE / 4];
+    const char *path = getenv("DHD_GS_VRAM_LOG");
+    FILE *f = path ? fopen(path, "ab") : NULL;
+    if (!f) return;
+    char label[32] = {0};
+    strncpy(label, name, sizeof label - 1);
+    CHECK(gs_gpu_readback_all(&gs, image));
+    fwrite(label, 1, sizeof label, f); fwrite(image, 1, sizeof image, f);
+    fclose(f);
+#else
+    (void)name;
+#endif
+}
 
 static void mip_sample(uint64_t tex1, float q, unsigned x)
 {
@@ -157,13 +177,13 @@ static void fog_blend(void)
     CHECK(at(63,7) == 0x80A05028); /* Equal colors remain equal for every F. */
 }
 
-static void batch_ordering(ID3D11Device *device, ID3D11DeviceContext *context)
+static void batch_ordering(void)
 {
     static uint32_t reference[GS_VRAM_SIZE / 4];
     for (unsigned pass = 0; pass < 2; pass++) {
         gs_gpu_destroy(&gs); gs_reset(&gs);
         _putenv_s("DHD_GS_BATCH", pass ? "256" : "1");
-        CHECK(gs_gpu_init(&gs, device, context));
+        CHECK(test_gpu_init(&gs));
         gs_write(&gs, GS_FRAME_1, 2u << 16);
         gs_write(&gs, GS_ZBUF_1, 16);
         gs_write(&gs, GS_SCISSOR_1, UINT64_C(127) << 16 | UINT64_C(127) << 48);
@@ -195,6 +215,7 @@ static void batch_ordering(ID3D11Device *device, ID3D11DeviceContext *context)
         }
         gs.sync(&gs);
         CHECK(gs_read_pixel(&gs, 0, 15000, 2, 0,0) == 0x80765432);
+        checkpoint(pass ? "batch 256" : "batch 1");
         if (!pass) memcpy(reference, gs.vram, sizeof reference);
         else CHECK(memcmp(reference, gs.vram, sizeof reference) == 0);
     }
@@ -225,6 +246,7 @@ static void scanout(void)
             }
             CHECK(gs_gpu_display(&gs, &w, &h) && w == 80 && h == 66);
             CHECK(gs_gpu_capture(&gs, pixels));
+            checkpoint("scanout");
             for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) {
                 uint32_t v = gs_read_pixel(&gs, psm, 511 * 32, stride, (2040+x)&2047, (2040+(y>>(field!=0)))&2047);
                 uint32_t expected = gs_color(v, psm, UINT64_C(0x80) << 32) | 0xFF000000;
@@ -267,6 +289,7 @@ static void local_copies(void)
             gs_write(&gs, GS_TRXREG, copies[n].w | (uint64_t)copies[n].h << 32);
             gs_write(&gs, GS_TRXDIR, 2);
             gs.sync(&gs);
+            if (!pass) checkpoint("local copy");
             if (!pass) memcpy(expected, gs.vram, sizeof expected);
             else if (memcmp(expected, gs.vram, sizeof expected)) { printf("FAIL local copy %u\n", n); failures++; }
         }
@@ -319,13 +342,9 @@ static void deferred_reads(void)
 
 int main(void)
 {
-    ID3D11Device *device = NULL;
-    ID3D11DeviceContext *context = NULL;
-    D3D_FEATURE_LEVEL level;
-    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &level, &context);
-    if (FAILED(hr)) { printf("FAIL D3D11 WARP %08lX\n", hr); return 1; }
+    /* WARP; DHD_GS_TEST_HARDWARE=1: the GPU (test_gpu_init). */
     gs_reset(&gs);
-    if (!gs_gpu_init(&gs, device, context)) return 1;
+    if (!test_gpu_init(&gs)) { printf("FAIL the renderer did not start\n"); return 1; }
     gs_write(&gs, GS_FRAME_1, 1u << 16);
     gs_write(&gs, GS_SCISSOR_1, UINT64_C(63) << 16 | UINT64_C(63) << 48);
     gs_write(&gs, GS_COLCLAMP, 1);
@@ -472,15 +491,20 @@ int main(void)
         sprite(16 | 256, 0x80808080, 0,0,1,1,1);
         CHECK(gs_read_pixel(&gs, 0, 0, 10, 0,0) == (0x80554400 | mode));
     }
+    checkpoint("basics");
     mipmapping();
+    checkpoint("mipmapping");
     depth_precision();
+    checkpoint("depth precision");
     fog_blend();
-    batch_ordering(device, context);
+    checkpoint("fog blend");
+    batch_ordering();
     scanout();
     local_copies();
     deferred_reads();
+    checkpoint("deferred reads");
+    const char *backend = gs_gpu_backend_name(&gs);
     gs_gpu_destroy(&gs);
-    ID3D11DeviceContext_Release(context); ID3D11Device_Release(device);
-    printf("D3D11 WARP raster tests: %u failures\n", failures);
+    printf("%s %s raster tests: %u failures\n", backend, test_gpu_hardware() ? "hardware" : "WARP", failures);
     return failures != 0;
 }
