@@ -119,6 +119,13 @@ void web_gpu_reattach(void)
 
 uint64_t web_gs_mmio(unsigned addr);  /* host_graphics.c */
 
+/* The page changed a variable the native renderer follows while the game runs (PC SETTINGS >
+   Resolution, Scaling: DHD_SCALE, DHD_PRESENT_FILTER, DHD_ASPECT; worker.js, or graphics.js in the
+   threaded build, calls this between the reactor's calls). The next web_display reads the
+   environment again and applies them. */
+static int env_changed;
+__attribute__((export_name("web_env_changed"))) void web_env_changed(void) { env_changed = 1; }
+
 /* The scanout into the display texture, submitted. Returns
    width << 16 | height, or 0 when nothing is displayed. */
 __attribute__((export_name("web_display"))) uint32_t web_display(void)
@@ -130,11 +137,16 @@ __attribute__((export_name("web_display"))) uint32_t web_display(void)
     for (unsigned addr = 0; addr <= 0xE0; addr += 16)
         gs_priv_write(g, addr, web_gs_mmio(addr));
     if (!web) return 0;
+    int changed = env_changed;
+    env_changed = 0;
     if (web->native) {
+        /* the present options before this picture, a new scale after it (native_rescale) */
+        if (changed) { __wasilibc_deinitialize_environ(); web_native_present_options(g); }
         /* the field is drawn now (NATIVE_INLINE) and shown by the web_present that follows */
         width = 640; height = 448;
         web_native_movie(g, NULL, 0, 0);
         web_native_vsync(g, &width, &height, 0);
+        if (changed) native_rescale(web->native);
         return web->native->present_pending ? width << 16 | height : 0;
     }
     if (!exact_display(g, &width, &height)) return 0;

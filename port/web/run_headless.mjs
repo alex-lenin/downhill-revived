@@ -1,8 +1,8 @@
 // Direct wasm/JSPI proof runner. No browser, wasm2c, display or audio device.
 // A threaded build (port/web/build.py --threads: the core defines a shared memory) runs as the
-// browser runs it: the GS reactor in a worker thread (headless_graphics.mjs) fed through the queue
-// of port/web/web_queue.h, the core's graphics imports linked to gqueue.wasm (--queue, by default
-// next to --graphics).
+// browser runs it: VIF1/VU1 (vu.wasm, --vu) and the GS reactor in two worker threads
+// (headless_graphics.mjs) fed through the queues of port/web/web_queue.h, the core's graphics
+// imports linked to gqueue.wasm (--queue; both by default next to --graphics).
 import fs from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import path from 'node:path';
@@ -25,6 +25,13 @@ const traceOff=args.includes('--trace-off'),timing=args.includes('--profile-impo
 // profile of the same window in build/web/node.cpuprofile.
 const from=Number(option('--from','0')),cpuProfile=args.includes('--cpu-profile');
 let fromAt=null,session=null;
+// --game-speed: every 2 s of wall time in a race, its race clock (60 per game second) against wall
+// time: about 60 when the game runs at its own speed, lower in slow motion.
+let gameSpeed=null;
+if(args.includes('--game-speed')){let at=0,tick=0,updates=0;gameSpeed=()=>{if(bytes.buffer!==memory.buffer)refresh();const now=performance.now(),
+  playing=dv.getInt32(0x0829DED8,true)===9&&dv.getInt32(0x0843F348,true)>=2&&dv.getInt32(0x0843F348,true)<=4,t=dv.getInt32(0x0843EEC8,true);
+  updates++;if(!playing){at=0;return;}if(!at){at=now;tick=t;updates=0;return;}
+  if(now-at>=2000){console.error(`game speed: ${((t-tick)*1000/(now-at)).toFixed(1)} race ticks/s, ${(updates*1000/(now-at)).toFixed(1)} updates/s`);at=now;tick=t;updates=0;}};}
 fs.mkdirSync(path.dirname(prefix),{recursive:true});
 const env={DHD_ISO:option('--iso',process.env.DHD_ISO||''),
   DHD_HEADLESS:'1',DHD_FRAME_CLOCK:'1',DHD_SKIP_MOVIES:'1',DHD_MEMCARD:'0',DHD_SND_OFF:'1',
@@ -37,7 +44,7 @@ for(let i=0;i<args.length;i++) if(args[i]==='--env') {
 }
 if(traceOff)delete env.DHD_STATE_TRACE;
 if(typeof WebAssembly.Suspending!=='function')throw Error('Node JSPI required; try --experimental-wasm-jspi');
-let core,graphics,queue,gfx,memory,bytes,dv,arena=0x07000000,current=65,csr=0x1f80,field=0;
+let core,graphics,queue,gfx,vuThread,memory,bytes,dv,arena=0x07000000,current=65,csr=0x1f80,field=0;
 const strings=new Map(),files=new Map(),counts={},importMs={};let nextFile=1,switches=0,sameSwitches=0;
 const fibers=new Map(),start=performance.now();
 function refresh(){bytes=new Uint8Array(memory.buffer);dv=new DataView(memory.buffer);}
@@ -74,9 +81,11 @@ const impl={
   host_error_box:(a,b)=>{throw Error(`${str(a)}: ${str(b)}`);},
   host_exe_path:(a,n)=>{const b=Buffer.from(path.join(root,'build/web/dhd.js')+'\0');span(a,n).set(b.subarray(0,n));return Math.min(n-1,b.length-1);},
   host_display_hz:()=>60,host_monitor_aspect:()=>16/9,
-  host_wall_seconds:()=>field/60,host_cycles:()=>0n,
+  // --env DHD_FPS_WALL=1: real time, as www/worker.js (the high-rate step follows it); else the
+  // deterministic virtual clock.
+  host_wall_seconds:env.DHD_FPS_WALL==='1'?()=>performance.now()/1000:()=>field/60,host_cycles:()=>0n,
   host_fp_csr:getCsr,host_fp_set_csr:setCsr,host_fp_mode:x=>{setCsr(x?0xffc0:0x1f80);},
-  host_frame_context:(f)=>{field=Number(f);if(fromAt===null&&field>=from){fromAt=performance.now();if(cpuProfile){session=new (await_inspector()).Session();session.connect();session.post('Profiler.enable');session.post('Profiler.setSamplingInterval',{interval:500});session.post('Profiler.start');}}if(queue)queue.web_q_frame(f);else graphics.web_frame(f);if(field%100===0)console.error(`web field ${field}`);if(traceOff&&field>=fields)throw new Exit(0);},
+  host_frame_context:(f)=>{field=Number(f);if(gameSpeed)gameSpeed();if(fromAt===null&&field>=from){fromAt=performance.now();if(cpuProfile){session=new (await_inspector()).Session();session.connect();session.post('Profiler.enable');session.post('Profiler.setSamplingInterval',{interval:500});session.post('Profiler.start');}}if(queue)queue.web_q_frame(f);else graphics.web_frame(f);if(field%100===0)console.error(`web field ${field}`);if(traceOff&&field>=fields)throw new Exit(0);},
   host_fiber_main:()=>{if(!fibers.has(65))fibers.set(65,{sp:core.__stack_pointer.value,csr:getCsr(),started:true});return 65;},
   host_fiber_current:()=>current,
   host_callback_fiber:(fn,ctx)=>{if(!core.__indirect_function_table.get(fn))throw Error('null callback');
@@ -117,6 +126,7 @@ const impl={
   host_dir_open:()=>0,host_dir_next:()=>0,host_dir_close:()=>{},host_path_info:()=>0,
   host_service_host_disc_ready:()=>0,host_service_host_skip_movies:()=>1,
   host_service_host_pad_device:(_,a)=>{span(a,18).fill(0);span(a+2,4).fill(128);},
+  host_service_mouse_state:a=>{span(a,36).fill(0);},
   host_service_host_game_options_read:()=>0,host_service_host_setting_locked:()=>0,
   host_service_host_setting_save:()=>0,host_service_movie_update:()=>0,host_service_movie_playing:()=>0,
   host_service_host_poll_dump:()=>0,
@@ -136,10 +146,14 @@ for(const n of noops)impl[n]=()=>{};
 for(const n of ['host_service_net_racing','host_service_net_seconds','host_service_net_server_ms','host_heartbeat_eip','host_service_update_after_game'])impl[n]=()=>0;
 const metadata=JSON.parse(fs.readFileSync(option('--imports',path.join(root,'build/web/imports.json'))));
 const coreBytes=fs.readFileSync(modulePath),threaded=definesSharedMemory(coreBytes);
+// As www/worker.js: the threaded core skips the waits that only order queued graphics work
+// (port/hle/hle.h); --env DHD_GRAPHICS_ORDERED= keeps them.
+if(threaded&&!('DHD_GRAPHICS_ORDERED' in env))env.DHD_GRAPHICS_ORDERED='1';
 const mod=await WebAssembly.compile(coreBytes),imports={env:{}};
 const graphicsPath=option('--graphics',path.join(root,'build/web/graphics.wasm'));
 const gm=await WebAssembly.compile(fs.readFileSync(graphicsPath));
 const qm=threaded?await WebAssembly.compile(fs.readFileSync(option('--queue',path.join(path.dirname(graphicsPath),'gqueue.wasm')))):null;
+const vm=threaded?await WebAssembly.compile(fs.readFileSync(option('--vu',path.join(path.dirname(graphicsPath),'vu.wasm')))):null;
 // As in the browser: core imports the reactor exports as web_x_* are linked through call_indirect
 // thunks (no JS frame), the FP control word included; threaded, gqueue.wasm's.
 const gnames=new Set(WebAssembly.Module.exports(gm).map(e=>e.name));
@@ -169,11 +183,15 @@ let gfxError=null;
 if(threaded){
   queue=(await WebAssembly.instantiate(qm,{env:{memory}})).exports;
   direct.forEach((n,i)=>table.set(i,queue['web_x_'+n]));
-  gfx=new Worker(new URL('./headless_graphics.mjs',import.meta.url),{workerData:{memory,module:gm,env,abi:queue.web_q_abi(),
-    preopens:{'/':path.parse(root).root}}});
-  await new Promise((resolve,reject)=>{gfx.on('message',m=>{if(m.type==='ready')resolve();
-    else if(m.type==='error'){gfxError=m.text;console.error('graphics thread:',m.text);reject(Error(m.text));fail(Error(m.text));}});
-    gfx.on('error',e=>{gfxError=String(e?.stack||e);reject(e);fail(e);});});
+  // the GS thread first: the VU thread's web_vq_init needs its queue
+  const thread=(role,module)=>{const t=new Worker(new URL('./headless_graphics.mjs',import.meta.url),{workerData:{memory,module,env,abi:queue.web_q_abi(),
+    preopens:{'/':path.parse(root).root},role}});
+    return [t,new Promise((resolve,reject)=>{t.on('message',m=>{if(m.type==='ready')resolve();
+      else if(m.type==='error'){gfxError=m.text;console.error(role+' thread:',m.text);reject(Error(m.text));fail(Error(m.text));}});
+      t.on('error',e=>{gfxError=String(e?.stack||e);reject(e);fail(e);});})];};
+  let ready;
+  [gfx,ready]=thread('gs',gm);await ready;
+  [vuThread,ready]=thread('vu',vm);await ready;
 }else{
 // The GS reactor has its own C globals, allocator, stack and function table,
 // but imports exactly the core's memory. It never runs concurrently with EE.
@@ -199,9 +217,10 @@ const window=fromAt===null?null:{from,fields:field-from,fields_per_second:(field
 if(session)await new Promise(r=>session.post('Profiler.stop',(e,res)=>{fs.writeFileSync(path.join(root,'build/web/node.cpuprofile'),JSON.stringify(res.profile));r();}));
 const rows=fs.existsSync(prefix+'.tsv')?fs.readFileSync(prefix+'.tsv','utf8').split('\n').filter(x=>/^\d/.test(x)).length:0;
 const completed=traceOff?field:rows;
-const vu=threaded?await new Promise(r=>{gfx.on('message',m=>{if(m.type==='report')r(m);});gfx.postMessage({type:'report'});setTimeout(()=>r({}),5000);})
+const vu=threaded?await new Promise(r=>{vuThread.on('message',m=>{if(m.type==='report')r(m);});vuThread.postMessage({type:'report'});setTimeout(()=>r({}),5000);})
   :{vu_native:graphics.web_vu_native?.(),vu_steps:graphics.web_vu_stat?.(0),vu_blocks:graphics.web_vu_stat?.(1),vu_ieee_probe:graphics.web_vu_ieee_probe&&[0,1,2,3].map(i=>graphics.web_vu_ieee_probe(i)),probe:[0,1,2,3].map(i=>graphics.web_vu_probe?.(i))};
 if(gfx)await gfx.terminate();
+if(vuThread)await vuThread.terminate();
 const report={vu_native:vu.vu_native,vu_steps:vu.vu_steps,vu_blocks:vu.vu_blocks,vu_ieee_probe:vu.vu_ieee_probe,probe:vu.probe,threaded,graphics_error:gfxError,rows,window,completed,requested:fields,trace:!traceOff,seconds,fields_per_second:completed/seconds,exit:status,switches,sameSwitches,counts,importMs};
 fs.writeFileSync(prefix+'-run.json',JSON.stringify(report,null,2));
 console.error(JSON.stringify({...report,counts:undefined,importMs:undefined}));

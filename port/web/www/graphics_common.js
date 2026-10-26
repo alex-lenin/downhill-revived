@@ -44,11 +44,12 @@ export function renderImports(graphicsModule, rx) {
 
 // ---- the threaded build (build.py --threads) ----
 
-// web_queue.h's control block (WEB_Q_BLOCK) and its fields as Int32Array indices.
-export const Q = 0x07A00000;
+// web_queue.h's control blocks (WEB_Q_BLOCK: the core's queue to the VU worker, vu.js;
+// WEB_Q_BLOCK2: the VU worker's to the GS worker, graphics.js) and their fields as Int32Array indices.
+export const Q = 0x07A00000, Q2 = 0x07A00800;
 export const QI = { written: 0, consumed: 16, sleeping: 32, waiting: 48, ring: 64, failed: 65, display: 67,
   env_text: 70, env_bytes: 71, stats: 72 };
-// The status line's numbers graphics.js leaves in the block's stats for worker.js.
+// The status line's numbers graphics.js leaves in the first block's stats for worker.js.
 export const STAT = { shown: 0, size: 1, draws: 2, dispatches: 3, reads: 4, submits: 5, scale: 6 };
 // Where worker.js puts an environment line for web_q_env (it is copied at once).
 export const ENV_SCRATCH = Q + 0x1000;

@@ -11,16 +11,18 @@
 // waits in env.web_gpu_await, a Suspending import on dhdr_web_pending()'s promise. Each vsync
 // shows the scanout through the reactor's web_present.
 //
-// The threaded build (build.py --threads; finding 087, BS2; the core module then defines a shared
-// memory): the reactor and the Rust renderer run in a second worker, www/graphics.js, which this
-// one starts and hands the memory, the compiled reactor and the canvas. The core's graphics
-// imports link to build/gqueue.wasm instead (port/web/web_queue.c's core side): it copies the
-// VIF1/GIF data into a queue in the shared memory and waits only where the native EE waits for
-// its graphics threads (a graphics wait, or a call that returns GS state). Each vsync queues the
-// picture; graphics.js shows it and leaves its numbers for the status line here.
+// The threaded build (build.py --threads; findings 087 BS2, 090 SP4; the core module then defines a
+// shared memory): the graphics run in two more workers, as natively on a vu and a GS thread:
+// www/vu.js (VIF1/VU1, build/vu.wasm) and www/graphics.js (the GS reactor and the Rust renderer),
+// which this one starts and hands the memory, the compiled modules and the canvas. The core's
+// graphics imports link to build/gqueue.wasm instead (port/web/web_queue.c's core side): it copies
+// the VIF1/GIF data into a queue in the shared memory and waits only where the native EE waits for
+// its graphics threads (a graphics wait, or a call that returns GS state). The VU worker runs that
+// queue and passes the GS's part on to the GS worker. Each vsync queues the picture; graphics.js
+// shows it and leaves its numbers for the status line here.
 import { createVfs } from './vfs.js';
 import { thunks } from './thunks.js';
-import { createSettings, BROWSER_ROWS } from './settings.js';
+import { createSettings, BROWSER_PC_SETTINGS, RENDERER_LIVE } from './settings.js';
 import { startRenderer, renderImports, definesSharedMemory, shareSafeDecoding, Q, QI, STAT, ENV_SCRATCH } from './graphics_common.js';
 
 const post = (type, data) => postMessage({ type, ...data });
@@ -74,11 +76,12 @@ async function start(m) {
   // The threaded build's core defines a shared memory; its graphics imports link to gqueue.wasm.
   const threaded = definesSharedMemory(coreBytes);
   if (threaded) shareSafeDecoding();
-  const [coreModule, graphicsModule, queueModule] = await Promise.all([WebAssembly.compile(coreBytes), WebAssembly.compile(graphicsBytes),
-    threaded ? WebAssembly.compileStreaming(fetch('build/gqueue.wasm')) : null]);
+  const [coreModule, graphicsModule, queueModule, vuModule] = await Promise.all([WebAssembly.compile(coreBytes), WebAssembly.compile(graphicsBytes),
+    threaded ? WebAssembly.compileStreaming(fetch('build/gqueue.wasm')) : null, threaded ? WebAssembly.compileStreaming(fetch('build/vu.wasm')) : null]);
   const disc = discSource(m);
   say(`disc: ${(disc.size / 2 ** 30).toFixed(2)} GiB`);
   const keys = new Uint8Array(m.input, 0, 256), pads = new Int32Array(m.input, 256, 16);
+  const mouse = new Int32Array(m.input, 320, 16);  // main.js: HostMouse, then [12] riding
   const ring = { head: new Int32Array(m.audio, 0, 2), data: new Int16Array(m.audio, 8), frames: (m.audio.byteLength - 8) / 4 };
 
   const vfs = await createVfs(say);
@@ -89,13 +92,20 @@ async function start(m) {
     const d = new Date(n.time || 0), t = [d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds()];
     t.forEach((v, i) => { dv.setUint16(fold(out) + 268 + 2 * i, v, true); dv.setUint16(fold(out) + 280 + 2 * i, v, true); }); }
   // DHD_SETTINGS: the stored dhd.ini's name (settings.js); the page's ?env.NAME go over everything.
+  // BROWSER_PC_SETTINGS: the PC SETTINGS rows the browser shows and applies (settings.js).
   // DHD_RENDER=native: the Rust renderer draws in its native (upscaled) mode, DHD_SCALE times the
   // PS2's resolution (2 unless the settings say otherwise); ?env.DHD_RENDER=exact shows the exact
   // renderer's picture instead (checks).
-  const env = { DHD_ISO: '/disc.iso', DHD_HEADLESS: '1', DHD_FRAME_CLOCK: '1', DHD_SKIP_MOVIES: '1',
-    DHD_RENDER: 'native', DHD_SETTINGS: 'dhd.ini', DHD_PC_SETTINGS_ROWS: BROWSER_ROWS, ...(m.env || {}) };
+  // DHD_GRAPHICS_ORDERED (threaded; port/hle/hle.h): the core skips the waits that only order queued
+  // graphics work, which the workers run in order anyway; ?env.DHD_GRAPHICS_ORDERED= keeps them.
+  // DHD_FPS_WALL=1 (port/hle/kernel.c): above 60 the game's step follows real time, as on x64, so a
+  // PC that can't keep 144 runs fewer, longer updates at the game's own speed, not slow motion;
+  // host_wall_seconds is then the real clock (performance.now). ?env.DHD_FPS_WALL= turns it off
+  // (the virtual clock, field / 60, as run_headless.mjs's deterministic runs keep).
+  const env = { DHD_ISO: '/disc.iso', DHD_HEADLESS: '1', DHD_FRAME_CLOCK: '1', DHD_FPS_WALL: '1', DHD_SKIP_MOVIES: '1',
+    DHD_RENDER: 'native', DHD_SETTINGS: 'dhd.ini', ...(threaded ? { DHD_GRAPHICS_ORDERED: '1' } : {}),
+    ...BROWSER_PC_SETTINGS, ...(m.env || {}) };
   const settings = await createSettings(env, m.env, say);
-  post('display', { mode: env.DHD_WINDOW });
   let core, graphics, queue, memory, bytes, dv, arena = 0x07000000, current = 65, csr = 0x1f80, field = 0;
   const strings = new Map(), files = new Map(), fibers = new Map(); let nextFile = 1, nextDir = 1; const dirs = new Map();
   const refresh = () => { bytes = new Uint8Array(memory.buffer); dv = new DataView(memory.buffer); };
@@ -124,11 +134,15 @@ async function start(m) {
     else if (!f.started) { f.started = true; WebAssembly.promising(core.__indirect_function_table.get(f.fn))(f.ctx).then(() => fail(Error(`fiber ${id} returned`)), fail); }
     else throw Error(`fiber ${id} has no continuation`); }
 
-  // Pacing: one field each 1/59.94 s at most; every field yields to the event loop so the
-  // canvas shows the picture (OffscreenCanvas commits when the worker's task ends).
+  // Pacing: one field each period at most, the core's port_frame_period (host_pacing_config at each
+  // vsync): 1/59.94 s, or 1/DHD_FPS above 60 (PC SETTINGS > Frame Rate; Monitor is the display's
+  // refresh, which the page measured: m.displayHz). Every field yields to the event loop so the
+  // canvas shows the picture (OffscreenCanvas commits when the worker's task ends). The core runs
+  // on its frame clock here; at 60 a PC that can't keep up runs the game slower, above 60 the
+  // update's step grows with real time (DHD_FPS_WALL), as on x64.
   const channel = new MessageChannel(); let wake = null; channel.port1.onmessage = () => { const w = wake; wake = null; w?.(); };
   const yieldTask = () => new Promise(r => { wake = r; channel.port2.postMessage(0); });
-  const period = 1000 / 59.94; let due = performance.now(), shown = 0, lastReport = performance.now(), lastField = 0;
+  let period = 1000 / 59.94, due = performance.now(), shown = 0, lastReport = performance.now(), lastField = 0;
   let riding = 0, held = new Int8Array(KEYS.length);
   function pad(port, out) {
     const o = span(out, 18); o.fill(0); o[2] = o[3] = o[4] = o[5] = 128;
@@ -136,6 +150,7 @@ async function start(m) {
     if (Atomics.load(p, 0)) { buttons = Atomics.load(p, 1); for (let i = 0; i < 4; i++) o[2 + i] = Atomics.load(p, 2 + i); }
     if (port === 0) {
       riding = dv.getInt32(0x0829E290, true) !== 0;
+      Atomics.store(mouse, 12, riding ? 1 : 0);  // the page hides the cursor while riding
       const dir = [0, 0, 0];
       KEYS.forEach((k, i) => { if (!Atomics.load(keys, k[0])) { held[i] = 0; return; }
         if (!held[i]) held[i] = riding ? 2 : 1;
@@ -148,26 +163,34 @@ async function start(m) {
   }
   // The core's environment; the threaded build's graphics worker gets each change in its queue,
   // in order with the graphics calls (the reactor reads DHD_RENDER, DHD_SCALE, ... from its own).
+  // A variable the renderer follows while the game runs (RENDERER_LIVE: PC SETTINGS > Resolution,
+  // Scaling) tells the reactor, here or in graphics.js, which applies it at the next vsync.
   function setEnv(name, value) {
     env[name] = value;
+    if (!threaded && graphics && RENDERER_LIVE.has(name)) graphics.web_env_changed();
     if (!threaded || !queue) return;
     const b = new TextEncoder().encode(`${name}=${value}`);
     if (b.length > 4000) throw Error(`environment line too long: ${name}`);
     span(ENV_SCRATCH, b.length).set(b); queue.web_q_env(ENV_SCRATCH, b.length);
   }
-  // Threaded: the graphics worker (graphics.js) on this memory, with the canvas; its log lines and
-  // errors come to the page through here.
-  function startGraphicsWorker() {
-    const gfx = new Worker('graphics.js', { type: 'module' });
+  // Threaded: the GS worker (graphics.js) on this memory, with the canvas, then the VU worker
+  // (vu.js), which needs the GS worker's queue; their log lines and errors come to the page
+  // through here.
+  function startWorker(script, name, start, transfer) {
+    const w = new Worker(script, { type: 'module' });
     const ready = new Promise((resolve, reject) => {
-      gfx.onmessage = e => { const d = e.data;
+      w.onmessage = e => { const d = e.data;
         if (d.type === 'ready') resolve(d);
         else if (d.type === 'error') { postMessage(d); const err = Error(d.text); reject(err); fail(err); }
         else postMessage(d); };
-      gfx.onerror = e => { const err = Error('graphics worker: ' + e.message); reject(err); fail(err); };
+      w.onerror = e => { const err = Error(name + ' worker: ' + e.message); reject(err); fail(err); };
     });
-    gfx.postMessage({ type: 'start', memory, module: graphicsModule, canvas: m.canvas, env: { ...env }, abi: queue.web_q_abi() }, [m.canvas]);
+    w.postMessage({ type: 'start', memory, env: { ...env }, abi: queue.web_q_abi(), ...start }, transfer);
     return ready;
+  }
+  async function startGraphicsWorker() {
+    await startWorker('graphics.js', 'graphics', { module: graphicsModule, canvas: m.canvas }, [m.canvas]);
+    await startWorker('vu.js', 'VU', { module: vuModule }, []);
   }
   let soundFrames = 0;  // stereo frames the game wrote (the status line's seconds of sound)
   const impl = {
@@ -177,8 +200,8 @@ async function start(m) {
     host_last_error: () => 0, host_exit: code => { throw new Exit(code); },
     host_error_box: (a, b) => { throw Error(`${str(a)}: ${str(b)}`); },
     host_exe_path: (a, n) => { const b = new TextEncoder().encode('/dhd.js\0'); span(a, n).set(b.subarray(0, n)); return Math.min(n - 1, b.length - 1); },
-    host_display_hz: () => 60, host_monitor_aspect: () => 16 / 9,
-    host_wall_seconds: () => field / 60, host_cycles: () => 0n,
+    host_display_hz: () => m.displayHz || 60, host_monitor_aspect: () => 16 / 9,
+    host_wall_seconds: env.DHD_FPS_WALL === '1' ? () => performance.now() / 1000 : () => field / 60, host_cycles: () => 0n,
     host_fp_csr: getCsr, host_fp_set_csr: setCsr, host_fp_mode: x => { setCsr(x ? 0xffc0 : 0x1f80); },
     host_frame_context: f => { field = Number(f); if (threaded) queue.web_q_frame(f); else graphics.web_frame(f); },
     host_fiber_main: () => { if (!fibers.has(65)) fibers.set(65, { sp: core.__stack_pointer.value, csr: getCsr(), started: true }); return 65; },
@@ -226,16 +249,19 @@ async function start(m) {
       dv.setBigUint64(size, BigInt(n.data?.length || 0), true); dv.setBigUint64(time, BigInt(n.time || 0), true); return 1; },
     host_service_host_disc_ready: () => 0, host_service_host_skip_movies: () => 1,
     host_service_host_pad_device: (port, a) => pad(port, a),
-    // PC settings (settings.js): dhd.ini's lines in this browser; Display is the page's fullscreen.
+    // host_api.h's HostMouse, 36 bytes, from the page (main.js)
+    host_service_mouse_state: out => { const o = span(out, 36);
+      for (let i = 0; i < 9; i++) { const v = Atomics.load(mouse, i); o[4 * i] = v; o[4 * i + 1] = v >> 8; o[4 * i + 2] = v >> 16; o[4 * i + 3] = v >> 24; } },
+    // PC settings (settings.js): dhd.ini's lines in this browser.
     host_service_host_game_options_read: (a, n) => { const v = settings.gameOptions(); if (v === undefined || !n) return 0;
       const b = new TextEncoder().encode(v).subarray(0, n - 1), o = span(a, b.length + 1); o.set(b); o[b.length] = 0; return 1; },
     host_service_host_setting_locked: a => settings.locked(str(a)),
     host_service_host_setting_save: (k, v) => settings.save(str(k), str(v)),
-    host_service_gs_window_apply: () => { post('display', { mode: env.DHD_WINDOW }); },
     host_service_movie_update: () => 0, host_service_movie_playing: () => 0,
     host_service_host_poll_dump: () => 0,
     host_service_graphics_threaded: () => 1, host_service_texpack_available: () => 0,
     host_pacing_period: () => 1 / 60,
+    host_pacing_config: p => { period = p * 1000; },
     host_sound_write: (a, frames) => {
       soundFrames += frames;
       const src = new Int16Array(span(a, frames * 4).slice().buffer), h = ring.head, cap = ring.frames;
@@ -268,7 +294,7 @@ async function start(m) {
       if (now - lastReport >= 1000) {
         post('status', { field, fps: (field - lastField) * 1000 / (now - lastReport), shown, size: size ? `${size >>> 16}x${size & 0xffff}` : '-',
           draws: stats(0), dispatches: stats(1), reads: stats(2), riding, sound: +(soundFrames / 48000).toFixed(1),
-          renderer: 'rust', submits: stats(3), scale: stats(4), workers: threaded ? 2 : 1 });
+          renderer: 'rust', submits: stats(3), scale: stats(4), workers: threaded ? 3 : 1 });
         lastReport = now; lastField = field;
       }
       due = Math.max(due + period, now - 4 * period);
@@ -276,7 +302,7 @@ async function start(m) {
     }),
   };
   const noops = `host_sleep_ms host_wait_wall host_dpi_aware host_callbacks_drain host_frame_registers host_frame_video host_capture_name
-host_pacing_config host_pacing_wait host_pacing_handoff host_pacing_input host_callback_heartbeat
+host_pacing_wait host_pacing_handoff host_pacing_input host_callback_heartbeat
 host_sound_open host_sound_reset host_sound_tick host_sound_log_stack snd_host_bench
 host_service_host_init host_service_host_console_init host_service_host_settings_load host_service_host_pad_vibrate
 host_service_splash_show host_service_splash_step host_service_update_save_environment host_service_update_at_start
@@ -310,7 +336,7 @@ host_service_text_input_begin host_service_text_input_end host_service_host_back
     queue = (await WebAssembly.instantiate(queueModule, { env: { memory } })).exports;
     direct.forEach((n, i) => table.set(i, queue['web_x_' + n]));
     await startGraphicsWorker();
-    say(`loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s; ${direct.length} GS calls queued to the graphics worker; renderer rust`);
+    say(`loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s; ${direct.length} GS calls queued to the VU and GS workers; renderer rust`);
     post('running', {});
     let status = 0;
     try { await Promise.race([WebAssembly.promising(core.__main_argc_argv)(0, 0), failure]); }
@@ -332,6 +358,8 @@ host_service_text_input_begin host_service_text_input_end host_service_host_back
       for (let i = 0; i < n; i++) { const p = dv.getUint32(iovs + 8 * i, true), l = dv.getUint32(iovs + 8 * i + 4, true); out += new TextDecoder().decode(bytes.subarray(p, p + l)); total += l; }
       dv.setUint32(written, total, true); if (out.trim()) say(out.trimEnd()); return 0; },
     fd_close: () => 0, fd_fdstat_get: () => 8, fd_fdstat_set_flags: () => 8, fd_prestat_get: () => 8, fd_prestat_dir_name: () => 8,
+    // clock_time_get: libc's clock (the graphics reactor's C may ask for it); nanoseconds of the page's clock
+    clock_time_get: (id, precision, out) => { if (bytes.buffer !== memory.buffer) refresh(); dv.setBigUint64(out, BigInt(Math.round(performance.now() * 1e6)), true); return 0; },
     fd_read: () => 8, fd_seek: () => 8, path_open: () => 44, proc_exit: code => { throw new Exit(code); },
   };
   const reactorImports = { env: { memory, host_wall_seconds: impl.host_wall_seconds,

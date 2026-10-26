@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import {spawn} from 'node:child_process';
 const kind=process.argv.includes('--double')?'double':'float';
-const total=kind==='double'?1000000:20000000,ops=kind==='double'?7:10,stride=kind==='double'?8:4;
+const total=kind==='double'?1000000:20000000,ops=kind==='double'?10:10,stride=kind==='double'?8:4;
 const {instance}=await WebAssembly.instantiate(fs.readFileSync(`build/web/${kind}-test.wasm`));
 const p=spawn(`build/web/${kind}-native.exe`,['--stream'],{windowsHide:true,stdio:['ignore','pipe','inherit']});
 const ended=new Promise((resolve,reject)=>{p.on('error',reject);p.on('exit',code=>code?reject(Error(`SSE exit ${code}`)):resolve());});

@@ -5,6 +5,9 @@
   graphics.wasm                 GS/VIF/VU1 module; imports env.memory
   renderer/dhd_render_bg.wasm   the Rust renderer; imports only from wbg, including its memory
                                 (wbg.memory)
+  vu.wasm                       a threaded build's VIF1/VU1 module (its VU worker, finding 090
+                                SP4); imports env.memory; only in a threaded build, and there
+                                required
 
 All three must be there (the JS renderer and its renderer-less builds are gone: cleanup CL5,
 finding 088; --require-renderer is accepted for old callers).
@@ -51,6 +54,7 @@ LOW_RESERVED = (0, MIB)                 # no renderer data or stack here (graphi
 RUST_WINDOW = (0x50000000, 0x70000000)
 CORE_STACK_BYTES = MIB                  # link flag -z stack-size=1048576 (build_graphics.py)
 GRAPHICS_STACK_BYTES = MIB              # build_graphics.py -Wl,-z,stack-size=1048576
+VU_STACK_BYTES = MIB                    # build_graphics.py build_vu: -Wl,-z,stack-size=1048576
 RUST_MIN_STACK_BYTES = MIB              # the Rust stack size is not readable from the module: at least this much must stay free above __data_end
 
 # role, file under the build dir, module that must carry the shared memory import (None = defines it), stack bytes
@@ -58,7 +62,9 @@ ROLES = (
     ('core', 'dhd_core.wasm', None, CORE_STACK_BYTES),
     ('graphics', 'graphics.wasm', 'env', GRAPHICS_STACK_BYTES),
     ('renderer', 'renderer/dhd_render_bg.wasm', 'wbg', RUST_MIN_STACK_BYTES),
+    ('vu', 'vu.wasm', 'env', VU_STACK_BYTES),
 )
+THREADED_ONLY = {'vu'}   # roles a threaded build (gqueue.wasm present) has, and only it
 STACK_BYTES = {role: size for role, _, _, size in ROLES}
 MEMORY_MODULE = {role: mod for role, _, mod, _ in ROLES}
 FILES = {role: name for role, name, _, _ in ROLES}
@@ -408,8 +414,13 @@ def check(mods, threads=False):
 
 def load(build_dir):
     mods = {}
+    threads = (Path(build_dir) / 'gqueue.wasm').exists()
     for role, name, _, _ in ROLES:
         path = Path(build_dir) / name
+        if role in THREADED_ONLY and not threads:
+            if path.exists():
+                raise WasmError('%s in a build without gqueue.wasm (a stale threaded module?)' % path)
+            continue
         if not path.exists():
             raise WasmError('missing %s' % path)
         mods[role] = parse(role, path)

@@ -6,11 +6,12 @@ CORE defaults to build/wasm/dhd_core.wasm (port/tools/build_wasm.py's output).
 The graphics reactor links gpu_rust_web.c and the Rust renderer module is built into
 build/web/renderer (port/web/build_renderer.py). --renderer rust is accepted for old callers (the
 JS renderer, www/gpu.js, is gone: cleanup CL5, finding 088).
-Threads (the default; --no-threads for one worker; finding 087, BS2): the game core and the graphics reactor in two Web Workers on
-one shared memory (www/worker.js and www/graphics.js, the queue of port/web/web_queue.h): the core's
-browser copy, the reactor and the Rust renderer get a shared memory (port/web/threads.py; the input
-core, the x64 build's, is not touched), build/web/gqueue.wasm is the core's side of the queue, and
-the Rust glue renews its memory views on a grown shared memory. worker.js picks the mode from the
+Threads (the default; --no-threads for one worker; findings 087 BS2, 090 SP4): the game core, VIF1/VU1
+and the GS reactor in three Web Workers on one shared memory (www/worker.js, www/vu.js and
+www/graphics.js, the queues of port/web/web_queue.h): the core's browser copy, the two graphics
+modules (build/web/vu.wasm, graphics.wasm) and the Rust renderer get a shared memory
+(port/web/threads.py; the input core, the x64 build's, is not touched), build/web/gqueue.wasm is the
+core's side of the queue, and the Rust glue renews its memory views on a grown shared memory. worker.js picks the mode from the
 core module's memory. check_web_layout.py's rule M2 then wants every memory shared (gqueue.wasm
 present), and none in a one-worker build.
 Input stays untouched; all derived modules, metadata and scratch stay in build/web.
@@ -56,7 +57,7 @@ def main():
         rm=OUT/'renderer-manifest.json';info=json.loads(rm.read_text())
         info['sha256']={str(RENDERER/n):hashlib.sha256((RENDERER/n).read_bytes()).hexdigest() for n in SERVED};info['threads']=True
         rm.write_text(json.dumps(info,indent=2)+'\n')
-    for src,dst in ((OUT/'core-web-raw.wasm',OUT/'dhd_core.wasm'),(OUT/'graphics.wasm',OUT/'graphics.wasm')):
+    for src,dst in ((OUT/'core-web-raw.wasm',OUT/'dhd_core.wasm'),(OUT/'graphics.wasm',OUT/'graphics.wasm'))+(((OUT/'vu.wasm',OUT/'vu.wasm'),) if a.threads else ()):
         if not a.no_opt:
             # Compact imports are a newer proposal unsupported by Node 24.
             tmp=OUT/(dst.stem+'-optimized.wasm')
@@ -64,7 +65,7 @@ def main():
             dst.write_bytes(tmp.read_bytes())
         elif src!=dst:dst.write_bytes(src.read_bytes())
     generate(OUT/'dhd_core.wasm',OUT/'imports.json')
-    files=[source,OUT/'dhd_core.wasm',OUT/'graphics.wasm']+([OUT/'gqueue.wasm'] if a.threads else [])+[RENDERER/n for n in SERVED]
+    files=[source,OUT/'dhd_core.wasm',OUT/'graphics.wasm']+([OUT/'gqueue.wasm',OUT/'vu.wasm'] if a.threads else [])+[RENDERER/n for n in SERVED]
     manifest={'input':str(source),'optimized':not a.no_opt,'renderer':'rust','threads':a.threads,
               'sha256':{str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files},'renderer_sizes':renderer['sizes']}
     (OUT/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')

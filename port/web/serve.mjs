@@ -12,8 +12,8 @@ const args = process.argv.slice(2), option = (name, fallback) => { const i = arg
 const port = Number(option('--port', 8177)), iso = option('--iso', null);
 const routes = [['/build/', path.join(root, 'build/web')], ['/', path.join(root, 'port/web/www')]];
 // /build/renderer/: the Rust renderer's two files (port/web/build_renderer.py).
-// gqueue.wasm: the threaded build's core side of the graphics queue (build.py --threads).
-const allowed = { '/build/': /^(dhd_core\.wasm|graphics\.wasm|gqueue\.wasm|imports\.json|renderer\/dhd_render\.js|renderer\/dhd_render_bg\.wasm)$/, '/': /^[\w.-]+$/ };
+// gqueue.wasm, vu.wasm: the threaded build's core side of the graphics queue and its VU worker (build.py --threads).
+const allowed = { '/build/': /^(dhd_core\.wasm|graphics\.wasm|gqueue\.wasm|vu\.wasm|imports\.json|renderer\/dhd_render\.js|renderer\/dhd_render_bg\.wasm)$/, '/': /^[\w.-]+$/ };
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
   '.json': 'application/json' };
 const server = http.createServer((req, res) => {

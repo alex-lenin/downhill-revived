@@ -30,6 +30,12 @@ core's memory made shared (port/web/threads.py), fed through the queue of port/w
     wrappers do not switch it) and its own helper stack, and a shared memory import;
   - build/web/gqueue.wasm is the core's side: web_queue.c's producer plus the generated web_x_*
     wrappers (gqueue_calls.c), which the core's graphics imports link to in the game's worker.
+  - VIF1/VU1 run in a third worker (www/vu.js; finding 090, SP4), as natively on the vu thread:
+    build/web/vu.wasm is vif.c and vu0_interp.c (with the VU1 AOT blocks), host_graphics.c's and
+    web_queue.c's VU sides and the VU1 calls' wrappers (web_exports_vu.c), linked in its own span
+    of the memory (VU_SPAN) with its own FP control word and helper stack. graphics.wasm is then
+    the GS worker's: the GS front end and the renderer, without VIF1/VU1, fed by the VU worker
+    through web_queue.h's second ring.
 """
 import json, os, re, subprocess, sys
 from pathlib import Path
@@ -55,10 +61,14 @@ def check_imports(wasm):
     env=by.get('env',set()); render=by.get('dhd_render',set()); bad=[]
     other=set(by)-{'env','dhd_render','wasi_snapshot_preview1'}
     if other:bad.append('imports from unexpected module(s) %s'%sorted(other))
-    declared=set(re.findall(r'DHDR_FN\((\w+)\)',(ROOT/'port/render/include/dhd_render.h').read_text()))
+    # the frozen v1 header and its later additions (dhd_render_ext.h)
+    declared=set()
+    for h in ('dhd_render.h','dhd_render_ext.h'):
+        declared|=set(re.findall(r'DHDR_FN\((\w+)\)',(ROOT/'port/render/include'/h).read_text()))
     if not render:bad.append('no dhd_render imports')
-    if render-declared:bad.append('dhd_render imports not in dhd_render.h: %s'%sorted(render-declared))
+    if render-declared:bad.append('dhd_render imports not in dhd_render.h or dhd_render_ext.h: %s'%sorted(render-declared))
     if AWAIT not in env:bad.append('no env.%s import'%AWAIT)
+    if THREADS and env-{'memory','host_wall_seconds',AWAIT}:bad.append('env imports %s (undefined in the GS worker\'s module?)'%sorted(env-{'memory','host_wall_seconds',AWAIT}))
     if env&JS_OPS:bad.append('JS device-op imports %s'%sorted(env&JS_OPS))
     if bad:sys.exit('build_graphics: %s: %s'%(wasm,'; '.join(bad)))
     print('build_graphics: renderer rust, imports: %s'%(', '.join('%s %d'%(m,len(f)) for m,f in sorted(by.items()))))
@@ -105,8 +115,18 @@ FOLD='''static inline unsigned web_fold(unsigned a) {
     }
     return a;
 }'''
-lines=['#include "'+(ROOT/'port/host/host_api.h').as_posix()+'"',FOLD,'void web_graphics_enter(void);','void web_gpu_reattach(void);','void web_vu_ready(void);']
+# --threads: the calls VIF1/VU1 own (defined in vif.c: host_vu1_*, the VIF feed) run in the VU
+# worker's module (vu.wasm), the rest in the GS worker's (graphics.wasm); the one-worker reactor
+# has them all.
+FEEDS=('host_service_vif_feed','host_service_graphics_feed')
+vif_text=(ROOT/'port/hle/vif.c').read_text()
+VU_OWNED=[n for n in defined if re.search(r'^[\w ]+'+n+r'\s*\([^;]*\{',vif_text,re.M)]
+if THREADS and set(VU_OWNED)!={'host_service_vif_feed','host_vu1_snapshot','host_vu1_file'}:
+    sys.exit('build_graphics: vif.c defines %s: check which worker runs each'%VU_OWNED)
+HEAD=['#include "'+(ROOT/'port/host/host_api.h').as_posix()+'"',FOLD,'void web_graphics_enter(void);','void web_gpu_reattach(void);','void web_vu_ready(void);']
+lines,vu_lines=list(HEAD),list(HEAD)
 for n in defined:
+    if THREADS and n in FEEDS:continue   # web_queue.c runs the feeds itself
     ret,args=api[n];types=[ctype(a) for a in args];names=[f'a{i}' for i in range(len(args))]
     params=', '.join(f'{t} {v}' for t,v in zip(types,names)) or 'void'
     call=f'{n}({", ".join(f"web_fold({v})" if i in GUEST_ARGS.get(n,()) else v for i,v in enumerate(names))});'
@@ -117,7 +137,7 @@ for n in defined:
     # switches it to the GS front end's IEEE mode and back. --threads: the reactor's own word is
     # in that mode at rest (web_q_init; whatever switches it switches it back).
     csr=('','') if THREADS else ('unsigned s = host_fp_csr(); host_fp_set_csr(0x1f80); ','host_fp_set_csr(s);')
-    lines.append(f'__attribute__((export_name("web_x_{n}"))) {ret} web_x_{n}({params}) '
+    (vu_lines if THREADS and n in VU_OWNED else lines).append(f'__attribute__((export_name("web_x_{n}"))) {ret} web_x_{n}({params}) '
                  f'{{ {csr[0]}web_graphics_enter(); {body}'
                  f'{csr[1]}{" return r;" if ret!="void" else ""} }}')
 QUEUE=ROOT/'port/web/web_queue.h'
@@ -127,11 +147,12 @@ if THREADS:
     # write guest memory (natively they too run on the EE thread, after a graphics wait).
     import zlib
     ASYNC={'host_service_gs_vblank','host_service_gs_priv_write','host_service_gs_trace_begin'}
-    calls=[n for n in defined if n not in ('host_service_vif_feed','host_service_graphics_feed')]
+    calls=[n for n in defined if n not in FEEDS]
     for n in ASYNC:
         if n not in calls or api[n][0]!='void' or n in GUEST_ARGS:sys.exit('build_graphics: %s is not a queued void call'%n)
-    abi=zlib.crc32((QUEUE.read_text()+repr([(n,api[n],n in ASYNC) for n in calls])).encode())
+    abi=zlib.crc32((QUEUE.read_text()+repr([(n,api[n],n in ASYNC,n in VU_OWNED) for n in calls])).encode())
     dispatch=['uint64_t web_q_dispatch(uint32_t id, const uint64_t *a)','{','    switch (id) {']
+    vu_dispatch=['uint64_t web_q_vu_dispatch(uint32_t id, const uint64_t *a)','{','    switch (id) {']
     producer=['/* Generated by port/web/build_graphics.py --threads: the core\'s side of the queued GS calls. */',
               '#include <stdint.h>','uint64_t web_q_call(uint32_t id, uint32_t wait, uint32_t flags, uint64_t a0, uint64_t a1, uint64_t a2);',
               f'__attribute__((export_name("web_q_abi"))) uint32_t web_q_abi(void) {{ return {abi}u; }}']
@@ -140,13 +161,17 @@ if THREADS:
         if len(types)>3:sys.exit('build_graphics: %s has more than 3 arguments'%n)
         params=', '.join(f'{t} a{k}' for k,t in enumerate(types)) or 'void'
         values=[f'(uint64_t)a{k}' for k in range(len(types))]+['0']*(3-len(types))
-        call=f'web_q_call({i}, {0 if n in ASYNC else 1}, 0, {", ".join(values)})'
+        # WQ_VU_CALL (web_queue.h): the VU worker runs it
+        call=f'web_q_call({i}, {0 if n in ASYNC else 1}, {0x200 if n in VU_OWNED else 0}, {", ".join(values)})'
         producer.append(f'__attribute__((export_name("web_x_{n}"))) {ret} web_x_{n}({params}) '
                         f'{{ {"return ("+ret+")" if ret!="void" else ""}{call}; }}')
         invoke=f'web_x_{n}({", ".join(f"({t})a[{k}]" for k,t in enumerate(types))})'
-        dispatch.append(f'    case {i}: {"return (uint64_t)"+invoke+";" if ret!="void" else invoke+"; return 0;"}')
-    dispatch+=['    }','    __builtin_trap();','}',f'__attribute__((export_name("web_q_abi"))) uint32_t web_q_abi(void) {{ return {abi}u; }}']
+        (vu_dispatch if n in VU_OWNED else dispatch).append(f'    case {i}: {"return (uint64_t)"+invoke+";" if ret!="void" else invoke+"; return 0;"}')
+    for d in (dispatch,vu_dispatch):
+        d+=['    }','    __builtin_trap();','}',f'__attribute__((export_name("web_q_abi"))) uint32_t web_q_abi(void) {{ return {abi}u; }}']
     lines+=['#include <stdint.h>']+dispatch
+    vu_lines+=['#include <stdint.h>']+vu_dispatch
+    (OUT/'web_exports_vu.c').write_text(chr(10).join(vu_lines)+chr(10))
     (OUT/'gqueue_calls.c').write_text(chr(10).join(producer)+chr(10))
     # The core's side: no libc, no data, its stack in the web host's scratch region (only the
     # core's thread runs it), the core's memory imported shared.
@@ -200,22 +225,72 @@ cmd += [str(OUT/'web_exports.c')]
 if THREADS:
     # The consumer and its atomics (wasm threads ops on the shared memory, which the import becomes
     # after postlink: threads.share), and the reactor's own FP control word (host_graphics.c).
-    cmd += ['-matomics','-mbulk-memory','-DDHD_WEB_THREADS=1','-I'+str(ROOT/'port/web'),str(ROOT/'port/web/web_queue.c')]
+    # VIF1/VU1 are in vu.wasm (below): this module is the GS worker's.
+    cmd += ['-matomics','-mbulk-memory','-DDHD_WEB_THREADS=1','-DDHD_WEB_GS=1','-I'+str(ROOT/'port/web'),str(ROOT/'port/web/web_queue.c')]
 # The native build's VU1 path (PS2_VU_AOT in build_host64.py): straight-line blocks translated
 # from the player's microcode plus the hand-written geometry kernels, instead of the interpreter
 # alone. Generated from assets/vutext.bin into build/web (game-derived: never committed).
+VU=[]
 if '--no-vu-aot' not in sys.argv:
     sys.path.insert(0,str(ROOT/'port/tools'))
     from vu1_aot import generate
     print('VU1 AOT: %d straight-line blocks' % generate(OUT/'vu1_aot.inc'))
-    cmd += ['-DPS2_VU_AOT','-I'+str(OUT)]
-cmd += [str(OUT/'vif.c'),str(OUT/'vu0_interp.c'),'-o',str(OUT/'graphics-raw.wasm')]
+    VU += ['-DPS2_VU_AOT','-I'+str(OUT)]
+VU += [str(OUT/'vif.c'),str(OUT/'vu0_interp.c')]
+if not THREADS:cmd += VU
+cmd += ['-o',str(OUT/'graphics-raw.wasm')]
 (OUT/'graphics-command.json').write_text(json.dumps(cmd,indent=2))
 r=subprocess.run(cmd,env=env,capture_output=True,text=True)
 (OUT/'graphics-build.log').write_text(r.stdout+r.stderr)
 print(r.stdout+r.stderr)
 if r.returncode:sys.exit(r.returncode)
 check_imports(OUT/'graphics-raw.wasm')
+# The threaded build's VU worker module (www/vu.js): VIF1 and VU1 (vif.c, vu0_interp.c with the AOT
+# blocks), web_queue.c's VU side and host_graphics.c's (DHD_WEB_VU), the VU1 calls' wrappers
+# (web_exports_vu.c). Its data, stack and heap lie in VU_SPAN, apart from every other module's:
+# data from the bottom, the stack after it (no stack first: the GS module's stack is at 0), the
+# heap up to the initial memory (wasi-libc's __heap_end), so its malloc never meets another's.
+VU_SPAN=(0x58000000,0x5C000000)
+def build_vu(gs_cmd):
+    text=QUEUE.read_text()
+    csr,stack=(int(re.search(r'#define %s (0x[0-9A-Fa-f]+)u'%n,text).group(1),16) for n in ('WEB_Q_VU_CSR','WEB_Q_VU_HELPER_STACK'))
+    # vif.c's DHD_VU_SUSPECT watch reads the GS's draw counter, which is in the other worker
+    v=(OUT/'vif.c').read_text()
+    for a,b in (('uint64_t suspects = watch ? gs.suspect_draws : 0;','uint64_t suspects = 0; watch = 0; /* threaded: the GS is in its own worker */'),
+                ('if (watch && gs.suspect_draws != suspects) save_suspect();','(void)suspects;')):
+        if a not in v:sys.exit('build_graphics: vif.c has no %r any more'%a)
+        v=v.replace(a,b)
+    (OUT/'vif_vu.c').write_text(v)
+    # the GS module's compile flags and include paths (everything before its link options)
+    vcmd=gs_cmd[:gs_cmd.index('-mexec-model=reactor')]+['-I'+str(ROOT/'port/web'),'-mexec-model=reactor','-Wl,--import-memory','-Wl,--export-memory',
+          '-Wl,--no-stack-first','-Wl,--global-base=%d'%VU_SPAN[0],'-Wl,--initial-memory=%d'%VU_SPAN[1],
+          '-Wl,--max-memory=2147483648','-Wl,-z,stack-size=1048576','-Wl,--allow-undefined','-Wl,--export=__stack_pointer',
+          '-Wl,--export=__heap_base','-Wl,--export=__data_end',
+          '-matomics','-mbulk-memory','-DDHD_WEB_THREADS=1','-DDHD_WEB_VU=1','-DWEB_QUEUE_VU=1']
+    if not EXACT_FLOAT:vcmd+=['-DPS2_VU_IEEE=1']+(['-DPS2_VU_IEEE_PROBE=1'] if '--vu-ieee-probe' in sys.argv else [])
+    vcmd+=[str(ROOT/'port/web/host_graphics.c'),str(OUT/'web_exports_vu.c'),str(ROOT/'port/web/web_queue.c')]
+    vcmd+=[x if x!=str(OUT/'vif.c') else str(OUT/'vif_vu.c') for x in VU]+['-o',str(OUT/'vu-raw.wasm')]
+    (OUT/'vu-command.json').write_text(json.dumps(vcmd,indent=2))
+    r=subprocess.run(vcmd,env=env,capture_output=True,text=True)
+    (OUT/'vu-build.log').write_text(r.stdout+r.stderr)
+    print(r.stdout+r.stderr)
+    if r.returncode:sys.exit('build_graphics: vu.wasm: link failed')
+    sys.path.insert(0,str(ROOT/'port/web'))
+    import check_web_layout as layout
+    m=layout.parse('vu',OUT/'vu-raw.wasm')
+    bad=sorted({(mod,f) for mod,f,_ in m.imports if mod!='wasi_snapshot_preview1'}-{('env','memory'),('env','host_wall_seconds')})
+    if bad:sys.exit('build_graphics: vu.wasm imports %s (undefined in the VU worker\'s module?)'%bad)
+    helper=OUT/'memory-vu.wasm'
+    builtins=next(WASI.glob('lib/clang/*/lib/wasm32-unknown-wasi/libclang_rt.builtins.a'))
+    subprocess.run([str(WASI/'bin/clang.exe'),'-O2','-msimd128','-mbulk-memory','-ffp-contract=off','-nostdlib','-Wl,--no-entry',
+                    '-Wl,--export-all','-Wl,--import-memory','-DWEB_CSR_AT=%#xu'%csr,
+                    *[str(ROOT/'port/web'/(n+'.c')) for n in ('memory','float','double')],str(builtins),'-o',str(helper)],check=True,env=env)
+    from postlink import rewrite
+    rewrite(OUT/'vu-raw.wasm',OUT/'vu.wasm',helper,float_ops=EXACT_FLOAT,memory=False,
+            fast_memory='--legacy-memory' not in sys.argv,debug_memory='--debug-memory' in sys.argv,helper_stack=stack)
+    from threads import share
+    if share(OUT/'vu.wasm',OUT/'vu.wasm')!=1:sys.exit('build_graphics: vu.wasm has no memory import to share')
+    print('build_graphics: vu.wasm, the VU worker\'s module (%d VU1 calls)'%len([n for n in VU_OWNED if n not in FEEDS]))
 from postlink import rewrite
 helper,stack=OUT/'memory.wasm',0x07920000
 if THREADS:
@@ -233,3 +308,6 @@ rewrite(OUT/'graphics-raw.wasm',OUT/'graphics.wasm',helper,float_ops=EXACT_FLOAT
 if THREADS:
     from threads import share
     if share(OUT/'graphics.wasm',OUT/'graphics.wasm')!=1:sys.exit('build_graphics: graphics.wasm has no memory import to share')
+    build_vu(cmd)
+else:
+    (OUT/'vu.wasm').unlink(missing_ok=True)   # one-worker build: no stale VU module

@@ -16,9 +16,30 @@ const PLAIN = {
   update_url: 'DHD_UPDATE_URL', auto_update: 'DHD_AUTO_UPDATE', texture_pack: 'DHD_TEXTURE_PACK', textures: 'DHD_TEXTURES',
   texture_cache_mb: 'DHD_TEXTURE_CACHE_MB', font: 'DHD_FONT', fps: 'DHD_FPS',
 };
-// The PC SETTINGS rows the browser can do (pc_settings.c's DHD_PC_SETTINGS_ROWS): Display, as the
-// page's fullscreen (Borderless and Fullscreen both are the browser's fullscreen).
-export const BROWSER_ROWS = 'DHD_WINDOW';
+// The browser's OPTIONS > PC SETTINGS (pc_settings.c's DHD_PC_SETTINGS_* variables):
+// - ROWS, the rows shown: Resolution (DHD_SCALE: 1x to DHD_SCALE_MAX, the reactor's NATIVE_SCALE_MAX,
+//   or Window, the canvas's match), Scaling, Widescreen, Font and Frame Rate. Display, window size,
+//   picture shape (the canvas has one shape: 16:9 with widescreen, else 4:3, main.js), texture
+//   packs, skip movies (the browser never plays them) and vibration (no rumble here) are left out.
+// - LIVE, the rows that apply at once here besides the core's live ones: Resolution (the reactor's
+//   native_rescale, through web_env_changed). Scaling is live everywhere.
+// - RESTART, the footer of the others (Widescreen, Font, Frame Rate): the page loaded again.
+// - FPS_MAX: the browser's Frame Rate list and Monitor stop at 144 (the core's own cap is 240).
+// Unset rows keep the core's defaults (2x, Smooth, the sharp font, 60) or BROWSER_DEFAULTS.
+export const BROWSER_PC_SETTINGS = {
+  DHD_PC_SETTINGS_ROWS: 'DHD_SCALE,DHD_PRESENT_FILTER,DHD_WIDESCREEN,DHD_FONT,DHD_FPS',
+  DHD_PC_SETTINGS_LIVE: 'DHD_SCALE',
+  DHD_PC_SETTINGS_RESTART: '* Applies when the page is loaded again',
+  DHD_SCALE_MAX: '8',
+  DHD_FPS_MAX: '144',
+};
+// A player's settings where the stored dhd.ini doesn't say, as host.c's player_defaults on the PC:
+// widescreen on (widescreen.c then shows the picture "wide"), 60, 2x, the sharp font. Only with
+// stored settings (DHD_SETTINGS=none keeps the core's defaults for checks); a stored line or
+// ?env. wins (createSettings fills what is still unset, after the stored lines).
+export const BROWSER_DEFAULTS = { DHD_WIDESCREEN: '1', DHD_FPS: '60', DHD_SCALE: '2', DHD_FONT: 'sharp' };
+// The variables the reactor follows while the game runs (gpu_rust_web.c's web_env_changed).
+export const RENDERER_LIVE = new Set(['DHD_SCALE', 'DHD_PRESENT_FILTER', 'DHD_ASPECT']);
 const TEMPLATE = '; Downhill Revived settings (browser): one "key = value" per line, written by the game\n' +
   '; (OPTIONS > PC SETTINGS and the game\'s options). Kept in this browser only.\n';
 
@@ -56,7 +77,7 @@ function open() {
   });
 }
 const request = r => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
-// The stored text ('' when there is none); also for the page, which needs the display mode at Start.
+// The stored text ('' when there is none); also for the page, which shapes the canvas at Start.
 export async function readIni(name) {
   const db = await open();
   try { return (await request(db.transaction(STORE).objectStore(STORE).get(name))) || ''; } finally { db.close(); }
@@ -78,7 +99,7 @@ export async function createSettings(env, overrides, log) {
     else if (PLAIN[lower]) set(PLAIN[lower], value);
     else log(`settings: unknown key ${key}`);
   }
-  set('DHD_WINDOW', 'windowed');  // the page, until the player picks fullscreen
+  if (on) for (const [key, value] of Object.entries(BROWSER_DEFAULTS)) set(key, value);
   if (on) log(`settings: ${parse(text).length} from ${name} in this browser`);
   const store = () => { if (!db) return;
     const t = db.transaction(STORE, 'readwrite'); t.objectStore(STORE).put(text, name);

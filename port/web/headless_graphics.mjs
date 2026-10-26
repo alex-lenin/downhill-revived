@@ -1,18 +1,22 @@
-// run_headless.mjs's graphics thread for a threaded build (port/web/build.py --threads): the GS
-// reactor on the core's shared memory in a Node worker thread, running the queued graphics calls
-// (port/web/web_queue.h) as www/graphics.js does in the browser, without WebGPU (the device ops are
-// never enabled here, as in run_headless.mjs's one-thread mode).
+// run_headless.mjs's graphics threads for a threaded build (port/web/build.py --threads): on the
+// core's shared memory in Node worker threads, running the queued graphics calls
+// (port/web/web_queue.h) as the browser's workers do, without WebGPU (the device ops are never
+// enabled here, as in run_headless.mjs's one-thread mode). workerData.role:
+//   'gs'  the GS reactor (graphics.wasm), the second queue's consumer, as www/graphics.js;
+//   'vu'  VIF1/VU1 (vu.wasm), the core's queue's consumer, as www/vu.js (started after the 'gs' one).
 import { parentPort, workerData } from 'node:worker_threads';
 import { WASI } from 'node:wasi';
-import { Q, QI } from './www/graphics_common.js';
+import { Q, Q2, QI } from './www/graphics_common.js';
 
-const { memory, module, env, abi, preopens } = workerData;
+const { memory, module, env, abi, preopens, role } = workerData;
 let gx;
 function fail(err) {
-  const q = new Int32Array(memory.buffer, Q, 128);
-  Atomics.store(q, QI.failed, 1); Atomics.notify(q, QI.consumed);
-  parentPort.postMessage({ type: 'error', text: String(err?.stack || err) });
+  for (const at of [Q, Q2]) { const q = new Int32Array(memory.buffer, at, 128); Atomics.store(q, QI.failed, 1); Atomics.notify(q, QI.consumed); }
+  parentPort.postMessage({ type: 'error', text: `${role} thread: ` + String(err?.stack || err) });
 }
+const report = () => ({ type: 'report', vu_native: gx.web_vu_native?.(),
+  vu_steps: gx.web_vu_stat?.(0), vu_blocks: gx.web_vu_stat?.(1),
+  vu_ieee_probe: gx.web_vu_ieee_probe && [0, 1, 2, 3].map(i => gx.web_vu_ieee_probe(i)), probe: [0, 1, 2, 3].map(i => gx.web_vu_probe?.(i)) });
 try {
   const wasi = new WASI({ version: 'preview1', args: [], env, preopens, returnOnExit: true });
   const noGpu = n => () => { throw Error(n + ' without WebGPU'); };
@@ -21,17 +25,26 @@ try {
     web_gpu_await: noGpu('web_gpu_await') }, dhd_render: renderStubs, wasi_snapshot_preview1: wasi.wasiImport });
   gx = gi.exports;
   wasi.initialize(gi);
-  if (gx.web_q_init() !== Q) throw Error('graphics: the reactor\'s queue is not at the address run_headless.mjs expects');
-  if (gx.web_q_abi() !== abi) throw Error('graphics: the reactor and gqueue.wasm come from different builds');
-  parentPort.on('message', m => { if (m.type === 'report') parentPort.postMessage({ type: 'report', vu_native: gx.web_vu_native?.(),
-    vu_steps: gx.web_vu_stat?.(0), vu_blocks: gx.web_vu_stat?.(1),
-    vu_ieee_probe: gx.web_vu_ieee_probe && [0, 1, 2, 3].map(i => gx.web_vu_ieee_probe(i)), probe: [0, 1, 2, 3].map(i => gx.web_vu_probe?.(i)) }); });
+  if (role === 'vu') {
+    if (gx.web_vq_init() !== Q) throw Error('VU: the queue is not at the address run_headless.mjs expects, or the GS thread\'s is not there');
+  } else if (gx.web_q_init() !== Q2) throw Error('graphics: the reactor\'s queue is not at the address run_headless.mjs expects');
+  if (gx.web_q_abi() !== abi) throw Error(`${role}: the module and gqueue.wasm come from different builds`);
+  parentPort.on('message', m => { if (m.type === 'report') parentPort.postMessage(report()); });
   parentPort.postMessage({ type: 'ready' });
+  if (role === 'vu') {
+    for (;;) {
+      const r = gx.web_vq_run();
+      // idle for 0.1 s: take messages (the report); WQ_RUN_ENV: Node's WASI environment is fixed,
+      // DHD_* lines the core sets later do not reach it, as in the one-thread runner
+      if (r === 0) await new Promise(r => setImmediate(r));
+      else if (r !== 2) throw Error(`VU: web_vq_run answered ${r}`);
+    }
+  }
   const run = WebAssembly.promising(gx.web_q_run);
   for (;;) {
     const r = await run();
     if (r === 0) {
-      const q = new Int32Array(memory.buffer, Q, 128);
+      const q = new Int32Array(memory.buffer, Q2, 128);
       const w = Atomics.waitAsync(q, QI.written, Atomics.load(q, QI.consumed), 1000);
       if (w.async) await w.value;
     } else if (r === 2) {

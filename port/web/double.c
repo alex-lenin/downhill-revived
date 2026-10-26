@@ -26,9 +26,22 @@ static double sum(double a,double b){
     if((s>0&&err<0)||(s<0&&err>0))s=value(bits(s)-1);
     return ftz(s);
 }
-double web_dadd(double a,double b){return ee()?sum(a,b):a+b;}
+/* The EE FPU's binary64 operands (ps2float.h computes ADD, SUB and MUL in binary64 from promoted
+   floats): at most 24 significant bits (the low 29 significand bits zero) and the exponent of a
+   normal float. For two of them the binary64 product is exact (48 bits, a normal binary64), and so
+   is the sum when the exponents are at most 28 apart (at most 53 bits, an exact zero or a normal
+   binary64): rounding toward zero, DAZ and FTZ then change nothing. */
+static int floatlike(uint64_t u){return !(u&0x1fffffffull)&&((unsigned)(u>>52&2047)-897u)<254u;}
+static int exact_sum(uint64_t x,uint64_t y){
+    int gap=(int)(x>>52&2047)-(int)(y>>52&2047);
+    return floatlike(x)&&floatlike(y)&&gap<=28&&gap>=-28;
+}
+double web_dadd(double a,double b){
+    if(!ee()||exact_sum(bits(a),bits(b)))return a+b;
+    return sum(a,b);
+}
 double web_dsub(double a,double b){
-    if(!ee())return a-b;
+    if(!ee()||exact_sum(bits(a),bits(b)))return a-b;
     if(__builtin_isnan(a)||__builtin_isnan(b))return special(a,b);
     return sum(a,value(bits(b)^0x8000000000000000ull));
 }
@@ -43,7 +56,8 @@ static double pack(u128 mant,int e,uint64_t sign){
     return value(sign|((uint64_t)exp<<52)|(q&0xfffffffffffffull));
 }
 double web_dmul(double a,double b){
-    if(!ee())return a*b;a=daz(a);b=daz(b);
+    if(!ee()||(floatlike(bits(a))&&floatlike(bits(b))))return a*b;
+    a=daz(a);b=daz(b);
     uint64_t x=bits(a),y=bits(b),ax=x&0x7fffffffffffffffull,ay=y&0x7fffffffffffffffull;
     if(!ax||!ay||ax>=0x7ff0000000000000ull||ay>=0x7ff0000000000000ull){
         double d=a*b;return __builtin_isnan(d)?special(a,b):d;
