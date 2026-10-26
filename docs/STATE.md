@@ -88,8 +88,15 @@ it unchanged (finding 088, CL3).
   (VIF1/VU1, GS front end, renderer) runs in its own worker on shared memory by default
   (`--no-threads` for one worker; finding 087, BS2). It draws only with the Rust renderer
   (`--renderer rust` is still accepted; the JS/WebGPU renderer `www/gpu.js` is gone, finding 088
-  CL5). Speed toward 60 fps: finding 087.
+  CL5). Speed toward 60 fps: finding 087. Its PC SETTINGS (finding 087 WO1): resolution 1x-8x
+  (applied at once), scaling, widescreen, font, frame rate (60-144 paced to the core's period).
 - Linux headless x64 (`build_host64_linux.py`, WSL, `DHD_HEADLESS=1`): for state traces only.
+- Android arm64 (finding 091): `build_host64_android.py` makes `libmain.so` (wasm2c core, the
+  POSIX host on arm64, the Rust renderer on Vulkan, SDL3 as `libSDL3.so`) and
+  `port/android/build_apk.py` a debug-signed APK with Gradle (no Android Studio). On the Mi 11i:
+  title, menus and a race draw right, background/foreground works, about 25 fields/s in a race
+  (60 is the goal: speed work next). Gamepad or keyboard only (no touch); online off (no TLS in
+  `ws_posix.c`).
 - Retired (finding 088): the 32-bit i686 build (`link.py`, `build_clean.py`, the x87/FP-trap
   runtime), the Direct3D 11 renderer, the C wgpu-native renderer and the browser's JS renderer.
   No D3D11 fallback.
@@ -103,9 +110,11 @@ it unchanged (finding 088, CL3).
   (`game_data.c`); the exe holds only the words the port changes (finding 053, section 4).
 - Inline asm runs on an emulated EE/FPU/VU0 register file (`port/runtime/ps2asm.c`, plus
   `ps2asm_aot.py`); EE float rounding follows PCSX2's (toward zero, FTZ/DAZ, finding 026,
-  `eefloat.py`). VU0 microprograms are native (finding 016); VU1 runs AOT blocks (`vu1_aot.py`)
-  and native geometry kernels (`vu1_native_clip.py`), checked against PCSX2's interpreter
-  (`test_vu1_pcsx2.py`) and on captured run sequences (`vu1_seq_diff.py`).
+  `eefloat.py`). VU0 microprograms are native (finding 016); VU1 runs AOT blocks (`vu1_aot.py`,
+  MAC/status updates no flag read can see made lazily) and native geometry kernels
+  (`vu1_native_clip.py`, `vu1_native_*.h`), checked against PCSX2's interpreter
+  (`test_vu1_pcsx2.py`) and on captured run sequences against our interpreter
+  (`vu1_seq_diff.py`, x64; finding 090 VU1R).
 - GS (`port/gs/`): GS memory and registers in C; the Rust renderer (`port/render`, wgpu: DX12
   or Vulkan, WARP last; WebGPU in the browser) behind the shared C front ends `gpu_exact.inc`
   (exact: the PS2's pixels) and `native_core.inc` (native: upscaled, the default). Glue:
@@ -119,7 +128,10 @@ PC SETTINGS in the game's options, saved to dhd.ini (finding 064): resolution an
 borderless/windowed, Hor+ widescreen with the HUD anchored (finding 056), frame rate (60, or real
 offline simulation steps at higher rates, finding 067), texture packs in PCSX2's format (finding 057), the sharp
 font (finding 058), movies, vibration, EXIT GAME. The updater (`port/hle/update.c`, finding 054)
-and online races (below).
+and online races (below). The port's own pages (PC SETTINGS, the exit question, ONLINE and the
+race room) share one centred layer in the game's popup style (`menu_page.c`), and the mouse works
+in them and in the game's own popups: hover selects, left click X, right click back, the wheel
+scrolls or changes values (finding 092; the shell's own menus are not bridged yet).
 
 ### Checks and tools
 - Native unit tests: `python port/tools/test_runtime.py` (still 32-bit test programs, built from
@@ -140,6 +152,33 @@ Bump `port/include/version.h`, `build_wasm.py`, `package_release.py`, publish th
 `latest.json` as `v<version>`, then raise `MIN_VERSION` in
 `online/server/wrangler.jsonc` and deploy when older versions should stop racing (finding 054,
 section 6; finding 088, CL3).
+
+2026-10-26 (finding 090, SP3): native GS vertex conversion and texture-page key iteration
+cost less CPU; one x64 race A/B measured GS busy 4.571 -> 3.807 ms/field.
+Exact, native and interpolated replay goldens and all 198 transfer golden items match;
+x64 packaging and the Rust browser build/layout pass. Exact/probe paths and game core unchanged.
+
+2026-10-26 (finding 090, SP6): fixed a retired-queue observation race that could wait after
+completion; added opt-in per-field cycles and host/GPU stall attribution. One race pair observed p99 73.803 -> 17.763 ms (not an isolated speedup estimate), with unchanged-counter
+timeouts 2,443 -> 513. All 4,500 race state-trace fields match with the existing mask; x64 packaging,
+Rust browser build/layout and GS FIFO stress pass. Details and the legacy VIF fixture link limit
+are in finding 090. No game core or GPU operation changed.
+
+2026-10-26 (finding 090, SP7): x64 core and packaging pass. Two race pairs retain padded queue counters
+and the 512-pause retired/full-ring spin policy: 104.548 -> 141.226 and
+121.783 -> 124.349 fields/s. EE spin falls in both; second-pair p99 worsens
+21.869 -> 24.024 ms. Run-to-run variability prevents an isolated speedup claim.
+Full busy/spin/park tables and limitations are in the SP7 section.
+
+2026-10-26 (finding 090, FPS1): at 240 the two counters that stayed per-update now
+advance per field behind `port_fps_high()`: the particle/effects frame clock
+`D_0029DBAC` (dust, snow and spray waves, glow phases) and the sound/skat queue age
+`obj->x60C`; the rate audit (`DHD_RATE_AUDIT`, off by default) now measures them at a quarter
+of their 60 Hz travel per update (0.250 and 1.002 against 1.000 and 4.004 before), which is
+time-based motion at 240. Boot 600- and race 5000-field state traces against the base build
+match in every column with the mask unchanged (3); x64 packaging, Rust browser build and layout
+pass.
+Measured words, attribution and the audit's false positives are in the FPS1 section.
 
 ### Open
 - Browser speed: about 25-30 fields/s on the title, 17-25 in a race before finding 087's work;
@@ -177,6 +216,8 @@ findings 039-047, 053-054, 065 and 072 and in this file's history.
   Grid, rider/bike looks, the countdown on the server's clock, hits between humans, finishes and
   results are shared (finding 047); a player who leaves becomes an AI rider.
 - In the game's own menus: name and code entry, public list, rider picker (finding 065); restart,
-  new level and rematch flows (finding 072).
+  new level and rematch flows (finding 072). Create/Join waits on ONLINE, then the rider screen
+  once and the room over it, with no bounce and no second title flight (finding 092); the shop's
+  bike/jersey pages are still skipped online.
 - Tests: `port/net/build_tests.py` (unit and loopback), the server's own tests (`npm test`),
   `port/tools/online_race.py` (two local games through a relay, optionally `nettool` bots).

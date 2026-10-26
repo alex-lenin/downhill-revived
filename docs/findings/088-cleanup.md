@@ -587,4 +587,31 @@ locked file was edited.
 Checks (builds only): `build_wasm.py -j 2`, `package_release.py --wasm ... --jobs 2` (dhd.exe x64,
 only Windows DLL imports), `port/web/build.py ... --renderer rust` threaded and `--no-threads` with
 `check_web_layout.py build/web` OK after each, `build_host64_linux.py` in WSL (PASS, 136 imports, 35
-Linux host objects), `py_compile` of every Python file touched. 
+Linux host objects), `py_compile` of every Python file touched.
+
+## AND1: Android arm64 build
+
+Finding 091. Shared code touched for arm64: `guard.rs` (FPCR), `surface.rs`/`ffi.rs`
+(`DHDR_WINDOW_ANDROID`), `rustgs.py` and `check_rust_lib.py` (the Android triple, ELF members),
+`sdl3.py --android`, `fiber_posix.c` (aarch64 frame fixed), `native_thread.h` (POSIX branch),
+`gpu_rust.c`/`gpu_rust_native.inc`/`present.c` (non-Windows window size, surface reset, Android
+lifecycle), `host.c`/`vif.c`/`keyboard.c` (`__aarch64__` with the x64 layout tests, pacing fences),
+`graphics_queue.c`/`gs_queue.inc` (`fp_control`), `vu0_interp.c` (SIMDe on arm64), `font_sharp.c`.
+New: `build_host64_android.py`, `port/host/android_main.c`, `backtrace_posix.h`, `port/android/`.
+The x64 exe (`package_release.py`) and the browser build were rebuilt after it. After the device
+runs: `sdl_host.c` (Android polls SDL's events, then sleeps 4 ms), `present.c` (the Android
+lifecycle in an SDL event watch), `surface.rs` (Android: a lost surface fails the present), `host.c`
+(the Android disc check before the core stops at SYSTEM.CNF), `host_posix.c` (Android: backslashes
+to slashes in host paths; the log drained at exit).
+
+## UI1: online flow, one centred menu layer, mouse
+
+Finding 092. Online: Create/Join waits on ONLINE until the server has the player, then the rider
+screen once and the room over it; back from the shop the title flight is skipped (the seek now comes
+after the forced play that rewound it). `menu_page.c` is the one layer for the port's pages (centred
+like the pause menu; button, value and text rows); PC SETTINGS, the exit question, ONLINE and the
+race room use it. Mouse: `host_service_mouse_state` (HostMouse, picture fractions) from SDL3
+(present.c, the renderer's picture rectangle) and the browser canvas (main.js/worker.js); hover,
+click, right click and wheel in every popup the manager runs; the OS cursor hides when idle or
+riding. No game logic changed: race-start state trace 3000/3000 rows match main's exe. Builds: wasm,
+x64 package, both web builds with check_web_layout. 

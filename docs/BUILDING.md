@@ -116,6 +116,14 @@ output goes under `DHD_DEVCACHES/dhd-cargo`, compiled objects are cached in
 place (`~/scoop/apps/llvm/current/bin`). `build_host64.py` names the Visual Studio and Windows SDK
 folders it uses (MSVC 14.51, SDK 10.0.26100.0) at its top.
 
+### Android (arm64 APK)
+
+`python port/android/build_apk.py --wasm build/wasm/dhd_core.wasm` builds `libmain.so` with
+`port/tools/build_host64_android.py` and a debug-signed APK, `build/android/downhill-revived-<version>-debug.apk`.
+It needs the Android SDK (`ANDROID_HOME`, platform android-35), an NDK (r29 tested), a JDK 17+
+(`JAVA_HOME`), the Rust target `aarch64-linux-android`, and `GRADLE_USER_HOME` and
+`ANDROID_USER_HOME` set (Gradle and the debug key). No Android Studio. Details and status: finding 091.
+
 ### SDL3 (window, sound, controllers)
 
 `port/tools/sdl3.py`, which `package_release.py` runs, provides SDL3 as a static library, so
