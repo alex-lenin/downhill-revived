@@ -1,5 +1,9 @@
 # Online play: plan
 
+**Historical.** This is the plan as decided in October 2026; it is done and no longer maintained.
+Online races shipped in 0.1.0. What exists now is in `docs/STATE.md` (Online play) and the wire
+protocol in `docs/online-protocol.md`.
+
 Decided with the project owner on 2026-10-16. Revised the same day: input lockstep is dropped
 (finding 041 has what was built and why it stopped); online races use state sync.
 
