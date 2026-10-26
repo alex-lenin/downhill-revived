@@ -10,6 +10,8 @@
 #include <stdio.h>
 
 #include "memory.h"
+#include "../include/guest.h"
+#include "../host/host_api.h"  /* the OS services: files, time, fibers, memory */
 
 /* Defines a C function under the retail name of the SDK function it replaces. */
 #define RETAIL(name) __asm__("_" #name)
@@ -24,8 +26,6 @@ void host_thread_name(const char *name); /* names the calling OS thread for benc
 unsigned host_thread_cpu(const char **names, double *seconds, unsigned max); /* CPU time of each */
 void host_poll_dump(void);   /* optional watchdog request at a kernel boundary */
 void host_backtrace(void);    /* the same report, here */
-void host_safe_vprint(FILE *f, const char *fmt, va_list ap);  /* checks %s pointers */
-int host_relaunch_reserving(uintptr_t at, size_t size);       /* see host.c */
 void host_settings_load(void); /* dhd.ini next to the exe into DHD_* variables (host.c) */
 int host_disc_ready(void);     /* the disc image checked, else asked for; nonzero: cancelled */
 /* update.c, the auto-updater (finding 054); all but update_request in the first dhd.exe */
@@ -47,15 +47,7 @@ void host_widescreen_init(void);  /* DHD_WIDESCREEN: Hor+ field of view, any asp
 void host_widescreen_vsync(void); /* its live-memory part, once a field */
 double host_widescreen_aspect(void);  /* the widescreen picture's width / height; 0 when off */
 void host_display_aware(void);    /* the process sees real pixels (DPI aware), before any window */
-void *host_fiber_main(void);  /* makes the calling OS thread a fiber; returns it */
-void *host_fiber_create(void (*fn)(void *), void *arg);
-void host_fiber_switch(void *fiber);
-void host_fiber_delete(void *fiber);
-void *host_fiber_current(void);
-double host_seconds(void);    /* since the first call */
-double host_wall_seconds(void); /* diagnostics; game clock can be virtual */
-void host_sleep_ms(unsigned ms);
-void host_wait_wall(double seconds); /* until host_wall_seconds() reaches it, without spinning long */
+double host_seconds(void);    /* the game clock in seconds: virtual under DHD_FRAME_CLOCK (kernel.c) */
 /* Just-in-time frames (kernel.c): the picture handed on at this VBLANK, when to show it (0: at
    once) and when its pad was read; the presenter calls pacing_present just before it presents. */
 void pacing_handed(double *due, double *began);
@@ -91,12 +83,31 @@ const uint8_t *keyboard_keys(int *count);  /* the keys it reads */
 void keyboard_reset(void);
 int keyboard_game_axis(int raw);           /* the game's reading of a stick byte (-127..127) */
 int keyboard_script(const char *script, double seconds, uint8_t down[256]);  /* DHD_KEYS */
+/* The keyboard's state, fed by the SDL thread (sdl_host.c): a key by its place (position: the
+   Windows virtual-key code of the US key, letters by place) and by the character it types on the
+   current layout (typed). Focus lost lets every key go up. */
+void keyboard_key(unsigned position, unsigned typed, int down);
+unsigned keyboard_typed_of(unsigned position);  /* what that key types on the current layout */
+int keyboard_position_down(unsigned position);
+int keyboard_is_down(unsigned typed);           /* a key that types `typed` is held */
+void keyboard_focus(int focused);               /* the game's window has the keyboard */
+int keyboard_focused(void);
+enum { VKEY_SHIFT = 0x10, VKEY_CONTROL = 0x11, VKEY_MENU = 0x12, VKEY_LWIN = 0x5B, VKEY_RWIN = 0x5C };
 
 /* gamepad.c: controllers through SDL3 (XInput, DirectInput, HID: DualSense, DualShock 4, Switch
-   Pro and the generic pads in SDL's mapping database). gamepad_start: 1 if SDL is running. */
+   Pro and the generic pads in SDL's mapping database). gamepad_start: 1 if SDL is running. The
+   pads are read on the SDL thread (sdl_host.c), which calls gamepad_thread_*. */
 int gamepad_start(void);
 int gamepad_read(int player, HostPad *out);  /* 0: no controller for that player */
 void gamepad_vibrate(int player, int light, int heavy);
+enum { PADDEV_ADDED = 1, PADDEV_REMOVED, PADDEV_REMAPPED };
+/* sdl_host.c's SDL thread: the pads' start (1 if up), a device change, and every pass. */
+int gamepad_thread_start(void);
+void gamepad_device(int change, unsigned id);
+void gamepad_thread_update(void);
+/* sdl_host.c: starts the SDL thread once and returns when it is up (see sdl_host.c). */
+int sdl_host_start(void);
+int sdl_host_run(void (*fn)(void *), void *arg);  /* runs fn on the SDL thread and waits for it */
 
 /* ---- kernel.c ---- */
 enum { INTC_GS = 0, INTC_VBLANK_START = 2, INTC_VBLANK_END = 3, INTC_TIMER0 = 9 };
@@ -117,7 +128,7 @@ void kernel_dmac_interrupt(int channel);
 void vif_feed(int unit, const uint32_t *words, uint32_t n);  /* vif.c */
 void dma_mmio_write(uintptr_t address, uint64_t value, unsigned size);
 void dma_poll(void);  /* ends the DMA transfers the game started (see dma.c) */
-void graphics_feed(int unit, const uint32_t *words, uint32_t count);
+void graphics_feed(int unit, uint32_t words, uint32_t count);  /* words: guest address */
 void graphics_wait(void);
 /* Writes deferred store-image reads (graphics.c) before host code passes PS2 RAM to the OS. */
 void graphics_settle(void);
@@ -160,7 +171,6 @@ extern int hle_mc_hold;                     /* mc.c: card writes held (online, a
 void hle_online_version(char *out, size_t size);  /* the build's identity for the lobby */
 void kernel_pace_slip(double seconds);      /* kernel.c: the frame clock waited this long */
 void kernel_pace_shared(int on);            /* kernel.c: online, fields keep to the shared race clock */
-int host_stack_ranges(uintptr_t (**ranges)[2]);  /* host.c: the EE threads' host stacks [low, high) */
 
 /* iop.c */
 void *iop_ptr(uint32_t addr);  /* host pointer of an IOP memory address */

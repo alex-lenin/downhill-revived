@@ -137,20 +137,6 @@ PATCHES = {
     'unsorted/001F8920.c': [
         ('text', '(float)race->x500 / (float)race->x504',
          'ps2_fdiv((float)race->x500, (float)race->x504)')],
-    # Observe stack/tag state around animation and the actual bone-cache writer.
-    # Disabled unless DHD_X87_CHECK=1; the observer preserves the complete x87 state.
-    'unsorted/001AD1C0.c': [
-        ('text', 'void func_001AD1C0(Ctrl *ctrl)\n{',
-         'void func_001AD1C0(Ctrl *ctrl)\n{\n    ps2_x87_checkpoint(0x001AD1C0, 0);'),
-        ('re', (r'\n}\s*$', 1), '\n    ps2_x87_checkpoint(0x001AD1C0, 1);\n}\n')],
-    'unsorted/001AD700.c': [
-        ('text', 'void func_001AD700(struct Obj *obj, float value)\n{',
-         'void func_001AD700(struct Obj *obj, float value)\n{\n    ps2_x87_checkpoint(0x001AD700, 0);'),
-        ('re', (r'\n}\s*$', 1), '\n    ps2_x87_checkpoint(0x001AD700, 1);\n}\n')],
-    'unsorted/0023AE78.c': [
-        ('text', 'void func_0023AE78(int index, Matrix *src)\n{',
-         'void func_0023AE78(int index, Matrix *src)\n{\n    ps2_x87_checkpoint(0x0023AE78, 0);'),
-        ('re', (r'\n}\s*$', 1), '\n    ps2_x87_checkpoint(0x0023AE78, 1);\n}\n')],
     # Empty animation tracks have zero duration. Keep the EE's finite divide,
     # multiply/add and integer-conversion semantics throughout the blend.
     'unsorted/001E75D8.c': [('body', 'Update', r'''{
@@ -295,7 +281,20 @@ PATCHES = {
                            '    unsigned char b;\n    unsigned short padding;\n    union {\n        unsigned int bits;\n        unsigned short n;'),
                           ('text', '    Huft r;', '    Huft r = {0};'),
                           ('text', '            r.b = k - w;\n',
-                           '            r.v.bits = 0; /* invalid leaves also have defined bytes */\n            r.b = k - w;\n')],
+                           '            r.v.bits = 0; /* invalid leaves also have defined bytes */\n            r.b = k - w;\n'),
+                          # The callers read the inflate block status. i686's void
+                          # body tail-calls the block decoder, retaining its EAX;
+                          # wasm's in-TU bitcast shim instead returns its argument.
+                          ('text', 'void func_00241E70(int *e)', 'int func_00241E70(int *e)'),
+                          ('text', '    if (t == 0) {\n        func_002413E8();\n'
+                                   '    } else if (t == 1) {\n        func_00241598();\n'
+                                   '    } else if (t == 2) {\n        func_002417E0();\n    }\n}',
+                           '    if (t == 0) {\n        return func_002413E8();\n'
+                           '    } else if (t == 1) {\n        return func_00241598();\n'
+                           '    } else if (t == 2) {\n        return func_002417E0();\n'
+                           '    }\n    return (int)t; /* i686 leaves the invalid block type in EAX */\n}'),
+                          ('re', (r'\(\(int \(\*\)\(int \*\)\)func_00241E70\)\(&done\)', 2),
+                           'func_00241E70(&done)')],
     # STR8 defines an 8-byte name string as two words; the PS2 data image has them, so the PC
     # build declares each name at its address instead (.sdata from 0x29D4A0, in order)
     'unsorted/001BA3B8.c': [('text', '#include "include_asm.h"\n', '#include "include_asm.h"\n' + STR8_DECLS),
@@ -647,3 +646,6 @@ PATCHES['unsorted/0019EA38.c'] = PATCHES.get('unsorted/0019EA38.c', []) + [
     ('text', 'func_00176E40(manager->x150,0); }\n}',
      'func_00176E40(manager->x150,0); }\n hle_online_restart_ready();\n}'),
 ]
+
+# wasm32: size_t is unsigned long there and unsigned int on i686 (the same type as the game's).
+PATCHES['unsorted/00235488.cpp'] = [('text', 'operator new[](unsigned int size)', 'operator new[](__SIZE_TYPE__ size)')]

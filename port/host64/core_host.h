@@ -1,0 +1,17 @@
+/* Native wasm2c runtime. One module and one cooperative EE scheduler per OS thread. */
+#ifndef HOST64_CORE_HOST_H
+#define HOST64_CORE_HOST_H
+#include <stdint.h>
+#include "../host/host_api.h"
+extern uintptr_t guest_base;
+/* Bind the exported mutable __stack_pointer before creating any EE fibers. */
+void host64_fiber_bind(uint32_t *stack_pointer);
+void host64_fiber_shutdown(void);
+uint32_t host64_fiber_stack_top(HostFiber fiber);
+int host64_fiber_id(void);  /* the running EE fiber, unchecked (diagnostics) */
+/* Commits guest [at, at + size) (guest_memory.c); everything else stays reserved. */
+int host64_memory_commit(uint64_t at, uint64_t size);
+/* After instantiation: the root shadow stack below the initial stack pointer,
+   when the module keeps it below HOST64_MODULE_BASE. 1 on success. */
+int host64_memory_commit_stack(uint32_t stack_pointer);
+#endif

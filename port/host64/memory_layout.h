@@ -1,0 +1,15 @@
+/* Shared allocator/optimizer invariant. Never use the adapter with another
+   allocator unless it enforces this same committed minimum at instantiation. */
+#ifndef DHD_HOST64_MEMORY_LAYOUT_H
+#define DHD_HOST64_MEMORY_LAYOUT_H
+#define HOST64_MIN_MEMORY_SIZE 0x70010000ull
+/* The module's own memory (wasm-ld --global-base: its shadow stack, data, bss
+   and heap) starts here, above the scratchpad. Only this range, the RAM views,
+   and what the module or host commits explicitly (host_mem_commit: scratchpad
+   and hardware windows; EE stack slots; the bridge arena) is committed. */
+#define HOST64_MODULE_BASE 0x70100000ull
+/* wasm-ld --stack-first places the shadow stack at [0, __stack_pointer) even
+   with --global-base. host64_memory_commit_stack commits it above a reserved
+   null/overflow page; it must end below the low RAM view (0x00400000). */
+#define HOST64_NULL_GUARD 0x1000u
+#endif

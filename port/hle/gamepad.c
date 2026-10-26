@@ -2,10 +2,10 @@
    8BitDo and most other USB and Bluetooth pads (DirectInput and HID), with SDL's built-in
    mapping database. Vibration goes to every pad that has motors.
 
-   SDL runs on a thread of its own: it initialises there (its device-change window lives on that
-   thread), waits for events, keeps each player's latest state and sends the vibration the game
-   asks for. The game thread only copies states (gamepad_read). Players are slots: a pad that
-   connects takes the first free one and keeps it until it disconnects.
+   SDL runs on one thread for the whole process (sdl_host.c): it creates the window, waits for
+   events and calls in here to keep each player's latest state and to send the vibration the
+   game asks for. The game thread only copies states (gamepad_read). Players are slots: a pad
+   that connects takes the first free one and keeps it until it disconnects.
 
    Buttons by position, as on a DualShock 2: the bottom face button is Cross, right Circle, left
    Square, top Triangle, whatever the labels (a Switch Pro's B is Cross). Back/Share/Create is
@@ -13,11 +13,12 @@
    A pad SDL knows as a joystick but has no gamepad mapping for gets a default one: hat 0 the
    d-pad, axes 0/1 the left stick, 2/3 the right stick, buttons 0-3 Cross Circle Square
    Triangle, 4/5 L1/R1, 6/7 L2/R2, 8 SELECT, 9 START, 10/11 L3/R3. gamecontrollerdb.txt beside
-   dhd.exe (SDL's format) adds or corrects mappings; so does SDL_GAMECONTROLLERCONFIG. */
+   dhd.exe (SDL's format) adds or corrects mappings; so does SDL_GAMECONTROLLERCONFIG.
+   DHD_SDL=0 leaves the pads to host.c's direct XInput and Sony code. */
 #include "hle.h"
 
+#if defined(_WIN32) || defined(DHD_HAVE_SDL)
 #include <SDL3/SDL.h>
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,13 +33,12 @@ typedef struct {
     Uint64 sent;                 /* when (it is sent again before SDL's duration runs out) */
 } Slot;
 
-static Slot slots[SLOTS];
-static HostPad latest[SLOTS];
-static volatile LONG present[SLOTS];
-static volatile LONG want_light[SLOTS], want_heavy[SLOTS];
-static CRITICAL_SECTION lock;
-static HANDLE ready;
-static volatile LONG running;   /* 1 once SDL is up, -1 if it couldn't start */
+static Slot slots[SLOTS];       /* SDL thread only */
+static HostPad latest[SLOTS];   /* under lock */
+static int present[SLOTS];      /* under lock */
+static SDL_Mutex *lock;         /* made by gamepad_thread_start */
+static SDL_AtomicInt want_light[SLOTS], want_heavy[SLOTS];
+static SDL_AtomicInt running;   /* 1 once the pads are up, -1 if they couldn't start */
 
 static const uint16_t pressure_order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
                                             PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
@@ -132,12 +132,12 @@ static void detach(SDL_JoystickID id)
 {
     int i = slot_of(id);
     if (i < 0) return;
-    EnterCriticalSection(&lock);
+    SDL_LockMutex(lock);
     if (slots[i].gamepad) SDL_CloseGamepad(slots[i].gamepad);
     if (slots[i].joystick) SDL_CloseJoystick(slots[i].joystick);
     memset(&slots[i], 0, sizeof slots[i]);
-    InterlockedExchange(&present[i], 0);
-    LeaveCriticalSection(&lock);
+    present[i] = 0;
+    SDL_UnlockMutex(lock);
     fprintf(stderr, "controller: player %d disconnected\n", i + 1);
 }
 
@@ -162,22 +162,36 @@ static void rumble(Slot *s, int light, int heavy)
     s->light = light, s->heavy = heavy, s->sent = now;
 }
 
-static DWORD WINAPI sdl_thread(void *unused)
+static void stop_vibration(void);
+
+/* ---- called by the SDL thread (sdl_host.c) ---- */
+
+static int enabled(void)
 {
-    (void)unused;
-    host_thread_name("controllers");
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  /* no SDL window: always "focused" */
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        fprintf(stderr, "controller: SDL didn't start (%s); using XInput and the Sony pads directly\n", SDL_GetError());
-        InterlockedExchange(&running, -1);
-        SetEvent(ready);
+    const char *setting = getenv("DHD_SDL");  /* DHD_SDL=0: host.c's direct XInput and Sony code */
+    return !(setting && !atoi(setting));
+}
+
+/* Once, on the SDL thread after SDL's events are up: 1 if the pads are up. */
+int gamepad_thread_start(void)
+{
+    static int registered;
+    if (!enabled()) {
+        SDL_SetAtomicInt(&running, -1);
         return 0;
     }
-    char path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
-    while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
-    snprintf(path + n, sizeof path - n, "gamecontrollerdb.txt");
-    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  /* the window may not have the focus */
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+        fprintf(stderr, "controller: SDL didn't start (%s); using XInput and the Sony pads directly\n", SDL_GetError());
+        SDL_SetAtomicInt(&running, -1);
+        return 0;
+    }
+    lock = SDL_CreateMutex();
+    const char *base = SDL_GetBasePath();  /* the folder of dhd.exe, with its separator */
+    char path[1024];
+    snprintf(path, sizeof path, "%sgamecontrollerdb.txt", base ? base : "");
+    SDL_PathInfo info;
+    if (SDL_GetPathInfo(path, &info)) {
         int added = SDL_AddGamepadMappingsFromFile(path);
         fprintf(stderr, "controller: %d mappings from %s\n", added, path);
     }
@@ -185,78 +199,91 @@ static DWORD WINAPI sdl_thread(void *unused)
     SDL_JoystickID *ids = SDL_GetJoysticks(&count);
     for (int i = 0; ids && i < count; i++) attach(ids[i]);
     SDL_free(ids);
-    InterlockedExchange(&running, 1);
-    for (int first = 1;; first = 0) {
-        SDL_Event e;
-        /* wakes on any input; 4 ms at most, so the vibration is never late */
-        for (int got = SDL_WaitEventTimeout(&e, 4); got; got = SDL_PollEvent(&e)) {
-            if (e.type == SDL_EVENT_JOYSTICK_ADDED) attach(e.jdevice.which);
-            else if (e.type == SDL_EVENT_JOYSTICK_REMOVED) detach(e.jdevice.which);
-            else if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMAPPED) remap(e.gdevice.which);
-        }
-        for (int i = 0; i < SLOTS; i++) {
-            Slot *s = &slots[i];
-            HostPad p;
-            if (!s->id) continue;
-            memset(&p, 0, sizeof p);
-            p.left_x = p.left_y = p.right_x = p.right_y = 128;
-            if (s->gamepad) read_gamepad(s->gamepad, &p);
-            else read_joystick(s->joystick, &p);
-            EnterCriticalSection(&lock);
-            latest[i] = p;
-            LeaveCriticalSection(&lock);
-            InterlockedExchange(&present[i], 1);
-            rumble(s, (int)want_light[i], (int)want_heavy[i]);
-        }
-        if (first) SetEvent(ready);  /* the pads there at the start have a state */
+    SDL_SetAtomicInt(&running, 1);
+    gamepad_thread_update();  /* the pads there at the start have a state */
+    if (!registered++) atexit(stop_vibration);
+    return 1;
+}
+
+/* A device came or went (SDL's joystick and gamepad events, relayed by sdl_host.c). */
+void gamepad_device(int change, unsigned id)
+{
+    if (SDL_GetAtomicInt(&running) != 1) return;
+    if (change == PADDEV_ADDED) attach(id);
+    else if (change == PADDEV_REMOVED) detach(id);
+    else if (change == PADDEV_REMAPPED) remap(id);
+}
+
+/* Every pass of the SDL thread: the pads' states for the game, and the vibration asked for. */
+void gamepad_thread_update(void)
+{
+    if (SDL_GetAtomicInt(&running) != 1) return;
+    for (int i = 0; i < SLOTS; i++) {
+        Slot *s = &slots[i];
+        HostPad p;
+        if (!s->id) continue;
+        memset(&p, 0, sizeof p);
+        p.left_x = p.left_y = p.right_x = p.right_y = 128;
+        if (s->gamepad) read_gamepad(s->gamepad, &p);
+        else read_joystick(s->joystick, &p);
+        SDL_LockMutex(lock);
+        latest[i] = p;
+        present[i] = 1;
+        SDL_UnlockMutex(lock);
+        rumble(s, SDL_GetAtomicInt(&want_light[i]), SDL_GetAtomicInt(&want_heavy[i]));
     }
 }
 
 /* At exit: no pad left vibrating (the motors keep the last command when the game ends mid-rumble). */
 static void stop_vibration(void)
 {
-    EnterCriticalSection(&lock);
+    if (!lock) return;
+    SDL_LockMutex(lock);
     for (int i = 0; i < SLOTS; i++) {
         if (slots[i].gamepad) SDL_RumbleGamepad(slots[i].gamepad, 0, 0, 0);
         else if (slots[i].joystick) SDL_RumbleJoystick(slots[i].joystick, 0, 0, 0);
     }
-    LeaveCriticalSection(&lock);
+    SDL_UnlockMutex(lock);
 }
+
+/* ---- the game's side ---- */
 
 int gamepad_start(void)
 {
-    static volatile LONG started;
-    if (!InterlockedExchange(&started, 1)) {
-        const char *setting = getenv("DHD_SDL");  /* DHD_SDL=0: host.c's direct XInput and Sony code */
-        if (setting && !atoi(setting)) {
-            InterlockedExchange(&running, -1);
-            return 0;
-        }
-        InitializeCriticalSection(&lock);
-        ready = CreateEventA(NULL, TRUE, FALSE, NULL);
-        HANDLE t = CreateThread(NULL, 0, sdl_thread, NULL, 0, NULL);
-        if (!t) InterlockedExchange(&running, -1);
-        else {
-            CloseHandle(t);
-            WaitForSingleObject(ready, 3000);
-            atexit(stop_vibration);
-        }
-    }
-    return running > 0;
+    if (!enabled()) return 0;
+    sdl_host_start();  /* the SDL thread, once; it returns when the pads are up or failed */
+    return SDL_GetAtomicInt(&running) > 0;
 }
 
 int gamepad_read(int player, HostPad *out)
 {
-    if (player < 0 || player >= SLOTS || !gamepad_start() || !present[player]) return 0;
-    EnterCriticalSection(&lock);
-    *out = latest[player];
-    LeaveCriticalSection(&lock);
-    return 1;
+    if (player < 0 || player >= SLOTS || !gamepad_start()) return 0;
+    SDL_LockMutex(lock);
+    int ok = present[player];
+    if (ok) *out = latest[player];
+    SDL_UnlockMutex(lock);
+    return ok;
 }
 
 void gamepad_vibrate(int player, int light, int heavy)
 {
     if (player < 0 || player >= SLOTS) return;
-    InterlockedExchange(&want_light[player], light ? 1 : 0);
-    InterlockedExchange(&want_heavy[player], heavy & 255);
+    SDL_SetAtomicInt(&want_light[player], light ? 1 : 0);
+    SDL_SetAtomicInt(&want_heavy[player], heavy & 255);
 }
+#else
+/* No controller backend on this host (SDL3 comes later): there are no pads. */
+int gamepad_start(void) { return 0; }
+int gamepad_read(int player, HostPad *out)
+{
+    (void)player;
+    (void)out;
+    return 0;
+}
+void gamepad_vibrate(int player, int light, int heavy)
+{
+    (void)player;
+    (void)light;
+    (void)heavy;
+}
+#endif

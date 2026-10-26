@@ -1,4 +1,4 @@
-"""32-bit exceptional arithmetic and game/host SSE trap regression."""
+"""EE float semantics: recompiled float code, the IR rewrite and the grid conversion patch."""
 from pathlib import Path
 import os
 import subprocess
@@ -124,23 +124,6 @@ def ir_rewrite():
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    exe = OUT / 'test_float.exe'
-    rt = ROOT / 'port/runtime'
-    subprocess.run(['clang', '--target=i686-pc-windows-msvc', '-fuse-ld=lld', '-O2',
-                    '-msse2', '-mfpmath=sse', '-ffp-contract=off', '-Wno-deprecated-declarations',
-                    str(rt / 'test_float.c'), str(rt / 'fp_trap.c'), '-o', str(exe),
-                    '-Wl,/opt:noicf', '-Wl,/fixed', '-Wl,/dynamicbase:no',
-                    '-Wl,/map:' + str(exe.with_suffix('.map'))], check=True)
-    env = os.environ.copy()
-    env.pop('DHD_FP_TRAP', None)
-    subprocess.run([str(exe)], env=env, check=True)
-    env['DHD_FP_TRAP'] = '1'
-    for mode in ('game', 'host', 'rearm'):
-        run = subprocess.run([str(exe), mode], env=env, capture_output=True, text=True)
-        assert run.returncode == 17, (mode, run.returncode, run.stderr)
-        assert 'FP trap:' in run.stderr and '_func_fp_div+' in run.stderr, run.stderr
-        assert 'xmm0:' in run.stderr and 'instruction:' in run.stderr, run.stderr
-    print('Game trap, host one-instruction retry and frame-boundary rearm pass')
     recompiled_float()
     ir_rewrite()
     grid_conversion()

@@ -5,8 +5,11 @@ This first tier removes instruction decoding; pipeline state remains in the
 reference runtime. Unknown or modified blocks use the interpreter unchanged.
 No upstream implementation is copied.
 
-A block runs only where micro memory holds the words it was translated from. dhd.exe doesn't
-keep a copy of them: the include lists where each block's words are in .vutext, and
+build_wasm.py (for the native VU0 routines' words), build_host64.py and port/web/build_graphics.py
+generate it into their own build folders.
+
+A block runs only where micro memory holds the words it was translated from. The executable
+keeps no copy of them: the include lists where each block's words are in .vutext, and
 ps2_vu_aot_load (port/runtime/vu0_interp.c) copies them from the data image read from the
 player's disc. The test and bench programs, which have no disc image, define
 PS2_VU_AOT_EMBED and get the words as constants.
@@ -193,10 +196,11 @@ def generate(destination):
     # A block runs only where micro memory holds its exact words. In the game's VU1 micro memory
     # (0x11008000, changed only by VIF1 MPG, which bumps ps2_vu1_code_version) the block found
     # (or none) is remembered until the next change; any other code buffer (the oracle tests)
-    # compares each time.
+    # compares each time. The micro memory is a guest address: GADDR (identity on i686) also
+    # recognises it on a 64-bit host, where it sits at guest_base + 0x11008000.
     lines += ['};', 'static struct { uint64_t version; const AotBlock *block; } aot_resolved[2][2048];  /* version + 1 */',
               'static const AotBlock *aot_find(unsigned pc, const uint32_t *words, unsigned remaining, int slot) {',
-              '    const int game = (uintptr_t)(words - pc * 2) == 0x11008000;',
+              '    const int game = GADDR(words - pc * 2) == 0x11008000;',
               '    const AotBlock *found = NULL;',
               '    if (game && aot_resolved[slot][pc].version == ps2_vu1_code_version + 1)',
               '        found = aot_resolved[slot][pc].block;',
@@ -263,4 +267,4 @@ def generate(destination):
 
 
 if __name__ == '__main__':
-    print('VU1 AOT:', generate(ROOT / 'build/port/link/vu1_aot.inc'), 'straight-line blocks')
+    print('VU1 AOT:', generate(ROOT / 'build/vu1aot/vu1_aot.inc'), 'straight-line blocks')

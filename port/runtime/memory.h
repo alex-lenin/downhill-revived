@@ -25,8 +25,8 @@ int ps2_memory_init(void);
    to host addresses and recompiled functions, port/tools/data.py) set. Then the VU kernels take
    their microcode from it. */
 void ps2_image_load(const uint8_t *retail);
-/* Nonzero if host PS2_LOW_VIEW..PS2_RAM_SIZE is reserved for the low view (by a parent process,
-   host_relaunch_reserving), as ps2_memory_init needs. */
+/* Nonzero if host PS2_LOW_VIEW..PS2_RAM_SIZE is reserved for the low view (host_mem_reserved;
+   the wasm core's linear memory always is), as ps2_memory_init needs. */
 int ps2_low_view_reserved(void);
 
 #endif

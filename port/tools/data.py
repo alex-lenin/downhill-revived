@@ -20,7 +20,7 @@ mirrors (0x20000000/0x30000000 | address), DMA tag addresses and fixed RAM addre
   code; scratchpad addresses (D_7000xxxx) stay numbers too (mapped at 0x70000000, port/runtime/memory.c); any other RAM
   address (the heap start D_8A0400, the stack) is PS2_RAM_BASE + address.
 The label offsets in the assembled image are checked against their addresses (check_image).
-usage: python port/tools/data.py   (normally run by port/tools/link.py)"""
+usage: python port/tools/data.py   (normally run by port/tools/build_wasm.py's image stage)"""
 import ast, bisect, glob, os, re, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

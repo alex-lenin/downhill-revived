@@ -10,8 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-#include <bcrypt.h>
 
 /* Downhill Domination (USA) SCUS-97177, redump disc 30393 */
 static const char us_iso_sha256[] = "0fe2b77713d3440cc3030741ea0b18f49e3feaa09671a30a421e0d4888a7eb86";
@@ -95,7 +93,7 @@ static void run_page(void)
     func_0023D020(0, camera);
     func_0023C8D8(mode, 0);
     func_0023D8D8(0, distance, aspect);
-    text_input_end();
+    host_service_text_input_end();
 }
 
 /* The retail rider screen's Back cleanup (func_001F24B8), also needed when
@@ -192,101 +190,102 @@ static const char *server(void)
     return s && *s ? s : NULL;
 }
 
-/* ---- the ISO check, in a thread ---- */
+/* ---- the ISO check ---- */
 
-static volatile LONG iso_state;  /* 0 not started, 1 hashing, 2 done, 3 failed */
+static volatile int iso_state;  /* 0 not started, 1 hashing, 2 done, 3 failed */
+
+/* A thread's result for the screen: a sequentially consistent store (the Interlocked exchanges were these). */
+static void set_state(volatile int *state, int value) { __atomic_store_n(state, value, __ATOMIC_SEQ_CST); }
 static char iso_hash[65];
 
 /* The online launcher's cache: "size:ticks:hash", ticks the file's .NET LastWriteTimeUtc. */
 static void iso_check_path(char *out, size_t size)
 {
-    char exe[MAX_PATH];
-    GetModuleFileNameA(NULL, exe, sizeof exe);
+    char exe[HOST_PATH_MAX];
+    host_exe_path(exe, sizeof exe);
     char *slash = strrchr(exe, '\\');
     if (slash) slash[1] = 0;
     snprintf(out, size, "%siso-check.txt", exe);
 }
 
-static DWORD WINAPI hash_iso(void *arg)
-{
-    (void)arg;
-    const char *path = getenv("DHD_ISO");
-    WIN32_FILE_ATTRIBUTE_DATA info;
-    char key[64], cache[MAX_PATH], line[160];
-    if (!path || !GetFileAttributesExA(path, GetFileExInfoStandard, &info)) {
-        InterlockedExchange(&iso_state, 3);
-        return 0;
-    }
-    unsigned long long size = (unsigned long long)info.nFileSizeHigh << 32 | info.nFileSizeLow;
-    unsigned long long ticks = ((unsigned long long)info.ftLastWriteTime.dwHighDateTime << 32 |
-                                info.ftLastWriteTime.dwLowDateTime) + 504911232000000000ull;  /* 1601 -> 0001 */
-    snprintf(key, sizeof key, "%llu:%llu:", size, ticks);
-    iso_check_path(cache, sizeof cache);
-    FILE *f = fopen(cache, "r");
-    if (f) {
-        if (fgets(line, sizeof line, f) && !strncmp(line, key, strlen(key)) && strlen(line + strlen(key)) >= 64) {
-            memcpy(iso_hash, line + strlen(key), 64);
-            iso_hash[64] = 0;
-            fclose(f);
-            InterlockedExchange(&iso_state, 2);
-            return 0;
-        }
-        fclose(f);
-    }
-    hle_log("online menu: checking the ISO's SHA-256\n");
-    BCRYPT_ALG_HANDLE alg;
-    BCRYPT_HASH_HANDLE h;
-    uint8_t digest[32];
-    static uint8_t buf[1 << 20];
-    DWORD n;
-    int ok = 0;
-    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (file != INVALID_HANDLE_VALUE && BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0) {
-        if (BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) == 0) {
-            while (ReadFile(file, buf, sizeof buf, &n, NULL) && n) BCryptHashData(h, buf, n, 0);
-            ok = BCryptFinishHash(h, digest, sizeof digest, 0) == 0;
-            BCryptDestroyHash(h);
-        }
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
-    if (!ok) {
-        InterlockedExchange(&iso_state, 3);
-        return 0;
-    }
-    for (int i = 0; i < 32; i++) snprintf(iso_hash + 2 * i, 3, "%02x", digest[i]);
-    if ((f = fopen(cache, "w"))) fprintf(f, "%s%s\n", key, iso_hash), fclose(f);
-    InterlockedExchange(&iso_state, 2);
-    return 0;
-}
+/* 64-bit hosts hash on a host thread (finding 082): the blocking part runs on the host,
+   and page_update picks up the digest, so the menu stays responsive. */
+/* The cache key of the pending check (the online launcher's "size:ticks" format). */
+static char cache_key[64];
 
 static void start_iso_check(void)
 {
     const char *given = getenv("DHD_NET_ISO_SHA256");  /* the launcher's, when it started us */
+    const char *path = getenv("DHD_ISO");
+    uint64_t size, ticks;
+    char cache[HOST_PATH_MAX], line[160];
+    FILE *f;
     if (iso_state) return;
     if (given && strlen(given) == 64) {
         snprintf(iso_hash, sizeof iso_hash, "%s", given);
         iso_state = 2;
         return;
     }
-    iso_state = 1;
-    HANDLE t = CreateThread(NULL, 0, hash_iso, NULL, 0, NULL);
-    if (t) CloseHandle(t);
-    else iso_state = 3;
+    if (!path || !host_path_info(path, &size, &ticks)) {
+        set_state(&iso_state, 3);
+        return;
+    }
+    ticks += 504911232000000000ull;  /* the write time: FILETIME (1601) -> .NET ticks (0001) */
+    snprintf(cache_key, sizeof cache_key, "%llu:%llu:", (unsigned long long)size, (unsigned long long)ticks);
+    iso_check_path(cache, sizeof cache);
+    f = fopen(cache, "r");
+    if (f) {
+        if (fgets(line, sizeof line, f) && !strncmp(line, cache_key, strlen(cache_key)) &&
+            strlen(line + strlen(cache_key)) >= 64) {
+            memcpy(iso_hash, line + strlen(cache_key), 64);
+            iso_hash[64] = 0;
+            fclose(f);
+            set_state(&iso_state, 2);
+            return;
+        }
+        fclose(f);
+    }
+    hle_log("online menu: checking the ISO's SHA-256\n");
+    set_state(&iso_state, 1);
+    /* The hash itself runs on a host thread; page_update picks up the digest. */
+    if (!host_service_file_sha256_start(GADDR(path))) set_state(&iso_state, 3);
 }
 
-/* ---- the public list, in a thread ---- */
+/* One poll of the hashing host job: the digest lands in iso_hash, as before. */
+static void poll_iso(void)
+{
+    static uint8_t digest[32];
+    char cache[HOST_PATH_MAX];
+    FILE *f;
+    int r;
+    if (iso_state != 1) return;
+    r = host_service_file_sha256_poll(GADDR(digest));
+    if (!r) return;
+    if (r < 0) {
+        set_state(&iso_state, 3);
+        return;
+    }
+    for (int i = 0; i < 32; i++) snprintf(iso_hash + 2 * i, 3, "%02x", digest[i]);
+    iso_check_path(cache, sizeof cache);
+    if ((f = fopen(cache, "w"))) fprintf(f, "%s%s\n", cache_key, iso_hash), fclose(f);
+    set_state(&iso_state, 2);
+}
 
-static volatile LONG list_state;  /* 0 none, 1 asking, 2 done */
+/* ---- the public list ---- */
+
+static volatile int list_state;  /* 0 none, 1 asking, 2 done */
 static NetLobbyInfo list[LIST_MAX];
 static int list_count, list_shown;  /* list_shown: the rows have the answer */
 
-static DWORD WINAPI fetch_list(void *arg)
+/* One poll of the fetching host job: the rows land in list, as before. */
+static void poll_list(void)
 {
-    (void)arg;
-    list_count = net_list_lobbies(list, LIST_MAX);
-    InterlockedExchange(&list_state, 2);
-    return 0;
+    int r;
+    if (list_state != 1) return;
+    r = host_service_net_list_lobbies_poll(GADDR(list), LIST_MAX);
+    if (r == -2) return;
+    list_count = r;
+    set_state(&list_state, 2);
 }
 
 /* ---- the player ---- */
@@ -314,8 +313,8 @@ static void load_player(void)
 /* Saved to dhd.ini and set for this run, as the online launcher does. */
 static void save(const char *key, const char *env, const char *value)
 {
-    host_setting_save(key, value);
-    _putenv_s(env, value);
+    host_service_host_setting_save(GADDR(key), GADDR(value));
+    host_putenv_s(env, value);
 }
 
 /* What stops this PC from joining a race, or NULL. */
@@ -338,9 +337,9 @@ static int home_row;  /* HOME's row last chosen: the cursor goes back to it */
 
 static void go(int to)
 {
-    text_input_end();
+    host_service_text_input_end();
     screen = to;
-    if (to == NAME || to == CODE) text_input_begin();
+    if (to == NAME || to == CODE) host_service_text_input_begin();
     if (to == ROOM) room_focus = selected;
     status[0] = 0;
     menu_page_rebuild_at(&page, to == HOME ? home_row : 0);
@@ -350,10 +349,9 @@ static void start_list(void)
 {
     if (list_state == 1) return;
     list_state = 1;
-    net_init(server(), name, version, iso_hash);
-    HANDLE t = CreateThread(NULL, 0, fetch_list, NULL, 0, NULL);
-    if (t) CloseHandle(t);
-    else list_state = 2, list_count = -1;
+    host_service_net_init(GADDR(server()), GADDR(name), GADDR(version), GADDR(iso_hash));
+    /* The fetch itself runs on a host thread; page_update picks up the rows. */
+    if (!host_service_net_list_lobbies_start(LIST_MAX)) list_state = 2, list_count = -1;
 }
 
 static void enter_room(int create, const char *code)
@@ -363,9 +361,9 @@ static void enter_room(int create, const char *code)
         snprintf(status, sizeof status, "%s", why);
         return;
     }
-    net_init(server(), name, version, iso_hash);
-    if (create) net_create_room();
-    else if (net_join_room(code) < 0) {
+    host_service_net_init(GADDR(server()), GADDR(name), GADDR(version), GADDR(iso_hash));
+    if (create) host_service_net_create_room();
+    else if (host_service_net_join_room(GADDR(code)) < 0) {
         snprintf(status, sizeof status, "That code can't be one");
         return;
     }
@@ -445,7 +443,7 @@ static void room_update(MenuPage *p, NetLobby *l)
         snprintf(status, sizeof status, "%s",
                  too_old ? outdated_text : l->error[0] ? l->error : "The connection to the server failed");
         hle_log("online menu: refused: %s (%s)\n", l->error, l->error_code);
-        net_leave();
+        host_service_net_leave();
         reset_selection();
         if (too_old) home_row = 5;
         if (in_shell) {  /* the rider screen's Back, then ONLINE again with the reason */
@@ -462,12 +460,12 @@ static void room_update(MenuPage *p, NetLobby *l)
         char room_name[40];
         snprintf(room_name, sizeof room_name, "%s", name);
         NetRoomSettings s = {tracks[room_track].index, room_options, public_room, 4, -1, room_name};
-        net_set_room(&s);
+        host_service_net_set_room(GADDR(&s));
         room_settings_sent = 1;
     }
     if (in && !room_ready_sent) {
         hle_log("online menu: room %s%s, version %s\n", l->code, l->is_host ? " (host)" : "", version);
-        net_set_ready(0);
+        host_service_net_set_ready(0);
         room_ready_sent = 1;
     }
     if (in)
@@ -500,7 +498,7 @@ static void room_update(MenuPage *p, NetLobby *l)
         else if (selected && l->member[i].rider == chosen_rider / 32) conflict = 1;
     }
     if (in) room_options = l->laps;
-    if (own_ready && (conflict || ready_track != l->track || ready_options != l->laps)) net_set_ready(0);
+    if (own_ready && (conflict || ready_track != l->track || ready_options != l->laps)) host_service_net_set_ready(0);
     int ready = 0;
     for (int i = 0; i < l->nmembers; i++) ready += l->member[i].ready;
     int can_start = in && l->is_host && l->nmembers >= 2 && ready == l->nmembers;
@@ -570,7 +568,7 @@ static void page_step(MenuPage *p, int row, int by);
 static void leave_room(MenuPage *p)
 {
     hle_log("online menu: leaving the room\n");
-    net_leave();
+    host_service_net_leave();
     reset_selection();
     if (in_shell) {
         race = 0;
@@ -592,6 +590,8 @@ static void page_update(MenuPage *p, int cursor)
         }
     }
     p->footer = status[0] ? status : NULL;
+    poll_iso();   /* the hashing host job: its digest lands in iso_hash */
+    poll_list();  /* the fetching host job: its rows land in list */
     switch (screen) {
     case HOME:
         if (!status[0] && cursor >= 2 && not_ready()) p->footer = not_ready();
@@ -602,8 +602,7 @@ static void page_update(MenuPage *p, int cursor)
     case NAME:
     case CODE:
         {
-            int action = text_input_edit(entry, (screen == NAME ? NAME_MAX : CODE_LENGTH) + 1,
-                                         screen == NAME ? name_letters : code_letters);
+            int action = host_service_text_input_edit(GADDR(entry), (screen == NAME ? NAME_MAX : CODE_LENGTH) + 1, GADDR(screen == NAME ? name_letters : code_letters));
             if (action < 0) { go(HOME); return; }
             if (action > 0) { page_accept(p, 1); return; }
         }
@@ -613,7 +612,7 @@ static void page_update(MenuPage *p, int cursor)
         break;
     case ROOM: {
         static NetLobby l;
-        net_get_lobby(&l);
+        host_service_net_get_lobby(GADDR(&l));
         room_update(p, &l);
         break;
     }
@@ -644,7 +643,7 @@ static void page_accept(MenuPage *p, int row)
             go(CODE);
         } else if (row == 5 && outdated) {
             hle_log("online menu: Update Now\n");
-            update_request();  /* ends the game; the first dhd.exe updates and starts it again */
+            host_service_update_request();  /* ends the game; the first dhd.exe updates and starts it again */
         }
         break;
     case LIST:
@@ -677,18 +676,18 @@ static void page_accept(MenuPage *p, int row)
     }
     case ROOM: {
         NetLobby l;
-        net_get_lobby(&l);
+        host_service_net_get_lobby(GADDR(&l));
         if (row == R_TRACK || row == R_BOTS) {
             page_step(p, row, 1);
             break;
         }
         if (row == R_SELECT) {
-            net_set_ready(0);
+            host_service_net_set_ready(0);
             selection_requested = 1;
         } else if (row == R_READY && !strcmp(text[R_READY], "Not Ready"))  /* the label shows the last snapshot */
-            net_set_ready(0);
-        else if (row == R_READY) { ready_track = l.track, ready_options = l.laps; net_set_ready(1); }
-        else if (row == R_START && l.is_host) net_start_race();
+            host_service_net_set_ready(0);
+        else if (row == R_READY) { ready_track = l.track, ready_options = l.laps; host_service_net_set_ready(1); }
+        else if (row == R_START && l.is_host) host_service_net_start_race();
         else if (row == R_LEAVE) leave_room(p);
         break;
     }
@@ -721,7 +720,7 @@ static void page_step(MenuPage *p, int row, int by)
 {
     if (screen == ROOM && (row == R_TRACK || row == R_BOTS)) {  /* the host's track and options */
         NetLobby l;
-        net_get_lobby(&l);
+        host_service_net_get_lobby(GADDR(&l));
         if (!l.is_host) return;
         NetRoomSettings s = {-1, -1, -1, -1, -1, NULL};
         if (row == R_TRACK) {
@@ -729,7 +728,7 @@ static void page_step(MenuPage *p, int row, int by)
             s.track = tracks[room_track].index;
         } else
             s.laps = room_options = l.laps ^ ROOM_NO_BOTS;
-        net_set_room(&s);
+        host_service_net_set_room(GADDR(&s));
         menu_page_sound(by > 0);
         return;
     }
@@ -774,7 +773,7 @@ int port_online_menu(void)
     race = 0;
     in_shell = 0;
     run_page();
-    if (!race) { net_leave(); reset_selection(); }
+    if (!race) { host_service_net_leave(); reset_selection(); }
     return race;
 }
 
@@ -804,8 +803,8 @@ static void keep_selection(void)
         chosen_cycle[i] = SETUP_WORD(0x11C + 4 * i);
     }
     selected = 1;
-    net_pick(-1, chosen_rider / 32, chosen_bike);
-    net_set_ready(0);
+    host_service_net_pick(-1, chosen_rider / 32, chosen_bike);
+    host_service_net_set_ready(0);
     hle_log("online menu: selection rider %d, outfit %d %d %d, bike %d %d %d\n",
             chosen_rider, chosen_outfit[0], chosen_outfit[1], chosen_outfit[2],
             chosen_cycle[0], chosen_cycle[1], chosen_cycle[2]);
@@ -832,7 +831,7 @@ int port_online_shell(void)
         return 0;
     }
     NetLobby connection;
-    net_get_lobby(&connection);
+    host_service_net_get_lobby(GADDR(&connection));
     int lost = connection.state == NET_FAILED || connection.state == NET_IDLE;
     if (menu == 18) {
         /* The shop's START: when its camera has flown out, retail goes on to the level chooser,
@@ -894,7 +893,7 @@ int port_online_shell(void)
         return 1;
     }
     reset_selection();
-    net_leave();
+    host_service_net_leave();
     selection_end();
     SETUP_WORD(0x10C) = offline_mode;
     SETUP_WORD(0x110) = offline_submode;
@@ -909,7 +908,7 @@ int port_online_guest_track(void)
 {
     if (!choosing) return 0;
     NetLobby lobby;
-    net_get_lobby(&lobby);
+    host_service_net_get_lobby(GADDR(&lobby));
     return !lobby.is_host;
 }
 

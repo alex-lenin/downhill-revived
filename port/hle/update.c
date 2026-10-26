@@ -1,4 +1,5 @@
-/* The auto-updater (finding 054), run by the first dhd.exe (the one before the relaunch, boot.c).
+/* The auto-updater (finding 054), run by the first dhd.exe process: in the 64-bit build the only
+   one (it starts no second process), in the old 32-bit build the one before the relaunch (boot.c).
 
    At start, unless dhd.ini says auto_update = off (DHD_AUTO_UPDATE):
    - it asks the update source (update_url, DHD_UPDATE_URL; empty: the GitHub releases API of
@@ -12,9 +13,10 @@
      without asking. No network, no answer or a bad one: the game just starts.
    Updating: the zip is downloaded beside dhd.exe (dhd-update\), its SHA-256 checked, unpacked
    (Windows' own tar.exe), the other files of its folder copied over (never dhd.ini, never a
-   folder such as saves\), then the running dhd.exe is renamed dhd.exe.old, the new one put in
+   folder such as saves\; a DLL this process has loaded, such as dxcompiler.dll after the online
+   menu's Update Now, is renamed NAME.dll.old first), then the running dhd.exe is renamed dhd.exe.old, the new one put in
    its place and started with the environment this process was started with; the next start
-   deletes dhd.exe.old and dhd-update\. A failure puts the old dhd.exe back, says why and
+   deletes dhd.exe.old, *.dll.old and dhd-update\. A failure puts the old dhd.exe back, says why and
    starts the game as it was.
 
    Online play needs the newest release: the server refuses older ones (client_outdated). The
@@ -32,10 +34,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt")
+#else
+#include "../host/win32_compat.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #define OFFICIAL_UPDATE_URL "https://api.github.com/repos/skuza-oss/downhill-revived/releases/latest"
 #define RELEASES_PAGE "https://github.com/skuza-oss/downhill-revived/releases/latest"
@@ -54,14 +63,24 @@ static char *start_environment;  /* the block this process started with (before 
 
 static void exe_path(char *out, size_t size)
 {
+#ifdef _WIN32
     GetModuleFileNameA(NULL, out, (DWORD)size);
+#else
+    host_exe_path(out, (unsigned)size);
+#endif
 }
 
-/* The folder dhd.exe is in, with its trailing backslash. */
+/* The folder the executable is in, with its trailing slash. */
 static void exe_dir(char *out, size_t size)
 {
     exe_path(out, size);
+#ifdef _WIN32
     char *slash = strrchr(out, '\\');
+#else
+    char *slash = strrchr(out, '/');
+    char *back = strrchr(out, '\\');
+    if (back > slash) slash = back;
+#endif
     if (slash) slash[1] = 0;
 }
 
@@ -124,8 +143,9 @@ static const char *source_url(void)
     return u && *u ? u : OFFICIAL_UPDATE_URL;
 }
 
-/* ---- HTTP (WinHTTP) ---- */
+/* ---- HTTP (WinHTTP on Windows; unavailable on this host) ---- */
 
+#ifdef _WIN32
 typedef struct {
     HINTERNET session, connection, request;
 } Http;
@@ -193,6 +213,21 @@ static int http_get_text(const char *url, char *out, int cap, char *why, size_t 
     http_close(&h);
     return n;
 }
+#else
+/* No HTTP stack on this host: the check reports no answer (as offline does). */
+typedef struct {
+    int unused;
+} Http;
+static void http_close(Http *h) { (void)h; }
+static int http_get_text(const char *url, char *out, int cap, char *why, size_t why_size)
+{
+    (void)url;
+    (void)out;
+    (void)cap;
+    snprintf(why, why_size, "no update check on this host");
+    return -1;
+}
+#endif
 
 /* ---- the newest release ---- */
 
@@ -301,6 +336,7 @@ static DWORD WINAPI check_thread(void *arg)
 
 /* ---- the progress window ---- */
 
+#ifdef _WIN32
 static HWND progress;
 
 static LRESULT CALLBACK progress_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
@@ -348,10 +384,16 @@ static void hide_progress(void)
     progress = NULL;
     pump();
 }
+#else
+/* The log carries the progress instead. */
+static void show_progress(const char *text) { fprintf(stderr, "update: %s\n", text); }
+static void hide_progress(void) {}
+#endif
 
 /* ---- the update itself ---- */
 
 /* Deletes a folder and everything in it. */
+#ifdef _WIN32
 static void remove_tree(const char *dir)
 {
     char pattern[MAX_PATH], path[MAX_PATH];
@@ -372,7 +414,26 @@ static void remove_tree(const char *dir)
     }
     RemoveDirectoryA(dir);
 }
+#else
+static void remove_tree(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *fd;
+    char path[4096];
+    while ((fd = readdir(d)) != NULL) {
+        struct stat st;
+        if (!strcmp(fd->d_name, ".") || !strcmp(fd->d_name, "..")) continue;
+        snprintf(path, sizeof path, "%s/%s", dir, fd->d_name);
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) remove_tree(path);
+        else unlink(path);
+    }
+    closedir(d);
+    rmdir(dir);
+}
+#endif
 
+#ifdef _WIN32
 /* Downloads r's zip into path, hashing it on the way; 1 when its SHA-256 is r's. */
 static int download(const Release *r, const char *path, char *why, size_t why_size)
 {
@@ -435,7 +496,17 @@ static int download(const Release *r, const char *path, char *why, size_t why_si
     fprintf(stderr, "update: %s downloaded, %llu bytes, sha256 %s\n", r->url, have, hex);
     return 1;
 }
+#else
+static int download(const Release *r, const char *path, char *why, size_t why_size)
+{
+    (void)r;
+    (void)path;
+    snprintf(why, why_size, "no updater on this host");
+    return 0;
+}
+#endif
 
+#ifdef _WIN32
 /* Unpacks zip into dir with Windows' own tar.exe (Windows 10 1803 and later). */
 static int unpack(const char *zip, const char *dir, char *why, size_t why_size)
 {
@@ -464,8 +535,18 @@ static int unpack(const char *zip, const char *dir, char *why, size_t why_size)
     if (code) snprintf(why, why_size, "the update couldn't be unpacked (tar exit %lu)", code);
     return code == 0;
 }
+#else
+static int unpack(const char *zip, const char *dir, char *why, size_t why_size)
+{
+    (void)zip;
+    (void)dir;
+    snprintf(why, why_size, "no updater on this host");
+    return 0;
+}
+#endif
 
 /* The unpacked release's folder: the one holding dhd.exe (the zip's DownhillRevived-X.Y.Z\). */
+#ifdef _WIN32
 static int release_folder(const char *dir, char *out, size_t size)
 {
     char pattern[MAX_PATH], exe[MAX_PATH];
@@ -490,6 +571,17 @@ static int release_folder(const char *dir, char *out, size_t size)
     FindClose(f);
     return found_one;
 }
+#else
+static int release_folder(const char *dir, char *out, size_t size)
+{
+    (void)dir;
+    (void)out;
+    (void)size;
+    return 0; /* no updater on this host */
+}
+#endif
+
+#ifdef _WIN32
 
 /* The release's other files (README.txt, LICENSE.txt, ...) over the old ones: plain files only,
    never dhd.ini or a log; folders (saves\) are never touched. */
@@ -506,10 +598,27 @@ static void copy_side_files(const char *from, const char *to)
             !_stricmp(fd.cFileName, "dhd.log") || !_stricmp(fd.cFileName, "iso-check.txt")) continue;
         snprintf(src, sizeof src, "%s\\%s", from, fd.cFileName);
         snprintf(dst, sizeof dst, "%s%s", to, fd.cFileName);
-        if (!CopyFileA(src, dst, FALSE)) fprintf(stderr, "update: can't replace %s (error %lu)\n", dst, GetLastError());
+        if (CopyFileA(src, dst, FALSE)) continue;
+        /* a DLL this process has loaded (dxcompiler.dll, when the game asked for the update) can't
+           be overwritten, but it can be renamed: NAME.old goes at the next start (clean_up) */
+        char old[MAX_PATH + 8];
+        snprintf(old, sizeof old, "%s.old", dst);
+        SetFileAttributesA(old, FILE_ATTRIBUTE_NORMAL);
+        DeleteFileA(old);
+        if (!MoveFileExA(dst, old, MOVEFILE_REPLACE_EXISTING) || !CopyFileA(src, dst, FALSE))
+            fprintf(stderr, "update: can't replace %s (error %lu)\n", dst, GetLastError());
     } while (FindNextFileA(f, &fd));
     FindClose(f);
 }
+#else
+static void copy_side_files(const char *from, const char *to)
+{
+    (void)from;
+    (void)to;
+}
+#endif
+
+#ifdef _WIN32
 
 /* Starts exe as this process was started: its command line, the environment from before dhd.ini
    was read, the same log handles. */
@@ -536,6 +645,15 @@ static int start_again(const char *exe)
     CloseHandle(pi.hProcess);
     return 1;
 }
+#else
+static int start_again(const char *exe)
+{
+    fprintf(stderr, "update: no updater on this host (would start %s)\n", exe);
+    return 0;
+}
+#endif
+
+#ifdef _WIN32
 
 /* Downloads, checks, unpacks and puts release r in place of this dhd.exe, then starts it and
    ends this process. Returns only on failure, with the old dhd.exe in place and why. */
@@ -590,9 +708,17 @@ failed:
     remove_tree(work);
     fprintf(stderr, "update: failed: %s\n", why);
 }
+#else
+static void install(const Release *r, char *why, size_t why_size)
+{
+    (void)r;
+    snprintf(why, why_size, "no updater on this host");
+}
+#endif
 
 /* Update now / Later: a message box whose Yes and No buttons are renamed by a CBT hook on this
    thread when the box opens. */
+#ifdef _WIN32
 static HHOOK button_hook;
 
 static LRESULT CALLBACK rename_buttons(int code, WPARAM wp, LPARAM lp)
@@ -621,7 +747,15 @@ static int ask(const Release *r)
     fprintf(stderr, "update: the player chose %s\n", answer == IDYES ? "Update now" : "Later");
     return answer == IDYES;
 }
+#else
+static int ask(const Release *r)
+{
+    (void)r;
+    return 0; /* no updater on this host: Later */
+}
+#endif
 
+#ifdef _WIN32
 static void failed_box(const char *why, const Release *r)
 {
     char text[1400];
@@ -629,20 +763,39 @@ static void failed_box(const char *why, const Release *r)
              "be downloaded from\n%s", why, DHD_VERSION, r && r->page[0] ? r->page : RELEASES_PAGE);
     MessageBoxA(NULL, text, TITLE, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
 }
+#else
+static void failed_box(const char *why, const Release *r)
+{
+    fprintf(stderr, "update: didn't work: %s (this is %s; the new version is at %s)\n", why, DHD_VERSION,
+            r && r->page[0] ? r->page : RELEASES_PAGE);
+}
+#endif
 
 /* ---- the entry points (boot.c, online_menu.c) ---- */
 
 void update_save_environment(void)
 {
+#ifdef _WIN32
     char *env = GetEnvironmentStringsA(), *end = env;
     if (!env) return;
     while (*end) end += strlen(end) + 1;
     size_t n = (size_t)(end - env) + 1;
     if ((start_environment = malloc(n))) memcpy(start_environment, env, n);
     FreeEnvironmentStringsA(env);
+#else
+    extern char **environ;
+    char **e = environ, *end;
+    size_t n;
+    if (!e) return;
+    for (end = *e; *e; e++) end = *e + strlen(*e) + 1;
+    n = (size_t)(end - *environ) + 1;
+    if (n < 2) return;
+    if ((start_environment = malloc(n))) memcpy(start_environment, *environ, n);
+#endif
 }
 
-/* What an earlier update left: dhd.exe.old (the exe it replaced) and its download folder. */
+/* What an earlier update left: dhd.exe.old (the exe it replaced), NAME.dll.old (a DLL that was in
+   use, copy_side_files) and its download folder. */
 static void clean_up(void)
 {
     char exe[MAX_PATH], old[MAX_PATH + 8], dir[MAX_PATH], work[MAX_PATH];
@@ -650,6 +803,7 @@ static void clean_up(void)
     exe_dir(dir, sizeof dir);
     snprintf(old, sizeof old, "%s.old", exe);
     snprintf(work, sizeof work, "%sdhd-update", dir);
+#ifdef _WIN32
     if (GetFileAttributesA(old) != INVALID_FILE_ATTRIBUTES) {
         for (int i = 0; i < 30; i++) {  /* just after an update the old process may still be ending */
             SetFileAttributesA(old, FILE_ATTRIBUTE_NORMAL);
@@ -658,7 +812,31 @@ static void clean_up(void)
         }
         fprintf(stderr, "update: %s %s\n", old, GetFileAttributesA(old) == INVALID_FILE_ATTRIBUTES ? "deleted" : "still there");
     }
+    {
+        char pattern[MAX_PATH], path[MAX_PATH];
+        WIN32_FIND_DATAA fd;
+        snprintf(pattern, sizeof pattern, "%s*.dll.old", dir);
+        HANDLE f = FindFirstFileA(pattern, &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                snprintf(path, sizeof path, "%s%s", dir, fd.cFileName);
+                SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+                DeleteFileA(path);
+            } while (FindNextFileA(f, &fd));
+            FindClose(f);
+        }
+    }
     if (GetFileAttributesA(work) != INVALID_FILE_ATTRIBUTES) remove_tree(work);
+#else
+    {
+        struct stat st;
+        if (stat(old, &st) == 0) {
+            if (unlink(old) == 0) fprintf(stderr, "update: %s deleted\n", old);
+            else fprintf(stderr, "update: %s still there\n", old);
+        }
+        if (stat(work, &st) == 0 && S_ISDIR(st.st_mode)) remove_tree(work);
+    }
+#endif
 }
 
 /* The first process, after dhd.ini: clean up, then look for a newer release and offer it. */
@@ -708,7 +886,11 @@ int update_after_game(int code)
         hide_progress();
         snprintf(text, sizeof text, "No version newer than %s was found at\n%s\n\nIf online races still ask for an "
                  "update, the new version can be downloaded from\n%s", DHD_VERSION, source_url(), r.page);
+#ifdef _WIN32
         MessageBoxA(NULL, text, TITLE, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
+#else
+        fprintf(stderr, "update: %s\n", text);
+#endif
     } else {
         install(&r, why, sizeof why);
         failed_box(why, &r);
@@ -726,3 +908,11 @@ void update_request(void)
     if (getenv("DHD_RELAUNCHED")) ExitProcess(UPDATE_EXIT_CODE);
     exit(update_after_game(UPDATE_EXIT_CODE));
 }
+
+/* Guest-address-only module boundary; native device code stays above. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+void host_service_update_save_environment(void) { update_save_environment(); }
+void host_service_update_at_start(void) { update_at_start(); }
+int host_service_update_after_game(int a0) { return update_after_game(a0); }
+void host_service_update_request(void) { update_request(); }

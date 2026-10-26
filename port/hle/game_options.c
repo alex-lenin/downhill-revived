@@ -1,6 +1,7 @@
 /* Player preferences, separate from the memory card and its career progress.
    Called on the game thread only, after boot/load and accepted option pages. */
 #include "hle.h"
+#include "../runtime/portable.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,8 +24,8 @@ _Static_assert(sizeof(Options) == 40, "retail options layout");
 
 static int enabled(void)
 {
-    const char *s = getenv("DHD_SETTINGS");
-    return !s || (_stricmp(s, "none") && strcmp(s, "0"));
+    const char *s = host_getenv("DHD_SETTINGS");
+    return !s || (dhd_stricmp(s, "none") && strcmp(s, "0"));
 }
 
 void port_game_options_save(void)
@@ -36,7 +37,7 @@ void port_game_options_save(void)
         o->speech, o->effects, o->music, o->scheme[0], o->scheme[1], o->scheme[2], o->scheme[3],
         o->vibration[0], o->vibration[1], o->vibration[2], o->vibration[3], o->difficulty, o->stereo,
         D_0039E82C[0], D_0039E830[0]);
-    if (!host_setting_save("game_options", value)) hle_log("options: could not save preferences\n");
+    if (!host_service_host_setting_save(GADDR("game_options"), GADDR(value))) hle_log("options: could not save preferences\n");
     else hle_log("options: saved %s\n", value);
 }
 
@@ -45,7 +46,7 @@ void port_game_options_apply(void)
     if (!enabled()) return;
     char text[256], extra;
     int v[16];
-    if (!host_game_options_read(text, sizeof text)) return;
+    if (!host_service_host_game_options_read(GADDR(text), sizeof text)) return;
     if (sscanf(text, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %c",
         &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10], &v[11],
         &v[12], &v[13], &v[14], &v[15], &extra) != 16 || v[0] != 1) return;
@@ -70,3 +71,5 @@ void port_game_options_boot(void)
     static int done;
     if (!done) { done = 1; port_game_options_apply(); }
 }
+
+int host_skip_movies(void) { return host_service_host_skip_movies(); }

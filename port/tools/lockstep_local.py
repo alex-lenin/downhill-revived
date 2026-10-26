@@ -2,7 +2,7 @@
 from the same scripted pads, in different configurations, and log the game state's hash every
 60 fields (DHD_HASH_LOG). Lockstep needs the race-state hash (online.c game_hash) to match field for field.
 
-    python port/tools/lockstep_local.py --exe build/port/link/dhd.exe --seconds 300 [--out DIR]
+    python port/tools/lockstep_local.py --exe build/host64-exe/dhd64.exe --seconds 300 [--out DIR]
 
 Arm A: native renderer + interpolation at 120 Hz; arm B: native renderer, plain. Needs DHD_ISO.
 Output (game data: keep it under build/): DIR/A, DIR/B with hashes.txt and the logs."""
@@ -50,7 +50,7 @@ def compare(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--exe', default=str(ROOT / 'build' / 'port' / 'link' / 'dhd.exe'))
+    ap.add_argument('--exe', default=str(ROOT / 'build' / 'host64-exe' / 'dhd64.exe'))
     ap.add_argument('--seconds', type=int, default=300)
     ap.add_argument('--out', default=str(ROOT / 'build' / 'port' / 'e4'))
     ap.add_argument('--stop-if', help='stop both instances as soon as this file exists (a benchmark lock)')

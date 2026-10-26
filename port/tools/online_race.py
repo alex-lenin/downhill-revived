@@ -11,7 +11,7 @@ each puppet, hits, finishes and results.
 
 Needs DHD_ISO, DHD_NET_SERVER (the official wss://dhd.skuza.app or
 your own; never write any other deployed address into a tracked file) and the
-build (python port/tools/link.py). At most two dhd.exe of its own run; all are stopped by PID."""
+x64 build (build_host64.py, default --exe build/host64-exe/dhd64.exe). At most two games of its own run; all are stopped by PID."""
 import argparse, hashlib, os, re, subprocess, sys, time
 from pathlib import Path
 
@@ -69,7 +69,7 @@ def wait_line(paths, pattern, seconds, procs, stop_if):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--exe', default=str(ROOT / 'build' / 'port' / 'link' / 'dhd.exe'))
+    ap.add_argument('--exe', default=str(ROOT / 'build' / 'host64-exe' / 'dhd64.exe'))
     ap.add_argument('--nettool', default=str(ROOT / 'build' / 'port' / 'net' / 'nettool.exe'))
     ap.add_argument('--seconds', type=int, default=420, help='at most this long once both race')
     ap.add_argument('--out', default=str(ROOT / 'build' / 'port' / 'online-race'))

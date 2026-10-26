@@ -35,6 +35,5 @@ static uint32_t grain_random(uint32_t range)
     result = grain_rng_words[grain_rng_at] ^ grain_rng_words[other];
     grain_rng_words[grain_rng_at] = result;
     if (++grain_rng_at == 250) grain_rng_at = 0;
-    snd_debug_random(grain_samples, grain_rng_at, result);
     return range ? result % range : 0;
 }

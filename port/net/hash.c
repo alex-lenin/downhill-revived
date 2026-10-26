@@ -65,3 +65,17 @@ uint64_t net_hash_ranges(const NetRange *ranges, int n)
         h = net_hash64(ranges[i].base, ranges[i].size, h);
     return h;
 }
+
+/* wasm32 NetRange is two 32-bit words, regardless of native pointer size. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+uint64_t host_service_net_hash_ranges(uint32_t address, int count) {
+    const uint32_t *in=GUEST(address);
+    uint64_t hash=0;
+    for (int i=0;i<count;i++) {
+        NetRange range={GUEST(in[i*2]),in[i*2+1]};
+        /* Use the same chained operation as net_hash_ranges. */
+        hash=net_hash64(range.base,range.size,hash);
+    }
+    return hash;
+}

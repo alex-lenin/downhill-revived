@@ -1,6 +1,7 @@
 /* config.h for the port's build of libmpeg2 0.5.1 (port/hle/movie.c, finding 055): portable C
-   only (no ARCH_X86, so no MMX/SSE paths and no CPU detection), built with clang for 32-bit
-   Windows by port/tools/link.py. Written for this port in place of libmpeg2's configure output. */
+   only (no ARCH_X86, so no MMX/SSE paths and no CPU detection), built with clang by the native
+   host builds (build_host64.py, build_host64_linux.py). Written for this port in place of
+   libmpeg2's configure output. */
 #define HAVE_INTTYPES_H 1
 #define HAVE_STDINT_H 1
 #define HAVE_STDLIB_H 1

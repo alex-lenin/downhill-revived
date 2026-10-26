@@ -8,8 +8,8 @@ unpaced (DHD_FRAME_CLOCK=1): the adaptive wall clock is off there, so the run re
 (finding 067). DHD_FPS_TRACE records every rider's state once per race tick and at every real
 update of the first six seconds, and DHD_FPS_STOP ends the game at --ticks. With --reference,
 every column the two traces share (except the host wall time) must be identical, row by row;
-the verdict is MATCH or DIFF with the first difference. The renderer gate
-(gate_native_renderer.py) covers the 60 path; this covers the high-rate one. Needs DHD_ISO. The
+the verdict is MATCH or DIFF with the first difference. At 60 fields/s the state traces
+(state_trace_run.py, state_diff.py) do the same. Needs DHD_ISO. The
 traces hold game-derived state: they stay below build/ (or outside the checkout, --external-out).
 """
 import argparse

@@ -11,15 +11,20 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
 
 #pragma comment(lib, "gdi32")
+#else
+#include "../host/win32_compat.h"
+#endif
 
 #define CLASS "DhdStartWindow"
 enum { W = 520, H = 196, ICON = 132, TIMER = 1, STEP_DATA = 0x44485354 /* "DHST" */ };
 
 typedef struct { int percent; char text[120]; } Step;
 
+#ifdef _WIN32
 static HWND window;
 static HANDLE ready;
 static CRITICAL_SECTION lock;
@@ -27,7 +32,9 @@ static Step step = {2, "Starting..."};
 static ULONGLONG step_since;  /* when step began (GetTickCount64) */
 static double shown;  /* the bar as drawn: it creeps towards the next step, never back */
 static HICON icon;
+#endif
 
+#ifdef _WIN32
 static void paint(HWND hwnd)
 {
     PAINTSTRUCT ps;
@@ -155,11 +162,28 @@ static DWORD WINAPI run(void *arg)
     }
     return 0;
 }
+#else
+/* No start window on this host: the steps go to the log only. */
+#endif
 
-static int wanted(void) { return !getenv("DHD_HEADLESS") && !getenv("DHD_NO_SPLASH"); }
+int start_minimised(void)
+{
+#ifdef _WIN32
+    STARTUPINFOA si = {sizeof si};
+    GetStartupInfoA(&si);
+    if (!(si.dwFlags & STARTF_USESHOWWINDOW)) return 0;
+    return si.wShowWindow == SW_SHOWMINIMIZED || si.wShowWindow == SW_MINIMIZE ||
+           si.wShowWindow == SW_SHOWMINNOACTIVE || si.wShowWindow == SW_FORCEMINIMIZE;
+#else
+    return 0;
+#endif
+}
+
+static int wanted(void) { return !getenv("DHD_HEADLESS") && !getenv("DHD_NO_SPLASH") && !start_minimised(); }
 
 void splash_show(void)
 {
+#ifdef _WIN32
     if (window || getenv("DHD_RELAUNCHED") || !wanted()) return;
     InitializeCriticalSection(&lock);
     step_since = GetTickCount64();
@@ -168,12 +192,16 @@ void splash_show(void)
     if (!t) return;
     CloseHandle(t);
     WaitForSingleObject(ready, 2000);
+#else
+    (void)wanted;
+#endif
 }
 
 void splash_step(int percent, const char *text)
 {
     Step s = {percent, ""};
     snprintf(s.text, sizeof s.text, "%s", text);
+#ifdef _WIN32
     FILETIME created, unused, now;  /* the log: when each step began, from this process's start */
     GetProcessTimes(GetCurrentProcess(), &created, &unused, &unused, &unused);
     GetSystemTimeAsFileTime(&now);
@@ -193,11 +221,22 @@ void splash_step(int percent, const char *text)
     COPYDATASTRUCT cd = {STEP_DATA, sizeof s, &s};
     DWORD_PTR result;
     SendMessageTimeoutA(first, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 500, &result);
+#else
+    fprintf(stderr, "start: %.2f s: %s\n", host_wall_seconds(), text);
+#endif
 }
 
 void splash_close(void)
 {
     splash_step(100, "Ready");
+#ifdef _WIN32
     HWND w = window ? window : getenv("DHD_RELAUNCHED") ? FindWindowA(CLASS, NULL) : NULL;
     if (w) PostMessageA(w, WM_CLOSE, 0, 0);
+#endif
 }
+
+/* Guest-address-only module boundary; native device code stays above. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+void host_service_splash_show(void) { splash_show(); }
+void host_service_splash_step(int a0, uint32_t a1) { splash_step(a0, (const char *)GUEST(a1)); }

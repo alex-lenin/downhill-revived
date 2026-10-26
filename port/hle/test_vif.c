@@ -19,15 +19,15 @@ uint64_t kernel_vsync_count;
 #ifndef GS_QUEUE_TEST
 GraphicsProvenance graphics_provenance;
 void graphics_gif_feed(unsigned path,const uint32_t *words,unsigned count) { gs_feed(&gs,path,words,count); }
-int graphics_xgkick(const uint32_t *memory,unsigned qword) { return gs_xgkick(&gs,memory,qword); }
+int graphics_xgkick(uint32_t memory,unsigned qword) { return gs_xgkick(&gs,GUEST(memory),qword); }
 #endif
 #ifndef GRAPHICS_QUEUE_TEST
 void graphics_wait(void) {}
 #endif
-extern int sceGsExecStoreImage(const uint32_t *, void *) RETAIL(func_00244228);
+extern int sceGsExecStoreImage(uint32_t, uint32_t) RETAIL(func_00244228);
 static void code(uint32_t value) {
 #ifdef GRAPHICS_QUEUE_TEST
-    graphics_feed(1, &value, 1);
+    graphics_feed(1, GADDR(&value), 1);
     graphics_wait();
 #else
     vif_feed(1, &value, 1);
@@ -113,7 +113,7 @@ int main(void)
     uint32_t depth[17];
     for (unsigned i = 0; i < 16; i++) gs_write_pixel(&gs, GS_PSMZ32, 0, 8, 13 + i % 4, 27 + i / 4, i * 0x1234567u);
     depth[16] = 0xDEADBEEF;
-    CHECK(sceGsExecStoreImage((const uint32_t *)store, depth) == 0);
+    CHECK(sceGsExecStoreImage(GADDR(store), GADDR(depth)) == 0);
     for (unsigned i = 0; i < 16; i++) CHECK(depth[i] == i * 0x1234567u);
     CHECK(depth[16] == 0xDEADBEEF && !(gs_priv_read(&gs, GS_CSR) & 2));
     gs_reset(&gs);

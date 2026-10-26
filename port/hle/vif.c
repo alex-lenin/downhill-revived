@@ -11,8 +11,10 @@
 #include "ps2asm.h"
 #include "../runtime/memory.h"
 #include "../gs/gs.h"
+#if !defined(DHD_VIF0_ONLY)
 #include "vu1_profile.h"
 #include "gs_queue.h"
+#endif
 
 typedef struct {
     int unit;
@@ -34,13 +36,33 @@ enum { NOP = 0x00, STCYCL = 0x01, OFFSET = 0x02, BASE = 0x03, ITOP = 0x04, STMOD
        MARK = 0x07, FLUSHE = 0x10, FLUSH = 0x11, FLUSHA = 0x13, MSCAL = 0x14, MSCALF = 0x15, MSCNT = 0x17,
        STMASK = 0x20, STROW = 0x30, STCOL = 0x31, MPG = 0x4A, DIRECT = 0x50, DIRECTHL = 0x51 };
 
-static uint8_t *micro(int unit) { return unit ? (uint8_t *)(uintptr_t)0x11008000 : ps2.vu0_code; }
-static uint32_t *data_mem(int unit) { return unit ? (uint32_t *)(uintptr_t)0x1100C000 : ps2.vu0_mem->w; }
+/* VU1 memories, as guest addresses (graphics_xgkick takes the data memory's guest address). */
+#define VU1_MICRO 0x11008000u
+#define VU1_DATA 0x1100C000u
+static uint8_t *micro(int unit) {
+#if defined(_WIN64) || defined(__x86_64__)
+    if (unit!=1) abort();
+    return GUEST(VU1_MICRO);
+#else
+    return unit ? (uint8_t *)GUEST(VU1_MICRO) : ps2.vu0_code;
+#endif
+}
+static uint32_t *data_mem(int unit) {
+#if defined(_WIN64) || defined(__x86_64__)
+    if (unit!=1) abort();
+    return GUEST(VU1_DATA);
+#else
+    return unit ? (uint32_t *)GUEST(VU1_DATA) : ps2.vu0_mem->w;
+#endif
+}
 static uint32_t data_qwords(int unit) { return unit ? 0x400 : 0x100; }
 
+#if !defined(DHD_VIF0_ONLY)
 static ps2_cpu vu1;
 /* VU0 micro code reads these registers at its data address 0x4000. */
 __attribute__((constructor)) static void publish_vu1(void) { ps2_vu1_regs = &vu1; }
+
+#endif
 
 static int trace_enabled(int unit)
 {
@@ -49,14 +71,15 @@ static int trace_enabled(int unit)
     return enabled[unit];
 }
 
+#if !defined(DHD_VIF0_ONLY)
 double vif_gs_seconds; /* Opt-in profiling total; owned by the graphics worker. */
 
 static int kick(void *opaque, unsigned qword)
 {
     (void)opaque;
-    if (!vu_profile_active) return graphics_xgkick(data_mem(1), qword);
+    if (!vu_profile_active) return graphics_xgkick(VU1_DATA, qword);
     double start = host_wall_seconds();
-    int result = graphics_xgkick(data_mem(1), qword);
+    int result = graphics_xgkick(VU1_DATA, qword);
     double elapsed = host_wall_seconds() - start;
     vu_profile_kick += elapsed; vif_gs_seconds += elapsed;
     return result;
@@ -194,23 +217,28 @@ static void capture_representative(unsigned addr, unsigned top, unsigned itop)
     count[group][continuation]++; next[group][continuation] = now + 2;
 }
 
+#endif
+
 static void run_micro(Vif *v, uint32_t addr)
 {
+#if !defined(_WIN64) && !defined(__x86_64__)
     if (v->unit == 0) {
         if (ps2_vu0_run(&ps2, addr))
             hle_log("vif0: microprogram at 0x%X failed\n", addr);
         v->tpc = ps2.vu0_ctrl[10] / 8;
         return;
     }
+#endif
+#if !defined(DHD_VIF0_ONLY)
     vu1.vu0_code = micro(1);
     vu1.vu0_mem = (ps2_q128 *)data_mem(1);
     v->top = v->tops & 1023;
     v->dbf ^= 1;
     v->tops = (v->base + (v->dbf ? v->offset : 0)) & 1023;
-    *(uint32_t *)(uintptr_t)0x10003C00 = v->dbf << 7;
-    *(uint32_t *)(uintptr_t)0x10003CE0 = v->top;
-    *(uint32_t *)(uintptr_t)0x10003CC0 = v->tops;
-    *(uint32_t *)(uintptr_t)0x10003CD0 = v->itop;
+    *(uint32_t *)GUEST(0x10003C00) = v->dbf << 7;
+    *(uint32_t *)GUEST(0x10003CE0) = v->top;
+    *(uint32_t *)GUEST(0x10003CC0) = v->tops;
+    *(uint32_t *)GUEST(0x10003CD0) = v->itop;
     static int traced = -1;
     if (traced < 0) traced = getenv("DHD_GS_TRACE") != NULL;
     static int isolate = -1;
@@ -221,8 +249,8 @@ static void run_micro(Vif *v, uint32_t addr)
     /* Compare the local retail package, never embed its instructions here.
        Both overlays upload at zero; entry numbers alone can overlap. */
     if (traced || isolate)
-        graphics_provenance.overlay = !memcmp(micro(1), (void *)(PS2_RAM_BASE + 0x265C10), 32) ? 1 :
-                        !memcmp(micro(1), (void *)(PS2_RAM_BASE + 0x269C60), 32) ? 2 : 0;
+        graphics_provenance.overlay = !memcmp(micro(1), GUEST(PS2_RAM_BASE + 0x265C10), 32) ? 1 :
+                        !memcmp(micro(1), GUEST(PS2_RAM_BASE + 0x269C60), 32) ? 2 : 0;
     capture_micro(addr, v->top, v->itop);
     capture_representative(addr, v->top, v->itop);
     capture_sequence(addr, v->top, v->itop);
@@ -236,13 +264,14 @@ static void run_micro(Vif *v, uint32_t addr)
     }
     double profile_start = vu_profile_begin();
     unsigned profile_overlay = 0;
-    if (profile_start) profile_overlay = !memcmp(micro(1), (void *)(PS2_RAM_BASE + 0x265C10), 32) ? 1 :
-                                       !memcmp(micro(1), (void *)(PS2_RAM_BASE + 0x269C60), 32) ? 2 : 0;
+    if (profile_start) profile_overlay = !memcmp(micro(1), GUEST(PS2_RAM_BASE + 0x265C10), 32) ? 1 :
+                                       !memcmp(micro(1), GUEST(PS2_RAM_BASE + 0x269C60), 32) ? 2 : 0;
     if (ps2_vu1_run(&vu1, addr, v->top, v->itop, kick, NULL))
         hle_log("vif1: microprogram at 0x%X failed\n", addr);
     if (profile_start) vu_profile_end(profile_start, profile_overlay, graphics_provenance.program, addr, (v->code >> 24 & 0x7f) == MSCNT);
     if (watch && gs.suspect_draws != suspects) save_suspect();
     v->tpc = vu1.vu0_ctrl[10] / 8;
+#endif
 }
 
 /* Bits per element and elements per vector of an UNPACK command (vn, vl in bits 0-3). */
@@ -539,7 +568,9 @@ static uint32_t command(Vif *v, uint32_t code)
     case ITOP: v->itop = imm & 0x3FF; return 0;
     case MSCAL: case MSCALF:
         v->tpc = imm;
+#if !defined(DHD_VIF0_ONLY)
         if (v->unit) graphics_provenance.program = imm * 8u;
+#endif
         run_micro(v, imm * 8u);
         return 0;
     case MSCNT:
@@ -563,6 +594,11 @@ static uint32_t command(Vif *v, uint32_t code)
 /* The words of one DMA transfer to VIF unit (0 or 1), in order. */
 void vif_feed(int unit, const uint32_t *words, uint32_t n)
 {
+#if defined(DHD_VIF0_ONLY)
+    if (unit!=0) abort();
+#elif defined(_WIN64) || defined(__x86_64__)
+    if (unit!=1) abort();
+#endif
     Vif *v = &vif[unit];
     uint32_t i = 0;
     while (i < n) {
@@ -582,15 +618,19 @@ void vif_feed(int unit, const uint32_t *words, uint32_t n)
             for (k = 0; k < take; k++, v->addr += 4)
                 if (memcmp(m + (v->addr % size), &words[i + k], 4)) {
                     memcpy(m + (v->addr % size), &words[i + k], 4);
+#if !defined(DHD_VIF0_ONLY)
                     if (unit) ps2_vu1_code_version++;
+#endif
                 }
         } else if ((cmd & 0x60) == 0x60)
             unpack_run(v, words + i, take);
         else if (cmd < DIRECT)
             for (uint32_t k = 0; k < take; k++)
                 v->data[v->have + k] = words[i + k];
+#if !defined(DHD_VIF0_ONLY)
         else if (unit == 1 && (cmd == DIRECT || cmd == DIRECTHL))
             direct_gif(words + i, take);
+#endif
         v->have += take;
         v->need -= take;
         i += take;
@@ -598,3 +638,23 @@ void vif_feed(int unit, const uint32_t *words, uint32_t n)
             command_done(v);
     }
 }
+
+#if !defined(DHD_VIF0_ONLY)
+/* Guest-address-only module boundary; native device code stays above. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+void host_service_vif_feed(int a0, uint32_t a1, uint32_t a2) { vif_feed(a0, (const uint32_t *)GUEST(a1), a2); }
+
+int host_vu1_snapshot(uint32_t address) {
+    /* wasm32 ps2_cpu has two 4-byte pointers between these fixed-width spans.
+       Those pointer words are zero: trace serialization excludes them. */
+    _Static_assert(offsetof(ps2_cpu,vu0_code)==(sizeof(void *)==8 ? 1896 : 1892),"VU register prefix layout");
+    if (!ps2_vu1_regs) return 0;
+    unsigned char *out=GUEST(address);
+    memset(out,0,2096);
+    memcpy(out,&vu1,1892);
+    memcpy(out+1900,vu1.cop0,196);
+    return 1;
+}
+void host_vu1_file(uint32_t address) { ps2_vu0_vu1_file(GUEST(address)); }
+#endif

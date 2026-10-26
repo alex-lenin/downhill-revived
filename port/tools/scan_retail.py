@@ -17,10 +17,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Runs the decompiled source itself compiles to (PS2 address, length, unit): string literals of
 # its functions, and the CRC-32 table clang computes from func_00234F38's loop. They are code of
-# the decompilation, not data copied from the disc; any other run is.
+# the decompilation, not data copied from the disc; any other run is. A window may start at the NULs
+# before its literal: the wasm module packs literals with their terminators, so a run there can
+# begin one to three bytes early (finding 082, x64 package).
 SOURCE = [
-    (0x288A30, 72, 'src/unsorted/00118898.c: getNextPoint format string'),
-    (0x288B6F, 67, 'src/unsorted/0011D048.c: AnimalHerd::addShadow message'),
+    (0x288A2F, 73, 'src/unsorted/00118898.c: getNextPoint format string, from the NUL before it'),
+    (0x288B6F, 136, 'src/unsorted/0011D048.c: both AnimalHerd::addShadow messages'),
     (0x288EAF, 122, 'src/unsorted/00127F20.c: "Stealing highestPed" messages'),
     (0x296A70, 113, 'src/unsorted/001EB1D8.cpp: uiScreenInit messages, "PRESS ... TO START"'),
     (0x296BEE, 126, 'src/unsorted/001EB1D8.cpp: float constants of its menus'),
@@ -31,7 +33,7 @@ SOURCE = [
     (0x298817, 76, 'src/unsorted/0021A008.c: messages'),
     (0x298868, 83, 'src/unsorted/0021A008.c: messages'),
     (0x2988C0, 128, 'src/unsorted/0021A008.c: messages'),
-    (0x298B48, 280, 'src/unsorted/0021F400.c: IOP module paths (cdrom0:\\MOD\\...)'),
+    (0x298B45, 283, 'src/unsorted/0021F400.c: IOP module paths (cdrom0:\\MOD\\...), from the NULs before them'),
     (0x2995B4, 2052, 'src/unsorted/00234F38.c: the CRC-32 table, computed by clang from the loop'),
 ]
 

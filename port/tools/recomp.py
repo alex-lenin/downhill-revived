@@ -1,6 +1,6 @@
 """PC build: static recompilation of MIPS functions to C (plan step 5), for the game functions
 that have no C version yet. Each function's splat asm (asm/nonmatchings, generated from your own
-ELF) becomes build/port/recomp/<name>.c:
+ELF) becomes <OUT>/<name>.c (build_wasm.py: build/wasm/recomp, signatures from build/wasm/sigsrc):
 
 - rc_<name>(void) runs the instructions on the emulated register file (port/runtime/recomp.h):
   integer, FPU, memory and control flow as C statements, VU0/MMI instructions through the asm
@@ -14,7 +14,7 @@ ELF) becomes build/port/recomp/<name>.c:
   switch over the function's labels, whose PS2 addresses the converted jump tables hold
   (port/tools/data.py).
 This is a bridge to a running game, not readable code: a function's matching C replaces it.
-usage: python port/tools/recomp.py NAME...   (normally run by port/tools/link.py)"""
+usage: python port/tools/recomp.py NAME...   (normally run by port/tools/build_wasm.py)"""
 import glob, json, os, re, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +24,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 ASM = os.path.join(ROOT, 'asm', 'nonmatchings', 'text')
 SRC = os.path.join(ROOT, 'build', 'port', 'src')
 OUT = os.path.join(ROOT, 'build', 'port', 'recomp')
+# build_wasm.py sets this: the wasm output passes exactly the callee's declared arguments when its
+# signature is not known from a declaration (the i686 output keeps its eight-register padding)
+WASM_EMIT = False
 
 GPR_NAMES = ['zero', 'at', 'v0', 'v1', 'a0', 'a1', 'a2', 'a3', 't0', 't1', 't2', 't3', 't4', 't5', 't6',
              't7', 's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 't8', 't9', 'k0', 'k1', 'gp', 'sp',
@@ -762,24 +765,16 @@ def translate(name, recompiled, sigs):
         return (op + ' ' + ', '.join(a)).strip()
 
     def call(callee):
-        diagnostic = name == 'func_001B6708'
-        site = '0x' + callee[5:] if re.fullmatch(r'func_[0-9A-F]{8}', callee) else '0'
-        if diagnostic:
-            L.append('ps2_x87_checkpoint(%s, 0);' % site)
         if callee in recompiled:
             fn.callees.add(callee)
             L.append('rc_%s();' % callee)
-            if diagnostic:
-                L.append('ps2_x87_checkpoint(%s, 1);' % site)
             return
         sig = sigs[callee]
         fn.callees.add(callee)
         srcs, ret = marshal(sig)
-        if sig['variadic'] or sig['from'] is None:
+        if sig['variadic'] or (sig['from'] is None and not WASM_EMIT):
             srcs = srcs + ['UW(%d)' % r for r in INT_ARGS[len(srcs):]]  # pass every argument register
         L.append(ret % ('%s(%s)' % (callee, ', '.join(srcs))))
-        if diagnostic:
-            L.append('ps2_x87_checkpoint(%s, 1);' % site)
 
     labels.add(start)
     i = 0
@@ -836,8 +831,6 @@ def translate(name, recompiled, sigs):
             L.append('}')
             i+=1
             continue
-        if name == 'func_001B40A0' and addr in (0x001B4128, 0x001B45B4):
-            L.append('ps2_x87_checkpoint(0x001B4128, %d);' % (addr == 0x001B45B4))
         control = op in BRANCH or op in LIKELY or op in ('j', 'jal', 'jr', 'jalr')
         if not control:
             fn.insn(op, a, text(op, a))

@@ -489,7 +489,8 @@ def hoist_asm_labels(text):
             if not after or after[0] not in ';,' :
                 continue  # a definition, a call or already labeled
             seg = mask[max(mask.rfind(c, 0, m.start()) for c in ';{}') + 1:m.start()]
-            if DECL_START.match(seg) and '=' not in seg and not re.search(r'\breturn\b', seg):
+            if DECL_START.match(seg) and '=' not in seg and not re.search(r'\breturn\b', seg) \
+                    and not re.search(r'[().,>-]', seg):  # a call (member, after if(...) or a macro) is no declaration
                 edits.append((end + 1, ' __asm__("%s")' % label))
     for pos, s in sorted(edits, reverse=True):
         text = text[:pos] + s + text[pos:]

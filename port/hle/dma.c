@@ -64,9 +64,15 @@ enum { CHCR_ASP = 0x30, CHCR_TTE = 0x40, CHCR_TIE = 0x80 };
 /* A transfer from memory to a VIF: qwc qwords from MADR (normal mode), or the source chain
    from TADR. A chain's tags say where each block is and where the next tag is; with TTE the
    VIF also gets each tag's upper half (two VIF codes). */
+#if defined(__wasm__)
+void module_vif0_feed(int unit, const uint32_t *words, uint32_t count);
+#endif
 static void feed(int unit, const uint32_t *words, uint32_t count)
 {
-    graphics_feed(unit, words, count);
+#if defined(__wasm__)
+    if (unit==0) { module_vif0_feed(unit,words,count); return; }
+#endif
+    host_service_graphics_feed(unit, GADDR(words), count);
 }
 
 static void transfer_out(Channel *c, int unit)
@@ -84,7 +90,7 @@ static void transfer_out(Channel *c, int unit)
         int end = 0;
         c->chcr = (c->chcr & 0xFFFF) | (tag[0] & 0xFFFF0000);  /* the tag's upper bits show in CHCR */
         if (unit != 2 && (c->chcr & CHCR_TTE))
-            graphics_feed(unit, tag + 2, 2);
+            feed(unit,tag+2,2);
         c->madr = id == TAG_REFE || id == TAG_REF || id == TAG_REFS ? addr : c->tadr + 16;
         feed(unit, dma_ptr(c->madr), qwc * 4);
         c->madr += qwc * 16;
@@ -145,7 +151,7 @@ int sceGsSyncPath(int mode, int timeout)
 {
     (void)mode, (void)timeout;
     kernel_poll();  /* tight render loops still deliver vsync and window messages */
-    graphics_wait();
+    host_service_graphics_wait();
     return 0;
 }
 
@@ -156,9 +162,9 @@ void dma_mmio_write(uintptr_t address, uint64_t value, unsigned size)
         kernel_intc_write((uint32_t)value);
         return;
     }
-    if (address >= 0x10003C00 && address < 0x10004000) graphics_wait();
+    if (address >= 0x10003C00 && address < 0x10004000) host_service_graphics_wait();
     if (address >= 0x10005000 && address + size <= 0x10005010) {
-        graphics_feed(1, (const uint32_t *)address, size / 4);
+        host_service_graphics_feed(1, (uint32_t)address, size / 4);
         return;
     }
     for (unsigned ch = 0; ch < DMA_CHANNELS; ch++)
@@ -167,9 +173,9 @@ void dma_mmio_write(uintptr_t address, uint64_t value, unsigned size)
             return;
         }
     if (address >= 0x12000000 && address < 0x12001100 && !(address & 15)) {
-        graphics_wait();
-        gs_priv_write(&gs, (unsigned)address, value);
+        host_service_graphics_wait();
+        host_service_gs_priv_write((unsigned)address, value);
         if (address == 0x12001000)
-            *(volatile uint64_t *)address = gs_priv_read(&gs, GS_CSR);
+            *(volatile uint64_t *)address = host_service_gs_priv_read(GS_CSR);
     }
 }

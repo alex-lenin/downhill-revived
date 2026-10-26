@@ -8,9 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import data, eefloat, pctarget, transform  # noqa: E402
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import patches  # noqa: E402  (port/patches.py)
+import data, eefloat, objcache, pctarget, port_source, transform  # noqa: E402
+from port_source import apply_patches, align_aggregate_allocas  # noqa: E402
 
 OUT = os.path.join(ROOT, 'build', 'port')
 ap = argparse.ArgumentParser()
@@ -38,6 +37,10 @@ CLANG = ['clang', '--target=' + pctarget.TARGET, '-c', '-O' + a.opt, '-w', '-fer
          # single-precision SSE math, no fused multiply-add: results that don't depend on the
          # optimizer or the machine (x87 keeps excess precision), as lockstep multiplayer needs
          '-msse2', '-mfpmath=sse', '-ffp-contract=off',
+         # Locals start as zero, not as whatever host code left on the stack: the game reads some
+         # before writing them, and host leftovers (ASLR'd stack and heap pointers) made two runs of
+         # one build differ (finding 075, state trace). Zero is the same on every host.
+         '-ftrivial-auto-var-init=zero',
          # gcc 2.95 accepted these; clang makes them errors by default
          '-Wno-error=incompatible-pointer-types', '-Wno-error=int-conversion',
          '-Wno-error=incompatible-function-pointer-types', '-Wno-error=implicit-function-declaration',
@@ -45,50 +48,14 @@ CLANG = ['clang', '--target=' + pctarget.TARGET, '-c', '-O' + a.opt, '-w', '-fer
          '-I', os.path.join(ROOT, 'port', 'include'), '-I', HEADER_OUT,
          '-I', os.path.join(ROOT, 'include')]
 # Diagnostic builds: canaries in every game frame catch a local buffer overflow at its
-# function's return (port/hle/host.c reports it) instead of a crash at a smashed address.
+# function's return (the CRT's check ends the process) instead of a crash at a smashed address.
 if os.environ.get('DHD_STACK_PROTECT'):
     CLANG.append('-fstack-protector-all')
 
 
-def keep_lines(old, new):
-    """new padded with newlines to old's line count, so later lines keep their numbers."""
-    return new + '\n' * max(0, old.count('\n') - new.count('\n'))
-
-
-def apply_patches(rel, text):
-    for kind, a, b in patches.PATCHES.get(rel, []):
-        if kind == 'text':
-            if text.count(a) != 1:
-                raise ValueError('patch text found %d times: %r' % (text.count(a), a[:60]))
-            text = text.replace(a, keep_lines(a, b))
-        elif kind == 're':
-            pattern, count = a
-            text, n = re.subn(pattern, b, text)
-            if n != count:
-                raise ValueError('patch pattern found %d times, not %d: %r' % (n, count, pattern))
-        else:
-            mask = transform.code_mask(text)
-            heads = list(re.finditer(r'\b%s\s*\([^;{)]*\)\s*\{' % a, mask))
-            if len(heads) != 1:
-                raise ValueError('patch: %d definitions of %s' % (len(heads), a))
-            s = heads[0].end() - 1
-            e = transform.close_paren(mask, s) + 1
-            text = text[:s] + keep_lines(text[s:e], b) + text[e:]
-    return text
-
-
 IMAGE = data.ImageNames()  # globals the PS2 data image defines (port/tools/data.py)
 
-# A local array, struct, union, class or 128-bit object (a stack slot in the frontend's IR).
-AGGREGATE_ALLOCA = re.compile(r'(= alloca (?:\[|\{|<|i128\b|%"?(?:struct|union|class)\.)[^\n]*?, align )(\d+)')
-
-
-def align_quadword_objects(ir):
-    """The EE stack keeps such objects 16-byte aligned, and lq/sq/lqc2/sqc2 ignore the low 4
-    address bits: recompiled code (recomp.h M128) and the inline asm runtime (ps2asm.c) both
-    do. The host stack only aligns them to their type, so give every aggregate local 16 bytes,
-    whatever path its address takes to a quadword access (finding 021)."""
-    return AGGREGATE_ALLOCA.sub(lambda m: m.group(1) + str(max(16, int(m.group(2)))), ir)
+REWRITERS = objcache.file_hashes(os.path.abspath(__file__), eefloat.__file__, port_source.__file__)
 
 
 def build(path):
@@ -116,17 +83,23 @@ def build(path):
         ['-x', 'c', '-std=gnu89', '-fcommon', '-Wno-return-mismatch']
     front = [f for f in CLANG if f != '-c'] + lang + ['-S', '-emit-llvm', '-Xclang', '-disable-llvm-passes',
                                                       '-include', eefloat.HEADER]
+    # the shared object cache: both steps and the IR rewrite between them (this file, eefloat.py)
+    cache = objcache.source_key(front + [src, '-o', '-'], '-', [' '.join(CLANG)] + REWRITERS)
+    if cache and objcache.fetch(cache, obj):
+        return rel, []
     p = subprocess.run(front + [src, '-o', '-'], capture_output=True, text=True,
                        encoding='utf-8', errors='replace')
     errors = [(int(l), m) for l, m in re.findall(r'^[^\n]*?:(\d+):\d+: error: (.*)$', p.stderr, re.M)]
     if p.returncode or errors:
         return rel, errors or [(0, 'clang: %s' % p.stderr.strip()[-200:])]
     try:
-        ir = eefloat.rewrite(align_quadword_objects(p.stdout))[0]  # EE float semantics (finding 026)
+        ir = eefloat.rewrite(align_aggregate_allocas(p.stdout))[0]  # EE float semantics (finding 026)
     except ValueError as e:
         return rel, [(0, str(e))]
     p = subprocess.run(CLANG + ['-x', 'ir', '-', '-o', obj], input=ir,
                        capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if cache and not p.returncode:
+        objcache.store(cache, obj)
     return rel, [] if not p.returncode else [(0, 'clang (IR): %s' % p.stderr.strip()[-200:])]
 
 

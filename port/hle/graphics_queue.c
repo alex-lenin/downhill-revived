@@ -1,8 +1,12 @@
 /* Copied VIF1/GIF packets run in FIFO order on one optional graphics worker.
    Interlocked publication owns the ring bytes until the consumer retires them.
    Design reference: PCSX2 MTVU's copied command ring; no source copied. */
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "../host/win32_compat.h"
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <xmmintrin.h>
@@ -181,8 +185,9 @@ static void initialize(void)
     }
 }
 
-void graphics_feed(int unit, const uint32_t *words, uint32_t count)
+void graphics_feed(int unit, uint32_t guest_words, uint32_t count)
 {
+    const uint32_t *words = GUEST(guest_words);
     if (unit == 0) { vif_feed(unit, words, count); return; }
     if (!initialized) initialize();
     if (!worker) { execute((unsigned)unit, words, count); return; }
@@ -211,3 +216,11 @@ void graphics_feed(int unit, const uint32_t *words, uint32_t count)
         words += take; count -= take;
     }
 }
+
+/* Guest-address-only module boundary; native device code stays above. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+void host_service_graphics_feed(int a0, uint32_t a1, uint32_t a2) { graphics_feed(a0, a1, a2); }
+void host_service_graphics_wait(void) { graphics_wait(); }
+int host_service_graphics_threaded(void) { return graphics_threaded(); }
+void host_service_graphics_shutdown(void) { graphics_shutdown(); }

@@ -1,10 +1,20 @@
 /* Exact fixed-template implementations. Parsing, operand binding, diagnostics,
    and output writeback remain shared with the generic interpreter. Recognition
    validates the full supported operation shape, never a hash or caller address.
-   DHD_ASM_GENERIC=1 retains the original interpreter for diagnosis and A/B. */
+   DHD_ASM_GENERIC=1 retains the original interpreter for diagnosis and A/B (also over the
+   generated ps2asm_aot.inc programs). */
 #include <emmintrin.h>
+#include "portable.h"
 enum { FAST_NONE, FAST_MATRIX_DIRECTION, FAST_BOUNDS, FAST_VECTOR_ADD, FAST_VECTOR_SUB, FAST_QUAD_COPY };
 static int fast_enabled = -1;
+static int asm_fast_enabled(void)
+{
+    if (fast_enabled < 0) {
+        const char *generic = getenv("DHD_ASM_GENERIC");
+        fast_enabled = !generic || !atoi(generic);
+    }
+    return fast_enabled;
+}
 
 #define FV(r) {K_VF, r, NO_COMP, 0, 0}
 #define FB(r,c) {K_VF, r, c, 0, 0}
@@ -145,14 +155,9 @@ static void matrix_direction(Prog *p)
 /* Keep fast-template temporaries out of ps2_asm's operand-binding frame.
    Legacy translated callers can copy partially initialized stack quadwords;
    changing that frame's footprint changes their otherwise unused stored lanes. */
-static __declspec(noinline) int run_fast_program(Prog *p, ps2_op *ops)
+static PS2_NOINLINE int run_fast_program(Prog *p, ps2_op *ops)
 {
-    if (!p->fast_kind) return 0;
-    if (fast_enabled < 0) {
-        const char *generic = getenv("DHD_ASM_GENERIC");
-        fast_enabled = !generic || !atoi(generic);
-    }
-    if (!fast_enabled) return 0;
+    if (!p->fast_kind || !asm_fast_enabled()) return 0;
     if (p->fast_kind == FAST_MATRIX_DIRECTION) {
         matrix_direction(p);
         return 1;

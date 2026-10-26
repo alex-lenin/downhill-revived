@@ -252,7 +252,6 @@ static void handler_run(SoundHandler *h)
         int type = (int)rd32(g), pc = h->pc, next = pc + 1, extra_delay = 0;
         int a = (int16_t)rd16(p), b = (int16_t)rd16(p + 2), c = (int16_t)rd16(p + 4), i;
         int8_t *reg;
-        snd_debug_grain(grain_samples, h->handle, h->sound->index, pc, type, h->delay);
         snd_grain_calls[type < 45 && type >= 0 ? type : 45]++;
         switch (type) {
         case 0: case 20: case 21: case 35: break;

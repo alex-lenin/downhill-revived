@@ -10,17 +10,22 @@
 
 #include "json.h"
 #include "../include/version.h"
+#include "../host/host_api.h"
 
 enum { PING_LOBBY_MS = 1000, PING_RACE_MS = 500, RESEND_MS = 100, SILENT_MS = 10000 };
 
 double net_now_ms(void)
 {
+#ifdef _WIN32
     static LARGE_INTEGER freq;
     LARGE_INTEGER now;
     if (!freq.QuadPart)
         QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&now);
     return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    return host_wall_seconds() * 1000.0;
+#endif
 }
 
 static void copy(char *dst, size_t cap, const char *src)

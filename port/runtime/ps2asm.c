@@ -9,6 +9,8 @@
    (whole-function asm; needs a C replacement), reported once per call site on stderr. */
 #include "ps2asm.h"
 #include "ps2float.h"
+#include "portable.h"
+#include "../host/host_api.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -90,7 +92,7 @@ typedef struct {
 
 enum { OPK_GPR = 1, OPK_FPR, OPK_MEM, OPK_LO, OPK_HI };
 
-typedef struct {
+typedef struct Prog {
     const char *tmpl, *cons;
     int n_ops, n_ins;
     uint8_t kind[32];    /* OPK_* of each operand */
@@ -101,9 +103,11 @@ typedef struct {
     int bad; /* unparsable or not runnable here: skipped */
     int quad_reported;
     int fast_kind; /* selected once from the complete parsed instruction sequence */
+    void (*aot)(struct Prog *, ps2_op *); /* the generated code of this exact sequence, if any */
 } Prog;
 
 static int select_fast_program(const Prog *p);
+static void (*select_aot_program(const Prog *p))(struct Prog *, ps2_op *);
 
 static int problems;
 int ps2_asm_problems(void) { return problems; }
@@ -471,7 +475,10 @@ static Prog *lookup(const char *tmpl, const char *cons, int n)
     table[h].tmpl = tmpl;
     table[h].cons = cons;
     Prog *p = table[h].prog = compile(tmpl, cons, n);
-    if (!p->bad) p->fast_kind = select_fast_program(p);
+    if (!p->bad) {
+        p->fast_kind = select_fast_program(p);
+        p->aot = select_aot_program(p);
+    }
     return p;
 }
 
@@ -581,7 +588,12 @@ static void vwrite(int reg, int dest, const float v[4])
 
 static void set_gpr32(int reg, uint32_t v) { ps2.gpr[reg].d[0] = (uint64_t)(int64_t)(int32_t)v; }
 
-static void vu_arith(const Ins *in)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PS2_ASM_INLINE static __forceinline
+#else
+#define PS2_ASM_INLINE static inline __attribute__((always_inline))
+#endif
+PS2_ASM_INLINE void vu_arith(const Ins *in)
 {
     float s[4], t[4], r[4];
     int c, acc = in->op >= V_ADDA;
@@ -619,11 +631,12 @@ static void vu_arith(const Ins *in)
         vwrite(fd->reg, in->dest, r);
 }
 
-static void run(Prog *p, ps2_op *ops)
+/* One instruction. Always inlined: run() loops over it, and the generated ps2asm_aot.inc (the wasm
+   module's build, ps2asm_aot.py) calls it once per instruction of a known program with a constant
+   Ins, so the compiler folds the decoding away and the very same code runs without it. */
+PS2_ASM_INLINE void run_ins(Prog *p, const Ins *in, ps2_op *ops)
 {
-    int k;
-    for (k = 0; k < p->n_ins; k++) {
-        const Ins *in = &p->ins[k];
+    {
         const Opd *a = &in->o[0], *b = &in->o[1], *c = &in->o[2];
         float v[4], w[4];
         int i;
@@ -910,8 +923,8 @@ static void run(Prog *p, ps2_op *ops)
             /* Native microprograms are host implementations of a coprocessor: they round
                like VU0 micro mode (toward zero, denormals flushed; ps2_vu0_run) and keep
                their intermediates outside EE first-fault diagnostics. */
-            unsigned control = _mm_getcsr();
-            _mm_setcsr((control & ~0x603Fu) | 0xFFC0u);
+            unsigned control = host_fp_csr();
+            host_fp_set_csr((control & ~0x603Fu) | 0xFFC0u);
             if (fn)
                 fn(&ps2);
             else if (ps2_vu0_run(&ps2, (unsigned)a->imm)) {
@@ -919,7 +932,7 @@ static void run(Prog *p, ps2_op *ops)
                 sprintf(at, "0x%x", (unsigned)a->imm);
                 report(p, "vcallms: the microcode failed at", at);
             }
-            _mm_setcsr(control);
+            host_fp_set_csr(control);
             break;
         }
         }
@@ -927,7 +940,38 @@ static void run(Prog *p, ps2_op *ops)
     }
 }
 
+static void run(Prog *p, ps2_op *ops)
+{
+    int k;
+    for (k = 0; k < p->n_ins; k++)
+        run_ins(p, &p->ins[k], ops);
+}
+
 #include "ps2asm_fast.h"
+
+/* Generated code for the game's known templates (PS2_ASM_AOT: the wasm module's build). A program
+   uses it only when its parsed instruction sequence is byte-for-byte the one the code was
+   generated from; run_ins makes it the interpreter's own code, with the decoding folded away. */
+#ifdef PS2_ASM_AOT
+#include "ps2asm_aot.inc"
+static void (*select_aot_program(const Prog *p))(struct Prog *, ps2_op *)
+{
+    unsigned i;
+    for (i = 0; i < sizeof aot_programs / sizeof *aot_programs; i++)
+        if (aot_programs[i].n == p->n_ins &&
+            !memcmp(aot_programs[i].ins, p->ins, (size_t)p->n_ins * sizeof *p->ins))
+            return aot_programs[i].run;
+    return 0;
+}
+#else
+static void (*select_aot_program(const Prog *p))(struct Prog *, ps2_op *) { (void)p; return 0; }
+#endif
+
+static void run_program(Prog *p, ps2_op *ops)
+{
+    if (p->aot && asm_fast_enabled()) p->aot(p, ops);
+    else run(p, ops);
+}
 
 int ps2_asm_check(const char *tmpl, const char *constraints, int n)
 {
@@ -947,7 +991,7 @@ void ps2_exec(const char *insn)
 {
     Prog *p = lookup(insn, RECOMPILED, 0);
     if (!p->bad)
-        run(p, NULL);
+        run_program(p, NULL);
 }
 
 void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops)
@@ -970,8 +1014,8 @@ void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops)
     }
     if (p->bad)
         return; /* reported when parsed */
-    asm_caller = __builtin_return_address(0);
-    if (!run_fast_program(p, ops)) run(p, ops);
+    asm_caller = PS2_CALLER_ADDRESS();
+    if (!run_fast_program(p, ops)) run_program(p, ops);
     for (k = 0; k < p->n_ops; k++) { /* write outputs back */
         unsigned size = ops[k].size;
         if (!p->out[k])

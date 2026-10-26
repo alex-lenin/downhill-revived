@@ -4,7 +4,11 @@
 #ifndef NET_CLIENT_H
 #define NET_CLIENT_H
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "../host/win32_compat.h"
+#endif
 
 #include "lockstep.h"
 #include "net.h"

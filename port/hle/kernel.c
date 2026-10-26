@@ -10,15 +10,16 @@
 #include "../gs/gs.h"
 #include "../gs/present.h"
 #include "timer.h"
+#include "state_trace.h"
 #include "../include/fps.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <xmmintrin.h>
 
 #include "ps2asm.h"
+#include "../runtime/portable.h"
 
 int hle_verbose;
 
@@ -36,15 +37,10 @@ void hle_debug_print(const char *format, va_list args)
 {
     if (hle_verbose) {
         fputs("game: ", stderr);
-        host_safe_vprint(stderr, format, args);
+        char message[4096];
+        int n=vsnprintf(message,sizeof message,format,args);
+        if (n>0) host_console_write(GADDR(message),(unsigned)n<sizeof message ? (unsigned)n : sizeof message-1);
     }
-}
-
-/* A function the PC build doesn't have yet (port/tools/link.py writes a stub calling this). */
-void hle_missing(const char *name)
-{
-    hle_log("missing function %s called (from %p)\n", name, __builtin_return_address(0));
-    exit(3);
 }
 
 /* ---- errors (Sony's kernel codes) ---- */
@@ -60,6 +56,13 @@ void hle_missing(const char *name)
 #define BUS_HZ 147456000.0
 #define VSYNC_CYCLES ((uint64_t)(BUS_HZ * 1001 / 60000)) /* NTSC 59.94 Hz */
 #define HSYNC_CYCLES (VSYNC_CYCLES / 262)               /* the alarms' unit */
+
+/* The game clock in seconds since the first call: the frame clock while it runs (DHD_FRAME_CLOCK),
+   else the wall clock (host_api.h). */
+double host_seconds(void)
+{
+    return ee_frame_clock_enabled() ? (double)ee_frame_clock_cycles() / 147456000.0 : host_wall_seconds();
+}
 
 static uint64_t now_cycles(void)
 {
@@ -90,14 +93,14 @@ typedef struct {
     uint32_t entry, stack, stack_size, gp, attr, option, arg;
     int wait, wait_id, wait_result, wakeup_count;
     int64_t order;  /* place in its priority's ready queue */
-    void *fiber, *dead_fiber;
+    HostFiber fiber, dead_fiber;
     Registers regs;
 } Thread;
 
 #define MAX_THREADS 256
 static Thread threads[MAX_THREADS];
 static Thread *current;         /* NULL while the idle loop runs */
-static void *idle_fiber;
+static HostFiber idle_fiber;
 static int64_t order_back = 1, order_front = 0;
 static int in_interrupt;
 static void (*root_function)(void);
@@ -182,7 +185,7 @@ static void reschedule(void)
     for (int i = 1; i < MAX_THREADS; i++)  /* fibers of threads that exited, now not running */
         if (threads[i].dead_fiber && &threads[i] != current) {
             host_fiber_delete(threads[i].dead_fiber);
-            threads[i].dead_fiber = NULL;
+            threads[i].dead_fiber = HOST_FIBER_NONE;
         }
 }
 
@@ -204,14 +207,12 @@ static void exit_current(void);
    round toward zero and denormals are flushed. Each fiber keeps its own MXCSR (host_fiber_switch). */
 static void ee_float_mode(void)
 {
-    _mm_setcsr((_mm_getcsr() & 63u) | 0xFFC0u);  /* toward zero, FTZ, DAZ, exceptions masked */
+    host_fp_mode(HOST_FP_EE);  /* toward zero, FTZ, DAZ, exceptions masked */
 }
 
 static void thread_main(void *param)
 {
-    extern void ps2_fp_trap_enable(void);
     ee_float_mode();
-    ps2_fp_trap_enable();
     Thread *t = param;
     memset(&t->regs, 0, sizeof t->regs);
     load_registers(&t->regs);
@@ -233,7 +234,7 @@ static void start(Thread *t, uint32_t arg)
         host_fiber_delete(t->fiber);
     else if (t->fiber)
         t->dead_fiber = t->fiber;
-    t->fiber = host_fiber_create(thread_main, t);
+    t->fiber = host_callback_fiber(HOST_CALLBACK(thread_main), GADDR(t));
     make_ready(t, 0);
 }
 
@@ -247,7 +248,7 @@ static void exit_current(void)
     }
     self->status = TS_DORMANT;
     self->dead_fiber = self->fiber;
-    self->fiber = NULL;
+    self->fiber = HOST_FIBER_NONE;
     reschedule();
 }
 
@@ -316,7 +317,7 @@ static int terminate(int id)
     t->wait = WAIT_NONE;
     if (t->fiber)
         host_fiber_delete(t->fiber);
-    t->fiber = NULL;
+    t->fiber = HOST_FIBER_NONE;
     return 0;
 }
 
@@ -790,158 +791,41 @@ static void pace(void)
    time moves: the game sees the same fields, frames and pad frames (the frame clock stays
    virtual). Off with DHD_INTERP and in online races (pace()). The idea is RetroArch's frame
    delay and NVIDIA Reflex's just-in-time frame start. */
-#define WORK_SAMPLES 300
-#define FIELD_SECONDS port_frame_period()
 static int jit = -1;
-static double jit_due, frame_began;           /* the next picture's due; when this frame's pad was read */
-static double handed_due, handed_began;       /* the same for the picture being handed on now */
-static volatile float work_ms[WORK_SAMPLES];  /* pad read to picture ready, by the presenter */
-static volatile unsigned work_count;
-static volatile double shown_due, shown_at;   /* the presenter's last picture: its due (0 while written), when shown */
-static FILE *pacing_log[2];  /* DHD_PACING_LOG=prefix: prefix-ee.csv, prefix-present.csv (each frame) */
-
-static FILE *pacing_file(int which)
-{
-    static int opened;
-    if (!opened) {
-        opened = 1;
-        const char *prefix = getenv("DHD_PACING_LOG");
-        char path[512];
-        for (int i = 0; prefix && i < 2; i++) {
-            snprintf(path, sizeof path, "%s-%s.csv", prefix, i ? "present" : "ee");
-            pacing_log[i] = fopen(path, "w");
-            if (pacing_log[i]) setvbuf(pacing_log[i], NULL, _IOFBF, 1 << 16);
-        }
-        if (pacing_log[0]) fprintf(pacing_log[0], "field,now,shown,due,start,work_ms,began\n");
-        if (pacing_log[1]) fprintf(pacing_log[1], "due,began,ready,presented\n");
-    }
-    return pacing_log[which];
-}
-
 static int jit_on(void)
 {
     if (jit < 0) {
-        const char *s = getenv("DHD_LATENCY");
-        jit = paced && !getenv("DHD_INTERP") && (!s || atoi(s) != 0);
+        const char *s = host_getenv("DHD_LATENCY");
+        jit = paced && !host_getenv("DHD_INTERP") && (!s || atoi(s) != 0);
         hle_log("pacing: %s\n", jit ? "just-in-time frames" : paced ? "wait before VBLANK" : "unpaced");
     }
     return jit && !pace_shared;
 }
 
-static void jit_wait(void)
-{
-    const double period = FIELD_SECONDS;
-    unsigned count = work_count, n = count < WORK_SAMPLES ? count : WORK_SAMPLES;
-    double work = period;  /* until there are samples (no presenter: always), pace()'s timing */
-    if (n >= 30) {
-        /* Frames longer than a field (a load, a stall) are late however early they start, so they
-           don't count, unless they are more than one in ten (a slow stretch: then no delay). */
-        float worst = 0, field_ms = (float)(period * 1000);
-        unsigned longer = 0;
-        for (unsigned i = 0; i < n; i++) {
-            float w = work_ms[i];
-            if (w > field_ms) longer++;
-            else if (w > worst) worst = w;
-        }
-        if (longer * 10 <= n) work = worst / 1000.0 + 0.0015;
-    }
-    double now = host_wall_seconds(), shown = jit_due;
-    /* The presenter moved the grid if the picture handed now, or the one before it, was late. */
-    double last_due, last_at;
-    do last_due = shown_due, last_at = shown_at; while (last_due != shown_due);
-    if (shown && last_due == shown && last_at > shown) shown = last_at;
-    else if (shown && last_due > 0 && last_due + period - shown < 1e-6 && shown - last_due - period < 1e-6 &&
-             last_at + period > shown) shown = last_at + period;
-    double due = shown + period;
-    if (!shown || now > due) {  /* the first field, or more than a field late: start again from now */
-        jit_due = now + (work < period ? work : period);
-        frame_began = now;
-        return;
-    }
-    double start = due - work;
-    if (start < shown) start = shown;  /* never two frames in one field */
-    host_wait_wall(start);
-    jit_due = due;
-    frame_began = host_wall_seconds();
-    FILE *log = pacing_file(0);
-    if (log) fprintf(log, "%llu,%.6f,%.6f,%.6f,%.6f,%.3f,%.6f\n", (unsigned long long)kernel_vsync_count, now, shown,
-                     due, start, work * 1000, frame_began);
-}
-
-/* The picture handed on at this VBLANK: when to show it (0: at once) and when its pad was read. */
-void pacing_handed(double *due, double *began)
-{
-    *due = handed_due;
-    *began = handed_began;
-}
-
-/* The presenter, just before it presents a picture pacing_handed described: notes how long the
-   frame took, then waits for the due time, and at least a field after its last picture. */
-void pacing_present(double due, double began)
-{
-    static double last_at;
-    double now = host_wall_seconds(), target = due;
-    if (due > 0) {
-        if (began > 0 && now > began) {
-            unsigned i = work_count;
-            work_ms[i % WORK_SAMPLES] = (float)((now - began) * 1000);
-            work_count = i + 1;
-        }
-        if (last_at + FIELD_SECONDS > target) target = last_at + FIELD_SECONDS;
-        if (target > now && target < now + 0.05)
-            host_wait_wall(target);
-        last_at = host_wall_seconds();
-        shown_due = 0;  /* x86 keeps stores in order: a reader sees due 0 or both values */
-        shown_at = last_at;
-        shown_due = due;
-    }
-    FILE *log = pacing_file(1);
-    if (log) fprintf(log, "%.6f,%.6f,%.6f,%.6f\n", due, began, now, host_wall_seconds());
-    if (log && !(work_count % 60)) fflush(log), fflush(pacing_log[0]);  /* DHD_BENCH_EXIT ends with ExitProcess */
-    /* DHD_PACING_STATS=1: every 600 pictures, how old the pad state was when each was presented. */
-    static int stats = -1;
-    static double sum, worst;
-    static unsigned count;
-    if (stats < 0) stats = getenv("DHD_PACING_STATS") != NULL;
-    if (stats && began > 0) {
-        double age = (host_wall_seconds() - began) * 1000;
-        sum += age, count++;
-        if (age > worst) worst = age;
-        if (count == 600) {
-            fprintf(stderr, "pacing: %s, pad to present mean %.2f ms max %.2f ms\n",
-                    due > 0 ? "just-in-time" : "wait before VBLANK", sum / count, worst);
-            sum = worst = 0, count = 0;
-        }
-    }
-}
-
-#include "frame_profile.h"
-
 static void vsync(void)
 {
-    frame_profile_mark(0);
     /* The original online clock accounts for this time. Do not charge it
        again if the player returns to an offline high-rate menu/race. */
     if (pads_online()) port_fps_wall_mode(paced);
     int fresh = paced && jit_on();
     if (paced && !fresh) pace();
-    handed_due = fresh ? jit_due : 0;
-    handed_began = frame_began;
-    frame_profile_mark(1);
+    host_pacing_handoff(fresh);
     ++kernel_vsync_count;
+    /* host_pacing_wait logs this field, as jit_wait did */
+    host_pacing_config(port_frame_period(),kernel_vsync_count);
+    host_frame_context(kernel_vsync_count,host_seconds());
     port_fps_observe();  /* DHD_FPS_TRACE */
     /* Presentation and the VBLANK handler consume completed graphics state. */
-    graphics_wait();
-    frame_profile_mark(2);
+    host_service_graphics_wait();
     /* CSR acknowledgements and VBLANK must share the read-only FIELD state. */
-    gs_vblank(&gs);
-    GS_CSR = gs_priv_read(&gs, 0x1000);
+    host_service_gs_vblank();
+    GS_CSR = host_service_gs_priv_read(0x1000);
     if (vsync_flag_addr) {
         *(uint32_t *)(uintptr_t)vsync_flag_addr = 1;
         *(uint64_t *)(uintptr_t)vsync_csr_addr = GS_CSR;
     }
     pad_vsync();  /* padman updates the controllers once a frame */
-    if (!fresh) frame_began = host_wall_seconds();
+    if (!fresh) host_pacing_input();
     host_widescreen_vsync();
     /* Mixer/SPU time stays at the NTSC field rate, independently of real
        offline simulation frames. Preserve the exact original call at 60. */
@@ -956,18 +840,26 @@ static void vsync(void)
     }
     intc_raise(INTC_VBLANK_START);
     run_handlers(intc_handlers, intc_enabled, INTC_VBLANK_START);
-    frame_profile_mark(3);
-    graphics_wait(); /* handlers may have submitted another packet */
-    frame_profile_mark(4);
-    gs_vsync();  /* latch the display buffer selected by the VBLANK handler */
-    frame_profile_mark(5);
+    host_service_graphics_wait(); /* handlers may have submitted another packet */
+#if defined(__wasm__)
+    extern int host_widescreen_flat_limit(void);
+    host_frame_video(host_widescreen_aspect(),host_widescreen_flat_limit());
+    const char *capture_prefix=host_getenv("DHD_SCREENSHOT");
+    if (capture_prefix && host_getenv("DHD_RACE_SYNC")) {
+        char capture_name[1024];
+        race_sync_vsync(kernel_vsync_count);
+        int ready=race_sync_capture(capture_prefix,capture_name,sizeof capture_name);
+        host_capture_name(GADDR(capture_name),ready);
+    }
+#endif
+    host_service_gs_vsync();  /* latch the display buffer selected by the VBLANK handler */
     intc_raise(INTC_VBLANK_END);
     run_handlers(intc_handlers, intc_enabled, INTC_VBLANK_END);
-    frame_profile_mark(6);
     if (fresh) {
-        jit_wait();
+        host_pacing_wait();
         pad_refresh();  /* the game reads the pad after this VBLANK: the state at the end of the wait */
     }
+    state_trace_field(kernel_vsync_count, next_vsync);  /* DHD_STATE_TRACE: the end of the field */
 }
 
 static int deliver(void)
@@ -1008,7 +900,12 @@ void kernel_poll(void)
     if (in_interrupt)
         return;
     ee_frame_clock_poll();
-    host_poll_dump();
+#if defined(__wasm__)
+    uint32_t registers[5]={ps2.gpr[29].w[0],ps2.gpr[31].w[0],ps2.gpr[4].w[0],ps2.gpr[5].w[0],ps2.gpr[2].w[0]};
+    host_frame_registers(GADDR(registers));
+#endif
+    host_callbacks_drain();
+    if (host_service_host_poll_dump()) kernel_dump();
     dma_poll();
     if (deliver())
         reschedule();
@@ -1043,7 +940,12 @@ static void intc_read(void)
         return;
     frame_waits++;
     wait_until(next_event());
-    host_poll_dump();
+#if defined(__wasm__)
+    uint32_t registers[5]={ps2.gpr[29].w[0],ps2.gpr[31].w[0],ps2.gpr[4].w[0],ps2.gpr[5].w[0],ps2.gpr[2].w[0]};
+    host_frame_registers(GADDR(registers));
+#endif
+    host_callbacks_drain();
+    if (host_service_host_poll_dump()) kernel_dump();
     dma_poll();
     if (deliver())
         reschedule();
@@ -1069,8 +971,8 @@ static uint64_t next_event(void)
 void Exit(int code) RETAIL(func_0025A300);
 void Exit(int code)
 {
-    hle_log("Exit(%d) from %p (ra %08X)\n", code, __builtin_return_address(0), ps2.gpr[31].w[0]);
-    host_backtrace();
+    hle_log("Exit(%d) from %p (ra %08X)\n", code, PS2_CALLER_ADDRESS(), ps2.gpr[31].w[0]);
+    host_service_host_backtrace();
     exit(code);
 }
 
@@ -1127,24 +1029,25 @@ int Deci2Call(int call, void *arg) { (void)call, (void)arg; return -1; }
 /* ---- startup and the idle loop ---- */
 void kernel_init(void)
 {
-    const char *frame_clock = getenv("DHD_FRAME_CLOCK"), *pacing = getenv("DHD_PACE");
+    const char *frame_clock = host_getenv("DHD_FRAME_CLOCK"), *pacing = host_getenv("DHD_PACE");
     const int unpaced = frame_clock && !strcmp(frame_clock, "1"), wall = pacing && !strcmp(pacing, "wall");
     ee_frame_clock_reset(unpaced || !wall);
     paced = !unpaced && !wall;
     port_fps_wall_mode(paced);
-    host_init();
-    gs_reset(&gs);
+    host_service_host_init();
+    host_service_gs_reset();
+    state_trace_init();  /* after gs_reset, which clears the GS struct; no-op unless DHD_STATE_TRACE */
     ps2_mmio_write = dma_mmio_write;
     ps2_intc_read = intc_read;
     intc_stat = 0;
     *(volatile uint32_t *)(uintptr_t)PS2_INTC_STAT = 0;
-    ps2_graphics_sync = graphics_threaded() ? graphics_wait : NULL;
+    ps2_graphics_sync = host_service_graphics_threaded() ? host_service_graphics_wait : NULL;
     ps2_vu1_regs_sync = ps2_graphics_sync;
     host_seconds();
     kernel_vsync_count = 0;
     next_vsync = VSYNC_CYCLES;
     ps2.cop0[12] = 0x10001;  /* Status: EIE, IE */
-    hle_verbose = getenv("DHD_LOG") != NULL;
+    hle_verbose = host_getenv("DHD_LOG") != NULL;
 }
 
 void kernel_run(void (*root)(void), uint32_t gp, uint32_t stack, uint32_t stack_size)

@@ -14,41 +14,6 @@ static const char *snd_report_path;
 static uint64_t snd_grain_calls[46], snd_grain_unsupported[46];
 static uint64_t snd_mix_clipped[2];
 static FILE *snd_gain, *snd_gain_events;
-static FILE *snd_rng_trace;
-static int snd_rng_trace_started;
-static FILE *snd_grain_trace;
-static int snd_grain_trace_started;
-static void snd_debug_grain(uint64_t sample, uint32_t handle, int sound,
-                            int pc, int type, int delay)
-{
-    if (!snd_grain_trace_started) {
-        const char *path = getenv("DHD_SND_GRAIN_TRACE"); snd_grain_trace_started = 1;
-        if (path && *path) {
-            snd_grain_trace = fopen(path, "wb");
-            if (snd_grain_trace) fputs("sample,handle,sound,pc,type,delay\n", snd_grain_trace);
-        }
-    }
-    if (snd_grain_trace) {
-        fprintf(snd_grain_trace, "%llu,%u,%d,%d,%d,%d\n",
-            (unsigned long long)sample, handle, sound, pc, type, delay);
-        fflush(snd_grain_trace);
-    }
-}
-static void snd_debug_random(uint64_t sample, unsigned index, unsigned value)
-{
-    if (!snd_rng_trace_started) {
-        const char *path = getenv("DHD_SND_RNG_TRACE");
-        snd_rng_trace_started = 1;
-        if (path && *path) {
-            snd_rng_trace = fopen(path, "wb");
-            if (snd_rng_trace) fputs("sample,index,value\n", snd_rng_trace);
-        }
-    }
-    if (snd_rng_trace) {
-        fprintf(snd_rng_trace, "%llu,%u,%u\n", (unsigned long long)sample, index, value);
-        fflush(snd_rng_trace);
-    }
-}
 static uint64_t snd_gain_energy[3][2];
 static int snd_gain_peak[3], snd_gain_frames, snd_gain_voices, snd_gain_streams;
 static int snd_gain_voice_max, snd_gain_lfo_min, snd_gain_lfo_max;
@@ -241,10 +206,6 @@ static void snd_debug_reset(void)
     if (snd_wav) fclose(snd_wav);
     if (snd_gain) fclose(snd_gain);
     if (snd_gain_events) fclose(snd_gain_events);
-    if (snd_rng_trace) fclose(snd_rng_trace);
-    if (snd_grain_trace) fclose(snd_grain_trace);
-    snd_grain_trace = NULL; snd_grain_trace_started = 0;
-    snd_rng_trace = NULL; snd_rng_trace_started = 0;
     snd_gain = snd_gain_events = NULL;
     memset(snd_gain_energy, 0, sizeof snd_gain_energy);
     memset(snd_gain_peak, 0, sizeof snd_gain_peak);

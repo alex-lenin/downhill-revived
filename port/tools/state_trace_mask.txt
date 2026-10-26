@@ -1,0 +1,9 @@
+# DHD_STATE_MASK for port/tools/state_trace_run.py (EE word addresses; hashed as zero).
+# Each entry: address, then the reason. Keep this list minimal; every entry needs a reason.
+#
+# Was empty since the EE thread stacks have fixed addresses under DHD_STATE_TRACE (host.c
+# host_fiber_create): the game keeps addresses of its stack locals (0x0093C3F0, 0x0093C560-
+# 0x0093C620, a menu stack), which used to move with Windows' stack placement. Two runs of one
+# build now match word for word over a 5000-field race with nothing masked (finding 075).
+0x0093C620 dead spill in func_00254D68 of a value computed from a host address (not a pointer: no symbol holds it); it moves by the exe image growth (wgpu-native, +5.5 MB, finding 084 section 10). Dumps at boot 25/300/590 and race 2500/4990 show no other difference.
+0x0093C3F0 dead EE stack local holding a host address: an i686 .rdata pointer (boot field 25), a pointer into the module C stack on x64 (0x7010xxxx); its value moves with any host frame or image layout change (W11 SDL3, W18 -fbuiltin). Was a code-pointer entry until 2026-10-24.

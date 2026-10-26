@@ -13,10 +13,10 @@ frame than the PS2 (the countdown took 560 port fields against 260). The port
 frame at delta 0 is paired with the most similar PCSX2 frame among deltas
 0..2*window; the chosen delta is reported, never widened.
 
-    python port/tools/race_compare.py race-r10 --exe build/port/compare-build/dhd.exe
+    python port/tools/race_compare.py race-r10 --exe build/host64-exe/dhd64.exe
 
-Needs DHD_ISO, the adapter from prepare_pcsx2_compare.py, and a port image with
-DHD_RACE_SYNC (build_compare_port.py). Output: build/port/compare/LABEL/.
+Needs DHD_ISO, the adapter from prepare_pcsx2_compare.py and the port's exe (--exe: a
+build_host64.py dhd64.exe; DHD_RACE_SYNC is a run-time switch). Output: build/port/compare/LABEL/.
 """
 from pathlib import Path
 from decimal import Decimal
@@ -151,7 +151,7 @@ def launch_retail(args, directory, race_events, moments):
 def launch_port(args, directory, race_events, moments):
     executable, digest = compare.snapshot_exe(args.exe, directory)
     if b'DHD_RACE_SYNC' not in executable.read_bytes():
-        raise RuntimeError('port image lacks DHD_RACE_SYNC; run build_compare_port.py')
+        raise RuntimeError('port image lacks DHD_RACE_SYNC; rebuild it')
     (directory / 'port').mkdir()
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DHD_', 'ROUND_'))}
     env.update(DHD_ISO=os.environ['DHD_ISO'], DHD_FRAME_CLOCK='1', DHD_LOG='1', DHD_SKIP_MOVIES='1', DHD_MEMCARD='0',
@@ -186,7 +186,7 @@ def thumb(image):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('label')
-    ap.add_argument('--exe', type=Path, default=compare.ROOT / 'build/port/compare-build/dhd.exe')
+    ap.add_argument('--exe', type=Path, required=True, help="the port's exe (build_host64.py's dhd64.exe)")
     ap.add_argument('--pcsx2', type=Path, default=compare.ROOT / 'build/port/compare-pcsx2-src/bin/pcsx2-dhd-compare.exe')
     ap.add_argument('--bios', default=os.environ.get('DHD_PCSX2_BIOS'))
     ap.add_argument('--retail-renderer', type=int, default=13, help='13 software (default), 3 D3D11')

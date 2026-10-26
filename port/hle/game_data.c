@@ -8,10 +8,10 @@
    The disc check of the first start (host.c disc_problem) asks the same question, so a player
    whose disc image fails here is told and can choose another one. */
 #include "hle.h"
+#include "../runtime/portable.h"
 
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #define SECTOR 2048
 #define GAME_ELF "SCUS_971.77"
@@ -63,11 +63,12 @@ const char *game_data_read(const char *path, uint8_t **elf)
     static char why[256];
     static uint8_t sector[SECTOR];
     if (elf) *elf = NULL;
-    FILE *f = fopen(path, "rb");
-    if (!f) return "The file can't be opened.";
+    HostFile f = host_file_open(path, HOST_FILE_READ);
+    if (f == HOST_FILE_NONE) return "The file can't be opened.";
     const char *problem = NULL;
     uint8_t *data = NULL;
-#define READ(lsn, n, dst) (_fseeki64(f, (long long)(lsn) * SECTOR, SEEK_SET) == 0 && fread(dst, SECTOR, n, f) == (n))
+#define READ(lsn, n, dst) (host_file_seek(f, (uint64_t)(lsn) * SECTOR) == 0 \
+                           && host_file_read(f, dst, (size_t)(n) * SECTOR) == (int64_t)(n) * SECTOR)
     uint32_t lsn = 0, size = 0;
     if (READ(16, 1, sector) && sector[0] == 1 && !memcmp(sector + 1, "CD001", 5)) {
         /* the root directory (the primary volume descriptor's record at 156) */
@@ -77,7 +78,7 @@ const char *game_data_read(const char *path, uint8_t **elf)
             for (unsigned i = 0; i + 33 < SECTOR && sector[i]; i += sector[i]) {
                 const uint8_t *r = sector + i;
                 size_t n = sizeof GAME_ELF - 1;
-                if (r[32] >= n && i + 33 + r[32] <= SECTOR && !_strnicmp((const char *)r + 33, GAME_ELF, n) &&
+                if (r[32] >= n && i + 33 + r[32] <= SECTOR && !dhd_strnicmp((const char *)r + 33, GAME_ELF, n) &&
                     (r[32] == n || r[33 + n] == ';')) {
                     lsn = le32(r + 2);
                     size = le32(r + 10);
@@ -112,13 +113,13 @@ const char *game_data_read(const char *path, uint8_t **elf)
 done:
 #undef READ
     free(data);
-    fclose(f);
+    host_file_close(f);
     return problem;
 }
 
 int game_data_load(void)
 {
-    const char *path = getenv("DHD_ISO");
+    const char *path = host_getenv("DHD_ISO");
     uint8_t *elf = NULL;
     const char *problem = path ? game_data_read(path, &elf) : "No disc image is chosen (DHD_ISO).";
     if (!problem) {
@@ -135,12 +136,23 @@ int game_data_load(void)
     }
     if (!problem) return 1;
     hle_log("game data: %s: %s\n", path ? path : "(none)", problem);
-    if (!getenv("DHD_HEADLESS")) {
+    if (!host_getenv("DHD_HEADLESS")) {
         char message[1024];
         snprintf(message, sizeof message, "The game's data can't be read from the disc image\n%s\n\n%s\n\n"
                  "Downhill Revived plays from your own copy of the disc: an unchanged .iso file of "
                  "Downhill Domination (USA), SCUS-97177.", path ? path : "(none chosen)", problem);
-        MessageBoxA(NULL, message, "Downhill Revived", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        host_error_box("Downhill Revived", message);
     }
     return 0;
 }
+
+#if defined(__wasm__)
+/* Synchronous reverse boundary for the native first-start disc chooser.
+   It runs only inside its originating module import, on that owning stack. */
+__attribute__((export_name("port_disc_validate")))
+uint32_t port_disc_validate(uint32_t path, uint32_t error, uint32_t capacity) {
+    const char *problem=game_data_read((const char *)(uintptr_t)path,NULL);
+    if (problem && capacity) snprintf((char *)(uintptr_t)error,capacity,"%s",problem);
+    return problem!=NULL;
+}
+#endif

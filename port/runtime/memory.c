@@ -12,10 +12,10 @@
    through those addresses. */
 #include "memory.h"
 #include "ps2asm.h"
+#include "../host/host_api.h"
 
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
 
 /* {PS2 address, value} of every word of the image that is not the retail one (port/tools/data.py
    fixups.s): pointers, which are host addresses here, and code addresses, which are the
@@ -28,62 +28,41 @@ extern const uint32_t ps2_fixups_end[][2] __asm__("_ps2_fixups_end");
    func_00223BB0's unit). They get PS2_RAM_BASE added after the fixups. */
 static const uint32_t ram_address_words[] = {0x29D9D4, 0x29DB0C, 0x29DB10, 0x29DB14, 0x29DB18, 0x29DB1C};
 
-static void *map_at(HANDLE h, uintptr_t at)
+/* A view of the RAM at PS2 address `at` (host_api.h: the guest addresses are the host's here). */
+static int map_at(uint32_t at)
 {
-    return MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, 0, PS2_RAM_SIZE, (void *)at);
+    return host_ram_view(at, 0, PS2_RAM_SIZE, 0);
 }
 
 /* The low view, at the PS2 addresses themselves: into the parent's reservation. */
-static int map_low(HANDLE h, uint32_t mirror)
+static int map_low(uint32_t mirror)
 {
-    uintptr_t at = mirror | PS2_LOW_VIEW;
-    if (!mirror)
-        VirtualFree((void *)at, 0, MEM_RELEASE);
-    return MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, PS2_LOW_VIEW, PS2_RAM_SIZE - PS2_LOW_VIEW, (void *)at)
-           == (void *)at;
+    uint32_t at = mirror | PS2_LOW_VIEW;
+    return host_ram_view(at, PS2_LOW_VIEW, PS2_RAM_SIZE - PS2_LOW_VIEW, !mirror);
 }
 
 int ps2_low_view_reserved(void)
 {
-    MEMORY_BASIC_INFORMATION m;
-    return VirtualQuery((void *)PS2_LOW_VIEW, &m, sizeof m) && m.State == MEM_RESERVE
-           && m.AllocationBase == (void *)PS2_LOW_VIEW && m.RegionSize >= PS2_RAM_SIZE - PS2_LOW_VIEW;
-}
-
-/* Fixed memory at its PS2 address: in the parent's reservation (host_relaunch_reserving), else
-   free space. If something else is there (a DLL), the log says what. */
-static int alloc_at(uintptr_t at, size_t size)
-{
-    if (VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) == (void *)at
-        || VirtualAlloc((void *)at, size, MEM_COMMIT, PAGE_READWRITE) == (void *)at)
-        return 1;
-    DWORD error = GetLastError();
-    MEMORY_BASIC_INFORMATION m = {0};
-    char owner[MAX_PATH] = "";
-    VirtualQuery((void *)at, &m, sizeof m);
-    if (m.Type == MEM_IMAGE) GetModuleFileNameA((HMODULE)m.AllocationBase, owner, sizeof owner);
-    fprintf(stderr, "ps2_memory_init: %08lX is taken (error %lu; state %lX, type %lX, from %p%s%s)\n",
-            (unsigned long)at, error, m.State, m.Type, m.AllocationBase, *owner ? ", " : "", owner);
-    return 0;
+    return host_mem_reserved(PS2_LOW_VIEW, PS2_RAM_SIZE - PS2_LOW_VIEW);
 }
 
 int ps2_memory_init(void)
 {
-    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, PS2_RAM_SIZE, NULL);
-    if (!h || map_at(h, PS2_RAM_BASE) != (void *)PS2_RAM_BASE
-        || map_at(h, 0x20000000 | PS2_RAM_BASE) != (void *)(0x20000000 | PS2_RAM_BASE)
-        || map_at(h, 0x30000000 | PS2_RAM_BASE) != (void *)(0x30000000 | PS2_RAM_BASE)) {
+    if (!host_ram_create(PS2_RAM_SIZE) || !map_at(PS2_RAM_BASE) || !map_at(0x20000000 | PS2_RAM_BASE)
+        || !map_at(0x30000000 | PS2_RAM_BASE)) {
         fprintf(stderr, "ps2_memory_init: can't map PS2 RAM at 0x%08X (error %lu)\n", PS2_RAM_BASE,
-                GetLastError());
+                host_last_error());
         return 0;
     }
-    if (!map_low(h, 0) || !map_low(h, 0x20000000) || !map_low(h, 0x30000000)) {
+    if (!map_low(0) || !map_low(0x20000000) || !map_low(0x30000000)) {
         fprintf(stderr, "ps2_memory_init: can't map PS2 RAM at its own addresses from 0x%08X (error %lu)\n",
-                PS2_LOW_VIEW, GetLastError());
+                PS2_LOW_VIEW, host_last_error());
         return 0;
     }
-    if (!alloc_at(PS2_SCRATCHPAD, 0x4000) || !alloc_at(0x10000000, 0x10000) || !alloc_at(0x12000000, 0x2000)
-        || !alloc_at(0x11000000, 0x10000)) {
+    /* Fixed memory at its PS2 address: in the host's reservation (the wasm core's linear memory),
+       else free space; if something else holds it, host_mem_commit's log line says what. */
+    if (!host_mem_commit(PS2_SCRATCHPAD, 0x4000) || !host_mem_commit(0x10000000, 0x10000)
+        || !host_mem_commit(0x12000000, 0x2000) || !host_mem_commit(0x11000000, 0x10000)) {
         fprintf(stderr, "ps2_memory_init: can't map the scratchpad, VU memory or the hardware registers\n");
         return 0;
     }

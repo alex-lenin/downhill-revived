@@ -37,7 +37,7 @@ static __m128 native_madd(NativeFlags *f, __m128 acc, __m128 a, __m128 b, int d)
    Keep the optimizer barrier even though the exceptional-value clamp is dead. */
 static __m128 native_madd_clean_acc(NativeFlags *f, __m128 acc, __m128 a, __m128 b, int d)
 {
-    __asm__("" : "+x"(acc));
+    PS2_OPAQUE_M128(acc);
     return native_result(f, _mm_add_ps(acc, _mm_mul_ps(operand4(a), operand4(b))), d);
 }
 static __m128 native_itof(__m128 value, float scale)

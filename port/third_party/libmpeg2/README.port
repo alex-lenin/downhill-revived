@@ -11,7 +11,7 @@ Licence: GNU GPL version 2 or (at your option) any later version (COPYING; each 
 
 Files: libmpeg2/{alloc,cpu_accel,cpu_state,decode,header,idct,motion_comp,slice}.c,
 mpeg2_internal.h, vlc.h and include/{mpeg2,attributes}.h, copied and flattened into this
-folder, unchanged but for one line: header.c's default_intra_quantizer_matrix is uint16_t, not
+folder, unchanged but for two lines: alloc.c's alignment mask is uintptr_t (not long, which is 32 bits on Windows x64), and header.c's default_intra_quantizer_matrix is uint16_t, not
 uint8_t (same values), so dhd.exe holds no 64-byte copy of the game executable's own copy of
 that MPEG-2 table (port/tools/scan_retail.py; marked in the file). config.h is the port's own (portable C, no CPU-specific code). The MMX/AltiVec/VIS/
 Alpha/ARM files, libmpeg2convert, libvo and the mpeg2dec program are not used.

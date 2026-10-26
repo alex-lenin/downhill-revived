@@ -74,7 +74,7 @@ int main(int argc, char **argv)
     for (unsigned n = 0; n < 3000; n++) {
         packet[4] = n;
         expect(3, n, packet, 8);
-        graphics_feed(1, packet, 8);
+        graphics_feed(1, GADDR(packet), 8);
         memset(packet + 4, 0, 8); /* queued bytes must survive producer reuse */
     }
     graphics_wait();
@@ -85,7 +85,7 @@ int main(int argc, char **argv)
         memcpy(memory, packet + 4, 16);
         graphics_provenance.program = n + 3000;
         expect(1, n + 3000, packet, 8);
-        failures += graphics_xgkick(memory, 1023) != 0;
+        failures += graphics_xgkick(GADDR(memory), 1023) != 0;
         memset(memory, 0, sizeof memory);
     }
     graphics_wait();

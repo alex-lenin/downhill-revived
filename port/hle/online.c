@@ -26,14 +26,12 @@
 #include "../gs/present.h"
 #include "../net/net.h"
 #include "../include/version.h"
+#include "../runtime/sha256.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt")
 
 #define EE32(a) (*(volatile int32_t *)(uintptr_t)(0x08000000u + (a)))
 #define EE_PTR(a) ((void *)(uintptr_t)(0x08000000u + (a)))
@@ -164,11 +162,11 @@ static const void *state_hash_copy(void) { return copy; }
 
 static uint64_t state_hash(int whole)
 {
-    uintptr_t (*stacks)[2];
+    static uint32_t stacks[64][2];
     uint32_t start = whole ? 0 : 0x26DD00, end = whole ? 32u << 20 : 0x8A0400, n = (end - start) / 4;
     const uint32_t *ee = EE_PTR(start);
-    int nstacks = host_stack_ranges(&stacks);
-    uintptr_t low = UINTPTR_MAX, high = 0;
+    int nstacks = host_stack_ranges_copy(GADDR(stacks), 64);
+    uint32_t low = UINT32_MAX, high = 0;
     for (int k = 0; k < nstacks; k++) {
         if (stacks[k][0] < low) low = stacks[k][0];
         if (stacks[k][1] > high) high = stacks[k][1];
@@ -182,7 +180,7 @@ static uint64_t state_hash(int whole)
         copy[i] = v;
     }
     NetRange r = {copy, (size_t)n * 4};
-    return net_hash_ranges(&r, 1);
+    return host_service_net_hash_ranges(GADDR(&r), 1);
 }
 
 /* The state that decides the race, which online PCs compare every NET_HASH_PERIOD fields: the
@@ -201,7 +199,7 @@ static uint64_t game_hash(void)
         {EE_PTR(MENU), 4}, {EE_PTR(PHASE), 4}, {EE_PTR(0x43EEC8), 4},
         {EE_PTR(0x660B80), 8 * 32},   /* pads */
     };
-    return net_hash_ranges(r, (int)(sizeof r / sizeof *r));
+    return host_service_net_hash_ranges(GADDR(r), (int)(sizeof r / sizeof *r));
 }
 
 /* DHD_HASH_LOG=file: offline, the hashes of every NET_HASH_PERIOD-th vsync from boot, for
@@ -221,8 +219,8 @@ static void log_hash(uint64_t field)
     /* DHD_HASH_DUMP=field: the hashed (masked) 32 MB at that field, and the stacks masked */
     const char *dump = getenv("DHD_HASH_DUMP");
     if (dump && strtoull(dump, NULL, 10) == field) {
-        uintptr_t (*stacks)[2];
-        int n = host_stack_ranges(&stacks);
+        static uint32_t stacks[64][2];
+        int n = host_stack_ranges_copy(GADDR(stacks), 64);
         char name[64];
         snprintf(name, sizeof name, "hashdump-%llu.bin", (unsigned long long)field);
         FILE *d = fopen(name, "wb");
@@ -324,7 +322,7 @@ static void title(const char *fmt, ...)
     va_end(ap);
     if (!strcmp(text, last)) return;
     strcpy(last, text);
-    gs_window_title(text);
+    host_service_gs_window_title(GADDR(text));
     fprintf(stderr, "online: %s\n", text);
 }
 
@@ -333,7 +331,7 @@ static void fail(const char *why)
     char text[400];
     snprintf(text, sizeof text, "Online play stopped: %s", why);
     fprintf(stderr, "online: %s\n", text);
-    MessageBoxA(NULL, text, "Downhill Revived online", MB_OK | MB_ICONERROR);
+    host_error_box("Downhill Revived online", text);
     exit(1);
 }
 
@@ -342,26 +340,20 @@ static void fail(const char *why)
    sends the release alone (clientVersion) for the version gate. */
 static void build_version(char *out, size_t size)
 {
-    char path[MAX_PATH];
-    BCRYPT_ALG_HANDLE alg;
-    BCRYPT_HASH_HANDLE h;
+    char path[HOST_PATH_MAX];
+    Sha256 hash;
     uint8_t digest[32], buf[65536];
-    DWORD n;
+    int64_t n;
     snprintf(out, size, "dhd-port " DHD_VERSION " unknown");
-    GetModuleFileNameA(NULL, path, sizeof path);
-    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0) {
-        if (BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) == 0) {
-            while (ReadFile(f, buf, sizeof buf, &n, NULL) && n) BCryptHashData(h, buf, n, 0);
-            if (BCryptFinishHash(h, digest, sizeof digest, 0) == 0)
-                snprintf(out, size, "dhd-port " DHD_VERSION " %02x%02x%02x%02x%02x%02x%02x%02x", digest[0], digest[1], digest[2],
-                         digest[3], digest[4], digest[5], digest[6], digest[7]);
-            BCryptDestroyHash(h);
-        }
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-    CloseHandle(f);
+    host_exe_path(path, sizeof path);
+    HostFile f = host_file_open(path, HOST_FILE_READ);
+    if (!f) return;
+    sha256_init(&hash);
+    while ((n = host_file_read(f, buf, sizeof buf)) > 0) sha256_update(&hash, buf, (size_t)n);
+    sha256_final(&hash, digest);
+    snprintf(out, size, "dhd-port " DHD_VERSION " %02x%02x%02x%02x%02x%02x%02x%02x", digest[0], digest[1], digest[2],
+             digest[3], digest[4], digest[5], digest[6], digest[7]);
+    host_file_close(f);
 }
 
 void hle_online_version(char *out, size_t size) { build_version(out, size); }
@@ -370,7 +362,7 @@ static void set_env(const char *name, const char *value)
 {
     char text[600];
     snprintf(text, sizeof text, "%s=%s", name, value);
-    _putenv(text);
+    host_putenv(text);
 }
 
 /* The menus to a single race, by the screen shown (port/hle/menu_nav.h; race_compare.py's NAV):
@@ -398,11 +390,11 @@ static void connect_lobby(void)
     if (!render || strcmp(render, "native")) fail("online races use the native renderer (DHD_RENDER=native).");
     if (!iso || strlen(iso) != 64) fail("the ISO's SHA-256 is missing (start the game from the launcher).");
     build_version(version, sizeof version);
-    net_init(server, name && *name ? name : "Rider", version, iso);
+    host_service_net_init(GADDR(server), GADDR(name && *name ? name : "Rider"), GADDR(version), GADDR(iso));
     if (join && *join) {
-        if (net_join_room(join) < 0) fail("that join code can't be one (6 letters and digits).");
+        if (host_service_net_join_room(GADDR(join)) < 0) fail("that join code can't be one (6 letters and digits).");
     } else
-        net_create_room();
+        host_service_net_create_room();
     fprintf(stderr, "online: %s, version %s\n", join && *join ? "joining" : "creating a room", version);
 }
 
@@ -410,7 +402,7 @@ static int pressed_start(void)
 {
     static int was;
     HostPad in;
-    host_pad_device(0, &in);
+    host_service_host_pad_device(0, GADDR(&in));
     int now = (in.buttons & PAD_START) != 0, edge = now && !was;
     was = now;
     return edge;
@@ -450,7 +442,7 @@ static void barrier(void)
     double last_change = 0, last_beat = 0;
     unsigned seq = ~0u;
     for (;;) {
-        net_get_lobby(&lobby);
+        host_service_net_get_lobby(GADDR(&lobby));
         if (lobby.state == NET_FAILED)
             fail(lobby.error[0] ? lobby.error : "the connection to the server failed.");
         if (lobby.state == NET_LOBBY || lobby.state == NET_RACING) {
@@ -459,13 +451,13 @@ static void barrier(void)
                 const char *track = getenv("DHD_NET_TRACK"), *room = getenv("DHD_NET_ROOM_NAME");
                 NetRoomSettings s = {track && *track ? atoi(track) : 0, -1, getenv("DHD_NET_PUBLIC") != NULL, 4, -1,
                                      room && *room ? room : NULL};
-                net_set_room(&s);
+                host_service_net_set_room(GADDR(&s));
                 settings_sent = 1;
             }
             if (!ready_sent) {
                 const char *rider = getenv("DHD_NET_RIDER");  /* rider index; the lobby keeps index + 1 */
-                net_pick(-1, rider && *rider ? atoi(rider) + 1 : 0, 1);
-                net_set_ready(1);
+                host_service_net_pick(-1, rider && *rider ? atoi(rider) + 1 : 0, 1);
+                host_service_net_set_ready(1);
                 ready_sent = 1;
             }
         }
@@ -473,24 +465,24 @@ static void barrier(void)
         for (int i = 0; i < lobby.nmembers; i++) ready += lobby.member[i].ready;
         /* who is in and ready (seq also moves with every ping) */
         unsigned roster = (unsigned)lobby.nmembers << 8 | (unsigned)ready;
-        if (roster != seq) seq = roster, last_change = net_seconds();
-        if (net_seconds() - last_beat > 2) {  /* the log shows the barrier is alive */
-            last_beat = net_seconds();
+        if (roster != seq) seq = roster, last_change = host_service_net_seconds();
+        if (host_service_net_seconds() - last_beat > 2) {  /* the log shows the barrier is alive */
+            last_beat = host_service_net_seconds();
             fprintf(stderr, "online: lobby state %d, %d members, %d ready, seq %u, ping %d ms\n", lobby.state,
                     lobby.nmembers, ready, lobby.seq, lobby.ping_ms);
         }
         int all_ready = lobby.nmembers >= 2 && ready == lobby.nmembers;
         if (lobby.state == NET_RACING || lobby.started) {
-            double left = lobby.start_at - net_seconds();
+            double left = lobby.start_at - host_service_net_seconds();
             title("Downhill Revived online - room %s - starting in %.1f s", lobby.code, left > 0 ? left : 0);
             if (left <= 0) break;
         } else if (lobby.state == NET_LOBBY) {
             if (lobby.is_host && all_ready && !start_sent &&
                 ((expected >= 2 && lobby.nmembers >= expected) || pressed_start())) {
                 /* a moment after the last change, so a player who just joined shows up first */
-                if (net_seconds() - last_change > 0.5) {
+                if (host_service_net_seconds() - last_change > 0.5) {
                     fprintf(stderr, "online: starting the race (%d players)\n", lobby.nmembers);
-                    net_start_race();
+                    host_service_net_start_race();
                     start_sent = 1;
                 }
             }
@@ -503,8 +495,8 @@ static void barrier(void)
         } else
             title("Downhill Revived online - connecting...");
         if (lobby.state == NET_LOBBY && lobby.is_host) pressed_start();
-        gs_pump_messages();
-        Sleep(10);
+        host_service_gs_pump_messages();
+        host_sleep_ms(10);
     }
     kernel_pace_slip(host_wall_seconds() - entered);  /* the lobby wait isn't game time to catch up */
     on.nslots = lobby.nslots < 2 ? 2 : lobby.nslots > 4 ? 4 : lobby.nslots;
@@ -531,7 +523,7 @@ static void barrier(void)
 
 static void send_event(const void *payload, int n)
 {
-    if (!net_send_frame(NET_FRAME_EVENT, payload, (size_t)n))
+    if (!host_service_net_send_frame(NET_FRAME_EVENT, GADDR(payload), (size_t)n))
         fprintf(stderr, "online: an event (type %d) could not be sent\n", ((const uint8_t *)payload)[1]);
 }
 
@@ -564,7 +556,7 @@ static void receive_frames(void)
 {
     uint8_t frame[NET_FRAME_MAX];
     int n;
-    while ((n = net_receive_frame(frame, sizeof frame)) > 0) {
+    while ((n = host_service_net_receive_frame(GADDR(frame), sizeof frame)) > 0) {
         int sender = frame[1];
         const uint8_t *e = frame + 2;
         if (frame[0] == NET_FRAME_STATE) {  /* the sender's riders: [size][snapshot]... */
@@ -636,16 +628,16 @@ static void exchange_rides(void)
     send_event(e, sizeof e);
     for (;;) {
         NetLobby lobby;
-        net_get_lobby(&lobby);
+        host_service_net_get_lobby(GADDR(&lobby));
         receive_frames();
         int missing = 0;
         for (int i = 0; i < on.nslots; i++)
             if (!lobby.racer[i].left && !on.ride[i].have) missing++;
-        if (!missing || !net_racing() || host_wall_seconds() - entered > 30) break;
+        if (!missing || !host_service_net_racing() || host_wall_seconds() - entered > 30) break;
         title("Downhill Revived online - room %s - waiting for %d player%s' riders", on.code, missing,
               missing == 1 ? "" : "s");
-        gs_pump_messages();
-        Sleep(5);
+        host_service_gs_pump_messages();
+        host_sleep_ms(5);
     }
     kernel_pace_slip(host_wall_seconds() - entered);
 }
@@ -722,31 +714,31 @@ static void start_together(void)
     send_event(loaded, sizeof loaded);
     for (;;) {
         NetLobby lobby;
-        net_get_lobby(&lobby);
+        host_service_net_get_lobby(GADDR(&lobby));
         receive_frames();
         int missing = 0;
         for (int i = 0; i < lobby.nslots; i++)
             if (i != on.local_slot && !lobby.racer[i].left && !on.loaded[i]) missing++;
         double waited = host_wall_seconds() - entered;
-        if (!net_racing() || waited > 75) break;
+        if (!host_service_net_racing() || waited > 75) break;
         if (host && !announced && (!missing || waited > 60)) {
             uint8_t e[10] = {EVENT_VERSION, EVENT_START};
-            on.go_at = net_server_ms() + START_LEAD_MS;
+            on.go_at = host_service_net_server_ms() + START_LEAD_MS;
             memcpy(e + 2, &on.go_at, 8);
             send_event(e, sizeof e);
             announced = 1;
         }
-        if (on.go_at && net_server_ms() >= on.go_at) break;
+        if (on.go_at && host_service_net_server_ms() >= on.go_at) break;
         if (missing) title("Downhill Revived online - room %s - waiting for %d player%s to load", on.code, missing,
                            missing == 1 ? "" : "s");
         else title("Downhill Revived online - room %s - get ready", on.code);
-        gs_pump_messages();
-        Sleep(on.go_at && on.go_at - net_server_ms() < 20 ? 0 : 2);
+        host_service_gs_pump_messages();
+        host_sleep_ms(on.go_at && on.go_at - host_service_net_server_ms() < 20 ? 0 : 2);
     }
     kernel_pace_shared(1);  /* from the agreed moment the fields keep to it, catching up after a stall */
     hle_puppet_rematch();  /* snapshots from before this start (of the race before, after a rematch) */
     fprintf(stderr, "online: countdown starts (waited %.3f s, %+.1f ms from the agreed moment)\n",
-            host_wall_seconds() - entered, on.go_at ? net_server_ms() - on.go_at : 0.0);
+            host_wall_seconds() - entered, on.go_at ? host_service_net_server_ms() - on.go_at : 0.0);
 }
 
 /* ---- the finish ---- */
@@ -839,7 +831,7 @@ static void finish_step(void)
     }
     if (on.local_slot != on.host_slot || on.have_results || !on.first_finish) return;
     NetLobby lobby;
-    net_get_lobby(&lobby);
+    host_service_net_get_lobby(GADDR(&lobby));
     int waiting = 0;
     for (int j = 0; j < on.nslots; j++)
         if (on.finish[j] < 0 && !lobby.racer[j].left && !on.gone[j]) waiting++;
@@ -867,7 +859,7 @@ static void finish_step(void)
 static void check_left(void)
 {
     NetLobby lobby;
-    net_get_lobby(&lobby);
+    host_service_net_get_lobby(GADDR(&lobby));
     for (int j = 0; j < on.nslots; j++) {
         int gone = j != on.local_slot && (lobby.racer[j].left || lobby.offline);
         if (!gone || on.gone[j]) continue;
@@ -894,7 +886,7 @@ static void state_sync(void)
     if (EE32(MENU) != LOAD_MENU || on.restart_accepted) return;
     if (race_running() && !on.go_sent) {  /* GO: when it was, on the server's clock */
         uint8_t e[10] = {EVENT_VERSION, EVENT_GO};
-        on.go_server = net_server_ms() - clock * (1000 / 59.94);
+        on.go_server = host_service_net_server_ms() - clock * (1000 / 59.94);
         memcpy(e + 2, &on.go_server, 8);
         send_event(e, sizeof e);
         on.go_sent = 1;
@@ -931,13 +923,13 @@ static void state_sync(void)
             at += 1 + n, riders++;
         }
     }
-    if (at && net_send_frame(NET_FRAME_STATE, payload, at)) on.sent += riders;
+    if (at && host_service_net_send_frame(NET_FRAME_STATE, GADDR(payload), at)) on.sent += riders;
     while ((n = hle_puppet_take_event(payload, sizeof payload)) > 0) send_event(payload, n);
     static double last_title;
     if (host_wall_seconds() - last_title > 1) {
         NetLobby lobby;
         char lag[160];
-        net_get_lobby(&lobby);
+        host_service_net_get_lobby(GADDR(&lobby));
         last_title = host_wall_seconds();
         hle_puppet_lag(lag, sizeof lag);
         if (!on.have_results)
@@ -958,7 +950,7 @@ static void choose_view(void)
     const char *v = getenv("DHD_VIEW");
     int want = v && *v ? (*v >= '0' && *v <= '3' ? *v - '0' + 1 : 0) : online_mode() && on.released ? on.local_slot + 1 : 0;
     int phase = EE32(PHASE), racing = EE32(MENU) == LOAD_MENU && phase >= 1 && phase <= 3;
-    gs_native_view = racing && EE32(SETUP + 0x288) >= 3 ? want : 0;
+    host_service_gs_native_view(racing && EE32(SETUP + 0x288) >= 3 ? want : 0);
 }
 
 /* ---- the other players' names over their riders ---- */
@@ -1030,8 +1022,8 @@ void hle_online_names(void *rider, int view)
 static int others_here(void)
 {
     NetLobby lobby;
-    net_get_lobby(&lobby);
-    if (!net_racing()) return 0;
+    host_service_net_get_lobby(GADDR(&lobby));
+    if (!host_service_net_racing()) return 0;
     for (int j = 0; j < lobby.nslots && j < NET_MAX_SLOTS; j++)
         if (j != on.local_slot && !lobby.racer[j].left && !on.gone[j]) return 1;
     return 0;
@@ -1168,7 +1160,7 @@ static int connected;
 static void race_over(void)
 {
     fprintf(stderr, "online: the race is over; back to offline play\n");
-    net_leave();
+    host_service_net_leave();
     hle_puppet_offline();
     port_online_relock();
     kernel_pace_shared(0);
@@ -1177,7 +1169,7 @@ static void race_over(void)
     memset(&on, 0, sizeof on);
     online = 0, from_menu = 0, connected = 0;
     selected_ride = 0;
-    gs_window_title("Downhill Revived");
+    host_service_gs_window_title(GADDR("Downhill Revived"));
 }
 
 void pads_begin_field(void)
@@ -1240,11 +1232,11 @@ void pads_read(int player, HostPad *out)
            player too. The boot script may already be spent after an earlier race. */
         int race = EE32(MENU) == LOAD_MENU && on.setup_done;
         if (player == 0 && race && (rematch_pad(out) || follow_pad(out))) {
-        } else if (player == 0 && race && !getenv("DHD_NET_SCRIPTED")) host_pad_device(0, out), guest_pad(out);
+        } else if (player == 0 && race && !getenv("DHD_NET_SCRIPTED")) host_service_host_pad_device(0, GADDR(out)), guest_pad(out);
         else if (!on.released || !host_pad_script(player, out)) neutral(out);
         for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;
         return;
     }
     if (!host_pad_script(player, out))
-        host_pad_device(player, out);
+        host_service_host_pad_device(player, GADDR(out));
 }

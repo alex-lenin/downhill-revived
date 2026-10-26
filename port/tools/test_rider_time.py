@@ -43,7 +43,6 @@ def prepare(directory, patched=True, patched_handle=True):
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-void ps2_x87_checkpoint(unsigned site, unsigned after) {(void)site; (void)after;}
 extern void func_001AD1C0(void *);
 extern void func_001AD580(void *, int, float, float);
 extern void func_001825B0(void);

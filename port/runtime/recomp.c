@@ -1,12 +1,14 @@
 /* Runtime of recompiled MIPS functions (recomp.h). */
 #include "recomp.h"
 #include "ps2float.h"
+#include "../hle/timer.h"  /* the virtual EE clock (ps2_mfc0 under DHD_FRAME_CLOCK) */
+
+#include "../host/host_api.h"
 
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <windows.h>
 
 static ps2_q128 stack[1 << 16]; /* 1 MB */
 
@@ -149,10 +151,13 @@ void ps2_swr(uint64_t rt, uintptr_t addr)
 uint32_t ps2_mfc0(int reg)
 {
     if (reg == 9) {
-        LARGE_INTEGER now, freq;
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&freq);
-        return (uint32_t)((double)now.QuadPart * 294912000.0 / (double)freq.QuadPart);
+        /* cop0 Count (EE clock / 2). Under DHD_FRAME_CLOCK it counts the virtual clock (bus cycles
+           / 2), so the frame clock stays the only time the game can see (finding 075). The
+           shipped SCUS_971.77 executes no mfc0 $9 (checked: no such word in its code), so this
+           path only guards the frame clock. */
+        if (ee_frame_clock_enabled()) return (uint32_t)(ee_frame_clock_cycles() / 2);
+        /* the host's clock, in EE cycles from its first reading (the shipped game never reads it) */
+        return (uint32_t)(host_wall_seconds() * 294912000.0);
     }
     return ps2.cop0[reg];
 }

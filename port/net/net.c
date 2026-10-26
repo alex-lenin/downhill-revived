@@ -228,3 +228,31 @@ int net_desync(uint32_t *field, uint32_t *slots)
 {
     return inited && client_desync(&client, field, slots);
 }
+
+/* Guest-address-only module boundary; native device code stays above. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+void host_service_net_init(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) { net_init((const char *)GUEST(a0), (const char *)GUEST(a1), (const char *)GUEST(a2), (const char *)GUEST(a3)); }
+int host_service_net_create_room(void) { return net_create_room(); }
+int host_service_net_join_room(uint32_t a0) { return net_join_room((const char *)GUEST(a0)); }
+void host_service_net_leave(void) { net_leave(); }
+void host_service_net_get_lobby(uint32_t a0) { net_get_lobby((NetLobby *)GUEST(a0)); }
+void host_service_net_pick(int a0, int a1, int a2) { net_pick(a0, a1, a2); }
+void host_service_net_set_ready(int a0) { net_set_ready(a0); }
+void host_service_net_start_race(void) { net_start_race(); }
+int host_service_net_racing(void) { return net_racing(); }
+double host_service_net_seconds(void) { return net_seconds(); }
+double host_service_net_server_ms(void) { return net_server_ms(); }
+int host_service_net_send_frame(int a0, uint32_t a1, uint32_t a2) { return net_send_frame(a0, (const void *)GUEST(a1), a2); }
+int host_service_net_receive_frame(uint32_t a0, uint32_t a1) { return net_receive_frame((uint8_t *)GUEST(a0), a1); }
+int host_service_net_list_lobbies(uint32_t a0, int a1) { return net_list_lobbies((NetLobbyInfo *)GUEST(a0), a1); }
+
+void host_service_net_set_room(uint32_t address) {
+    const uint32_t *in=GUEST(address);
+    NetRoomSettings out;
+    out.track=(int)in[0]; out.laps=(int)in[1];
+    out.is_public=(int)in[2]; out.max_players=(int)in[3];
+    memcpy(&out.seed,in+4,8);
+    out.room_name=GUEST(in[6]);
+    net_set_room(&out);
+}

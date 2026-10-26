@@ -147,11 +147,10 @@ def run_native(args, directory, script, events, manifest, compare):
     binary = executable.read_bytes()
     for marker in (b'DHD_FRAME_CLOCK', b'DHD_AUTOPAD_FRAMES', b'DHD_CAPTURE_FRAME_INTERVAL'):
         if marker not in binary:
-            raise RuntimeError('port image lacks virtual-clock comparison hooks; rebuild or use build_compare_port.py')
+            raise RuntimeError('port image lacks virtual-clock comparison hooks; rebuild it')
     env = {key: value for key, value in os.environ.items() if not key.startswith(('DHD_', 'ROUND_'))}
     env.update(DHD_ISO=iso, DHD_FRAME_CLOCK='1', DHD_AUTOPAD_FRAMES=compare.frame_script(events),
                DHD_LOG='1', DHD_SKIP_MOVIES='1', DHD_MEMCARD='0', DHD_SND_OFF='1', DHD_SCREENSHOT=str(directory / 'native'),
-               DHD_PROFILE=str(directory / 'profile'),
                DHD_CAPTURE_FRAME=str(compare.field_at(args.at)),
                DHD_CAPTURE_FRAME_INTERVAL=str(compare.field_at(args.interval)))
     count = math.floor((args.until - args.at)/args.interval + 1e-9)+1
@@ -159,7 +158,7 @@ def run_native(args, directory, script, events, manifest, compare):
                     pad_frames=compare.frame_script(events), native_requested_captures=count)
     log_path = directory / 'port.log'
     with log_path.open('wb') as file:
-        process = subprocess.Popen([str(executable)], cwd=compare.ROOT / 'build/port/link', env=env,
+        process = subprocess.Popen([str(executable)], cwd=executable.parent, env=env,
                                    stdout=file, stderr=subprocess.STDOUT)
         deadline = time.monotonic()+args.timeout
         try:

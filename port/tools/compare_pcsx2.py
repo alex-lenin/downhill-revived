@@ -142,8 +142,7 @@ def run_port(args, directory, script, events, manifest):
     # Do not inherit diagnostic runs, screen schedules, or other workers' scripts.
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DHD_', 'ROUND_'))}
     env.update(DHD_ISO=iso, DHD_LOG='1', DHD_SKIP_MOVIES='1', DHD_MEMCARD='0', DHD_SND_OFF='1',
-               DHD_GS_CAPTURE=str(dumps), DHD_GS_CAPTURE_FIELDS=str(args.fields),
-               DHD_PROFILE=str(directory / 'profile'))
+               DHD_GS_CAPTURE=str(dumps), DHD_GS_CAPTURE_FIELDS=str(args.fields))
     if args.clock == 'fields':
         env.update(DHD_AUTOPAD_FRAMES=frame_script(events),
                    DHD_GS_CAPTURE_FRAME=str(field_at(args.at)),
@@ -159,7 +158,7 @@ def run_port(args, directory, script, events, manifest):
     log_path = directory / 'port.log'
     print(f'Running isolated port; {expected} captures; timeout {args.timeout:g}s', flush=True)
     with log_path.open('wb') as log:
-        process = subprocess.Popen([str(exe)], cwd=ROOT / 'build/port/link', env=env,
+        process = subprocess.Popen([str(exe)], cwd=exe.parent, env=env,
                                    stdout=log, stderr=subprocess.STDOUT)
         try:
             while process.poll() is None:
@@ -442,7 +441,7 @@ def main():
     parser.add_argument('--replay-timeout', type=float, default=90)
     parser.add_argument('--threshold', type=int, default=16)
     parser.add_argument('--line-shift', type=int, choices=(0, 1), default=1)
-    parser.add_argument('--exe', type=Path, default=ROOT / 'build/port/link/dhd.exe')
+    parser.add_argument('--exe', type=Path, help="the port's exe (build_host64.py's dhd64.exe); needed unless --from-dumps")
     parser.add_argument('--pcsx2', type=Path, default=ROOT / 'build/port/pcsx2/pcsx2-qt.exe')
     parser.add_argument('--from-dumps', type=Path, help='reuse existing native dumps and sibling native BMPs')
     args = parser.parse_args()
@@ -462,7 +461,9 @@ def main():
         parser.error('fields must be 2..600 and threshold 0..255')
     if args.mode == 'gs-replay' and args.fields >= field_at(args.interval) and not args.from_dumps:
         parser.error('capture length must be shorter than the interval')
-    args.exe, args.pcsx2 = args.exe.resolve(), args.pcsx2.resolve()
+    if args.exe is None and not (args.mode == 'gs-replay' and args.from_dumps):
+        parser.error("--exe is required: the port's exe (build_host64.py's dhd64.exe)")
+    args.exe, args.pcsx2 = args.exe and args.exe.resolve(), args.pcsx2.resolve()
     if args.mode == 'gs-replay' and not args.pcsx2.is_file():
         parser.error(f'PCSX2 not found: {args.pcsx2}')
     script = args.pad

@@ -60,12 +60,12 @@ int main(int argc, char **argv)
             words[i] = random;
             expected = append(expected, unit, words[i]);
         }
-        graphics_feed((int)unit, words, count);
+        graphics_feed((int)unit, GADDR(words), count);
         memset(words, 0xCD, sizeof words); /* DMA source may be reused immediately */
         if (!(packet % 19)) {
             graphics_wait();
             failures += actual != expected || (_mm_getcsr() & 0x680u) != 0;
-            graphics_feed(0, words, 1);
+            graphics_feed(0, GADDR(words), 1);
         }
     }
     graphics_shutdown(); /* drains the last packets before joining */

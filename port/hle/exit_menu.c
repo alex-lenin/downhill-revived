@@ -38,7 +38,7 @@ void port_exit_menu(void)
     menu_page_run(&page);
     if (quit) {
         hle_log("exit game: chosen in the main menu\n");
-        gs_window_close();
+        host_service_gs_window_close();
     }
 }
 

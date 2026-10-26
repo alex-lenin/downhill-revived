@@ -31,9 +31,13 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <process.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "../host/win32_compat.h"
+#endif
 
 #include "../third_party/libmpeg2/mpeg2.h"
 
@@ -471,27 +475,21 @@ int movie_test_ready(void)
    that can't play ends at the host_movie_update after next. */
 static int started;  /* host_movie_update calls since the start */
 
-void host_movie_start(const char *name, int audio)
+void host_service_movie_prepare(void) { movie_close(); started=0; }
+
+void host_service_movie_start(uint32_t address,uint32_t lsn,uint32_t size,int audio,int found)
 {
-    uint32_t lsn, size;
-    const char *iso = getenv("DHD_ISO");
-    if ((uintptr_t)name < 0x02000000u)  /* a PS2 address left in the data image: its host copy */
-        name = (const char *)(uintptr_t)(0x08000000u + (uintptr_t)name);
-    movie_close();
-    started = 0;
-    if (!iso || !cdvd_find(name, &lsn, &size)) {
-        hle_log("movie: %s isn't on the disc, skipped\n", name);
-        return;
-    }
-    if (movie_open(iso, lsn, size, audio, name))
-        hle_log("movie: %s (%u bytes, sound %s)\n", name, size, audio ? "on" : "off");
+    const char *name=GUEST(address), *iso=getenv("DHD_ISO");
+    if (!iso || !found) { hle_log("movie: %s isn't on the disc, skipped\n",name); return; }
+    if (movie_open(iso,lsn,size,audio,name))
+        hle_log("movie: %s (%u bytes, sound %s)\n",name,size,audio ? "on" : "off");
 }
 
 /* func_00223C60, once a game frame: keep is 0 when the player skips. Nonzero: the movie is over
    (closed here). Never over in the frame it started: its callers (func_001EBFD8's D_0029D920,
    func_001B53C0's D_0029D408) note that a movie runs at the top of the next frame, from
    D_0029DAFC, and only then wait for D_0029DB00; ended at once, they would wait forever. */
-int host_movie_update(int keep)
+int host_service_movie_update(int keep)
 {
     if (!started++) return 0;
     if (keep && movie_playing() && !movie_over()) return 0;
@@ -500,3 +498,9 @@ int host_movie_update(int keep)
     return 1;
 }
 #endif
+
+/* Guest-address-only module boundary; native device code stays above. */
+#include "../host/host_api.h"
+#include "../include/guest.h"
+int host_service_movie_playing(void) { return movie_playing(); }
+void host_service_movie_audio(uint32_t a0, int a1) { movie_audio((int32_t *)GUEST(a0), a1); }

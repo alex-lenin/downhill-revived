@@ -15,7 +15,6 @@ extern "C" {
 int ps2_cvt_w_s(float value);
 /* EE finite division for native decompiled callers, including zero durations. */
 float ps2_fdiv(float numerator, float denominator);
-void ps2_x87_checkpoint(unsigned site, unsigned after);
 float ps2_fmul(float left, float right);
 float ps2_fadd(float left, float right);
 float ps2_fsub(float left, float right);

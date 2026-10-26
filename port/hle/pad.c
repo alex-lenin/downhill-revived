@@ -101,7 +101,7 @@ int scePadSetActDirect(int port, int slot, const unsigned char *data)
         if (p->align[i] == 0 && data[i]) light = 1;
         if (p->align[i] == 1) heavy = data[i];
     }
-    host_pad_vibrate(player_of(port, slot), light, heavy);
+    host_service_host_pad_vibrate(player_of(port, slot), light, heavy);
     return 1;
 }
 
@@ -150,7 +150,7 @@ void pad_refresh(void)
                 continue;
             PadFrame *f = p->area[0].frame > p->area[1].frame ? &p->area[0] : &p->area[1];
             HostPad in;
-            host_pad_device(player_of(port, slot), &in);
+            host_service_host_pad_device(player_of(port, slot), GADDR(&in));
             f->data[2] = (uint8_t)~in.buttons;
             f->data[3] = (uint8_t)(~in.buttons >> 8);
             if (f->length >= 8)
@@ -193,7 +193,7 @@ void rpc_pad(int fno, void *send, int ssize, void *recv, int rsize)
         break;
     case PAD_CLOSE:
         p->open = 0;
-        host_pad_vibrate(player_of(port, slot), 0, 0);
+        host_service_host_pad_vibrate(player_of(port, slot), 0, 0);
         break;
     case PAD_SET_MMODE:  /* mode (0 digital, 1 analog), lock (3 locks it) */
         p->analog = a[3] & 1;
@@ -212,7 +212,7 @@ void rpc_pad(int fno, void *send, int ssize, void *recv, int rsize)
                 if (p->align[i] == 0 && data[i]) light = 1;   /* actuator 0: on or off */
                 if (p->align[i] == 1) heavy = data[i];         /* actuator 1: speed */
             }
-            host_pad_vibrate(player_of(port, slot), light, heavy);
+            host_service_host_pad_vibrate(player_of(port, slot), light, heavy);
         }
         r[5] = 1;
         break;

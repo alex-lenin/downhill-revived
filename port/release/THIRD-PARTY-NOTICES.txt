@@ -69,8 +69,9 @@ xxHash (https://github.com/Cyan4973/xxHash), BSD-2-Clause
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 SDL 3.4.18 (https://libsdl.org), zlib License
-  Controllers (port/hle/gamepad.c) go through SDL3, linked into dhd.exe unchanged (joystick,
-  gamepad and HID parts only), with its built-in controller mapping database. SDL includes HIDAPI
+  The window, the sound and the controllers (port/hle/gamepad.c) go through SDL3, linked into
+  dhd.exe unchanged (video, audio, joystick, gamepad and HID parts), with its built-in controller
+  mapping database. SDL includes HIDAPI
   (Copyright 2009 Alan Ott, Signal 11 Software), used here under its GPL-3.0 option.
 
   Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
@@ -91,14 +92,193 @@ SDL 3.4.18 (https://libsdl.org), zlib License
      misrepresented as being the original software.
   3. This notice may not be removed or altered from any source distribution.
 
+wgpu (https://github.com/gfx-rs/wgpu), MIT OR Apache-2.0, used under MIT
+  The graphics renderer (port/render) is written in Rust on wgpu (with naga and wgpu-hal, the
+  Direct3D 12 and Vulkan backends). dhd.exe links it with the crates it is built from; they, their
+  versions and their licence texts are listed under "Rust crates linked into dhd.exe" at the end
+  of this file.
+
+The Rust standard library (https://github.com/rust-lang/rust), MIT OR Apache-2.0, used under MIT
+  dhd.exe links the Rust standard library (std, core, alloc and compiler_builtins).
+
+  Copyright (c) The Rust Project Contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+WABT (https://github.com/WebAssembly/wabt), Apache-2.0, Copyright 2018 WebAssembly Community Group
+participants
+  The game's code is compiled to WebAssembly and then to C by WABT's wasm2c; dhd.exe contains
+  that C and wasm2c's runtime (wasm-rt-impl.c), unchanged. The Apache License 2.0 text is at the
+  end of this file.
+
+wasi-libc (https://github.com/WebAssembly/wasi-libc), wasi-sdk 34
+  The game's code is linked with wasi-libc's C library before wasm2c. wasi-libc as a whole is
+  multi-licensed under the Apache License v2.0 with LLVM Exceptions, the Apache License v2.0 and
+  the MIT License; it is used here under the MIT License. Its parts derived from musl
+  (MIT, Copyright (c) 2005-2020 Rich Felker, et al.), cloudlibc (BSD-2-Clause, below), dlmalloc
+  (CC0, public domain), emmalloc (MIT) and musl-fts (BSD-3-Clause) keep their licences.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+  cloudlibc: Copyright (c) 2015-2017 Nuxi (https://nuxi.nl/) and contributors.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+  SUCH DAMAGE.
+
+SIMDe (https://github.com/simd-everywhere/simde), MIT
+  The game's vector code is compiled for WebAssembly through SIMDe's portable SIMD headers.
+
+  Copyright (c) 2017 Evan Nemerson <evan@nemerson.com>
+
+  Permission is hereby granted, free of charge, to any person obtaining
+  a copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to
+  the following conditions:
+
+  The above copyright notice and this permission notice shall be
+  included in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+DirectX Shader Compiler v1.9.2609 (https://github.com/microsoft/DirectXShaderCompiler)
+  dxcompiler.dll (x64), shipped next to dhd.exe unchanged from Microsoft's release, compiles the
+  renderer's Direct3D 12 shaders. It is LLVM-based: University of Illinois/NCSA Open Source License, with parts
+  under the MIT License.
+
+  ==============================================================================
+  LLVM Release License
+  ==============================================================================
+  University of Illinois/NCSA
+  Open Source License
+
+  Copyright (c) 2003-2015 University of Illinois at Urbana-Champaign.
+  All rights reserved.
+
+  Developed by:
+
+      LLVM Team
+
+      University of Illinois at Urbana-Champaign
+
+      http://llvm.org
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal with
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+  of the Software, and to permit persons to whom the Software is furnished to do
+  so, subject to the following conditions:
+
+      * Redistributions of source code must retain the above copyright notice,
+        this list of conditions and the following disclaimers.
+
+      * Redistributions in binary form must reproduce the above copyright notice,
+        this list of conditions and the following disclaimers in the
+        documentation and/or other materials provided with the distribution.
+
+      * Neither the names of the LLVM Team, University of Illinois at
+        Urbana-Champaign, nor the names of its contributors may be used to
+        endorse or promote products derived from this Software without specific
+        prior written permission.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+  FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+  CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
+  SOFTWARE.
+
+  Copyright (c) Microsoft Corporation.
+
+  MIT License
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED *AS IS*, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
 LLVM / clang (https://llvm.org), Apache-2.0 WITH LLVM-exception
-  dhd.exe is compiled with clang and may contain the compiler's runtime support code, which is
-  covered by the LLVM exception (no notice required in binaries).
+  dhd.exe is compiled with clang and may contain the compiler's runtime support code (compiler-rt's
+  builtins, also those of wasi-sdk), which is covered by the LLVM exception (no notice required in
+  binaries).
 
 Microsoft C runtime and Windows SDK import libraries
-  dhd.exe links the static Microsoft C runtime and uses Windows system libraries (Direct3D 11,
-  DXGI, the D3D compiler, WinHTTP, the Windows Imaging Component for PNG files, and for the
-  controllers XInput, DirectInput, Windows.Gaming.Input, SetupAPI and HID), all part of Windows.
+  dhd.exe links the static Microsoft C runtime and uses Windows system libraries (Direct3D 12,
+  DXGI, WinHTTP, the Windows Imaging Component for PNG files, and for the controllers XInput,
+  DirectInput, Windows.Gaming.Input, SetupAPI and HID), all part of Windows.
 
 The game itself
   Downhill Domination and its code, data, names and trademarks belong to their owners. They are

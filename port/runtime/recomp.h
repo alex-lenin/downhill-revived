@@ -7,7 +7,6 @@
 
 #include "ps2asm.h" /* no C library headers: recompiled code calls game functions named strcmp etc. */
 #include "ps2float.h"
-#include "fp_trap.h"
 
 #define GPR(n) ps2.gpr[n].d[0]
 #define UW(n) ((uint32_t)ps2.gpr[n].d[0])

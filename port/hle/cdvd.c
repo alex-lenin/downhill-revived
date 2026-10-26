@@ -2,6 +2,7 @@
    ISO named by the DHD_ISO environment variable (finding 020). Command numbers and buffers as
    Sony's libcdvd sends them (ps2sdk's ee/rpc/cdvd documents the same protocol). */
 #include "hle.h"
+#include "../runtime/portable.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,21 +10,21 @@
 
 #define SECTOR 2048
 
-static FILE *iso;
+static HostFile iso = HOST_FILE_NONE;
 
 static int read_sectors(uint32_t lsn, uint32_t count, void *dst)
 {
-    if (!iso) {
-        const char *path = getenv("DHD_ISO");
-        if (!path || !(iso = fopen(path, "rb"))) {
+    if (iso == HOST_FILE_NONE) {
+        const char *path = host_getenv("DHD_ISO");
+        if (!path || (iso = host_file_open(path, HOST_FILE_READ)) == HOST_FILE_NONE) {
             hle_log("cdvd: set DHD_ISO to the path of your Downhill Domination (USA) disc image\n");
             exit(2);
         }
     }
-    if (_fseeki64(iso, (long long)lsn * SECTOR, SEEK_SET) != 0)
+    if (host_file_seek(iso, (uint64_t)lsn * SECTOR) != 0)
         return 0;
     graphics_settle();  /* the OS writes dst: no guarded pages */
-    return fread(dst, SECTOR, count, iso) == count;
+    return host_file_read(iso, dst, (size_t)SECTOR * count) == (int64_t)SECTOR * count;
 }
 
 /* ---- ISO 9660: sceCdSearchFile's lookup ---- */
@@ -55,7 +56,7 @@ static int find_entry(uint32_t *lsn, uint32_t *size, const char *name, size_t le
                 }
             if (idlen && id[idlen - 1] == '.')  /* "NAME." for a name without extension */
                 idlen--;
-            if (idlen == len && _strnicmp(id, name, len) == 0) {
+            if (idlen == len && dhd_strnicmp(id, name, len) == 0) {
                 *lsn = le32(r + 2);
                 *size = le32(r + 10);
                 *is_dir = (r[25] & 2) != 0;
@@ -224,7 +225,7 @@ void rpc_cd_search(int fno, void *send, int ssize, void *recv, int rsize)
     (void)fno;
     char *pkt = send;
     const char *name = pkt + sizeof(CdFile);  /* after the result area (func_00246FA0) */
-    CdFile f;
+    CdFile f = {0};  /* the reply copies all of it: no host stack bytes after the name's NUL */
     int found = search_file(name, &f);
     if (hle_verbose || !found)
         hle_log("sceCdSearchFile(%s): %s (lsn %u, %u bytes)\n", name, found ? "found" : "not found",
@@ -248,3 +249,16 @@ int cdvd_find(const char *path, uint32_t *lsn, uint32_t *size)
 }
 
 int cdvd_read(uint32_t lsn, uint32_t count, void *dst) { return read_sectors(lsn, count, dst); }
+
+/* Module-side entry points used by patched game code. No native decoder calls
+   back into this module to walk the ISO directory. */
+void host_movie_start(const char *name, int audio)
+{
+    uint32_t lsn=0,size=0;
+    if ((uintptr_t)name<0x02000000u) name=GUEST(0x08000000u+(uint32_t)(uintptr_t)name);
+    const char *iso=host_getenv("DHD_ISO");
+    host_service_movie_prepare();
+    int found=iso && cdvd_find(name,&lsn,&size);
+    host_service_movie_start(GADDR(name),lsn,size,audio,found);
+}
+int host_movie_update(int keep) { return host_service_movie_update(keep); }

@@ -58,6 +58,7 @@ PS2_NATIVE float ps2_native_fdiv(float a, float b)
     return ps2_native_dtof((double)a / (double)b);
 }
 
+#if defined(__i386__) || defined(__x86_64__)
 /* One SSE2 double operation at round-to-nearest, MXCSR restored after it. */
 #define PS2_NATIVE_DOUBLE(name, insn) \
     PS2_NATIVE double name(double a, double b) \
@@ -74,6 +75,14 @@ PS2_NATIVE_DOUBLE(ps2_native_dsub, "subsd")
 PS2_NATIVE_DOUBLE(ps2_native_dmul, "mulsd")
 PS2_NATIVE_DOUBLE(ps2_native_ddiv, "divsd")
 #undef PS2_NATIVE_DOUBLE
+#else
+/* No inline asm and no MXCSR (wasm32): the host's double operations already round to nearest,
+   which is what these are forced to on x86. */
+PS2_NATIVE double ps2_native_dadd(double a, double b) { return a + b; }
+PS2_NATIVE double ps2_native_dsub(double a, double b) { return a - b; }
+PS2_NATIVE double ps2_native_dmul(double a, double b) { return a * b; }
+PS2_NATIVE double ps2_native_ddiv(double a, double b) { return a / b; }
+#endif
 #undef PS2_NATIVE
 
 #ifdef __cplusplus

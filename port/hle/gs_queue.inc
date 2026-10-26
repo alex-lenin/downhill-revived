@@ -182,8 +182,9 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
         count -= take;
     }
 }
-int graphics_xgkick(const uint32_t *memory, unsigned qword)
+int graphics_xgkick(uint32_t guest_memory, unsigned qword)
 {
+    const uint32_t *memory = GUEST(guest_memory);
     if (!gs_worker) {
         const GraphicsProvenance *p = &graphics_provenance;
         gs.vu_entry = p->entry;

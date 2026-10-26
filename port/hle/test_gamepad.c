@@ -9,6 +9,7 @@
 #include <windows.h>
 
 void host_thread_name(const char *name) { (void)name; }
+void gs_window_event(unsigned type) { (void)type; }  /* present.c's: this test has no window */
 
 int main(int argc, char **argv)
 {

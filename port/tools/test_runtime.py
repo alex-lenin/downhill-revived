@@ -2,7 +2,7 @@
 program. Needs LLVM (clang-cl) and Visual Studio's x86 libraries; run port/tools/build.py first,
 the test parses every ps2_asm() call site found in build/port/src.
 usage: python port/tools/test_runtime.py"""
-import glob, os, re, subprocess, sys, json
+import glob, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, 'build', 'port', 'runtime')
@@ -53,12 +53,8 @@ from test_rider_step import main as check_rider_step
 check_rider_step()
 from test_blend_float import main as check_blend_float
 check_blend_float()
-from test_x87 import main as check_x87
-check_x87()
 from test_virtual_scale import main as check_virtual_scale
 check_virtual_scale()
-from test_fiber_float import main as check_fiber_float
-check_fiber_float()
 from test_recomp import prepare
 recomp_test = prepare(OUT)
 from test_recomp import check_forwarders
@@ -71,11 +67,6 @@ from test_integer_abi import prepare as prepare_integer_abi
 integer_abi_tests = prepare_integer_abi(OUT)
 from test_member_abi import prepare as prepare_member_abi
 member_test = prepare_member_abi(OUT)
-with open(os.path.join(ROOT, 'port', 'gs', 'raster.hlsl'), encoding='utf-8') as f:
-    shader = f.read()
-with open(os.path.join(OUT, 'gs_shader.h'), 'w', encoding='utf-8') as f:
-    f.write('static const char gs_shader[] = ' + json.dumps(shader) + ';\n')
-    f.write('static const char gs_shader_path[] = ' + json.dumps(os.path.join(ROOT, 'port', 'gs', 'raster.hlsl')) + ';\n')
 sites = set()
 for f in glob.glob(os.path.join(ROOT, 'build', 'port', 'src', '**', '*.c*'), recursive=True):
     for m in CALL.finditer(open(f, encoding='utf-8').read()):
@@ -194,10 +185,12 @@ with open(cmd, 'w') as f:
 
     # SDL3 starts and enumerates the controllers (none needed); gamepad.c's smoke test
     import sdl3
-    sdl_lib, sdl_include = sdl3.build()
+    sdl_lib, sdl_include = sdl3.build('i686-pc-windows-msvc')  # these test programs are 32-bit
     gamepad_exe = os.path.join(OUT, 'test_gamepad.exe')
-    f.write('clang-cl -m32 /nologo /O2 -w /I"%s" /I"%s" "%s\\gamepad.c" "%s\\test_gamepad.c" "%s" %s /Fe:"%s"\n'
-            % (hle, sdl_include, hle, hle, sdl_lib, ' '.join(sdl3.SYSTEM_LIBS), gamepad_exe))
+    # the SDL thread (host/sdl_host.c) with the keyboard and the text field it feeds (W11)
+    host = os.path.join(ROOT, 'port', 'host')
+    f.write('clang-cl -m32 /nologo /O2 -w /I"%s" /I"%s" "%s\\gamepad.c" "%s\\keyboard.c" "%s\\text_input.c" "%s\\sdl_host.c" "%s\\test_gamepad.c" "%s" %s /Fe:"%s"\n'
+            % (hle, sdl_include, hle, hle, hle, host, hle, sdl_lib, ' '.join(sdl3.SYSTEM_LIBS), gamepad_exe))
     f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % gamepad_exe)
 
     sif_exe = os.path.join(OUT, 'test_sif.exe')
@@ -217,13 +210,8 @@ with open(cmd, 'w') as f:
     f.write('clang-cl -m32 /nologo /O2 /DSND_NO_HOST /I"%s" "%s\\sound.c" "%s\\test_sound.c" /Fe:"%s"\n'
             % (hle, hle, hle, sound_exe))
     f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % sound_exe)
-
-    gpu_exe = os.path.join(OUT, 'test_gpu.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations /I"%s" '
-            '"%s\\memory.c" "%s\\gs.c" "%s\\gpu.c" "%s\\test_gpu.c" '
-            '/Fe:"%s" /link d3d11.lib d3dcompiler.lib\n' % (OUT, gs, gs, gs, gs, gpu_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % gpu_exe)
+    # The GS renderer's own tests (test_gpu, test_depth, test_present) run on the Rust renderer
+    # in x64: port/tools/test_gs_wgpu.py.
 
 # The native VU0 microprograms are checked against the interpreter running the retail
 # microcode, extracted locally (never tracked) to assets/vutext.bin.

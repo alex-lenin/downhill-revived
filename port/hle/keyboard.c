@@ -66,7 +66,12 @@ static const Key keys[] = {
 enum { KEYS = sizeof keys / sizeof *keys };
 
 #define RAMP_SECONDS 0.1
+#if defined(_WIN64) || defined(__x86_64__)
+/* Native devices consume the module's published rate, never call game logic. */
+#define FIELD_SECONDS (host_pacing_period() < 1.0/60 ? host_pacing_period() : 1.0/60)
+#else
 #define FIELD_SECONDS (port_fps_high() ? port_frame_period() : 1.0 / 60)
+#endif
 
 static struct {
     int8_t held[KEYS];      /* 0 up, 1 down as in menus, 2 down as while riding */
@@ -83,6 +88,49 @@ const uint8_t *keyboard_keys(int *count)
 }
 
 void keyboard_reset(void) { memset(&state, 0, sizeof state); }
+
+/* The keys the SDL thread reports (keyboard_key). Written there, read by the game thread: a byte
+   each, as GetAsyncKeyState's state was read. typed[] starts as the identity: a key that was never
+   pressed types its own code. */
+static volatile uint8_t position_down[256], position_typed[256], typed_down[256];
+static volatile int has_focus;
+static volatile int typed_ready;
+
+static void typed_init(void)
+{
+    if (typed_ready) return;
+    for (unsigned i = 0; i < 256; i++) position_typed[i] = (uint8_t)i;
+    typed_ready = 1;
+}
+
+void keyboard_key(unsigned position, unsigned typed, int down)
+{
+    if (position >= 256 || typed >= 256) return;
+    typed_init();
+    if (down) position_typed[position] = (uint8_t)typed;
+    position_down[position] = down != 0;
+    typed_down[position_typed[position]] = down != 0;
+}
+
+unsigned keyboard_typed_of(unsigned position)
+{
+    if (position >= 256) return position;
+    typed_init();
+    return position_typed[position];
+}
+
+int keyboard_position_down(unsigned position) { return position < 256 && position_down[position]; }
+
+int keyboard_is_down(unsigned typed) { return typed < 256 && typed_down[typed]; }
+
+void keyboard_focus(int focused)
+{
+    has_focus = focused != 0;
+    if (!has_focus)  /* a key let go while the window was away is let go here too */
+        for (unsigned i = 0; i < 256; i++) position_down[i] = typed_down[i] = 0;
+}
+
+int keyboard_focused(void) { return has_focus; }
 
 /* What the game makes of a raw stick byte: func_00220AE0 (riding, D_0029E290 = 1). */
 int keyboard_game_axis(int raw)

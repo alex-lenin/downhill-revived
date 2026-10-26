@@ -2,6 +2,7 @@
    sound driver (finding 020); the controllers are in pad.c, the memory card in mc.c. Those not
    written yet log their calls and reply with zeros (rpc_unknown). */
 #include "hle.h"
+#include "../runtime/portable.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,7 +73,7 @@ int sceOpen(const char *name, int flags)
 {
     kernel_poll();
     const char *path = strchr(name, ':');
-    if (!path || _strnicmp(name, "cdrom", 5) != 0) {
+    if (!path || dhd_strnicmp(name, "cdrom", 5) != 0) {
         hle_log("sceOpen(%s, %x): only cdrom0: files\n", name, flags);
         return -1;
     }

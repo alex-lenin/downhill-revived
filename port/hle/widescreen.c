@@ -21,7 +21,6 @@
    This changes EE memory and what the game culls, so the game-state gates run without it. */
 #include "hle.h"
 
-#include <windows.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,13 +48,7 @@ void host_display_aware(void)
 {
     static int done;
     if (done++) return;
-    HMODULE user32 = GetModuleHandleA("user32.dll");
-    typedef BOOL(WINAPI * ContextFn)(HANDLE);
-    typedef BOOL(WINAPI * AwareFn)(void);
-    ContextFn context = user32 ? (ContextFn)(void *)GetProcAddress(user32, "SetProcessDpiAwarenessContext") : NULL;
-    if (context && context((HANDLE)-4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */)) return;
-    AwareFn aware = user32 ? (AwareFn)(void *)GetProcAddress(user32, "SetProcessDPIAware") : NULL;
-    if (aware) aware();
+    host_dpi_aware();
 }
 
 /* "W:H" or "WxH" as W / H; 0 if it isn't one. */
@@ -65,16 +58,6 @@ static double ratio(const char *v)
     char sep;
     if (!v || sscanf(v, "%lf%c%lf", &w, &sep, &h) != 3 || (sep != ':' && sep != 'x') || w <= 0 || h <= 0) return 0;
     return w / h;
-}
-
-/* The primary monitor's shape (present.c puts the borderless and fullscreen window there). */
-static double monitor_aspect(void)
-{
-    MONITORINFO m = {sizeof m};
-    POINT origin = {0, 0};
-    if (!GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &m)) return 16.0 / 9.0;
-    double w = m.rcMonitor.right - m.rcMonitor.left, h = m.rcMonitor.bottom - m.rcMonitor.top;
-    return w > 0 && h > 0 ? w / h : 16.0 / 9.0;
 }
 
 /* The shape the game is shown in: what DHD_WIDESCREEN names, else DHD_ASPECT's ratio, else the
@@ -87,12 +70,14 @@ static double wanted_aspect(void)
     if (!on || !atoi(on)) return 0;
     if ((named = ratio(getenv("DHD_ASPECT")))) return named;
     const char *mode = getenv("DHD_WINDOW");
-    if (!mode || !strcmp(mode, "windowed")) {
-        const char *w = getenv("DHD_WINDOW_WIDTH"), *h = getenv("DHD_WINDOW_HEIGHT");
+    const char *w = getenv("DHD_WINDOW_WIDTH"), *h = getenv("DHD_WINDOW_HEIGHT");
+    /* "monitor" (dhd.ini's default window size): the monitor's size, which present.c reads later */
+    int monitor_sized = (w && !strcmp(w, "monitor")) || (h && !strcmp(h, "monitor"));
+    if ((!mode || !strcmp(mode, "windowed")) && !monitor_sized) {
         int width = w && atoi(w) > 0 ? atoi(w) : 896, height = h && atoi(h) > 0 ? atoi(h) : 672;
         return (double)width / height;
     }
-    return monitor_aspect();
+    return host_monitor_aspect();  /* the primary monitor (present.c puts the borderless and fullscreen window there) */
 }
 
 static uint32_t float_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
@@ -127,9 +112,9 @@ void host_widescreen_init(void)
     /* The picture's shape follows (DHD_ASPECT "wide", the default with widescreen on). */
     char text[32];
     snprintf(text, sizeof text, "%d:1000", (int)(aspect * 1000 + 0.5));
-    _putenv_s("DHD_WIDESCREEN_ASPECT", text);
+    host_putenv_s("DHD_WIDESCREEN_ASPECT", text);
     const char *shape = getenv("DHD_ASPECT");
-    if (!shape || !*shape) _putenv_s("DHD_ASPECT", "wide");
+    if (!shape || !*shape) host_putenv_s("DHD_ASPECT", "wide");
     unsigned changed = 0;
     for (unsigned i = 0; i < sizeof words / sizeof *words; i++) {
         uint32_t *at = (uint32_t *)(uintptr_t)(PS2_RAM_BASE + words[i][0]);
@@ -273,7 +258,7 @@ void port_hud_text_l(int font, int view, int x, int y, const char *text)
     hud_text = 0;
 }
 
-/* ---- the picture (port/gs/gpu_native.inc) ---- */
+/* ---- the picture (the native renderer, port/gs/native_core.inc) ---- */
 
 /* The widescreen picture's shape (width / height), 0 when off. */
 double host_widescreen_aspect(void) { return widescreen ? aspect : 0; }

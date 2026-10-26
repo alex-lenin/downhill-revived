@@ -12,7 +12,11 @@
      last, WAITQ waits for it, q-operands read the Q of the moment.
    The integer unit's results are ready on the next instruction. */
 #include "ps2asm.h"
+#include "../include/guest.h"
+#include "portable.h"
+#include "../host/host_api.h"
 #include "ps2float.h"
+#include "memory.h"
 
 #include <float.h>
 #include <math.h>
@@ -23,7 +27,6 @@
 #include <time.h>
 #include <xmmintrin.h>
 #include <emmintrin.h>
-#include <intrin.h>
 
 enum { FMAC_LATENCY = 4, FLAG_LATENCY = 4, DIV_LATENCY = 7, RSQRT_LATENCY = 13 };
 enum { MAX_STEPS = 1 << 20 };  /* a program that never ends (bad upload) gives up */
@@ -158,7 +161,7 @@ static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
     __m128i bits = _mm_castps_si128(value), magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7fffffff));
     __m128i large = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7f7fffff));
     __m128 result = _mm_castsi128_ps(_mm_xor_si128(bits, _mm_and_si128(large, _mm_xor_si128(magnitude, _mm_set1_epi32(0x7f7fffff)))));
-    __asm__("" : "+x"(result));
+    PS2_OPAQUE_M128(result);
     return result;
 }
 
@@ -348,6 +351,10 @@ void (*ps2_vu1_regs_sync)(void);
 
 void ps2_vu0_vu1_file(ps2_q128 file[64])
 {
+#if defined(__wasm__)
+    if (ps2_vu1_regs_sync) ps2_vu1_regs_sync();
+    host_vu1_file(GADDR(file));
+#else
     memset(file, 0, 64 * sizeof *file);
     const ps2_cpu *v = ps2_vu1_regs;
     if (!v) return;
@@ -358,6 +365,7 @@ void ps2_vu0_vu1_file(ps2_q128 file[64])
     for (unsigned i = 0; i < 16; i++) file[48 + i].w[0] = v->vu0_ctrl[i];
     file[52].w[0] = v->r; memcpy(&file[53].w[0], &v->i, 4);
     memcpy(&file[54].w[0], &v->q, 4); memcpy(&file[55].w[0], &v->p, 4);
+#endif
 }
 #endif
 
@@ -984,13 +992,19 @@ static int native_code_matches(const uint8_t *code, unsigned kind, unsigned star
 {
     static uint64_t checked[4096];  /* ps2_vu1_code_version + 1 */
     static uint8_t matched[4096];
-    if ((uintptr_t)code != 0x11008000) return native_code_compare(code, kind, start, end);
+    if (GADDR(code) != 0x11008000) return native_code_compare(code, kind, start, end);
     if (checked[kind] != ps2_vu1_code_version + 1) {
         matched[kind] = (uint8_t)native_code_compare(code, kind, start, end);
         checked[kind] = ps2_vu1_code_version + 1;
     }
     return matched[kind];
 }
+#endif
+
+#if defined(PS2_VU0_NATIVE) && !defined(PS2_VU_AOT)
+/* The wasm module runs VU0 but not VU1: only the native VU0 routines' words
+   (port/tools/vu0_native_words.py, from the same vu1_aot.inc), not the VU1 blocks. */
+#include "vu0_native_words.inc"
 #endif
 
 void ps2_vu_aot_load(const void *vutext)
@@ -1000,6 +1014,8 @@ void ps2_vu_aot_load(const void *vutext)
 #if !defined(PS2_VU_GEOMETRY_BENCH) && !defined(PS2_VU_REFERENCE)
     native_words_load(vutext);
 #endif
+#elif defined(PS2_VU0_NATIVE)
+    vu0_native_words_load(vutext);
 #else
     (void)vutext;
 #endif
@@ -1247,7 +1263,7 @@ static void vu0_stats(unsigned addr, unsigned long long ticks)
                     calls[i], 100.0 * spent[i] / all, (double)spent[i] / calls[i]);
 }
 
-#if defined(PS2_VU_AOT) && !defined(PS2_VU_REFERENCE)
+#if (defined(PS2_VU_AOT) || defined(PS2_VU0_NATIVE)) && !defined(PS2_VU_REFERENCE)
 #include "vu0_native.h"
 #endif
 
@@ -1261,12 +1277,12 @@ int ps2_vu0_run(ps2_cpu *cpu, unsigned addr)
         const char *value = getenv("DHD_VU0_STATS");
         timing = value && atoll(value) != 0;
     }
-    unsigned long long start = timing ? __rdtsc() : 0;
+    unsigned long long start = timing ? host_cycles() : 0;
     /* VU0 micro mode rounds like VU1 (PCSX2's default VU0FPCR is toward zero, FTZ/DAZ). */
-    unsigned control = _mm_getcsr();
-    _mm_setcsr((control & ~0x603F) | 0xFFC0);
+    unsigned control = host_fp_csr();
+    host_fp_set_csr((control & ~0x603F) | 0xFFC0);
     int result;
-#if defined(PS2_VU_AOT) && !defined(PS2_VU_REFERENCE)
+#if (defined(PS2_VU_AOT) || defined(PS2_VU0_NATIVE)) && !defined(PS2_VU_REFERENCE)
     /* Native VU0 routines (vu0_native.h, finding 066). DHD_VU0_NATIVE=0, DHD_VU_INTERPRETER
        or DHD_VU_TRACE keep every program on the interpreter. */
     static int native = -1;
@@ -1307,8 +1323,8 @@ int ps2_vu0_run(ps2_cpu *cpu, unsigned addr)
     } else
 #endif
         result = run(cpu, addr, 0, 0, 0, NULL, NULL);
-    _mm_setcsr(control);
-    if (timing) vu0_stats(addr, __rdtsc() - start);
+    host_fp_set_csr(control);
+    if (timing) vu0_stats(addr, host_cycles() - start);
     return result;
 }
 
@@ -1317,11 +1333,22 @@ int ps2_vu1_run(ps2_cpu *cpu, unsigned addr, unsigned top, unsigned itop,
 {
     /* VU arithmetic truncates rather than rounding to nearest. Keep this local
        to the VU so the EE/host and the native VU0 routines (vu0_micro.c) retain theirs. */
-    unsigned control = _mm_getcsr();
+    unsigned control = host_fp_csr();
     /* Its FMACs intentionally overflow before the existing bitwise clamp.
        Keep host exceptions masked here even during EE first-fault diagnostics. */
-    _mm_setcsr((control & ~0x603F) | 0xFFC0); /* toward zero, FTZ/DAZ, host masks */
+    host_fp_set_csr((control & ~0x603F) | 0xFFC0); /* toward zero, FTZ/DAZ, host masks */
+#if defined(PS2_VU_AOT) && !defined(PS2_VU_AOT_EMBED) && !defined(__wasm__) &&     (defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__))
+    /* 64-bit host: ps2_image_load (memory.c) runs in the wasm module, whose copy of this file has
+       no AOT, so it never fills this copy's block and kernel words. Take them from the same loaded
+       image in guest RAM before the first VU1 program, as i686 does at its image load. Without
+       this no block or native kernel ever matches and VU1 runs only on the interpreter. */
+    static int aot_loaded;
+    if (!aot_loaded) {
+        aot_loaded = 1;
+        ps2_vu_aot_load(GUEST(PS2_RAM_BASE + PS2_IMAGE_START));  /* the guest's PS2_PTR(PS2_IMAGE_START) */
+    }
+#endif
     int result = run(cpu, addr, 1, top, itop, kick, opaque);
-    _mm_setcsr(control);
+    host_fp_set_csr(control);
     return result;
 }

@@ -7,7 +7,8 @@ game reads its program data, graphics, sound and everything else from your own c
 each time it starts.
 
 What you need
-- Windows 10 or 11 (64-bit), a graphics card with Direct3D 11.
+- Windows 10 or 11 (64-bit), a graphics card with Direct3D 12 or Vulkan. Without one the game
+  draws with Windows' software renderer (WARP), slowly.
 - Your own dump of the Downhill Domination USA disc (SCUS-97177) as an .iso file. Other regions
   and modified images are refused.
 
@@ -74,8 +75,8 @@ Files the game writes beside dhd.exe
 Updates
 At start the game looks for a newer version. If there is one it asks: "Update now" downloads
 it, checks it, puts it in place and starts the game again; "Later" starts this version. Without
-a network the game just starts. An update replaces dhd.exe and the text files only: dhd.ini and
-saves\ are never touched. You can also update by hand: copy the files of a newer version over
+a network the game just starts. An update replaces dhd.exe and the other files of the release
+(the text files, dxcompiler.dll) only: dhd.ini and saves\ are never touched. You can also update by hand: copy the files of a newer version over
 your folder (a release holds no dhd.ini and no saves, so yours are kept).
 In dhd.ini:
     auto_update = ask    ask before updating (the default); on: update without asking;
