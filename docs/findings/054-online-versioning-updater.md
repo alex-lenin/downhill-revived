@@ -218,8 +218,9 @@ Native renderer gate (`gate_native_renderer.py`, ebf21db1, reference r39-plain):
 
 ## 6. At release time
 
-1. Build the release (`build_clean.py`) at the commit to publish, then run
-   `package_release.py --exe build/port/clean/<rev>/dhd.exe`. That writes
+1. Build the release at the commit to publish. Since the 64-bit release (finding 088, CL3):
+   `python port/tools/build_wasm.py`, then `python port/tools/package_release.py`. (Until 0.3.1:
+   `build_clean.py`, then `package_release.py --exe build/port/clean/<rev>/dhd.exe`.) That writes
    `build/release/DownhillRevived-0.2.0-win.zip` and `build/release/latest.json`.
 2. Publish GitHub release `v0.2.0` with both files as assets. 0.2.0 players then find newer
    releases there, and 0.1.0 players are told by the server once step 3 is done.

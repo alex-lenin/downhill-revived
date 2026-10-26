@@ -2,7 +2,8 @@
 
 There are two builds:
 
-- **The PC port**: `dhd.exe`, the game for Windows. Built with clang.
+- **The PC port**: `dhd.exe`, the 64-bit game for Windows, and the browser build. Built with
+  clang, wasm2c and Rust.
 - **The matching build**: the original PS2 executable rebuilt from `src/` with the game's
   original compiler, then compared with retail section by section. This is what proves the
   decompilation. You only need it to work on `src/`.
@@ -22,14 +23,17 @@ For both builds:
 For the PC port, also:
 
 - [LLVM](https://github.com/llvm/llvm-project/releases) for Windows: `clang`, `clang-cl`,
-  `lld-link`, `llvm-rc`, `llvm-nm`, `llvm-objcopy` and `llvm-cxxfilt` on PATH. The project is built with
-  LLVM 23. `build_clean.py` also finds a [scoop](https://scoop.sh) install (`scoop install llvm`)
-  that is not on PATH.
-- Visual Studio 2022 Build Tools (or Visual Studio) with the "Desktop development with C++"
-  workload: the MSVC **x86** libraries and a Windows SDK. clang finds them by itself.
+  `lld-link`, `wasm-ld`, `llvm-rc`, `llvm-nm`, `llvm-objcopy` and `llvm-cxxfilt` on PATH, or a
+  [scoop](https://scoop.sh) install (`scoop install llvm`). The project is built with LLVM 23.
+- The wasi-sdk sysroot, WABT (`wasm2c`) and SIMDe (see
+  [Tools outside the checkout](#tools-outside-the-checkout)).
+- Rust ([rustup](https://rustup.rs)) for the renderer (`port/render`).
+- Visual Studio (or its Build Tools) with the "Desktop development with C++" workload: the MSVC
+  **x64** libraries and a Windows SDK.
 - [CMake](https://cmake.org) 3.16 or newer, on PATH or in `C:\Program Files\CMake`, for SDL3
-  (controllers). `requirements.txt` brings the `ninja` package it builds with.
-- A network connection once, for SDL3's source (see [SDL3](#sdl3-controllers)).
+  (window, sound, controllers). `requirements.txt` brings the `ninja` package it builds with.
+- A network connection once, for SDL3's source and the shader compiler (see
+  [SDL3](#sdl3-window-sound-controllers)).
 
 For the matching build, also:
 
@@ -63,99 +67,95 @@ This takes about 15 seconds and writes `asm/` and `assets/` (about 37 MB) from y
 
 ## 3. Build the PC port
 
-    python port/tools/build_clean.py
+The PC game is the 64-bit Windows `dhd.exe` and the browser build. Both are made from one
+portable game core, a wasm32 module (`build/wasm/dhd_core.wasm`). The 32-bit build is retired: its
+last source is the tag `v0.3.1`.
 
-This builds the last commit (`--rev` picks another) in a separate, clean git worktree
-(`build/port/clean/tree`), so uncommitted edits and old objects can't get into the executable.
-It compiles every unit of `src/` and `port/` (`port/tools/build.py`), recompiles the functions
-that are still assembly into C, converts the game's data, and links with VU1 ahead-of-time code
-on (`DHD_BUILD_VU_AOT=1`: the VU1 ahead-of-time blocks and the native VU1 kernels, generated
-under `build/` from your executable's microcode).
+    python port/tools/build_wasm.py             # the game core, build/wasm/dhd_core.wasm
+    python port/tools/package_release.py        # dhd.exe from it, checked, zipped into build/release/
+    python port/web/build.py                    # the browser build, into build/web/
+
+`build_wasm.py` compiles every unit of `src/` (rewritten at build time by `port/tools/transform.py`
+with the PC patches of `port/patches*.py`), the functions that are still assembly recompiled to C
+(`port/tools/recomp.py`), the module-side runtime and HLE and the game data's fixups into one
+module. Everything it needs is generated from the checkout, `asm/` and `assets/vutext.bin`.
+
+`package_release.py` builds `dhd.exe` with `port/tools/build_host64.py` (wasm2c, the x64 host code
+in `port/host64/` and `port/host/`, the Rust renderer in `port/render/` built by
+`port/tools/rustgs.py`), checks it and writes the release (below). It builds only from committed
+source. `python port/tools/build_host64.py build/wasm/dhd_core.wasm` builds the executable alone,
+into `build/host64-exe/`.
 
 `dhd.exe` holds no game data. The game's data sections (`.vutext` to `.sdata`) are read from
 `SCUS_971.77` on the player's disc image at every start, checked by SHA-1
 (`port/hle/game_data.c`); the executable keeps only the words the port changes in them
-(pointers and code addresses, `port/tools/data.py`), and the link checks that everything else
-is byte for byte your `iso/SCUS_971.77`. The VU ahead-of-time blocks and kernels take their copy
-of the microcode from the same place. About 3,800 units: on a 6-core desktop CPU the
-compile takes about 1.5 minutes and the link about 5.
+(pointers and code addresses, `port/tools/data.py`).
 
-The result is `build/port/clean/<revision>/dhd.exe`, with `manifest.json` (revision, hash,
-build flags) beside it. This plain command is the release build: nothing else is needed for a
-full-speed executable. `--install` also copies it to `build/port/fast-preview/native/dhd.exe`
-with the settings launcher. (`--recomp-basis` exists only to compare with old local builds; never
-use it for a release.)
+To run a build, copy `dhd.exe` (with `dxcompiler.dll`) to a folder of its own and start it. It
+asks for your `.iso` the first time. `DHD_ISO=<path to iso>` in the environment skips the question.
 
-### SDL3 (controllers)
+### Tools outside the checkout
 
-`port/tools/sdl3.py`, which `link.py` runs, provides SDL3 as a static library, so `dhd.exe`
-stays one file:
+Keep the checkout, `DHD_DEVCACHES` (below) and the Rust toolchain off the C: drive: the 64-bit
+build and the Rust build refuse to write there, and `rustgs.py` needs `CARGO_HOME` and
+`RUSTUP_HOME` set to folders on another drive. The tools below are looked for under
+`DHD_DEVCACHES` (an environment variable; default `~/DevCaches`), with these folder names, or where
+their own variable or option says:
+
+| Tool | Folder under `DHD_DEVCACHES` | Or |
+|---|---|---|
+| [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) 34 | `wasi-sdk/wasi-sdk-34.0-x86_64-windows` | `WASI_SYSROOT`, `build_host64.py --wasi` |
+| [WABT](https://github.com/WebAssembly/wabt) 1.0.42 | `wabt/wabt-1.0.42` | `WABT_DIR`, `build_host64.py --wabt` |
+| [SIMDe](https://github.com/simd-everywhere/simde) source | `simde-src` | `SIMDE_DIR` |
+| [Binaryen](https://github.com/WebAssembly/binaryen) 133 (browser build) | `binaryen/binaryen-version_133` | |
+| DirectX Shader Compiler (downloaded and checked by `port/tools/dxc.py`) | `dxc` | `DHD_DXC_CACHE` |
+
+The Rust toolchain comes from `rustup` (`port/render/rust-toolchain.toml` pins it); cargo's
+output goes under `DHD_DEVCACHES/dhd-cargo`, compiled objects are cached in
+`DHD_DEVCACHES/dhd-objcache` (`DHD_OBJCACHE_DIR`). LLVM is found on PATH or in scoop's default
+place (`~/scoop/apps/llvm/current/bin`). `build_host64.py` names the Visual Studio and Windows SDK
+folders it uses (MSVC 14.51, SDK 10.0.26100.0) at its top.
+
+### SDL3 (window, sound, controllers)
+
+`port/tools/sdl3.py`, which `package_release.py` runs, provides SDL3 as a static library, so
+`dhd.exe` stays one file:
 
 - it downloads `SDL3-3.4.18.tar.gz` from SDL's GitHub release into `build/downloads/` and checks
-  its SHA-256 (pinned in the script; any other file is refused). `build_clean.py` copies
-  `build/downloads/` into its worktree, so later builds need no network;
-- it builds with CMake + Ninja + clang for `i686-pc-windows-msvc`, the static C runtime, only the
-  joystick, gamepad, HIDAPI and event parts (DirectInput, XInput, RawInput, Windows.Gaming.Input
-  and HID drivers), into `build/port/sdl3/3.4.18/` (about 2 minutes, once per worktree);
-- `link.py` links `SDL3-static.lib` and the Windows libraries it needs.
+  its SHA-256 (pinned in the script; any other file is refused), so later builds need no network;
+- it builds with CMake + Ninja + clang for `x86_64-pc-windows-msvc`, the static C runtime, only the
+  window, audio, joystick, gamepad, HIDAPI and event parts, into `build/port/sdl3/3.4.18-x86_64/`
+  (a few minutes, once per checkout).
 
 To change the version, update `VERSION` and `SHA256` in `sdl3.py` together (the hash of the
 release's `.tar.gz` as GitHub lists it). `python port/tools/sdl3.py` builds it alone.
 
 ### Package a release
 
-    python port/tools/package_release.py --exe build/port/clean/<revision>/dhd.exe --version <version>
+    python port/tools/package_release.py
 
 This writes `build/release/DownhillRevived-<version>-win.zip`: one folder with `dhd.exe`,
-`README.txt`, `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` (from `port/release/`). There is no
-`dhd.ini` in it: the game writes one the first time it saves a setting, so unpacking a new
-version over an old folder never replaces a player's settings or saves. `dhd.exe` needs only
-Windows' own DLLs. The script refuses an executable that `build_clean.py` didn't make or that was
-linked with `--recomp-basis`. It also refuses one that holds an absolute path (your user or
-checkout folder) or a server address other than the official server's, and any file that
-names another server. Every packaged file is
+`dxcompiler.dll`, `README.txt`, `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` (from `port/release/`,
+then the licences of the Rust crates linked in). There is no `dhd.ini` in it: the game writes one
+the first time it saves a setting, so unpacking a new version over an old folder never replaces a
+player's settings or saves. `dhd.exe` needs only Windows' own DLLs. The script refuses an
+executable that holds an absolute path (your user or checkout folder) or a server address other
+than the official server's, and any file that names another server. Every packaged file is
 scanned for runs of 64 bytes or more of your `iso/SCUS_971.77` (`port/tools/scan_retail.py`);
 any run outside the short list of string literals and tables that the decompiled source itself
-holds stops the package.
+holds stops the package. `--wasm PATH` packages another core; the docstring has the rest.
 
-For a quicker loop while working on the port (uses your working tree as it is):
+### Tests
 
-    python port/tools/build.py -j 8
-    $env:DHD_BUILD_VU_AOT = "1"
-    python port/tools/link.py
+`python port/tools/test_runtime.py` builds and runs the runtime and HLE tests, among them
+`test_keyboard` (keyboard layout and steering ramp) and `test_gamepad` (SDL starts and lists the
+controllers; none needed). These small test programs are still 32-bit Windows builds.
 
-The result is `build/port/link/dhd.exe`. Without `DHD_BUILD_VU_AOT=1` the vector unit code runs
-in the interpreter, at about a third of the speed.
-
-To run a build, copy `dhd.exe` to a folder of its own and start it. It asks for your `.iso` the
-first time. `DHD_ISO=<path to iso>` in the environment skips the question.
-
-Tests of the port runtime (after `port/tools/build.py`):
-
-    python port/tools/test_runtime.py
-
-They include `test_keyboard` (keyboard layout and steering ramp) and `test_gamepad` (SDL starts
-and lists the controllers; none needed).
-
-### The game-state gate
-
-`port/tools/gate_native_renderer.py` plays a recorded race twice with one executable, once with
-the exact PS2 graphics path and once with the native renderer, and requires the game's memory
-to match between the two and, at the first moments of the race, a reference recording. The
-reference is a capture of the game's memory, so it is not in the repository: record your own
-once, from a plain `build_clean.py` executable of a release commit:
-
-    $env:DHD_ISO = "<path to your iso>"
-    python port/tools/build_clean.py --rev <release tag or commit>
-    python port/tools/gate_native_renderer.py --exe build/port/clean/<revision>/dhd.exe --out build/port/gate/record --reference build/port/compare/mine --record
-
-`--record` checks the two arms against each other and then writes the exact arm to
-`build/port/compare/mine` (it must not exist yet). Later builds are compared with it:
-
-    python port/tools/gate_native_renderer.py --exe build/port/link/dhd.exe --out build/port/gate/<name> --reference build/port/compare/mine
-
-Each arm plays the race once, a few minutes each. The gate prints `NATIVE RENDERER GAME-STATE GATE MATCH` when it passes. Record the reference again
-only when a change to the game's memory is understood and intended, and say why in the commit.
+The renderer's tests run the Rust renderer in x64: `python port/tools/test_gs_wgpu.py`
+(test_gpu, test_depth, test_present) and `python port/tools/gs_golden.py compare KIND` (replay
+goldens you record yourself; they hold pictures of the game, so they are not in the repository).
+Per-field state traces (`port/hle/state_trace.c`, `port/tools/state_trace_run.py`,
+`state_diff.py`) compare two builds' game state field by field.
 
 ## 4. Build the matching executable
 
@@ -206,7 +206,7 @@ the file. A few useful ones:
 | Key / variable | What |
 |---|---|
 | `iso` / `DHD_ISO` | the disc image |
-| `scale` / `DHD_SCALE` | internal resolution, `1` to `4` or `window` |
+| `scale` / `DHD_SCALE` | internal resolution, `1` to `8` or `window` |
 | `widescreen` / `DHD_WIDESCREEN` | `1` the monitor's shape, `0` off, or a shape such as `21:9` |
 | `DHD_ASPECT` | the picture's shape: `wide`, `4:3`, `16:9`, `stretch` or `pixels` |
 | `window` / `DHD_WINDOW` | `windowed`, `borderless` or `fullscreen` |
@@ -224,7 +224,7 @@ the file. A few useful ones:
 | `DHD_SDL` | `0` reads controllers without SDL (XInput and Sony pads only) |
 
 A dhd.ini without a key gets the player defaults (`port/hle/host.c`, `player_defaults`):
-native renderer, scale 2, borderless, widescreen 1, movies on. With no dhd.ini at all (the test
+native renderer, scale 2, borderless at the monitor's resolution, widescreen 1, movies skipped. With no dhd.ini at all (the test
 tools set `DHD_SETTINGS=none`) none of them apply. Tools that drive the game (`DHD_NAV`,
 `DHD_RACE_SYNC`, ...) never run the updater.
 

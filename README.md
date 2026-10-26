@@ -2,7 +2,7 @@
 
 A PC port of Downhill Domination.
 
-Downhill Revived is a native Windows port of *Downhill Domination* (PlayStation 2, Incognito
+Downhill Revived is a native 64-bit Windows port of *Downhill Domination* (PlayStation 2, Incognito
 Entertainment / SCEA, 2003). It is built on a matching decompilation: C/C++ source that
 compiles back to the original game program byte for byte. The port takes that source, builds it
 for the PC and replaces the PS2 hardware with native code. It adds a modern renderer, PC display
@@ -25,17 +25,19 @@ updates.
 
 What works today:
 
-- **Native renderer** (Direct3D 11). The original PS2 graphics hardware is reproduced on the
-  GPU. An exact emulation path stays in the code as the reference it is tested against.
+- **Native renderer** on Direct3D 12 or Vulkan, written in Rust on [wgpu](https://wgpu.rs). The
+  original PS2 graphics hardware is reproduced on the GPU. An exact emulation path stays in the
+  code as the reference it is tested against.
 - **60 fps with even frame pacing.** The game runs at its original 59.94 Hz, and each picture is
   shown on a fixed 59.94 Hz grid, so frames don't come out long-short-long. Pad input is read as
   late as possible before each frame.
-- **Higher resolution and widescreen.** Internal resolution 1x to 4x (or matched to the window).
+- **Higher resolution and widescreen.** Internal resolution 1x to 8x (or matched to the window).
   Widescreen at the monitor's shape (16:9, 21:9 or any other) is Hor+: a wider view with the same
   vertical framing, and the HUD, menus and 2D screens keep their shape. Windowed, borderless and
-  exclusive fullscreen. A new install starts borderless at 2x in widescreen.
+  exclusive fullscreen. A new install starts borderless at 2x in widescreen, at the monitor's
+  resolution.
 - **The movies play**: the intro, the attract loop and OPTIONS > VIDEO CLIPS, decoded with
-  libmpeg2 from your disc. Skip Movies in PC SETTINGS turns them off.
+  libmpeg2 from your disc. Skip Movies in PC SETTINGS (on in a new install) skips them.
 - **PC SETTINGS in the game's own OPTIONS menu**: resolution, display mode, window size, picture
   shape, scaling, widescreen, skip movies, vibration, texture pack and font, drawn with the
   game's own menus and font. Changes are saved to `dhd.ini`.
@@ -65,13 +67,15 @@ Known gaps:
 - The 2-4 player split screens have not been checked in widescreen.
 - Online races have been tested with two games and two scripted players, not yet with four
   people on four PCs.
+- The browser build (built from source, `port/web`) is experimental and not yet at full speed.
 - The game has only been tested on a few PCs. Please report problems.
 
 ## Playing
 
 1. Download `DownhillRevived-<version>-win.zip` from the [Releases](../../releases) page and
    unzip it into a folder you can write to (not Program Files). It holds `dhd.exe`,
-   `README.txt`, `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt`; nothing else is needed.
+   `dxcompiler.dll` (Microsoft's shader compiler), `README.txt`, `LICENSE.txt` and
+   `THIRD-PARTY-NOTICES.txt`; nothing else is needed.
 2. Run `dhd.exe`.
 3. The first time, the game asks for your disc image. Pick your `.iso` of the USA disc. It is
    checked and remembered in `dhd.ini`, which the game writes then; you won't be asked again
@@ -90,10 +94,11 @@ Files the game keeps beside `dhd.exe`:
 
 At start the game looks for a newer release. If there is one it asks: **Update now** downloads
 it, checks its SHA-256, puts it in place and starts the game again; **Later** starts this
-version. Without a network the game just starts. An update replaces `dhd.exe` and the text files
-only, never `dhd.ini` or `saves\`. You can also update by hand: copy the files of a newer release
-over your folder (a release holds no `dhd.ini` and no saves, so yours are kept). Online races
-need the newest version; an older one is offered Update Now in the ONLINE menu.
+version. Without a network the game just starts. An update replaces `dhd.exe` and the other files
+of the release (the text files, `dxcompiler.dll`), never `dhd.ini` or `saves\`. You can also
+update by hand: copy the files of a newer release over your folder (a release holds no `dhd.ini`
+and no saves, so yours are kept). Online races need the newest version; an older one is offered
+Update Now in the ONLINE menu.
 
 ### Controls
 
@@ -153,11 +158,11 @@ first start. The PC SETTINGS page writes most of them for you.
 |---|---|---|
 | `iso` | (asked at the first start) | your disc image |
 | `renderer` | `native` | `native`, or `exact` (the slow reference path) |
-| `scale` | `2` | the 3D picture's resolution, `1` to `4` times the PS2's, or `window` |
+| `scale` | `2` | the 3D picture's resolution, `1` to `8` times the PS2's, or `window` |
 | `window` | `borderless` | `windowed`, `borderless` or `fullscreen` |
 | `widescreen` | `1` | `1` the monitor's shape, `0` off, or a shape such as `21:9` |
 | `DHD_ASPECT` | `wide` | the picture's shape: `wide`, `4:3`, `16:9`, `stretch` or `pixels` |
-| `skip_movies` | `0` | `1` skips the movies |
+| `skip_movies` | `1` | `1` skips the movies, `0` plays them |
 | `vibration` | on | `0` turns rumble off |
 | `texture_pack` | (empty) | a texture pack's folder; empty: `textures\SCUS-97177\replacements` beside `dhd.exe` |
 | `textures` | `on` | `off` draws the game's own textures |
@@ -172,8 +177,9 @@ Each key has a `DHD_*` environment variable (`scale` is `DHD_SCALE`, `server` is
 
 ### System requirements
 
-- Windows 10 or 11, 64-bit (`dhd.exe` is a 32-bit program).
-- A graphics card with Direct3D 11 (feature level 11_0).
+- Windows 10 or 11, 64-bit.
+- A graphics card with Direct3D 12 or Vulkan. Without one the game draws with Windows' software
+  renderer (WARP), slowly.
 - A reasonably modern CPU: the PS2's vector units are run on the CPU.
 
 ## Building from source
@@ -181,20 +187,21 @@ Each key has a `DHD_*` environment variable (`scale` is `DHD_SCALE`, `server` is
 The PC port and the matching build both need the original game executable, `SCUS_971.77`,
 taken from your own disc. Nothing in this repository can be built without it.
 
-Short version (Windows 10/11, Python 3.12+, Git, LLVM, Visual Studio Build Tools; details
-in [docs/BUILDING.md](docs/BUILDING.md)):
+Short version (Windows 10/11, Python 3.12+, Git, LLVM, wasi-sdk, WABT, SIMDe, Rust, Visual
+Studio Build Tools, CMake; details in [docs/BUILDING.md](docs/BUILDING.md)):
 
     git clone <this repository>
     cd <repository folder>
     python -m pip install -r requirements.txt
     7z e "<your dump>.iso" SCUS_971.77 -oiso
     python tools/split.py
-    python port/tools/build_clean.py
+    python port/tools/build_wasm.py
+    python port/tools/package_release.py
 
-The executable is written to `build/port/clean/<revision>/dhd.exe`. This is the same build as
-the releases (VU1 ahead-of-time code on, nothing else needed). To make the release zip from it:
-
-    python port/tools/package_release.py --exe build/port/clean/<revision>/dhd.exe --version <version>
+`build_wasm.py` compiles the game into one portable core, `build/wasm/dhd_core.wasm`.
+`package_release.py` turns it into the 64-bit `dhd.exe` (wasm2c, the Windows host code and the
+Rust renderer), checks it and writes the release zip to `build/release/`: the same build as the
+releases. `python port/web/build.py` makes the browser build (experimental) into `build/web/`.
 
 ## Decompilation progress
 
@@ -228,7 +235,7 @@ the format [decomp.dev](https://decomp.dev) reads).
 | `include/` | Shared headers: structs and types of the game. |
 | `config/` | splat configuration, symbol names, identified library functions. |
 | `tools/` | The matching build and its checks (`configure.py`, `check_image.py`, `try_func.py`, `promote.py`, `report.py`). |
-| `port/` | The PC port: build tools (`port/tools/`), PS2 system replacement (`port/hle/`), graphics (`port/gs/`), CPU/VU runtime (`port/runtime/`), network client (`port/net/`), launchers. |
+| `port/` | The PC port: build tools (`port/tools/`), PS2 system replacement (`port/hle/`), graphics (`port/gs/`, the Rust renderer in `port/render/`), CPU/VU runtime (`port/runtime/`), the 64-bit host (`port/host/`, `port/host64/`), the browser build (`port/web/`), network client (`port/net/`). |
 | `online/` | The online race server (Cloudflare Workers + Durable Objects). |
 | `docs/` | `STATE.md` (where each part stands), `findings/` (how things were worked out), `WORKER.md` (how to decompile a function), `BUILDING.md`, the online protocol. |
 
@@ -257,8 +264,18 @@ This project builds on the work of others:
   included). The reverb presets are read from the player's own disc (Sony's libsd module).
 - [OpenGOAL](https://github.com/open-goal/jak-project) (ISC): the SPU2 Gaussian interpolation
   table in `port/hle/sound_gaussian.h`.
-- [SDL](https://libsdl.org) 3.4.18 (zlib): controllers, built from its pinned release source by
-  `port/tools/sdl3.py` and linked in statically.
+- [SDL](https://libsdl.org) 3.4.18 (zlib): the window, sound and controllers, built from its
+  pinned release source by `port/tools/sdl3.py` and linked in statically.
+- [wgpu](https://github.com/gfx-rs/wgpu) (MIT/Apache-2.0) with naga and the Rust standard library:
+  the renderer (`port/render`); the crates linked into `dhd.exe` are listed with their licences in
+  the release's `THIRD-PARTY-NOTICES.txt`.
+- [WABT](https://github.com/WebAssembly/wabt) (Apache-2.0): wasm2c turns the game core into C for
+  the 64-bit build. [wasi-sdk / wasi-libc](https://github.com/WebAssembly/wasi-sdk) (MIT option) and
+  [SIMDe](https://github.com/simd-everywhere/simde) (MIT) build the core.
+- [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler) (NCSA/MIT):
+  `dxcompiler.dll`, shipped unchanged, compiles the Direct3D 12 shaders.
+- [Binaryen](https://github.com/WebAssembly/binaryen) (Apache-2.0) and
+  [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen) (MIT/Apache-2.0): the browser build.
 - [libmpeg2](https://libmpeg2.sourceforge.io) 0.5.1 (GPL-2.0-or-later): the movie decoder,
   `port/third_party/libmpeg2`, unchanged.
 - [xxHash](https://github.com/Cyan4973/xxHash) (BSD-2-Clause): the XXH64 specification, from
