@@ -19,11 +19,12 @@
 #include <commdlg.h>  /* the file-open dialog's struct; comdlg32 itself is loaded when needed */
 #else
 #include "../host/win32_compat.h"
+#include "../host/backtrace_posix.h"  /* <execinfo.h>, or Android's own (API < 33) */
 #include <dirent.h>
-#include <execinfo.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <ucontext.h>
@@ -44,9 +45,14 @@
 #define CTX_SP(c) ((uintptr_t)(c)->Esp)
 #endif
 #else
-/* Linux crash/dump signals hand a ucontext_t. Only x86_64 is supported. */
+/* Linux crash/dump signals hand a ucontext_t: x86_64, or aarch64 (Android, finding 091). */
+#if defined(__aarch64__)
+#define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext.pc)
+#define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext.sp)
+#else
 #define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext.gregs[REG_RIP])
 #define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext.gregs[REG_RSP])
+#endif
 typedef ucontext_t CONTEXT;
 #endif
 
@@ -144,7 +150,7 @@ static void snapshot(Snapshot *out, const CONTEXT *c)
         if (value >= lo && value < hi) out->returns[out->count++] = value;
     }
 #endif
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
     memcpy(out->registers,published_registers,sizeof out->registers);
 #else
     out->registers[0] = ps2.gpr[29].w[0]; out->registers[1] = ps2.gpr[31].w[0];
@@ -166,6 +172,11 @@ static void print_snapshot(const Snapshot *s)
     fprintf(stderr, "  eip %08lX eax %08lX ebx %08lX ecx %08lX edx %08lX esi %08lX edi %08lX esp %08lX\n",
             c->Eip, c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Esp);
 #endif
+#elif defined(__aarch64__)
+    const unsigned long long *x = (const unsigned long long *)c->uc_mcontext.regs;
+    fprintf(stderr, "  pc %016llX sp %016llX lr %016llX x0 %016llX x1 %016llX x2 %016llX x19 %016llX x29 %016llX\n",
+            (unsigned long long)c->uc_mcontext.pc, (unsigned long long)c->uc_mcontext.sp, x[30], x[0], x[1], x[2],
+            x[19], x[29]);
 #else
     const greg_t *r = c->uc_mcontext.gregs;
     fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
@@ -224,7 +235,11 @@ static LONG WINAPI crashed(EXCEPTION_POINTERS *e)
 static void crashed(int sig, siginfo_t *info, void *ctx)
 {
     const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL" : "SIGFPE";
-    fprintf(stderr, "crash: %s at %016llX\n", name, (unsigned long long)(uintptr_t)(info ? info->si_addr : NULL));
+    char thread[17] = "?";
+    prctl(PR_GET_NAME, thread);  /* which of the port's threads (host_thread_name) */
+    fprintf(stderr, "crash: %s at %016llX in thread %s\n", name,
+            (unsigned long long)(uintptr_t)(info ? info->si_addr : NULL), thread);
+    fflush(stderr);
     report((const CONTEXT *)ctx);
     {
         void *frames[32];
@@ -282,8 +297,11 @@ static LONG WINAPI watch_hit(EXCEPTION_POINTERS *e)
             uint32_t value = 0;
             SIZE_T got;  /* a kernel read: a plain load would hit a load watchpoint again */
             ReadProcessMemory(GetCurrentProcess(), GUEST(0x08000000u + watch_address[i]), &value, 4, &got);
-            fprintf(stderr, "watch: EE %08X = %08X field %llu after eip %08llX\n", watch_address[i], value,
-                    (unsigned long long)kernel_vsync_count, (unsigned long long)CTX_IP(c));
+            extern char __ImageBase[];
+            fprintf(stderr, "watch: EE %08X = %08X field %llu after eip %08llX rva %08llX (map)\n",
+                    watch_address[i], value, (unsigned long long)kernel_vsync_count,
+                    (unsigned long long)CTX_IP(c),
+                    (unsigned long long)((uintptr_t)CTX_IP(c) - (uintptr_t)__ImageBase));
             report(c);
         }
     c->Dr6 = 0;
@@ -385,6 +403,9 @@ void host_thread_name(const char *name)
 #else
     pthread_setname_np(pthread_self(), name);
 #endif
+#ifdef __ANDROID__
+    { void android_perf_thread(const char *name); android_perf_thread(name); }  /* port/host/android_perf.c */
+#endif
     LONG at = InterlockedIncrement(&named_count) - 1;
     if (at >= NAMED_THREADS) return;
 #ifdef _WIN32
@@ -416,6 +437,23 @@ unsigned host_thread_cpu(const char **names, double *seconds, unsigned max)
         seconds[n++] = (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 #endif
     }
+    return n;
+}
+
+/* Raw scheduled CPU cycles, complementary to GetThreadTimes (coarse on Windows). */
+unsigned host_thread_cycles(const char **names, uint64_t *cycles, unsigned max)
+{
+    unsigned n = 0;
+#ifdef _WIN32
+    for (LONG i = 0; i < named_count && i < NAMED_THREADS && n < max; i++) {
+        ULONG64 value;
+        if (!named[i].name || !QueryThreadCycleTime(named[i].handle, &value)) continue;
+        names[n] = named[i].name;
+        cycles[n++] = value;
+    }
+#else
+    (void)names; (void)cycles; (void)max;
+#endif
     return n;
 }
 
@@ -1027,10 +1065,10 @@ static const char settings_template[] =
     "; on the first start, and OPTIONS > PC SETTINGS writes the display settings here. DHD_*\n"
     "; environment variables override them.\n"
     "\n"
-    "; scale: the 3D picture's resolution, 1-8 times the PlayStation 2's (1-4 on the 32-bit game),\n"
+    "; scale: the 3D picture's resolution, 1-8 times the PlayStation 2's,\n"
     ";   or window.\n"
     "; window: windowed (width x height; the monitor's resolution when not set), borderless\n"
-    ";   or fullscreen (the monitor's own resolution).\n"
+    ";   or fullscreen (borderless over the whole monitor).\n"
     "; widescreen: 1 the monitor's shape (a wider view, the HUD and menus kept in shape), 0 off,\n"
     ";   or a shape such as 21:9. DHD_ASPECT, the picture's shape: wide (widescreen's), 4:3, 16:9,\n"
     ";   stretch or pixels.\n"
@@ -1040,7 +1078,7 @@ static const char settings_template[] =
     "widescreen = 1\n"
     "DHD_ASPECT = wide\n"
     "skip_movies = 1\n"
-    "; Offline real simulation rate: 60 (original), 120, 144 or monitor (max 144).\n"
+    "; Offline real simulation rate: 60 (original), 120, 144, 165, 240 or monitor (max 240).\n"
     "; Online always uses 60. Frame rate changes apply at the next start.\n"
     "fps = 60\n"
     "\n"
@@ -1135,7 +1173,9 @@ static uint32_t le32_at(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16
 
 /* Whether path is Downhill Domination (USA): the ISO 9660 root holds a SYSTEM.CNF whose boot
    line names SCUS_971.77, and SCUS_971.77 is the retail one (game_data_read: the game's data
-   comes from it). NULL if it is, else why not. */
+   comes from it). NULL if it is, else why not. disc_shallow (the Android start, before the core
+   exists) leaves out game_data_read, which runs in the core; host_disc_ready checks it later. */
+static int disc_shallow;
 static const char *disc_problem(const char *path, char *why, size_t size)
 {
     enum { SECTOR = 2048 };
@@ -1171,7 +1211,7 @@ static const char *disc_problem(const char *path, char *why, size_t size)
     memcpy(text, sector, SECTOR);
     text[cnf_size < SECTOR ? cnf_size : SECTOR] = 0;
     if (strstr(text, "SCUS_971.77")) {
-        problem = game_data_read(path, NULL);  /* the game's program and data, unchanged (game_data.c) */
+        if (!disc_shallow) problem = game_data_read(path, NULL);  /* the game's program and data, unchanged (game_data.c) */
         goto done;
     }
     /* Name the game it is: BOOT2 = cdrom0:\SLUS_123.45;1 */
@@ -1271,6 +1311,16 @@ int host_disc_ready(void)
     return 0;
 #else
     /* No dialogs on this host: without DHD_ISO the game cannot start. */
+#ifdef __ANDROID__
+    /* The copy android_main.c made passed its first look but not the game's data: say so and drop
+       the copy, so the next start asks for the disc again. */
+    if (iso && problem) {
+        snprintf(message, sizeof message, "The disc image can't be used:\n%s\n\nStart the game again to choose "
+                 "your Downhill Domination (USA) disc image (SCUS-97177).", problem);
+        host_error_box(title, message);
+        remove(iso);
+    }
+#endif
     if (!iso)
         fprintf(stderr, "settings: set DHD_ISO to your Downhill Domination (USA) disc image\n");
     else
@@ -1287,6 +1337,18 @@ int host_disc_ready(void)
 void host_service_host_init(void) { host_init(); }
 void host_service_host_console_init(void) { host_console_init(); }
 int host_service_host_disc_ready(void) { return host_disc_ready(); }
+#ifdef __ANDROID__
+/* The Android start (port/host/android_main.c) checks the copy it made of the player's disc image:
+   NULL when it is Downhill Domination (USA), else why not. */
+const char *host_disc_check(const char *path)
+{
+    static char why[256];
+    disc_shallow = 1;
+    const char *problem = disc_problem(path, why, sizeof why);
+    disc_shallow = 0;
+    return problem;
+}
+#endif
 int host_service_host_poll_dump(void) { return InterlockedExchange(&dump_pending,0)!=0; }
 void host_service_host_settings_load(void) { host_settings_load(); }
 int host_service_host_setting_save(uint32_t a0, uint32_t a1) { return host_setting_save((const char *)GUEST(a0), (const char *)GUEST(a1)); }
@@ -1300,7 +1362,7 @@ int host_service_host_relaunch_reserving(uint32_t a0, uint32_t a1) {
 
 /* Wall-clock pacing is shared by the EE producer and native presenter. */
 #define WORK_SAMPLES 300
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 #define FIELD_SECONDS pacing_period
 #else
 #include "../include/fps.h"
@@ -1513,7 +1575,16 @@ void host_pacing_wait(void)
        are on time (this one isn't known yet: on time is the least it can wait). */
     double last_due, last_at, spacing;
     int last_late;
+#ifdef __aarch64__  /* arm64 reorders loads: the writer's order (below) is kept with fences */
+    do {
+        last_due = shown_due;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        last_at = shown_at, last_late = shown_late;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while (last_due != shown_due);
+#else
     do last_due = shown_due, last_at = shown_at, last_late = shown_late; while (last_due != shown_due);
+#endif
     spacing = period - (last_late ? 0 : pacing_slack);
     int previous = display.frames ? fabs(shown - last_due - period) < 0.03 * period  /* dues steered a little */
                                   : last_due + period - shown < 1e-6 && shown - last_due - period < 1e-6;
@@ -1564,8 +1635,14 @@ void pacing_present(double due, double began)
         last_at = host_wall_seconds();
         last_late = late;
         shown_due = 0;  /* x86 keeps stores in order: a reader sees due 0 or all three values */
+#ifdef __aarch64__  /* arm64 does not: fences keep it */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
         shown_at = last_at;
         shown_late = late;
+#ifdef __aarch64__
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
         shown_due = due;
     }
     FILE *log = pacing_file(1);
@@ -1600,13 +1677,13 @@ void host_pacing_input(void) { frame_began=host_wall_seconds(); }
 
 /* Native diagnostics consume published scalar state, never call the module
    from graphics, presenter or device OS threads. i686 keeps its direct clock. */
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 uint64_t kernel_vsync_count;
 static double module_seconds;
 double host_seconds(void) { return module_seconds; }
 #endif
 void host_frame_context(uint64_t field, double seconds) {
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
     kernel_vsync_count=field; module_seconds=seconds;
 #else
     (void)field; (void)seconds;
@@ -1619,14 +1696,14 @@ void host_frame_registers(uint32_t address) {
 
 double host_pacing_period(void) { return pacing_period; }
 
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 static double published_aspect;
 static int published_flat_limit;
 double host_widescreen_aspect(void) { return published_aspect; }
 int host_widescreen_flat_limit(void) { return published_flat_limit; }
 #endif
 void host_frame_video(double aspect, int flat_limit) {
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
     published_aspect=aspect; published_flat_limit=flat_limit;
 #else
     (void)aspect; (void)flat_limit;

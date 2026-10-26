@@ -38,8 +38,10 @@ def add(patches):
     # Reset must take place after the original initializer too.
     edit('00238A68', '*(volatile int *)0x10000800 = 0;',
          '*(volatile int *)0x10000800 = 0;\n    if (port_fps_high()) port_clock_reset();')
+    edit('00238C00', 'extern int func_00243CE8(int);',
+         'extern int func_00243CE8(int);\nextern void rate_audit_update(void);')
     entry('00238C00', 'func_00238C00',
-          '    if (port_fps_high()) { port_clock_wait(result); return 1; }')
+          '    rate_audit_update();\n    if (port_fps_high()) { port_clock_wait(result); return 1; }')
     entry('00238D98', 'func_00238D98',
           '    if (port_fps_high()) { port_clock_step(); return; }')
     entry('0011A100', 'func_0011A100','    port_fps_race_step();')
@@ -54,6 +56,18 @@ def add(patches):
          '(race->x501B4 += port_fps_high() ? port_whole_step() : 1)')
     edit('0011A100', '--race->x501C0',
          '(race->x501C0 -= port_fps_high() ? port_whole_step() : 1)')
+
+    # FPS1 (rate audit): two per-update counters that are time in disguise.
+    # D_0029DBAC is the particle/effects frame clock: the dust, snow and spray waves
+    # (001DF920 Wave), the glow phases (0022E9A0) and the effect matrix wobble
+    # (0022E3D0) read it as a 60 Hz frame count, so at 240 they ran four times too
+    # fast. Whole fields keep the retail 60 Hz phase and the 60 arithmetic identical.
+    edit('00228BE8', 'D_0029DBAC += 1;',
+         'D_0029DBAC += port_fps_high() ? port_whole_step() : 1;')
+    # obj->x60C is the sound/skat queue owner's age; func_001BC250 returns it as
+    # milliseconds with *1000/60, so per-update counting at 240 reports 4x the time.
+    edit('001BBF30', 'obj->x60C++;',
+         'obj->x60C += port_fps_high() ? port_whole_step() : 1;')
     for unit,expression in (
             ('0010EC80','*(int *)(obj->x0 + 0x797C) == D_002AF2C0.x501B4'),
             ('0010F0D8','obj->x0->x797C == D_002AF2C0.x501B4'),
@@ -377,6 +391,54 @@ def add(patches):
     # The specialized float-step particle path already receives f20 from the
     # generated dispatcher. Convert its frame damping to fractional decay.
     edit('00228BE8', 'values[3]=1.0f-obj->x2778;', 'values[3]=port_decay(1.0f-obj->x2778);')
+    # SP5b (finding 090): the remaining per-update constants found for 165/240.
+    # Rider-pair overlap (00134688): each call moves both riders apart by a tenth of the
+    # overlap (00231A48 translates the body), a relaxation, not an impulse.
+    edit('00134688', 'length * (push - 1.0f) * 0.1f', 'length * (push - 1.0f) * port_blend(0.1f)')
+    # The jump wind sound's pitch/volume walk (001D1528): a slope per 60 Hz field
+    # (x40/(x70*60)), added on every call of the rider's sound update (001C8380).
+    for lane, slopes in (('x58', 's->x4C+s->x50'), ('x54', 's->x44+s->x48')):
+        edit('001C5040', 'value=s->%s+(%s);' % (lane, slopes),
+             'value=s->%s+(port_fps_high() ? (%s)*port_step() : (%s));' % (lane, slopes, slopes))
+    # Particle rise after half the burst's life (0022A168, called from 0022B708 once per update):
+    # x2630.x134 is 0x2764, the life per field, which 0022B708 already advances by f20.
+    edit('00228BE8', 'v = obj->x2630.x68 + obj->x2630.x134 * 60.0f;',
+         'v = obj->x2630.x68 + obj->x2630.x134 * (port_fps_high() ? 60.0f*port_step() : 60.0f);')
+    # The human rider's trick button sequencer (001E6970: chord window x724 > 2, trick after
+    # x720 > 3 quiet fields) and the HUD's code sequencer (001E6F58: x8 > 2, x4 > 20): field
+    # counters, compared with field budgets. The samples stay per update.
+    for unit, fields in (('001E6970', ('x724', 'x720')), ('001E6F58', ('x8', 'x4'))):
+        for field in fields:
+            patches.setdefault('unsorted/%s.c' % unit, []).append(('re', (r'obj->%s\+\+' % field, 2),
+                'obj->%s+=port_fps_high() ? port_whole_step() : 1' % field))
+    # OPTIONS volume sliders (0015E750): one step per field while a direction is held.
+    for button in ('0x20', '0x80'):
+        edit('0015E750', '    if ((buttons & %s) || func_002209A8(' % button,
+             '    if ((!port_fps_high() || port_whole_step()) && ((buttons & %s) || func_002209A8(' % button)
+        edit('0015E750', 'func_002209A8(%s, func_002205A0(D_003F52D0.x130))) {' % button,
+             'func_002209A8(%s, func_002205A0(D_003F52D0.x130)))) {' % button)
+    # HUD timers counted per draw: trick banner (x12BC, 120 fields) and score popup (x12C4,
+    # 90/120 fields with its fades) in 00178730; pickup icon blink (x132C, 120 fields, 32-field
+    # blink; whole steps never pass 0) and two 75-field fades in 00179A60, whose panels slide
+    # in 20 steps (0017A1B0); the message popup (x12F0, 180 fields) and its 16-field blink
+    # (x1308) in 0017B3C0; mode 10's 240-field banner cycle (x1324) and the item list's
+    # 300-field timer (x1310) in 00176ED8, whose 60-field event (0017C638) fires once.
+    patches.setdefault('unsorted/00178730.c', []).append(('re', (r'obj->x12BC\+\+', 2),
+        'obj->x12BC+=port_fps_high() ? port_whole_step() : 1'))
+    edit('00178730', 'obj->x12C4++;', 'obj->x12C4+=port_fps_high() ? port_whole_step() : 1;')
+    edit('00179A60', '        obj->x132C--;',
+         '        if (port_fps_high()) { obj->x132C -= port_whole_step(); if (obj->x132C < 0) obj->x132C = 0; }\n'
+         '        else obj->x132C--;')
+    for field in ('x135D', 'x135E'):
+        edit('00179A60', 'obj->%s += 2;' % field,
+             'if (!port_fps_high() || port_whole_step()) obj->%s += 2;' % field)
+    entry('0017A1B0', 'func_0017A1B0', ' if (port_fps_high() && !port_whole_step()) return;')
+    edit('0017B3C0', 'obj->x12F0--;', 'obj->x12F0-=port_fps_high() ? port_whole_step() : 1;')
+    edit('0017B3C0', 'obj->x1308++;', 'obj->x1308+=port_fps_high() ? port_whole_step() : 1;')
+    for field in ('x1324', 'x1310'):
+        edit('00176ED8', '--obj->%s;' % field,
+             'obj->%s-=port_fps_high() ? port_whole_step() : 1;' % field)
+    edit('0017C638', 'if (state==60) {', 'if (state==60 && (!port_fps_high() || port_whole_step())) {')
     # NPC event rolls consume RNG only on whole fields. Preserve their original
     # probability and RNG draw frequency, rather than doubling ambient events.
     for path in root.glob('*.*'):

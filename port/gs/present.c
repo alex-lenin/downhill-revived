@@ -7,7 +7,9 @@
 #include "../host/win32_compat.h"
 #endif
 /* The window is SDL's (W11): created on the SDL thread (host/sdl_host.c), its events come there too.
-   The renderer's surface takes the window's HWND (SDL_PROP_WINDOW_WIN32_HWND_POINTER). */
+   The renderer's surface takes the window's HWND (SDL_PROP_WINDOW_WIN32_HWND_POINTER); on Android
+   its ANativeWindow (SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER), dropped while the app is in the
+   background and made again when it comes back (android_background, finding 091). */
 #if defined(_WIN32) || defined(DHD_HAVE_SDL)
 #include <SDL3/SDL.h>
 #define PRESENT_SDL 1
@@ -92,6 +94,9 @@ static void make_window(void *arg)
     /* A minimised start: SDL applies its window state when the window shows, so it must know
        (show_window); otherwise it restores the window then. */
     if (start_minimised()) flags |= SDL_WINDOW_MINIMIZED;
+#ifdef __ANDROID__
+    flags = SDL_WINDOW_FULLSCREEN;  /* the whole screen, immersive (landscape: android_main.c's hint) */
+#endif
     sdl_window = SDL_CreateWindow("Downhill Revived", s->w, s->h, flags);  /* s->w x s->h: the client area */
     if (!sdl_window) {
         fprintf(stderr, "gs: SDL window (%s)\n", SDL_GetError());
@@ -165,6 +170,76 @@ static int init(void)
     if (fullscreen) gs_window_apply();  /* the whole monitor */
     return 1;
 }
+#elif defined(__ANDROID__) && defined(PRESENT_SDL)
+static void *window;                /* sdl_window's ANativeWindow, for the renderer's surface (NULL in the background) */
+static volatile int app_background; /* the app is in the background (lifecycle_watch): the game waits */
+static volatile int surface_dropped; /* lifecycle_watch dropped the surface: android_background makes it again */
+
+/* SDL's app events, from the thread that pumps SDL's events (sdl_host.c), synchronously: SDL blocks
+   that thread right after the background events (SDL_HINT_ANDROID_BLOCK_ON_PAUSE), so the queued
+   copies arrive only after the app is back. Here the render thread stops presenting before Android
+   takes the window (on its own thread, soon after); the game thread waits at its next field. */
+static bool SDLCALL lifecycle_watch(void *unused, SDL_Event *e)
+{
+    (void)unused;
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND && !app_background) {
+        app_background = 1;
+        if (surface) gs_gpu_surface_reset(&gs, NULL);
+        surface_dropped = 1;
+    } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        app_background = 0;
+    }
+    return true;
+}
+
+/* SDL's ANativeWindow for the window: NULL until Android has made the surface (it is made again
+   after the app comes back from the background). */
+static void *native_window(void)
+{
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+}
+
+/* The window (SDL's, fullscreen), the renderer (gpu_rust.c: wgpu on Vulkan) and its surface on the
+   window's ANativeWindow. */
+static int init(void)
+{
+    WindowSpec spec = {0, 0, 0, 0, 1};
+    sdl_host_run(make_window, &spec);
+    if (!sdl_window) return 0;
+    for (int i = 0; i < 200 && !(window = native_window()); i++) SDL_Delay(10);
+    if (!window) { hle_log("gs: the window has no ANativeWindow\n"); return 0; }
+    if (!gs_gpu_init(&gs)) return 0;
+    if (!gs_gpu_surface(&gs, window)) {
+        hle_log("gs: the renderer has no surface on the window\n");
+        gs_gpu_destroy(&gs);
+        return 0;
+    }
+    surface = 1;
+    SDL_AddEventWatch(lifecycle_watch, NULL);
+    hle_log("gs: WebGPU presentation (%s, Vulkan)\n", gs_gpu_backend_name(&gs));
+    return 1;
+}
+
+/* The app went to the background (EE thread, at a field): the surface is dropped before Android
+   takes the window, and the game waits (SDL pauses the sound) until the app is back, then the
+   surface is made on the new window. The close of the app ends the game as the close button does. */
+static void android_background(void)
+{
+    hle_log("gs: in the background; the game waits\n");
+    gs_gpu_surface_reset(&gs, NULL);
+    window = NULL;
+    while (app_background && !window_closed) SDL_Delay(20);
+    surface_dropped = 0;
+    gs_pump_messages();
+    for (int i = 0; i < 300 && !(window = native_window()); i++) SDL_Delay(10);
+    if (!window || !gs_gpu_surface_reset(&gs, window)) {
+        hle_log("gs: no surface on the window after the background\n");
+        window = NULL;
+        return;
+    }
+    resize_pending = 1;
+    hle_log("gs: back in the foreground\n");
+}
 #elif defined(PRESENT_SDL)
 /* No presentation device on this host (Linux: the renderer has no surface here yet). The SDL
    window still opens for input, and audio still plays; rendering stays headless, so init reports
@@ -224,7 +299,7 @@ void gs_window_apply(void) {}
 /* The picture's filter and shape changed (DHD_PRESENT_FILTER, DHD_ASPECT): native renderer only. */
 void gs_present_options_apply(void)
 {
-#ifdef _WIN32
+#if defined(_WIN32) || (defined(__ANDROID__) && defined(PRESENT_SDL))
     if (sdl_window && gs_gpu_native(&gs)) gs_native_present_options(&gs);
 #endif
 }
@@ -249,6 +324,11 @@ static void capture(unsigned width, unsigned height, int gpu_frame)
 {
     const uint32_t *image = pixels;
     static unsigned saved;
+    /* Every branch below needs DHD_SCREENSHOT: without it, return before the getenvs (each scans
+       the whole environment, six per field; finding 090 SP14). Nothing sets it at run time. */
+    static int screenshot = -1;
+    if (screenshot < 0) screenshot = getenv("DHD_SCREENSHOT") != NULL;
+    if (!screenshot) return;
     const char *path = getenv("DHD_SCREENSHOT"), *at = getenv("DHD_CAPTURE_AT");
     const char *every = getenv("DHD_CAPTURE_INTERVAL");
     const char *frame_at = getenv("DHD_CAPTURE_FRAME");
@@ -397,6 +477,163 @@ void gs_pump_messages(void)
     if (window_closed) exit(0);
 }
 
+#ifndef _WIN32
+/* The window's size in pixels (gpu_rust.c's window_size, any thread): SDL's copy; 0 x 0 without a
+   window. */
+void gs_window_pixels(unsigned *width, unsigned *height)
+{
+    int w = 0, h = 0;
+#ifdef PRESENT_SDL
+    if (sdl_window) SDL_GetWindowSizeInPixels(sdl_window, &w, &h);
+#endif
+    *width = w > 0 ? (unsigned)w : 0;
+    *height = h > 0 ? (unsigned)h : 0;
+}
+#endif
+
+/* ---- the mouse (finding 092) ----
+   The SDL thread passes the window's mouse events (touch arrives as SDL's mouse events too); the
+   module reads HostMouse (host_service_mouse_state) once a field. Positions are fractions of the
+   picture where the renderer last showed it (gs_picture_rect: the bars beside it are outside), so
+   the window's size, the picture's shape and DHD_SCALE don't matter to the menus. The OS cursor
+   shows while the mouse moves, and hides after a few idle seconds and while a race is ridden. */
+#ifdef PRESENT_SDL
+#define MOUSE_LOCK() SDL_LockSpinlock(&mouse.lock)
+#define MOUSE_UNLOCK() SDL_UnlockSpinlock(&mouse.lock)
+#else
+#define MOUSE_LOCK() ((void)0)
+#define MOUSE_UNLOCK() ((void)0)
+#endif
+static struct {
+    int lock;
+    int left, top, right, bottom, w, h;  /* the picture in the window, pixels (0 x 0: the whole window) */
+    float px, py;                        /* the pointer, window pixels */
+    float before_x, before_y;            /* test desktops: where it was before the last motion, */
+    float os_x, os_y;                    /* and where SDL puts the OS cursor (learnt at the first leave) */
+    int dropped;                         /* the last motion went there and was dropped */
+    HostMouse state;
+    float wheel;                         /* wheel motion not yet a whole step */
+    double moved;                        /* wall time of the last move or press */
+} mouse;
+
+void gs_picture_rect(int left, int top, int right, int bottom, int w, int h)
+{
+    if (right <= left || bottom <= top) return;
+    MOUSE_LOCK();
+    mouse.left = left, mouse.top = top, mouse.right = right, mouse.bottom = bottom, mouse.w = w, mouse.h = h;
+    MOUSE_UNLOCK();
+}
+
+/* The pointer as fractions of the picture (65536 its width / height); lock held. */
+static void mouse_place(void)
+{
+    int left = mouse.left, top = mouse.top, right = mouse.right, bottom = mouse.bottom;
+    float px = mouse.px, py = mouse.py;
+#ifdef PRESENT_SDL
+    int ww = 0, wh = 0;
+    if (sdl_window && SDL_GetWindowSizeInPixels(sdl_window, &ww, &wh) && ww > 0 && wh > 0) {
+        if (right <= left || mouse.w <= 0) left = top = 0, right = ww, bottom = wh;
+        else px *= (float)mouse.w / ww, py *= (float)mouse.h / wh;  /* a resize the picture hasn't followed yet */
+    }
+#endif
+    if (right <= left || bottom <= top) return;
+    mouse.state.x = (int32_t)((px - left) * 65536.0f / (right - left));
+    mouse.state.y = (int32_t)((py - top) * 65536.0f / (bottom - top));
+}
+
+/* DHD_TEST_INPUT (test runs on a desktop that is never shown, driven by posted messages): the
+   OS cursor is never over the window there, so Windows reports a leave after each posted move:
+   SDL first moves its pointer to where the OS cursor is (taken back at the leave event, which
+   also tells where that is), and before the next press it resyncs the pointer there (dropped).
+   Presses keep the posted move's point (SDL gives them its own idea of the pointer). So a test's
+   moves and clicks act as a real mouse's would. */
+void gs_mouse_event(const void *event)
+{
+#ifdef PRESENT_SDL
+    static int test_input = -1;
+    const SDL_Event *e = event;
+    if (test_input < 0) test_input = getenv("DHD_TEST_INPUT") != NULL;
+    float density = sdl_window ? SDL_GetWindowPixelDensity(sdl_window) : 1.0f;
+    if (density <= 0) density = 1.0f;
+    MOUSE_LOCK();
+    switch (e->type) {
+    case SDL_EVENT_MOUSE_MOTION:
+        if (test_input && e->motion.x == mouse.os_x && e->motion.y == mouse.os_y) {  /* to the OS cursor */
+            mouse.dropped = 1;
+            break;
+        }
+        mouse.dropped = 0;
+        mouse.before_x = mouse.px, mouse.before_y = mouse.py;
+        mouse.px = e->motion.x * density, mouse.py = e->motion.y * density;
+        mouse_place();
+        mouse.state.moves++;
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        int index = e->button.button == SDL_BUTTON_LEFT ? 0 : e->button.button == SDL_BUTTON_RIGHT ? 1
+                  : e->button.button == SDL_BUTTON_MIDDLE ? 2 : -1;
+        if (!test_input) {  /* a test's press is where its posted move put the pointer (above) */
+            mouse.px = e->button.x * density, mouse.py = e->button.y * density;
+            mouse_place();
+        }
+        if (index < 0) break;
+        if (e->button.down) mouse.state.buttons |= 1u << index, mouse.state.presses[index]++;
+        else mouse.state.buttons &= ~(1u << index);
+        break;
+    }
+    case SDL_EVENT_MOUSE_WHEEL: {
+        mouse.wheel += e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e->wheel.y : e->wheel.y;
+        int steps = (int)mouse.wheel;
+        mouse.state.wheel += steps;
+        mouse.wheel -= (float)steps;
+        break;
+    }
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:  /* test desktops: the motion before it is taken back */
+        if (test_input && !mouse.dropped) {  /* its motion got through: learn the point, take it back */
+            mouse.os_x = mouse.px / density, mouse.os_y = mouse.py / density;
+            mouse.px = mouse.before_x, mouse.py = mouse.before_y;
+            mouse_place();
+        }
+        MOUSE_UNLOCK();
+        return;
+
+    default:
+        MOUSE_UNLOCK();
+        return;
+    }
+    mouse.state.seen = 1;
+    mouse.moved = host_wall_seconds();
+    MOUSE_UNLOCK();
+#else
+    (void)event;
+#endif
+}
+
+/* SDL thread, every pass of its loop: the cursor shows for 3 s after the mouse was used, never
+   while a race is ridden (the game's controls in riding mode, D_0029E290). */
+void gs_cursor_tick(void)
+{
+#ifdef PRESENT_SDL
+    static int shown = -1;
+    if (!sdl_window) return;
+    int riding = *(volatile int32_t *)GUEST(0x0829E290) != 0;
+    MOUSE_LOCK();
+    int want = mouse.state.seen && !riding && host_wall_seconds() - mouse.moved < 3.0;
+    MOUSE_UNLOCK();
+    if (want == shown) return;
+    shown = want;
+    if (want) SDL_ShowCursor();
+    else SDL_HideCursor();
+#endif
+}
+
+void host_service_mouse_state(uint32_t out)
+{
+    MOUSE_LOCK();
+    *(HostMouse *)GUEST(out) = mouse.state;
+    MOUSE_UNLOCK();
+}
+
 /* DHD_BENCH=first-last times the wall clock between consecutive fields of that virtual-field
    window (run with DHD_FRAME_CLOCK=1 for an unpaced measurement) and prints one summary line
    at the last field; DHD_BENCH_EXIT=1 then ends the process. */
@@ -516,6 +753,12 @@ void gs_vsync(void)
     bench_vsync();
     gs_pump_messages();  /* first: the close button ends the game even with no renderer */
     if (disabled) return;
+#if defined(__ANDROID__) && defined(PRESENT_SDL)
+    if (app_background || surface_dropped) android_background();
+#endif
+#ifdef __ANDROID__
+    { void android_perf_field(void); android_perf_field(); }  /* port/host/android_perf.c: CPU clocks */
+#endif
     /* Plain MMIO pages are the authoritative privileged register storage. */
     for (unsigned addr = 0; addr <= 0xE0; addr += 16)
         gs_priv_write(&gs, addr, *(volatile uint64_t *)GUEST(0x12000000 + addr));
@@ -549,6 +792,8 @@ void gs_vsync(void)
         RECT client = {0};
         GetClientRect(window, &client);
         client_width = (unsigned)client.right; client_height = (unsigned)client.bottom;
+#else
+        gs_window_pixels(&client_width, &client_height);
 #endif
         double due, began;
         pacing_handed(&due, &began);

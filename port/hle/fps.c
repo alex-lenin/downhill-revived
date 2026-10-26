@@ -34,6 +34,9 @@ static double clock_interval(void)
             /* Retain late-frame debt even when this step hits the 1/60 cap.
                A later faster stretch repays it without an oversized step. */
             if (elapsed>=0 && isfinite(elapsed)) wall_error+=elapsed-nominal;
+            /* A stall (a hidden browser tab, a window drag) is not repaid in full: at most half
+               a second of game time is caught up, at up to one field per update. */
+            if (wall_error>30) wall_error=30;
             result=nominal+wall_error/8;
             if (result<nominal) result=nominal;
             if (result>1) result=1;
@@ -52,6 +55,17 @@ static uint64_t race_steps;  /* real race updates, for DHD_FPS_TRACE */
 static void reset_body_clocks(void);
 void port_fps_race_step(void) { race_steps++; }
 
+/* The highest selectable rate: 240, or DHD_FPS_MAX when lower (the browser keeps 144). At 240 an
+   update is 256 animation subticks (port_animation_step); keep the cap far below 1024. */
+int port_fps_max(void)
+{
+    static int most;
+    if (!most) {
+        const char *s = host_getenv("DHD_FPS_MAX");
+        most = s && atoi(s) >= 60 && atoi(s) < 240 ? atoi(s) : 240;
+    }
+    return most;
+}
 int port_fps(void)
 {
     if (!requested) {
@@ -62,7 +76,7 @@ int port_fps(void)
             if (!requested) requested = 60;
         }
         if (requested < 60) requested = 60;
-        if (requested > 144) requested = 144;
+        if (requested > port_fps_max()) requested = port_fps_max();
         hle_log("fps: requested %d real offline steps/s (online: 60)\n", requested);
     }
     return pads_online() ? 60 : requested;

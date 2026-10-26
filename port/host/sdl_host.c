@@ -22,6 +22,7 @@
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static SDL_AtomicInt started;      /* 1 once the thread was started */
 static SDL_AtomicInt up_ok;        /* 1 once SDL's events are up on the thread */
@@ -126,6 +127,13 @@ static void dispatch(const SDL_Event *e)
         keyboard_focus(0);
         text_input_clear();
         break;
+    case SDL_EVENT_MOUSE_MOTION:
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+    case SDL_EVENT_MOUSE_WHEEL:
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+        gs_mouse_event(e);  /* present.c: the pointer over the picture, for the menus */
+        break;
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
     case SDL_EVENT_QUIT:
@@ -171,14 +179,25 @@ static int sdl_thread(void *unused)
         return 0;
     }
     SDL_SetAtomicInt(&up_ok, 1);
+    /* DHD_TEST_INPUT=1 (test runs on a desktop that is never shown, whose window never gets the
+       focus): the keys sent to the window count, as if it had the keyboard. */
+    if (getenv("DHD_TEST_INPUT")) keyboard_focus(1);
     gamepad_thread_start();  /* the controllers: their own messages, logs and failures */
     SDL_SignalSemaphore(up);
     for (;;) {
         run_request();
         SDL_Event e;
+#ifdef __ANDROID__
+        /* SDL's Android wait wakes itself with each event it queues (a core spinning, measured on
+           a Mi 11i): the events so far, then a 4 ms sleep, the same cadence */
+        while (SDL_PollEvent(&e)) dispatch(&e);
+        SDL_Delay(4);
+#else
         /* wakes on any event; 4 ms at most, so the controllers' states and vibration are never late */
         for (int got = SDL_WaitEventTimeout(&e, 4); got; got = SDL_PollEvent(&e)) dispatch(&e);
+#endif
         gamepad_thread_update();
+        gs_cursor_tick();
     }
     return 0;
 }

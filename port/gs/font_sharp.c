@@ -14,7 +14,11 @@
    game's texture. The renderer makes the texture (replace_texture.h). */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
+#if defined(_WIN32) || defined(DHD_WEB_HOST)  /* the web build swaps windows.h for its lock stub */
 #include <windows.h>
+#else
+#include "../host/win32_compat.h"  /* SRWLOCK (the Android build) */
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

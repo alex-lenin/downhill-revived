@@ -1,4 +1,4 @@
-"""Deterministic high-rate race: prove a change leaves the 120/144 simulation unchanged.
+"""Deterministic high-rate race: prove a change leaves the 120..240 simulation unchanged.
 
     python port/tools/test_fps_race.py --exe OLD.exe --out build/fps-race/old
     python port/tools/test_fps_race.py --exe NEW.exe --out build/fps-race/new --reference build/fps-race/old
@@ -93,8 +93,8 @@ def main():
     out = args.out.resolve()
     if ROOT / 'build' not in out.parents and (not args.external_out or out == ROOT or ROOT in out.parents):
         ap.error('--out must be below build/, or outside the checkout with --external-out')
-    if not 60 <= args.rate <= 144:
-        ap.error('--rate must be 60..144')
+    if not 60 <= args.rate <= 240:
+        ap.error('--rate must be 60..240')
     if not os.environ.get('DHD_ISO'):
         ap.error('DHD_ISO must reference the local game image')
     if out.exists():

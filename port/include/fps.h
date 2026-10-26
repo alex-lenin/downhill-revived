@@ -6,6 +6,7 @@ extern "C" {
 /* Offline simulation clock (port/hle/fps.c, finding 067). 60 retains the original NTSC
    path and arithmetic; online always runs at 60. */
 int port_fps(void);
+int port_fps_max(void);  /* 240, or DHD_FPS_MAX when lower */
 int port_fps_high(void);
 void port_fps_wall_mode(int enabled);
 double port_frame_period(void);

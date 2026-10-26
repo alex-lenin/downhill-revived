@@ -274,6 +274,23 @@ void host_service_host_backtrace(void);
 int host_service_host_game_options_read(uint32_t a0, uint32_t a1);
 int host_service_host_skip_movies(void);
 int host_service_texpack_available(void);
+
+/* ---- the mouse, and touch later (menu_page.c, finding 092) ----
+   Where the pointer is over the game's picture, in its own units: x and y are fractions of the
+   picture as the player sees it (65536 = its whole width or height), whatever the window's size,
+   the bars beside the picture or the canvas's scale; outside the picture they are below 0 or
+   above 65536. The counters only grow (the module compares them with the last ones it saw), so a
+   click between two fields is never lost: moves, presses of the left, right and middle buttons,
+   wheel steps (away from the player positive). buttons: those held now (1 left, 2 right, 4
+   middle). seen: 1 once a mouse or a touch was used. A host without a mouse leaves it all 0. */
+typedef struct {
+    int32_t x, y;
+    uint32_t buttons, seen, moves;
+    uint32_t presses[3];
+    int32_t wheel;
+} HostMouse;  /* 36 bytes */
+void host_service_mouse_state(uint32_t out);
+
 void host_service_text_input_begin(void);
 void host_service_text_input_end(void);
 int host_service_text_input_edit(uint32_t a0, int a1, uint32_t a2);

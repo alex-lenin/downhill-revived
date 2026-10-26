@@ -271,7 +271,12 @@ int64_t host_file_read(HostFile h, void *dst, size_t size)
     FILE *f = file_of(h);
     size_t n;
     if (!f) return -1;
+    static int profile = -1;
+    if (profile < 0) profile = getenv("DHD_SPIKES") != NULL;
+    double start = profile ? host_wall_seconds() : 0;
     n = fread(dst, 1, size, f);
+    if (profile) fprintf(stderr, "spike_io: start=%.9f ms=%.6f bytes=%zu\n", start,
+                         (host_wall_seconds() - start) * 1e3, n);
     return n < size && ferror(f) ? -1 : (int64_t)n;
 }
 

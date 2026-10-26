@@ -10,11 +10,15 @@
    sets (DHD_*) is shown but can't be changed here. Nothing here writes game state: the page
    lives in host memory and the settings in dhd.ini, never in the memory card's save.
    A host that can do only some of the rows says which in DHD_PC_SETTINGS_ROWS, a comma list of
-   the rows' variables (the browser, port/web/www/settings.js: "DHD_WINDOW"); unset, every row is
-   shown. */
+   the rows' variables; unset, every row is shown. A host that applies more rows at once than the
+   ones marked live below lists their variables in DHD_PC_SETTINGS_LIVE (the row then sets its
+   variable at once and the host follows it), and DHD_PC_SETTINGS_RESTART replaces the footer of
+   a row that waits for the next start. The browser sets all three (port/web/www/settings.js);
+   x64 sets none of them, so its page is as described above. */
 #include "hle.h"
 #include "../runtime/portable.h"
 #include "menu_page.h"
+#include "../include/fps.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +36,6 @@ typedef struct {
     const Choice *choices;
     int count, live;
     int selected, running, opened;    /* choice indexes; -1: a value not in the list */
-    char text[64];
 } Row;
 
 /* Resolution: 1x up to what the renderer draws (DHD_SCALE_MAX, which the Rust native renderer sets:
@@ -52,10 +55,12 @@ static const Choice filters[] = {{"Smooth", "linear"}, {"Sharp", "point"}};
 static const Choice switches[] = {{"OFF", "0"}, {"ON", "1"}};
 static const Choice toggles[] = {{"OFF", "off"}, {"ON", "on"}};
 static const Choice fonts[] = {{"Original", "original"}, {"Sharp", "sharp"}};
-static const Choice rates[] = {{"60", "60"}, {"120", "120"}, {"144", "144"}, {"Monitor", "monitor"}};
+/* Frame Rate: the rates up to port_fps_max (240; the browser sets DHD_FPS_MAX 144), then Monitor. */
+static const Choice rates[] = {{"60", "60"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"240", "240"}};
+static Choice rate_list[sizeof rates / sizeof *rates + 1];
 
 #define CHOICES(c) c, (int)(sizeof c / sizeof *c)
-enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT };
+enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT, RATE };
 static Row rows[ROWS] = {
     {"Resolution:", "scale", "DHD_SCALE", "2", CHOICES(scales), 0},
     {"Display:", "window", "DHD_WINDOW", "windowed", CHOICES(displays), 1},
@@ -70,7 +75,6 @@ static Row rows[ROWS] = {
     {"Frame Rate:", "fps", "DHD_FPS", "60", CHOICES(rates), 0},
 };
 
-static MenuPage page;
 static int loaded;
 
 /* The lists that depend on this PC: the scales the renderer draws, the monitor's size. */
@@ -92,24 +96,36 @@ static void choices_build(void)
         if (!known) { size_list[size_count].text = size_list[size_count].value = monitor_size; size_count++; }
     }
     rows[SIZE].choices = size_list; rows[SIZE].count = size_count;
+    int rate_count = 0;
+    for (int i = 0; i < (int)(sizeof rates / sizeof *rates); i++)
+        if (atoi(rates[i].value) <= port_fps_max()) rate_list[rate_count++] = rates[i];
+    rate_list[rate_count].text = "Monitor"; rate_list[rate_count].value = "monitor";
+    rows[RATE].choices = rate_list; rows[RATE].count = rate_count + 1;
 }
 static char footer[64];
+static const char *restart_footer = "* Applies when the game starts again";
 static int shown[ROWS], shown_count;  /* the page's rows: indexes into rows[] */
 
-/* The rows the host can do (DHD_PC_SETTINGS_ROWS, else all). */
+/* Whether env is one of list's comma-separated names. */
+static int listed(const char *list, const char *env)
+{
+    size_t n = strlen(env);
+    for (const char *at = list; at && (at = strstr(at, env)); at += n)
+        if ((at == list || at[-1] == ',') && (at[n] == 0 || at[n] == ',')) return 1;
+    return 0;
+}
+
+/* The rows the host can do (DHD_PC_SETTINGS_ROWS, else all), the ones it applies at once besides
+   the live ones (DHD_PC_SETTINGS_LIVE) and its words for the others (DHD_PC_SETTINGS_RESTART). */
 static void choose_rows(void)
 {
-    const char *list = host_getenv("DHD_PC_SETTINGS_ROWS");
+    const char *list = host_getenv("DHD_PC_SETTINGS_ROWS"), *live = host_getenv("DHD_PC_SETTINGS_LIVE");
+    const char *restart = host_getenv("DHD_PC_SETTINGS_RESTART");
+    if (restart && *restart) restart_footer = restart;
     shown_count = 0;
     for (int i = 0; i < ROWS; i++) {
-        const char *at = list, *env = rows[i].env;
-        size_t n = strlen(env);
-        int found = !list;
-        while (at && !found && (at = strstr(at, env))) {
-            found = (at == list || at[-1] == ',') && (at[n] == 0 || at[n] == ',');
-            at += n;
-        }
-        if (found) shown[shown_count++] = i;
+        if (!list || listed(list, rows[i].env)) shown[shown_count++] = i;
+        if (live && listed(live, rows[i].env)) rows[i].live = 1;
     }
 }
 
@@ -146,13 +162,21 @@ static int locked(const Row *r)
     return host_service_host_setting_locked(GADDR(r->env)) || (r == &rows[SIZE] && host_service_host_setting_locked(GADDR("DHD_WINDOW_HEIGHT")));
 }
 
+static MenuPage page;
+
+/* A row on the page: "Label:  < Value >", "*" after it while it waits for the next start; no
+   arrows when the environment sets it. */
 static void format(Row *r)
 {
-    char value[32];
+    char value[40];
+    int index = -1;
+    for (int i = 0; i < shown_count; i++)
+        if (&rows[shown[i]] == r) index = i;
+    if (index < 0) return;
     if (r->selected >= 0) snprintf(value, sizeof value, "%s", r->choices[r->selected].text);
     else current(r, value, sizeof value);
-    /* the game's own layout: the label padded, two tabs, the value ("Music Volume: \t\t1024") */
-    snprintf(r->text, sizeof r->text, "%-14s\t\t%s%s", r->label, value, r->selected != r->running ? " *" : "");
+    if (r->selected != r->running) strncat(value, " *", sizeof value - strlen(value) - 1);
+    menu_page_value_set(&page, index, r->label, value, !locked(r));
 }
 
 /* Saves the row's choice and, for a live row, applies it. */
@@ -201,8 +225,8 @@ static void change(int index, int step)
 static void page_build(MenuPage *p)
 {
     for (int i = 0; i < shown_count; i++) {
+        menu_page_value(p, rows[shown[i]].label, "", 1);
         format(&rows[shown[i]]);
-        menu_page_row(p, rows[shown[i]].text, 1);
     }
 }
 
@@ -213,7 +237,7 @@ static void page_update(MenuPage *p, int cursor)  /* the footer for the row */
     if (r && locked(r)) {
         snprintf(footer, sizeof footer, "Set by %s outside the game", r == &rows[SIZE] ? "DHD_WINDOW_WIDTH" : r->env);
         p->footer = footer;
-    } else if (r && r->selected != r->running) p->footer = "* Applies when the game starts again";
+    } else if (r && r->selected != r->running) p->footer = restart_footer;
     else if (r == &rows[TEXTURES] && !host_service_texpack_available()) p->footer = "No pack: see texture_pack in dhd.ini";
 }
 

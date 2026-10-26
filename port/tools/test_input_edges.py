@@ -9,7 +9,7 @@ subprocess.run(['clang','--target=i686-pc-windows-msvc','-O2','-w','-ffunction-s
     '-I',str(ROOT/'port/runtime'),str(ROOT/'port/hle/pad.c'),str(ROOT/'port/hle/test_input_edges.c'),
     str(out/'obj/unsorted/001909A8.c.o'),str(out/'obj/unsorted/00220640.c.o'),str(out/'obj/unsorted/0017EB00.c.o'),
     '-Wl,/opt:ref','-o',str(out/'test.exe')],check=True)
-for rate in (60,61,75,90,100,120,144):
+for rate in (60,61,75,90,100,120,144,165,240):
     subprocess.run([str(out/'test.exe'),str(rate)],check=True)
     if rate>60:
         subprocess.run([str(out/'test.exe'),str(rate),'variable'],check=True)

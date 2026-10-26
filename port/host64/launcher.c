@@ -2,7 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
-#include <execinfo.h>
+#include "../host/backtrace_posix.h"  /* <execinfo.h>, or Android's own (API < 33) */
 #include <unistd.h>
 #endif
 #include <stdio.h>

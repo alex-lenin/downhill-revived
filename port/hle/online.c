@@ -183,7 +183,7 @@ static uint64_t state_hash(int whole)
     return host_service_net_hash_ranges(GADDR(&r), 1);
 }
 
-/* The state that decides the race, which online PCs compare every NET_HASH_PERIOD fields: the
+/* The state that decides the race, hashed every NET_HASH_PERIOD fields for DHD_HASH_LOG: the
    rider world D_002AF2C0 (10 riders, the AI and human controllers), the four random generators
    (libc rand's state behind D_0028191C, the twister D_00663140, the particle and weather LCGs,
    D_0029E2C0), the menu, race phase and race clock, and the pads as the game read them. The rest
@@ -1236,11 +1236,17 @@ void pads_read(int player, HostPad *out)
            player too. The boot script may already be spent after an earlier race. */
         int race = EE32(MENU) == LOAD_MENU && on.setup_done;
         if (player == 0 && race && (rematch_pad(out) || follow_pad(out))) {
-        } else if (player == 0 && race && !hle_env(&scripted_env, "DHD_NET_SCRIPTED")) host_service_host_pad_device(0, GADDR(out)), guest_pad(out);
+        } else if (player == 0 && race && !hle_env(&scripted_env, "DHD_NET_SCRIPTED")) {
+            host_service_host_pad_device(0, GADDR(out));
+            menu_mouse_merge(0, out);  /* the pause menu by mouse, under the same rules */
+            guest_pad(out);
+        }
         else if (!on.released || !host_pad_script(player, out)) neutral(out);
         for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;
         return;
     }
-    if (!host_pad_script(player, out))
+    if (!host_pad_script(player, out)) {
         host_service_host_pad_device(player, GADDR(out));
+        menu_mouse_merge(player, out);
+    }
 }
