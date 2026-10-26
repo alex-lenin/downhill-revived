@@ -7,10 +7,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(ROOT, 'build', 'port', 'net')
 FLAGS = '-m32 /nologo /O2 /W4 -Wno-deprecated-declarations /D_CRT_SECURE_NO_WARNINGS'
-CORE = ['lockstep.c', 'hash.c']
-CLIENT = CORE + ['json.c', 'client.c']
+CLIENT = ['hash.c', 'json.c', 'client.c']
 PROGRAMS = {  # name: (sources, libraries, run in the tests)
-    'test_lockstep': (CORE + ['test_lockstep.c'], '', True),
+    'test_hash': (['hash.c', 'test_hash.c'], '', True),
     'test_json': (['json.c', 'test_json.c'], '', True),
     'test_loopback': (CLIENT + ['test_loopback.c'], 'winmm.lib', True),
     'nettool': (CLIENT + ['ws_winhttp.c', 'net.c', 'nettool.c'], 'winhttp.lib winmm.lib', False),

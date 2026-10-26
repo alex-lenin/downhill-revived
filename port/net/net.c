@@ -194,25 +194,9 @@ int net_local_slot(void)
     return client.lobby.local_slot;
 }
 
-void net_submit_local(uint32_t field, const NetInput *in)
-{
-    client_submit_local(&client, field, in);
-}
 
-int net_inputs_for_field(uint32_t field, NetPad out[NET_MAX_SLOTS], unsigned timeout_ms)
-{
-    return inited ? client_inputs_for_field(&client, field, out, timeout_ms) : NET_ERROR;
-}
 
-uint32_t net_waiting_for(void)
-{
-    return inited ? client_waiting(&client) : 0;
-}
 
-void net_submit_hash(uint32_t field, uint64_t hash)
-{
-    client_submit_hash(&client, field, hash);
-}
 
 int net_send_frame(int type, const void *payload, size_t n)
 {
@@ -224,10 +208,6 @@ int net_receive_frame(uint8_t *out, size_t max)
     return inited ? client_receive_frame(&client, out, max) : 0;
 }
 
-int net_desync(uint32_t *field, uint32_t *slots)
-{
-    return inited && client_desync(&client, field, slots);
-}
 
 /* Guest-address-only module boundary; native device code stays above. */
 #include "../host/host_api.h"

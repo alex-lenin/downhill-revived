@@ -1,18 +1,14 @@
 // One lobby and its race. Lobby control is JSON; the race is binary frames relayed to the other
 // racers with no game logic. Protocol: docs/online-protocol.md.
 import { DurableObject } from "cloudflare:workers";
-import { DesyncTracker } from "./desync";
 import { LISTING_REFRESH_MS, type LobbyEntry } from "./lobbies";
 import {
   CLOSE_CODES,
   DEFAULT_MAX_PLAYERS,
-  FRAME_HASH,
-  FRAME_INPUT,
   FRAME_PING,
   FRAME_PONG,
   FRAME_STATE,
   FRAME_EVENT,
-  HASH_FRAME_BYTES,
   HELLO_TIMEOUT_MS,
   OUTDATED_MESSAGE,
   MAX_BINARY_BYTES,
@@ -25,22 +21,16 @@ import {
   START_LEAD_MS,
   type ErrorCode,
   clientVersionOf,
-  inputFrameLastField,
   isOutdated,
   isByte,
   isU32,
   measuredRtt,
   minVersionOf,
   randomSeed,
-  readU32,
-  readU64Hex,
-  suggestedInputDelay,
 } from "./protocol";
 
 /** A claimed room nobody joined is dropped after this long. */
 const UNUSED_ROOM_MS = 60_000;
-/** lastField value after a wake-up: what was relayed before is not known. */
-const UNKNOWN_FIELD = -2;
 
 interface Member {
   id: number;
@@ -58,7 +48,6 @@ interface Race {
   track: number;
   laps: number;
   seed: number;
-  inputDelay: number;
   startAt: number;
 }
 
@@ -112,8 +101,6 @@ export class Room extends DurableObject<Env> {
   // Race relay state, rebuilt from `state.race` after a wake-up.
   private raceSockets: (WebSocket | null)[] = [];
   private slotOf = new Map<WebSocket, number>();
-  private lastField: number[] = [];
-  private desync: DesyncTracker | null = null;
 
   private listedKey: string | null = null;
   private listedAt = 0;
@@ -127,7 +114,7 @@ export class Room extends DurableObject<Env> {
         if (info?.memberId != null) this.sockets.set(info.memberId, ws);
       }
       // After a wake-up mid-race the last relayed fields are unknown (see leave()).
-      this.rebuildRace(UNKNOWN_FIELD);
+      this.rebuildRace();
     });
   }
 
@@ -321,27 +308,6 @@ export class Room extends DurableObject<Env> {
         }
         return;
       }
-      case FRAME_INPUT: {
-        const last = inputFrameLastField(b);
-        if (last < 0) return;
-        if (last > this.lastField[slot] || this.lastField[slot] === UNKNOWN_FIELD) this.lastField[slot] = last;
-        const socks = this.raceSockets;
-        for (let i = 0; i < socks.length; i++) {
-          const s = socks[i];
-          if (s !== null && s !== ws) {
-            try {
-              s.send(data);
-            } catch {}
-          }
-        }
-        return;
-      }
-      case FRAME_HASH: {
-        if (n !== HASH_FRAME_BYTES || !this.desync) return;
-        const d = this.desync.add(slot, readU32(b, 2), readU64Hex(b, 6));
-        if (d) this.broadcast({ type: "desync", ...d });
-        return;
-      }
       case FRAME_PING:
         if (n > 2 + PING_MAX_PAYLOAD) return;
         b[0] = FRAME_PONG;
@@ -363,13 +329,11 @@ export class Room extends DurableObject<Env> {
     return slot;
   }
 
-  private rebuildRace(lastField = -1): void {
+  private rebuildRace(): void {
     const race = this.state?.race;
     this.slotOf.clear();
     if (!race) {
       this.raceSockets = [];
-      this.lastField = [];
-      this.desync = null;
       return;
     }
     this.raceSockets = race.slots.map((id, slot) => {
@@ -377,8 +341,6 @@ export class Room extends DurableObject<Env> {
       if (ws) this.slotOf.set(ws, slot);
       return ws;
     });
-    this.lastField = race.slots.map(() => lastField);
-    this.desync = new DesyncTracker(race.slots.map((_, s) => s).filter((s) => !race.left.includes(s)));
   }
 
   // ---- Lobby ----
@@ -501,7 +463,6 @@ export class Room extends DurableObject<Env> {
       track: st.track,
       laps: st.laps,
       seed: st.seed ?? randomSeed(),
-      inputDelay: this.inputDelay(),
       startAt: now + START_LEAD_MS,
     };
     this.rebuildRace();
@@ -519,7 +480,6 @@ export class Room extends DurableObject<Env> {
           track: race.track,
           laps: race.laps,
           seed: race.seed,
-          inputDelay: race.inputDelay,
           players,
           serverTime: now,
           startAt: race.startAt,
@@ -534,7 +494,7 @@ export class Room extends DurableObject<Env> {
     if (info?.memberId != null) await this.leave(info.memberId, "disconnect");
   }
 
-  /** Removes a member (idempotent). A racer's rider goes to AI from one past its last relayed field. */
+  /** Removes a member (idempotent). A racer's rider goes to the host's AI (the game decides). */
   private async leave(memberId: number, reason: "disconnect" | "leave" | "kicked"): Promise<void> {
     const st = this.state;
     if (!st) return;
@@ -556,10 +516,7 @@ export class Room extends DurableObject<Env> {
       if (slot >= 0 && !race.left.includes(slot)) {
         race.left.push(slot);
         this.raceSockets[slot] = null;
-        this.desync?.remove(slot);
-        const last = this.lastField[slot] ?? UNKNOWN_FIELD;
-        const fromField = last === UNKNOWN_FIELD ? null : last + 1;
-        this.broadcast({ type: "left", slot, memberId, fromField, reason });
+        this.broadcast({ type: "left", slot, memberId, reason });
       }
     }
     if (st.hostId === memberId) st.hostId = st.members[0]?.id ?? null;
@@ -578,11 +535,6 @@ export class Room extends DurableObject<Env> {
   }
 
   // ---- Helpers ----
-
-  private inputDelay(): number {
-    const st = this.state!;
-    return suggestedInputDelay(st.members.map((x) => this.rttOf(x.id) ?? 0));
-  }
 
   private rttOf(memberId: number): number | null {
     return measuredRtt(this.firstRtts.get(memberId) ?? null, this.rtts.get(memberId) ?? []);
@@ -610,7 +562,6 @@ export class Room extends DurableObject<Env> {
       version: st.version,
       settings: { track: st.track, laps: st.laps, seed: st.seed },
       members: st.members.map((x) => ({ ...x, rttMs: this.rttOf(x.id) })),
-      inputDelay: st.race?.inputDelay ?? this.inputDelay(),
     };
   }
 

@@ -250,7 +250,7 @@ def main():
     os.environ.update(TMP=str(OUT), TEMP=str(OUT), TMPDIR=str(OUT))
     sources = [harness, ROOT / 'port/host/host_win32.c', ROOT / 'port/runtime/sha256.c',
                ROOT / 'port/net/net.c', ROOT / 'port/net/client.c', ROOT / 'port/net/json.c',
-               ROOT / 'port/net/hash.c', ROOT / 'port/net/lockstep.c',
+               ROOT / 'port/net/hash.c',
                ROOT / 'port/net/ws_winhttp.c']
     cmd = ['clang', '--target=' + TARGET, '-O1', '-w',
            '-I' + str(ROOT / 'port' / 'include'), '-I' + str(ROOT / 'port' / 'runtime'),

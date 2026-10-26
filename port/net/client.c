@@ -1,8 +1,7 @@
-/* One online player (client.h): docs/online-protocol.md's lobby messages, the race frames and
-   pings, around the lockstep core. */
+/* One online player (client.h): docs/online-protocol.md's lobby messages, the race's relayed
+   frames and pings. */
 #include "client.h"
 
-#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +11,7 @@
 #include "../include/version.h"
 #include "../host/host_api.h"
 
-enum { PING_LOBBY_MS = 1000, PING_RACE_MS = 500, RESEND_MS = 100, SILENT_MS = 10000 };
+enum { PING_LOBBY_MS = 1000, PING_RACE_MS = 500, SILENT_MS = 10000 };
 
 double net_now_ms(void)
 {
@@ -122,8 +121,6 @@ static void read_room(NetClient *c, const char *t)
     if (json_int(t, "settings.laps", &v))
         l->laps = (int)v;
     l->seed = json_int(t, "settings.seed", &v) ? v : -1;
-    if (json_int(t, "inputDelay", &v))
-        l->input_delay = (int)v;
     n = json_count(t, "members");
     l->nmembers = n < 0 ? 0 : n > NET_MAX_SLOTS ? NET_MAX_SLOTS : n;
     for (i = 0; i < l->nmembers; i++) {
@@ -156,8 +153,6 @@ static void read_start(NetClient *c, const char *t)
     l->race_track = json_int(t, "track", &v) ? (int)v : 0;
     l->race_laps = json_int(t, "laps", &v) ? (int)v : 0;
     l->race_seed = json_int(t, "seed", &v) ? (uint32_t)v : 0;
-    if (json_int(t, "inputDelay", &v))
-        l->input_delay = (int)v;
     memset(l->racer, 0, sizeof l->racer);
     n = json_count(t, "players");
     for (i = 0; i < n; i++) {
@@ -183,47 +178,17 @@ static void read_start(NetClient *c, const char *t)
             nslots = slot + 1;
     }
     l->nslots = nslots;
-    /* field 0's time on our clock */
+    /* the start's time on our clock */
     if (json_number(t, "startAt", &start_at)) {
         if (!c->have_offset && json_number(t, "serverTime", &server_time))
             c->clock_offset = server_time - net_now_ms();
         l->start_at = (start_at - c->clock_offset) / 1000.0;
     } else
         l->start_at = net_now_ms() / 1000.0;
-    ls_init(&c->ls, nslots, l->local_slot, l->input_delay);  /* every slot a racer */
-    ls_start(&c->ls);
     c->racing = 1;
-    c->waiting = 0;
-    c->stall_since = 0;
-    c->desynced = 0;
-    memset(c->sent_hash_field, 0xFF, sizeof c->sent_hash_field);
     l->offline = 0;
     l->started = 1;
     l->state = NET_RACING;
-}
-
-static void read_desync(NetClient *c, const char *t)
-{
-    long long field;
-    uint32_t slots = 0;
-    char ours[20] = "", hash[20], path[32];
-    int s, at;
-    if (!json_int(t, "field", &field))
-        return;
-    at = (int)((uint32_t)field / NET_HASH_PERIOD % LS_HASHES);
-    if (c->sent_hash_field[at] == (uint32_t)field)
-        snprintf(ours, sizeof ours, "%016llx", (unsigned long long)c->sent_hash[at]);
-    for (s = 0; s < NET_MAX_SLOTS; s++) {
-        snprintf(path, sizeof path, "hashes.%d", s);
-        if (json_string(t, path, hash, sizeof hash) && s != c->lobby.local_slot &&
-            (!ours[0] || _stricmp(hash, ours)))
-            slots |= 1u << s;
-    }
-    if (!c->desynced || (uint32_t)field < c->desync_field) {
-        c->desynced = 1;
-        c->desync_field = (uint32_t)field;
-        c->desync_slots = slots;
-    }
 }
 
 static void add_rtt(NetClient *c, double rtt)
@@ -288,16 +253,7 @@ void client_on_text(NetClient *c, const char *text, size_t n)
         read_start(c, text);
         changed(c);
     } else if (!strcmp(type, "left") && json_int(text, "slot", &v) && v >= 0 && v < NET_MAX_SLOTS) {
-        long long from;
-        if (!json_int(text, "fromField", &from))  /* null: the room was evicted mid-race */
-            from = c->racing ? ls_after_last_received(&c->ls, (int)v) : 0;
-        if (c->racing)
-            ls_slot_ai_from(&c->ls, (int)v, (uint32_t)from);
         c->lobby.racer[v].left = 1;
-        c->lobby.racer[v].left_field = (uint32_t)from;
-        changed(c);
-    } else if (!strcmp(type, "desync")) {
-        read_desync(c, text);
         changed(c);
     } else if (!strcmp(type, "ended")) {
         c->racing = 0;
@@ -317,7 +273,7 @@ void client_on_binary(NetClient *c, const uint8_t *data, size_t n)
 {
     EnterCriticalSection(&c->lock);
     c->last_rx = net_now_ms();
-    if (n >= 2 + sizeof(double) && data[0] == LS_MSG_PONG) {
+    if (n >= 2 + sizeof(double) && data[0] == NET_FRAME_PONG) {
         double sent;
         memcpy(&sent, data + 2, sizeof sent);
         add_rtt(c, net_now_ms() - sent);
@@ -329,10 +285,6 @@ void client_on_binary(NetClient *c, const uint8_t *data, size_t n)
             c->relayed_count++;
         memcpy(c->relayed[at], data, n);
         c->relayed_size[at] = (uint16_t)n;
-    } else if (c->racing) {
-        LsEvent ev = ls_receive(&c->ls, data, n);
-        if (ev.fresh)
-            WakeAllConditionVariable(&c->changed);
     }
     LeaveCriticalSection(&c->lock);
 }
@@ -343,12 +295,8 @@ int client_on_closed(NetClient *c, int code, const char *reason)
     EnterCriticalSection(&c->lock);
     c->connected = 0;
     if (c->racing) {
-        /* No reconnect during a race (protocol 1): the others hand our rider to the AI, and
-           here everyone else becomes the AI from the first field we lack, so the race goes on. */
-        int s;
-        for (s = 0; s < c->ls.nslots; s++)
-            if (s != c->ls.local)
-                ls_slot_ai_from(&c->ls, s, (uint32_t)(ls_have_through(&c->ls, s) + 1));
+        /* No reconnect during a race (protocol 1): the others hand our rider to the host's AI,
+           and here the race goes on without them (online.c). */
         c->lobby.offline = 1;
         c->lobby.state = NET_FAILED;
     } else if (c->leaving)
@@ -376,7 +324,7 @@ int client_tick(NetClient *c)
     if (c->connected) {
         if (now >= c->next_ping) {
             if (c->racing) {
-                uint8_t ping[2 + sizeof(double)] = {LS_MSG_PING, (uint8_t)c->ls.local};
+                uint8_t ping[2 + sizeof(double)] = {NET_FRAME_PING, (uint8_t)c->lobby.local_slot};
                 memcpy(ping + 2, &now, sizeof now);
                 send_binary(c, ping, sizeof ping);
                 c->next_ping = now + PING_RACE_MS;
@@ -385,12 +333,6 @@ int client_tick(NetClient *c)
                     say(c, "{\"type\":\"ping\",\"t\":%.3f}", now);
                 c->next_ping = now + PING_LOBBY_MS;
             }
-        }
-        if (c->racing && c->stall_since && now - c->stall_since > RESEND_MS &&
-            now - c->last_resend > RESEND_MS) {
-            uint8_t frame[LS_MAX_FRAME];
-            send_binary(c, frame, ls_encode_resend(&c->ls, frame, sizeof frame));
-            c->last_resend = now;
         }
         dead = now - c->last_rx > SILENT_MS;
     }
@@ -478,71 +420,6 @@ void client_lobby(NetClient *c, NetLobby *out)
     LeaveCriticalSection(&c->lock);
 }
 
-void client_submit_local(NetClient *c, uint32_t field, const NetInput *in)
-{
-    EnterCriticalSection(&c->lock);
-    if (c->racing && ls_submit_local(&c->ls, field, in) > 0) {
-        uint8_t frame[LS_MAX_FRAME];
-        send_binary(c, frame, ls_encode_recent(&c->ls, frame, sizeof frame));
-    }
-    LeaveCriticalSection(&c->lock);
-}
-
-int client_inputs_for_field(NetClient *c, uint32_t field, NetPad out[NET_MAX_SLOTS], unsigned timeout_ms)
-{
-    double deadline = net_now_ms() + timeout_ms;
-    int result;
-    EnterCriticalSection(&c->lock);
-    for (;;) {
-        double now = net_now_ms();
-        if (!c->racing) {
-            result = NET_ERROR;
-            break;
-        }
-        if (ls_take(&c->ls, field, out) == 0) {
-            c->waiting = 0;
-            c->stall_since = 0;
-            result = NET_OK;
-            break;
-        }
-        c->waiting = ls_missing(&c->ls, field);
-        if (!c->stall_since)
-            c->stall_since = now;
-        if (now >= deadline) {
-            result = NET_WAIT;
-            break;
-        }
-        SleepConditionVariableCS(&c->changed, &c->lock, (DWORD)ceil(deadline - now));
-    }
-    LeaveCriticalSection(&c->lock);
-    return result;
-}
-
-uint32_t client_waiting(NetClient *c)
-{
-    uint32_t mask;
-    EnterCriticalSection(&c->lock);
-    mask = c->waiting;
-    LeaveCriticalSection(&c->lock);
-    return mask;
-}
-
-void client_submit_hash(NetClient *c, uint32_t field, uint64_t hash)
-{
-    EnterCriticalSection(&c->lock);
-    if (c->racing) {
-        ls_local_hash(&c->ls, field, hash);
-        if (net_hash_due(field)) {
-            uint8_t frame[LS_HASH_SIZE];
-            int at = (int)(field / NET_HASH_PERIOD % LS_HASHES);
-            c->sent_hash[at] = hash;
-            c->sent_hash_field[at] = field;
-            send_binary(c, frame, ls_encode_hash(c->ls.local, field, hash, frame));
-        }
-    }
-    LeaveCriticalSection(&c->lock);
-}
-
 int client_send_frame(NetClient *c, int type, const void *payload, size_t n)
 {
     uint8_t frame[NET_FRAME_MAX];
@@ -573,17 +450,4 @@ int client_receive_frame(NetClient *c, uint8_t *out, size_t max)
     }
     LeaveCriticalSection(&c->lock);
     return n;
-}
-
-int client_desync(NetClient *c, uint32_t *field, uint32_t *slots)
-{
-    int d;
-    EnterCriticalSection(&c->lock);
-    d = c->desynced || c->ls.desynced;
-    if (c->desynced)
-        *field = c->desync_field, *slots = c->desync_slots;
-    else if (c->ls.desynced)  /* found here: only when the hashes travel peer to peer */
-        *field = c->ls.desync_field, *slots = c->ls.desync_slots;
-    LeaveCriticalSection(&c->lock);
-    return d;
 }

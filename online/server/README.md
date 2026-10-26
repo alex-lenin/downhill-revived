@@ -1,6 +1,6 @@
 # Online server
 
-Lobbies, join codes and the lockstep input relay for the PC port's online races. Cloudflare
+Lobbies, join codes and the race relay for the PC port's online races. Cloudflare
 Workers + Durable Objects, TypeScript. The wire protocol is `docs/online-protocol.md`; the plan
 is `docs/ONLINE-PLAN.md`.
 
@@ -9,10 +9,9 @@ is `docs/ONLINE-PLAN.md`.
 | `src/index.ts` | Worker entry: routes `/v1/lobbies`, `/v1/health` and room WebSockets. |
 | `src/room.ts` | `Room` Durable Object, one per join code: lobby, start, race relay, leave handling. |
 | `src/lobbies.ts` | `LobbyIndex` Durable Object (a single global one): the public lobby list. |
-| `src/desync.ts` | Compares the per-field state hashes racers send. |
-| `src/protocol.ts` | Constants, join codes, input-delay formula, frame parsing. |
+| `src/protocol.ts` | Constants, join codes, the version gate. |
 | `test/` | Vitest suite, run inside the Workers runtime (`@cloudflare/vitest-plugin`). |
-| `tools/loadtest.mjs` | Simulated lockstep race against a running server; reports relay latency. |
+| `tools/loadtest.mjs` | Simulated race (STATE frames, 20 a second per player) against a running server; reports relay latency. |
 
 Rooms use the WebSocket hibernation API, so an idle lobby costs little. The relay path does
 no awaits and no copies: it fixes the slot byte and sends the received buffer to the other
@@ -28,17 +27,15 @@ npm install
 npm test                 # unit + integration tests (workerd, no network)
 npm run typecheck        # generates src/worker-configuration.d.ts, then tsc
 npm run dev              # local server on http://127.0.0.1:8787
-npm run loadtest         # in a second terminal: 4 players, 600 fields
-node tools/loadtest.mjs --players 8 --fields 300
-node tools/loadtest.mjs --desync     # last player's hash differs from field 299: expects one desync event
+npm run loadtest         # in a second terminal: 4 players, 10 s
+node tools/loadtest.mjs --players 8 --seconds 30 --bytes 3000
 node tools/loadtest.mjs --url wss://dhd-online.<account>.workers.dev   # against a deployment
 ```
 
-Measured on 2026-10-16 with `wrangler dev` on the dev PC (4 players, 600 fields at 59.94 Hz,
-3 fields per frame): all 1,800 inputs per player arrived intact, no field waited for input,
-relay one-way (sender → server → receiver) median 2.5 ms, p99 9 ms; binary PING round-trip
-median 4.3 ms. These are local numbers: on the internet add the players' own round-trips to
-the nearest Cloudflare location.
+Measured with `wrangler dev` on the dev PC (4 players, 4 s, 600-byte STATE frames): every
+frame arrived whole and in order, relay one-way (sender → server → receiver) median 2.2 ms,
+p99 4.7 ms; binary PING round-trip median 3.8 ms. These are local numbers: on the internet add
+the players' own round-trips to the nearest Cloudflare location.
 
 ## Deploy
 
@@ -82,7 +79,7 @@ removing a class later needs a new migration entry, not an edit of `v1`.
 
 ## Limits and what is not there yet
 
-- No reconnect: a dropped racer becomes AI for the rest of the race.
+- No reconnect: a dropped racer becomes the host's AI rider for the rest of the race.
 - No authentication or rate limiting beyond the protocol checks (version, ISO hash, sizes).
 - The server does not check the ISO hash against the known US ISO; the client must refuse
   other regions, and the server only makes everyone match the host.

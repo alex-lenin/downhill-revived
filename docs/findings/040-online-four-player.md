@@ -1,5 +1,8 @@
 # Online four-player race: what the game already does, and what the port must add
 
+**Superseded:** the lockstep split-screen plan below was dropped on 2026-10-16; races use state
+sync, one-player races with puppet riders (findings 041, 044).
+
 Status: research only (2026-10-16). Nothing here was run: another worker was benchmarking on
 this PC. Every claim cites the US (SCUS_971.77) code; experiments that need a run are written
 out in "Experiments for the game-side worker". Plan: `docs/ONLINE-PLAN.md`.
@@ -413,5 +416,6 @@ Use `build/` for dumps (game data). All runs: `DHD_RENDER=native`, `DHD_RACE_SEE
 - ps2sdk `ee/rpc/multitap/src/libmtap.c` (server ids 0x80000901-0x80000903, function 1, port in
   send word 0, result in reply word 1). ps2sdk `ee/rpc/pad` for the padman protocol (as in
   finding 020).
-- The rider stride 0x7BD0 and type byte +0x7A5C (1 human / 3 AI), confirmed here on US code.
+- Pedroj-64/DownHill-Port-PC `docs/p2s-savestates.md` (PAL rider stride 0x7BD0 and type byte
+  +0x7A5C, 1 human / 3 AI), via the project's research notes; confirmed here on US code.
 - The game's manual (multitap on port 1 for 3-4 players).

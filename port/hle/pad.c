@@ -6,7 +6,8 @@
    layouts as Sony's libpad uses them (ps2sdk's ee/rpc/pad documents the same protocol).
    Every pad is a DualShock 2. One pad is port 0 slot 0; two are ports 0 and 1; three or four
    sit in a multitap on port 0, slots 0-3 (DHD_PADS, 4 online; finding 040). Player i's input
-   comes from online.c's pads_read: the host's controller, a script, or the online lockstep. */
+   comes from online.c's pads_read: the host's controller or a script (online too: the race is
+   this PC's own, the others' riders are puppets). */
 #include "hle.h"
 #include "../include/fps.h"
 
@@ -115,6 +116,7 @@ static int connected(int port, int slot)
 void pad_vsync(void)
 {
     int port, slot;
+    menu_mouse_field();  /* the mouse in the menus: the presses it makes this field */
     pads_begin_field();
     for (port = 0; port < 2; port++)
         for (slot = 0; slot < 4; slot++) {
@@ -151,6 +153,7 @@ void pad_refresh(void)
             PadFrame *f = p->area[0].frame > p->area[1].frame ? &p->area[0] : &p->area[1];
             HostPad in;
             host_service_host_pad_device(player_of(port, slot), GADDR(&in));
+            menu_mouse_merge(player_of(port, slot), &in);
             f->data[2] = (uint8_t)~in.buttons;
             f->data[3] = (uint8_t)(~in.buttons >> 8);
             if (f->length >= 8)

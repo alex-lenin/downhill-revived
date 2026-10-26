@@ -1,8 +1,9 @@
 /* Four players in one process: client.c over a fake transport, through a fake relay that does
    what online/server does (docs/online-protocol.md): welcome and room snapshots, slots at start,
-   INPUT relayed with the slot byte overwritten, PING answered, HASH compared, left with
-   fromField. Each player has its own one-way latency; delivery keeps each socket's order.
-   Each player's game thread runs a toy race whose state depends on every pad of every field. */
+   STATE and EVENT relayed with the slot byte overwritten, PING answered, left when a socket
+   closes. Each player has its own one-way latency; delivery keeps each socket's order. Each
+   player's game thread sends numbered STATE frames for a while, as online.c does about 20 times
+   a second, and checks that every other player's frames arrive whole and in order. */
 #include "client.h"
 #include "json.h"
 
@@ -15,7 +16,7 @@
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("%s:%d: CHECK(%s) failed\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
-enum { PLAYERS = 4, FIELDS = 600 };
+enum { PLAYERS = 4, RACE_MS = 3000, FRAME_MS = 50 };
 
 typedef struct Msg { struct Msg *next; double due; int binary; size_t n; char data[]; } Msg;
 
@@ -28,20 +29,14 @@ typedef struct {
     double last_due;
     HANDLE thread, game;
     volatile LONG stop;
-    /* the toy race */
-    int start_late_ms, drop_at, corrupt_from;
-    uint32_t played;
-    uint64_t state;
-    uint32_t saw_waiting;
-    int pad_kinds[PLAYERS];
+    /* the race */
+    int drop_at_ms;
+    int sent, got[PLAYERS], out_of_order;
 } Player;
 
 static Player players[PLAYERS];
 static CRITICAL_SECTION relay;
-static int next_member, host_member, started, null_from_field, race_delay;
-static int64_t last_field[PLAYERS];
-static struct { uint32_t field; uint8_t have; uint64_t hash[PLAYERS]; } hashes[64];
-static int64_t reported_desync = -1;
+static int next_member, host_member, started;
 
 static void deliver(Player *to, const Player *from, int binary, const void *data, size_t n)
 {
@@ -82,27 +77,22 @@ static void send_room(void)
                           players[i].latency_ms * 2);
             first = 0;
         }
-    snprintf(text + n, sizeof text - n, "],\"inputDelay\":3}");
+    snprintf(text + n, sizeof text - n, "]}");
     for (i = 0; i < PLAYERS; i++)
         text_to(&players[i], &players[i], text);
 }
 
 static void start_race(void)
 {
-    float rtt[PLAYERS];
     char text[2048];
-    int i, slot = 0, delay;
+    int i, slot = 0;
     double now = (double)time(NULL) * 1000;
-    for (i = 0; i < PLAYERS; i++) {
-        rtt[i] = (float)players[i].latency_ms * 2;
+    for (i = 0; i < PLAYERS; i++)
         players[i].slot = slot++;
-        last_field[players[i].slot] = -1;
-    }
-    delay = race_delay = ls_auto_delay(rtt, PLAYERS);
     started = 1;
     for (i = 0; i < PLAYERS; i++) {
         int n = snprintf(text, sizeof text, "{\"type\":\"start\",\"yourSlot\":%d,\"track\":3,\"laps\":2,"
-                         "\"seed\":2864434397,\"inputDelay\":%d,\"players\":[", players[i].slot, delay), j;
+                         "\"seed\":2864434397,\"players\":[", players[i].slot), j;
         for (j = 0; j < PLAYERS; j++)
             n += snprintf(text + n, sizeof text - n, "%s{\"slot\":%d,\"memberId\":%d,\"name\":\"P%d\",\"rider\":%d,"
                           "\"bike\":%d}", j ? "," : "", players[j].slot, players[j].member, j, players[j].rider,
@@ -110,7 +100,6 @@ static void start_race(void)
         snprintf(text + n, sizeof text - n, "],\"serverTime\":%.0f,\"startAt\":%.0f}", now, now + 300);
         text_to(&players[i], &players[i], text);
     }
-    printf("  started: input delay %d\n", delay);
 }
 
 static void relay_text(Player *p, const char *text)
@@ -160,52 +149,23 @@ static void relay_text(Player *p, const char *text)
 
 static void relay_binary(Player *p, const uint8_t *data, size_t n)
 {
-    uint8_t frame[256];
+    uint8_t frame[NET_FRAME_MAX];
     int i;
-    CHECK(n >= 2 && n <= 256);
+    CHECK(n >= 2 && n <= sizeof frame);
+    if (n < 2 || n > sizeof frame)
+        return;
     memcpy(frame, data, n);
-    CHECK(frame[1] == p->slot);  /* (the server would overwrite it) */
-    frame[1] = (uint8_t)p->slot;
-    if (frame[0] == LS_MSG_INPUT) {
-        uint32_t first = frame[2] | frame[3] << 8 | frame[4] << 16 | (uint32_t)frame[5] << 24;
-        CHECK(frame[6] >= 1 && frame[6] <= 16 && n == 7 + 6u * frame[6]);
-        CHECK(first >= (uint32_t)race_delay);  /* the neutral fields aren't sent */
-        if ((int64_t)first + frame[6] - 1 > last_field[p->slot])
-            last_field[p->slot] = first + frame[6] - 1;
+    frame[1] = (uint8_t)p->slot;  /* the server says who sent it */
+    if (frame[0] == NET_FRAME_STATE || frame[0] == NET_FRAME_EVENT) {
         for (i = 0; i < PLAYERS; i++)
             if (&players[i] != p)
                 deliver(&players[i], p, 1, frame, n);
-    } else if (frame[0] == LS_MSG_PING) {
-        frame[0] = LS_MSG_PONG;
+    } else if (frame[0] == NET_FRAME_PING) {
+        frame[0] = NET_FRAME_PONG;
         deliver(p, p, 1, frame, n);
-    } else if (frame[0] == LS_MSG_HASH) {
-        uint32_t field = frame[2] | frame[3] << 8 | frame[4] << 16 | (uint32_t)frame[5] << 24;
-        uint64_t hash;
-        int at = field / 60 % 64, have = 0, differ = 0;
-        CHECK(n == 14 && field % 60 == 59);
-        memcpy(&hash, frame + 6, 8);
-        if (hashes[at].field != field)
-            memset(&hashes[at], 0, sizeof hashes[at]), hashes[at].field = field;
-        hashes[at].hash[p->slot] = hash;
-        hashes[at].have |= 1 << p->slot;
-        for (i = 0; i < PLAYERS; i++)
-            if (players[i].open && !(hashes[at].have & 1 << players[i].slot))
-                have = -1;
-        for (i = 0; i < PLAYERS && !have; i++)
-            if (hashes[at].have & 1 << i && hashes[at].hash[i] != hash)
-                differ = 1;
-        if (!have && differ && (reported_desync < 0 || field < reported_desync)) {
-            char text[512];
-            int k = snprintf(text, sizeof text, "{\"type\":\"desync\",\"field\":%u,\"hashes\":{", field), first = 1;
-            reported_desync = field;
-            for (i = 0; i < PLAYERS; i++)
-                if (hashes[at].have & 1 << i)
-                    k += snprintf(text + k, sizeof text - k, "%s\"%d\":\"%016llx\"", first ? "" : ",", i,
-                                  (unsigned long long)hashes[at].hash[i]), first = 0;
-            snprintf(text + k, sizeof text - k, "}}");
-            for (i = 0; i < PLAYERS; i++)
-                text_to(&players[i], &players[i], text);
-        }
+    } else {
+        printf("  relay: unexpected binary frame type %d\n", frame[0]);
+        failures++;
     }
 }
 
@@ -231,12 +191,8 @@ static void drop(Player *p)
     int i;
     EnterCriticalSection(&relay);
     p->open = 0;
-    if (null_from_field)
-        snprintf(text, sizeof text, "{\"type\":\"left\",\"slot\":%d,\"memberId\":%d,\"fromField\":null,"
-                 "\"reason\":\"disconnect\"}", p->slot, p->member);
-    else
-        snprintf(text, sizeof text, "{\"type\":\"left\",\"slot\":%d,\"memberId\":%d,\"fromField\":%lld,"
-                 "\"reason\":\"disconnect\"}", p->slot, p->member, (long long)(last_field[p->slot] + 1));
+    snprintf(text, sizeof text, "{\"type\":\"left\",\"slot\":%d,\"memberId\":%d,\"reason\":\"disconnect\"}",
+             p->slot, p->member);
     for (i = 0; i < PLAYERS; i++)
         if (players[i].open)
             text_to(&players[i], p, text);
@@ -274,53 +230,45 @@ static DWORD WINAPI network(void *arg)
     return 0;
 }
 
-static NetInput pad_of(int slot, uint32_t field)
-{
-    NetInput in;
-    uint32_t x = (field + 7) * 2654435761u ^ (uint32_t)(slot + 1) * 0x9E3779B9u;
-    in.buttons = (uint16_t)x, in.lx = (uint8_t)(x >> 16), in.ly = (uint8_t)(x >> 24);
-    in.rx = (uint8_t)(x >> 5), in.ry = (uint8_t)(x >> 11);
-    return in;
-}
-
-/* The game thread: one field after another, as pad_vsync will. */
+/* The game thread: a numbered STATE frame every FRAME_MS, as online.c's state_sync sends, and
+   the others' frames taken as they come. */
 static DWORD WINAPI game(void *arg)
 {
     Player *p = arg;
-    NetLobby lobby;
-    uint32_t f;
-    double give_up;
-    Sleep(p->start_late_ms);
-    client_lobby(&p->client, &lobby);
-    p->state = lobby.race_seed;
-    for (f = 0; f < FIELDS; f++) {
-        NetPad out[NET_MAX_SLOTS];
-        NetInput in = pad_of(lobby.local_slot, f);
-        int r, s;
-        if (p->drop_at && f == (uint32_t)p->drop_at)
+    uint8_t frame[NET_FRAME_MAX];
+    int32_t last[PLAYERS], seq;
+    double start = net_now_ms(), next = start;
+    int i, n;
+    for (i = 0; i < PLAYERS; i++)
+        last[i] = -1;
+    while (net_now_ms() < start + RACE_MS + 500) {  /* (and half a second for the last frames) */
+        if (p->drop_at_ms && net_now_ms() >= start + p->drop_at_ms && p->open)
             drop(p);
-        client_submit_local(&p->client, f, &in);
-        give_up = net_now_ms() + 5000;
-        while ((r = client_inputs_for_field(&p->client, f, out, 20)) == NET_WAIT && net_now_ms() < give_up)
-            p->saw_waiting |= client_waiting(&p->client);
-        if (r != NET_OK) {
-            printf("  player %d stuck at field %u (%d), waiting for %x\n", p->index, f, r, client_waiting(&p->client));
-            failures++;
-            return 1;
+        if (net_now_ms() >= next && net_now_ms() < start + RACE_MS && p->open) {
+            uint8_t payload[64];
+            memset(payload, p->index, sizeof payload);
+            memcpy(payload, &p->sent, 4);
+            if (client_send_frame(&p->client, NET_FRAME_STATE, payload, sizeof payload))
+                p->sent++;
+            next += FRAME_MS;
         }
-        for (s = 0; s < lobby.nslots; s++) {
-            p->state = net_hash64(&out[s], sizeof out[s], p->state);
-            if (out[s].kind != (p->pad_kinds[s] & 0xFF))
-                p->pad_kinds[s] = out[s].kind | (int)f << 8;  /* the kind, and the field it changed */
+        while ((n = client_receive_frame(&p->client, frame, sizeof frame)) > 0) {
+            int from = frame[1];
+            CHECK(n == 2 + 64 && frame[0] == NET_FRAME_STATE && from < PLAYERS && from != p->slot);
+            if (n != 2 + 64 || from >= PLAYERS)
+                continue;
+            memcpy(&seq, frame + 2, 4);
+            if (seq != last[from] + 1)
+                p->out_of_order++;
+            last[from] = seq;
+            p->got[from]++;
         }
-        if (net_hash_due(f))
-            client_submit_hash(&p->client, f, p->state ^ (p->corrupt_from && f >= (uint32_t)p->corrupt_from));
-        p->played = f + 1;
+        Sleep(1);
     }
     return 0;
 }
 
-static void run(const char *name, const int latency[PLAYERS], int late_player, int dropper, int corrupter)
+static void run(const char *name, const int latency[PLAYERS], int dropper)
 {
     int i;
     NetTransport tr;
@@ -328,8 +276,7 @@ static void run(const char *name, const int latency[PLAYERS], int late_player, i
     NetLobby lobby;
     printf("%s\n", name);
     memset(players, 0, sizeof players);
-    next_member = 0, host_member = -1, started = 0, reported_desync = -1;
-    memset(hashes, 0, sizeof hashes);
+    next_member = 0, host_member = -1, started = 0;
     for (i = 0; i < PLAYERS; i++) {
         Player *p = &players[i];
         char who[8];
@@ -362,13 +309,11 @@ static void run(const char *name, const int latency[PLAYERS], int late_player, i
             client_lobby(&players[i].client, &lobby);
         } while (lobby.state != NET_RACING && net_now_ms() < until);
         CHECK(lobby.state == NET_RACING && lobby.nslots == PLAYERS && lobby.local_slot == i);
-        CHECK(lobby.racer[2].rider == 3 && lobby.race_seed == 2864434397u && lobby.input_delay >= 1);
+        CHECK(lobby.racer[2].rider == 3 && lobby.race_seed == 2864434397u);
     }
     for (i = 0; i < PLAYERS; i++) {
         Player *p = &players[i];
-        p->start_late_ms = i == late_player ? 700 : 0;
-        p->drop_at = i == dropper ? 300 : 0;
-        p->corrupt_from = i == corrupter ? 400 : 0;
+        p->drop_at_ms = i == dropper ? RACE_MS / 2 : 0;
         p->game = CreateThread(NULL, 0, game, p, 0, NULL);
     }
     for (i = 0; i < PLAYERS; i++) {
@@ -377,37 +322,24 @@ static void run(const char *name, const int latency[PLAYERS], int late_player, i
     }
     for (i = 0; i < PLAYERS; i++) {
         Player *p = &players[i];
-        uint32_t field = 0, slots = 0;
-        int desync = client_desync(&p->client, &field, &slots);
+        int j;
         client_lobby(&p->client, &lobby);
-        CHECK(p->played == FIELDS);
-        printf("  player %d: %u fields, state %016llx, ping %d ms, waited for %x%s", i, p->played,
-               (unsigned long long)p->state, lobby.ping_ms, p->saw_waiting, lobby.offline ? ", offline" : "");
-        if (desync)
-            printf(", desync at %u with %x", field, slots);
-        printf("\n");
-        if (i != dropper)
-            CHECK(lobby.ping_ms >= latency[i] * 2 && lobby.ping_ms < latency[i] * 2 + 40);
-        if (i != dropper && dropper >= 0) {
-            CHECK((players[i].pad_kinds[dropper] & 0xFF) == NET_SLOT_AI);
-            CHECK(players[i].pad_kinds[dropper] >> 8 == (players[0].pad_kinds[dropper] >> 8));
-            CHECK(lobby.racer[dropper].left);
-        }
-        if (i != dropper)  /* (the dropper is never player 0) */
-            CHECK(p->state == players[0].state);
-        if (i == dropper)
+        printf("  player %d: sent %d, got %d %d %d %d, ping %d ms%s\n", i, p->sent, p->got[0], p->got[1], p->got[2],
+               p->got[3], lobby.ping_ms, lobby.offline ? ", offline" : "");
+        CHECK(!p->out_of_order);
+        if (i == dropper) {
             CHECK(lobby.offline && lobby.state == NET_FAILED);
-        if (late_player >= 0 && i != late_player)
-            CHECK(p->saw_waiting & 1u << late_player);
-        if (corrupter >= 0) {
-            CHECK(desync && field == 419);
-            CHECK(slots == (i == corrupter ? 0xFu & ~(1u << i) : 1u << corrupter));
-        } else
-            CHECK(!desync);
+            continue;
+        }
+        /* (a pong waits behind the frames already queued on the socket: up to the slowest one way) */
+        CHECK(lobby.ping_ms >= latency[i] * 2 && lobby.ping_ms < latency[i] * 2 + 100);
+        CHECK(p->sent >= RACE_MS / FRAME_MS - 2);
+        for (j = 0; j < PLAYERS; j++)
+            if (j != i)
+                CHECK(p->got[j] == players[j].sent);  /* everything the others sent, the dropper's too */
+        if (dropper >= 0)
+            CHECK(lobby.racer[dropper].left);
     }
-    if (dropper >= 0)
-        printf("  slot %d: the AI from field %d on every PC\n", dropper,
-               players[dropper ? 0 : 1].pad_kinds[dropper] >> 8);
     for (i = 0; i < PLAYERS; i++) {
         Msg *m;
         players[i].stop = 1;
@@ -424,14 +356,9 @@ int main(void)
     static const int lan[PLAYERS] = {2, 3, 2, 4}, wan[PLAYERS] = {10, 25, 45, 70};
     timeBeginPeriod(1);
     InitializeCriticalSection(&relay);
-    run("four players, close", lan, -1, -1, -1);
-    run("four players, 10-70 ms away", wan, -1, -1, -1);
-    run("a player starts late", wan, 2, -1, -1);
-    run("a player drops at field 300", wan, -1, 3, -1);
-    null_from_field = 1;
-    run("a player drops, the server lost track (fromField null)", wan, -1, 1, -1);
-    null_from_field = 0;
-    run("a player's state differs from field 400", lan, -1, -1, 2);
+    run("four players, close", lan, -1);
+    run("four players, 10-70 ms away", wan, -1);
+    run("a player drops halfway", wan, 3);
     timeEndPeriod(1);
     if (failures) {
         printf("test_loopback: %d failures\n", failures);

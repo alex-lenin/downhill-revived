@@ -8,28 +8,18 @@ export const MAX_TEXT_BYTES = 4096;
 /** A STATE frame carries all of a player's riders (port/net/net.h NET_FRAME_MAX). */
 export const MAX_BINARY_BYTES = 3072;
 
-/** One NTSC field in milliseconds (59.94 Hz). */
-export const FIELD_MS = 16.68;
-export const MIN_INPUT_DELAY = 1;
-export const MAX_INPUT_DELAY = 8;
-
 export const HELLO_TIMEOUT_MS = 10_000;
 export const PING_INTERVAL_MS = 2_000;
 export const START_LEAD_MS = 3_000;
 export const RTT_SAMPLES = 5;
 
-// Binary race frames.
-export const FRAME_INPUT = 1;
-export const FRAME_HASH = 2;
+// Binary race frames. (Types 1 and 2 were the first design's INPUT and HASH, input lockstep, which
+// the game no longer uses; the server drops them.)
 export const FRAME_PING = 3;
 export const FRAME_PONG = 4;
 /** State sync (finding 044): a rider snapshot and a gameplay event, relayed as they are. */
 export const FRAME_STATE = 5;
 export const FRAME_EVENT = 6;
-export const INPUT_HEADER_BYTES = 7;
-export const INPUT_ENTRY_BYTES = 6;
-export const INPUT_MAX_ENTRIES = 16;
-export const HASH_FRAME_BYTES = 14;
 export const PING_MAX_PAYLOAD = 32;
 
 /** Refusal reasons and the close code each one uses. */
@@ -132,37 +122,6 @@ export function median(values: number[]): number {
 export function measuredRtt(first: number | null, later: number[]): number | null {
   if (later.length) return Math.round(median(later));
   return first === null ? null : Math.round(first);
-}
-
-/**
- * Suggested input delay in fields. A relayed input goes sender -> server -> receiver, so the
- * worst one-way time is half the sum of the two largest member round-trips.
- */
-export function suggestedInputDelay(rttsMs: number[]): number {
-  const s = [...rttsMs].sort((a, b) => b - a);
-  const worstOneWay = s.length === 0 ? 0 : s.length === 1 ? s[0] / 2 : (s[0] + s[1]) / 2;
-  const delay = Math.ceil(worstOneWay / FIELD_MS) + 1;
-  return Math.min(MAX_INPUT_DELAY, Math.max(MIN_INPUT_DELAY, delay));
-}
-
-/** Last field covered by a valid INPUT frame, or -1 if the frame is malformed. */
-export function inputFrameLastField(b: Uint8Array): number {
-  if (b.length < INPUT_HEADER_BYTES) return -1;
-  const count = b[6];
-  if (count < 1 || count > INPUT_MAX_ENTRIES) return -1;
-  if (b.length !== INPUT_HEADER_BYTES + INPUT_ENTRY_BYTES * count) return -1;
-  return readU32(b, 2) + count - 1;
-}
-
-export function readU32(b: Uint8Array, at: number): number {
-  return (b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)) >>> 0;
-}
-
-/** The u64 at `at` as 16 lowercase hex digits (big-endian digit order, i.e. the number). */
-export function readU64Hex(b: Uint8Array, at: number): string {
-  let hex = "";
-  for (let i = 7; i >= 0; i--) hex += b[at + i].toString(16).padStart(2, "0");
-  return hex;
 }
 
 export function isByte(v: unknown): v is number {

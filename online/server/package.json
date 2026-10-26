@@ -2,7 +2,7 @@
   "name": "dhd-online-server",
   "private": true,
   "type": "module",
-  "description": "Downhill Domination PC port: online lobbies and lockstep relay (Cloudflare Workers + Durable Objects)",
+  "description": "Downhill Domination PC port: online lobbies and race relay (Cloudflare Workers + Durable Objects)",
   "scripts": {
     "dev": "wrangler dev",
     "types": "wrangler types src/worker-configuration.d.ts",

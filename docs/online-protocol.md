@@ -5,8 +5,9 @@ Cloudflare Workers + Durable Objects). The plan behind it is `docs/ONLINE-PLAN.m
 
 - One WebSocket per player. Lobby control travels as JSON **text** frames, the race as compact
   little-endian **binary** frames.
-- The server runs no game logic. In a race it relays inputs, compares state hashes and
-  reports players who leave.
+- The server runs no game logic. In a race it relays STATE and EVENT frames (state sync: every
+  PC runs its own race and shows the others' riders from their snapshots, findings 041 and 044)
+  and reports players who leave.
 - `PROTOCOL = 1`. It is in the URL (`/v1/`) and in `hello`. Any incompatible change raises
   it; the server refuses clients with another number.
 
@@ -111,8 +112,7 @@ use the same `error` frame **without** a close; the client just shows `message`.
  "started":false,"version":"dhd-port 0.4.0",
  "settings":{"track":3,"laps":2,"seed":null},
  "members":[{"id":0,"name":"Ann","ready":true,"rider":5,"bike":1,"rttMs":38},
-            {"id":2,"name":"Bo","ready":false,"rider":0,"bike":0,"rttMs":null}],
- "inputDelay":3}
+            {"id":2,"name":"Bo","ready":false,"rider":0,"bike":0,"rttMs":null}]}
 
 // Server-timestamped ping, every 2 s while in the lobby. Echo "s" back unchanged in a "pong".
 {"type":"ping","s":1734000000123}
@@ -121,16 +121,13 @@ use the same `error` frame **without** a close; the client just shows `message`.
 {"type":"pong","t":12345.6,"serverTime":1734000000150}
 
 // Race start, sent to every member at once.
-{"type":"start","yourSlot":1,"track":3,"laps":2,"seed":2864434397,"inputDelay":3,
+{"type":"start","yourSlot":1,"track":3,"laps":2,"seed":2864434397,
  "players":[{"slot":0,"memberId":0,"name":"Ann","rider":5,"bike":1},
             {"slot":1,"memberId":2,"name":"Bo","rider":0,"bike":0}],
  "serverTime":1734000005000,"startAt":1734000008000}
 
-// A racer left or dropped. Their rider becomes AI from field "fromField" on, on every PC.
-{"type":"left","slot":1,"memberId":2,"fromField":1843,"reason":"disconnect"}   // or "leave"/"kicked"
-
-// State hashes differ (see HASH). Sent once per newly found earliest bad field.
-{"type":"desync","field":1800,"hashes":{"0":"9f3a...","1":"77c0..."}}
+// A racer left or dropped. The host's game hands their rider to its AI.
+{"type":"left","slot":1,"memberId":2,"reason":"disconnect"}   // or "leave"/"kicked"
 
 // Host ended the race; the room is a lobby again (ready flags cleared).
 {"type":"ended"}
@@ -141,76 +138,18 @@ use the same `error` frame **without** a close; the client just shows `message`.
   first). All race frames use slots.
 - Lobby members who leave just disappear from the next `room`. If the host leaves, the
   longest-present member becomes host.
-- `startAt` is server time (ms since the Unix epoch) at which field 0 should run, about 3 s
-  after `start`. Clients map it to local time with the offset from `ping`/`pong`
-  (`offset ≈ serverTime - (tSend + rtt/2)`). Lockstep does not need it to be exact: a
-  client that starts early just waits for inputs.
-
-### Suggested input delay
-
-The server keeps each member's last five round-trips (from its own pings) and uses their
-median. A relayed input travels sender → server → receiver, so the worst one-way time is
-half the sum of the two largest member RTTs (with one member: half its RTT). Then
-
-`inputDelay = clamp(ceil(worstOneWayMs / 16.68) + 1, 1, 8)` fields,
-
-with 16.68 ms = one NTSC field (59.94 Hz). Unknown RTTs count as 0 until measured. The value
-in `start` is final for the race.
+- `startAt` is server time (ms since the Unix epoch), about 3 s after `start`. Clients map it
+  to local time with the offset from `ping`/`pong` (`offset ≈ serverTime - (tSend + rtt/2)`).
+  The game itself starts every PC's countdown together on the server's clock once all have
+  loaded (port/hle/online.c).
 
 ## Race (binary frames, little-endian)
 
 After `start` each racer sends binary frames on the same socket. The server overwrites byte
-1 (`slot`) with the sender's real slot, then forwards INPUT frames unchanged to every other
-racer. Malformed frames, and binary frames from a socket that is not racing (for example
-stragglers after `ended`), are dropped silently.
-
-### INPUT, type 1 — client ↔ server ↔ clients
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | u8 | `type` = 1 |
-| 1 | u8 | `slot` of the rider these inputs belong to |
-| 2 | u32 | `field`: the field number of the first entry |
-| 6 | u8 | `count`: 1..16 entries, for fields `field .. field+count-1` |
-| 7 | 6 × count | entries |
-
-Entry (6 bytes):
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | u16 | `buttons`: the PS2 digital button word as the game's pad buffer holds it (active low: a bit is 0 while its button is held; `0xFFFF` = nothing held) |
-| 2 | u8 | `lx` (left stick X; 0x80 = centre) |
-| 3 | u8 | `ly` |
-| 4 | u8 | `rx` |
-| 5 | u8 | `ry` |
-
-Frame size = 7 + 6 × count bytes. Field numbers start at 0 at the race start and count game
-fields (59.94 per second).
-
-**Redundancy:** every frame carries the newest field plus the previous ones not yet known to
-be safe; send each field in at least 3 consecutive frames (count 3 is the normal case). A
-receiver keeps the first copy of each field and ignores repeats. Inputs for a field are
-fixed once sent; a client must never send different inputs for a field it already sent.
-
-With input delay `D`, the input a player makes on local field `F` is sent tagged `F + D`, and
-every PC runs field `F` only once it holds all racers' inputs for `F`. Fields `0 .. D-1` use
-neutral input (`buttons 0xFFFF`, sticks `0x80`) and are never sent.
-
-### HASH, type 2 — client → server
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | u8 | `type` = 2 |
-| 1 | u8 | `slot` |
-| 2 | u32 | `field` |
-| 6 | u64 | `hash` of the game state after running `field` |
-
-14 bytes. Send one every 60 fields (`field % 60 == 59`, i.e. after fields 59, 119, ...).
-The hash function is the client's choice (all clients run the same build, which `version`
-enforces). The server does not forward HASH frames; it compares the hashes of all racers
-still connected for that field and broadcasts `desync` (JSON, above) naming the field and
-each slot's hash as 16 lowercase hex digits. It reports a field only if it is earlier than
-any field it reported before.
+1 (`slot`) with the sender's real slot, then forwards STATE and EVENT frames unchanged to every
+other racer. Other types, frames shorter than 2 bytes, and binary frames from a socket that is
+not racing (for example stragglers after `ended`), are dropped silently. Types 1 and 2 were the
+first design's INPUT and HASH frames (input lockstep, finding 039); they are no longer used.
 
 ### PING, type 3 — client → server; PONG, type 4 — server → client
 
@@ -238,16 +177,9 @@ racer and keeps nothing.
 ### Leaving
 
 A racer leaves by closing the socket (or sends `{"type":"leave"}` first, which only changes
-`reason`). The server broadcasts `left` with `fromField` = one past the last field the server
-had relayed for that slot (0 if none). All inputs up to `fromField - 1` reached the others
-before the `left` message (same socket, ordered), so all PCs switch the rider to AI on the
-same field.
-
-`fromField` is `null` in one rare case: the room was evicted from memory mid-race (the
-runtime keeps a room awake during a race, so this needs seconds with no traffic at all) and
-that racer sent nothing since. Clients then use one past the last field they received from
-that slot, which is the same on every PC because every one of them got the same relayed
-frames.
+`reason`). The server broadcasts `left`; every frame the racer sent before reached the others
+first (same socket, ordered). The host's game hands the rider to its AI and sends it as its
+own from then on.
 
 ## Lobby list
 
@@ -265,7 +197,8 @@ show only rooms whose `version` matches their own.
 ## Limits
 
 - One room holds at most 8 members.
-- Text frames: at most 4 KB. Binary frames: at most 256 bytes.
+- Text frames: at most 4 KB. Binary frames: at most 3072 bytes (a STATE frame carries all of a
+  player's riders).
 - A room with no members is deleted.
 - No reconnect in version 1: a dropped racer is handed to AI for the rest of the race.
 

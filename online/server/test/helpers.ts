@@ -103,30 +103,6 @@ export class Client {
   }
 }
 
-export function inputFrame(slot: number, field: number, entries: number[][]): ArrayBuffer {
-  const b = new Uint8Array(7 + 6 * entries.length);
-  const v = new DataView(b.buffer);
-  b[0] = 1;
-  b[1] = slot;
-  v.setUint32(2, field, true);
-  b[6] = entries.length;
-  entries.forEach(([buttons, lx, ly, rx, ry], i) => {
-    v.setUint16(7 + 6 * i, buttons, true);
-    b.set([lx, ly, rx, ry], 9 + 6 * i);
-  });
-  return b.buffer;
-}
-
-export function hashFrame(slot: number, field: number, hash: bigint): ArrayBuffer {
-  const b = new Uint8Array(14);
-  const v = new DataView(b.buffer);
-  b[0] = 2;
-  b[1] = slot;
-  v.setUint32(2, field, true);
-  v.setBigUint64(6, hash, true);
-  return b.buffer;
-}
-
 /** Host plus `n - 1` joiners, all ready, race started. Returns clients by slot. */
 export async function startedRace(n: number): Promise<{ clients: Client[]; code: string; starts: any[] }> {
   const { host, code } = await Client.host("P0");

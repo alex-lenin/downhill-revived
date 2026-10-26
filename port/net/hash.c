@@ -1,6 +1,6 @@
-/* State hashes for desync detection: XXH64, written here from its published specification
+/* State hashes (online.c's DHD_HASH_LOG): XXH64, written here from its published specification
    (github.com/Cyan4973/xxHash, doc/xxhash_spec.md), checked against its reference values in
-   test_lockstep.c. Ranges chain through the seed, so their order matters. */
+   test_hash.c. Ranges chain through the seed, so their order matters. */
 #include "net.h"
 
 #include <string.h>

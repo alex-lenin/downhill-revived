@@ -1,5 +1,8 @@
 # 039: Online server (lobbies and lockstep relay)
 
+**Superseded for races:** input lockstep was dropped on 2026-10-16; races use state sync
+(findings 041, 044). The lobby and relay here are still what runs.
+
 2026-10-16. Code in `online/server/`, protocol in `docs/online-protocol.md`, plan in
 `docs/ONLINE-PLAN.md`.
 

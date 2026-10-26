@@ -1,7 +1,7 @@
 import { evictDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { Client, hashFrame, inputFrame, ISO, startedRace } from "./helpers";
+import { Client, ISO, startedRace } from "./helpers";
 
 describe("lobby", () => {
   it("creates a room with a join code and lets others join", async () => {
@@ -140,7 +140,7 @@ describe("lobby", () => {
     expect(sh).toMatchObject({ yourSlot: 0, track: 2, seed: 77 });
     expect(sa.yourSlot).toBe(1);
     expect(sa.players.map((p: any) => p.name)).toEqual(["H", "A"]);
-    expect(sa.inputDelay).toBeGreaterThanOrEqual(1);
+    expect(sa.inputDelay).toBeUndefined();
     expect(sa.startAt).toBeGreaterThan(sa.serverTime);
 
     const late = await Client.connect(`/v1/rooms/${code}`);
@@ -176,18 +176,8 @@ describe("public lobby list", () => {
 });
 
 describe("race relay", () => {
-  it("forwards INPUT to the other racers with the sender's slot", async () => {
-    const { clients } = await startedRace(4);
-    // Slot 2 lies about its slot: the server corrects it.
-    clients[2].ws.send(inputFrame(0, 3, [[0xfffe, 0x80, 0x10, 0x80, 0x80]]));
-    for (const i of [0, 1, 3]) {
-      const f = await clients[i].binary();
-      expect(f[0]).toBe(1);
-      expect(f[1]).toBe(2);
-      expect(new DataView(f.buffer).getUint32(2, true)).toBe(3);
-      expect(f.length).toBe(13);
-    }
-    // Nothing comes back to the sender; a ping does.
+  it("answers a race ping to the sender only, with its slot", async () => {
+    const { clients } = await startedRace(3);
     clients[2].ws.send(new Uint8Array([3, 0, 9, 9]).buffer);
     expect([...(await clients[2].binary())]).toEqual([4, 2, 9, 9]);
   });
@@ -206,48 +196,37 @@ describe("race relay", () => {
     expect((await clients[2].binary())[0]).toBe(5);
   });
 
-  it("drops malformed frames", async () => {
+  it("drops short frames and the old INPUT and HASH types", async () => {
     const { clients } = await startedRace(2);
-    clients[0].ws.send(new Uint8Array([1, 0, 0, 0, 0, 0, 2, 1, 2]).buffer); // count 2, one byte of entries
-    clients[0].ws.send(inputFrame(0, 7, [[1, 2, 3, 4, 5]]));
-    const f = await clients[1].binary();
-    expect(new DataView(f.buffer).getUint32(2, true)).toBe(7);
+    clients[0].ws.send(new Uint8Array([5]).buffer);
+    clients[0].ws.send(new Uint8Array([1, 0, 0, 0, 0, 0, 1, 1, 2, 3, 4, 5, 6]).buffer);
+    clients[0].ws.send(new Uint8Array([2, 0, 59, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]).buffer);
+    clients[0].ws.send(new Uint8Array([5, 0, 7]).buffer);
+    expect([...(await clients[1].binary())]).toEqual([5, 0, 7]);
   });
 
-  it("reports a desync naming the first differing field", async () => {
+  it("announces a dropped racer", async () => {
     const { clients } = await startedRace(3);
-    clients[0].ws.send(hashFrame(0, 59, 1n));
-    clients[1].ws.send(hashFrame(1, 59, 1n));
-    clients[2].ws.send(hashFrame(2, 59, 1n));
-    clients[0].ws.send(hashFrame(0, 119, 0xabcn));
-    clients[1].ws.send(hashFrame(1, 119, 0xabdn));
-    const d = await clients[2].json("desync");
-    expect(d.field).toBe(119);
-    expect(d.hashes).toEqual({ "0": "0000000000000abc", "1": "0000000000000abd" });
-  });
-
-  it("announces a dropped racer with the field AI takes over from", async () => {
-    const { clients } = await startedRace(3);
-    clients[1].ws.send(inputFrame(1, 40, [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]));
+    clients[1].ws.send(new Uint8Array([5, 0, 40]).buffer);
     await clients[0].binary();
     clients[1].ws.close(1000);
     const left = await clients[0].json("left");
-    expect(left).toMatchObject({ slot: 1, fromField: 43, reason: "disconnect" });
+    expect(left).toMatchObject({ slot: 1, reason: "disconnect" });
+    expect(left.fromField).toBeUndefined();
     // The others keep relaying to each other.
-    clients[2].ws.send(inputFrame(2, 44, [[0, 0, 0, 0, 0]]));
+    clients[2].ws.send(new Uint8Array([5, 0, 44]).buffer);
     expect((await clients[0].binary())[1]).toBe(2);
   });
 
   it("keeps relaying after the room is evicted with hibernated sockets", async () => {
     const { clients, code } = await startedRace(3);
     await evictDurableObject(env.ROOM.get(env.ROOM.idFromName(code)));
-    clients[1].ws.send(inputFrame(0, 10, [[1, 2, 3, 4, 5]]));
+    clients[1].ws.send(new Uint8Array([5, 0, 10]).buffer);
     for (const i of [0, 2]) expect((await clients[i].binary())[1]).toBe(1);
-    // Slot 2 sent nothing since the wake-up, so its last field is unknown.
     clients[2].ws.close(1000);
-    expect(await clients[0].json("left")).toMatchObject({ slot: 2, fromField: null });
+    expect(await clients[0].json("left")).toMatchObject({ slot: 2 });
     clients[1].ws.close(1000);
-    expect(await clients[0].json("left")).toMatchObject({ slot: 1, fromField: 11 });
+    expect(await clients[0].json("left")).toMatchObject({ slot: 1 });
   });
 
   it("hands a kicked racer to AI", async () => {
@@ -255,7 +234,7 @@ describe("race relay", () => {
     clients[0].sendJson({ type: "kick", member: 1 });
     expect((await clients[1].json("error")).code).toBe("kicked");
     expect(await clients[1].closed()).toBe(4007);
-    expect(await clients[0].json("left")).toMatchObject({ slot: 1, fromField: 0, reason: "kicked" });
+    expect(await clients[0].json("left")).toMatchObject({ slot: 1, reason: "kicked" });
   });
 
   it("returns to the lobby when the host ends the race", async () => {

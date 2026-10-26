@@ -1,40 +1,18 @@
 /* Online races: the API the rest of the port uses (docs/ONLINE-PLAN.md, finding 039, the wire
    protocol in docs/online-protocol.md).
 
-   Every PC runs the same race; only pad inputs travel, through a relay over a WebSocket. A
-   background thread keeps the connection (lobby JSON, binary race frames, pings); the game
-   thread calls the race functions below once per field.
-
-   Integration, per field F from the race start (pad_vsync, for the 4 multitap pads):
-       net_submit_local(F, &pad_of_this_pc);          host_pad_read's state, as a NetInput
-       while (net_inputs_for_field(F, pads, 50) == NET_WAIT)
-           show "waiting for" net_waiting_for();      keep the window responsive
-       slot i's pad = pads[i] (NET_SLOT_AI: the game's AI rider, NET_SLOT_EMPTY: no pad)
-   and after field F ran, when net_hash_due(F):
-       net_submit_hash(F, net_hash_ranges(ranges, n));
-   Pressure-sensitive buttons don't travel: derive them from the buttons (pressed = 255) on
-   every PC, so all of them see the same pads. */
+   Races use state sync (findings 041, 044): every PC runs its own one-player race and sends
+   snapshots of the riders it owns (STATE frames) and hits it deals (EVENT frames) with
+   net_send_frame, through a relay over a WebSocket; the others' riders are puppets
+   (port/hle/online.c, port/hle/puppet.c). A background thread keeps the connection (lobby JSON,
+   binary race frames, pings). */
 #ifndef NET_H
 #define NET_H
 
 #include <stddef.h>
 #include <stdint.h>
 
-enum { NET_MAX_SLOTS = 8, NET_HASH_PERIOD = 60 };  /* a room holds 8; the game's multitap 4 */
-enum { NET_OK = 0, NET_WAIT = 1, NET_ERROR = -1 };
-enum { NET_SLOT_EMPTY = 0, NET_SLOT_HUMAN = 1, NET_SLOT_AI = 2 };
-
-/* One pad as it travels: libpad's button bits (1 = pressed, hle.h's PAD_*), sticks 0..255
-   with 128 centred. */
-typedef struct {
-    uint16_t buttons;
-    uint8_t lx, ly, rx, ry;
-} NetInput;
-
-typedef struct {
-    NetInput in;           /* neutral unless kind is NET_SLOT_HUMAN */
-    uint8_t kind;          /* NET_SLOT_* for this field */
-} NetPad;
+enum { NET_MAX_SLOTS = 8 };  /* a room holds 8 */
 
 /* ---- connection and lobby ---- */
 
@@ -51,8 +29,7 @@ typedef struct {
     int slot, member_id;
     char name[100];
     int rider, bike;
-    int left;                  /* gone: the AI drives the rider from left_field on */
-    uint32_t left_field;
+    int left;                  /* gone: the host's AI drives the rider */
 } NetRacer;
 
 typedef struct {
@@ -66,15 +43,14 @@ typedef struct {
     long long seed;            /* -1 until set */
     int nmembers;
     NetMember member[NET_MAX_SLOTS];
-    int input_delay;           /* the server's suggestion, final once the race starts */
     int ping_ms;               /* this PC to the relay, -1 unknown */
     /* the race, once started */
     int local_slot, nslots;
     NetRacer racer[NET_MAX_SLOTS];
     int race_track, race_laps;
     uint32_t race_seed;
-    double start_at;           /* net_seconds() at which field 0 should run */
-    int offline;               /* the connection dropped mid-race: everyone else is AI now */
+    double start_at;           /* net_seconds() of the server's start */
+    int offline;               /* the connection dropped mid-race */
     /* the last error */
     char error_code[32], error[200];
 } NetLobby;
@@ -115,14 +91,6 @@ double net_server_ms(void);
 
 int net_racing(void);
 int net_local_slot(void);
-/* The local pad, sampled at field (it plays at field + the input delay). */
-void net_submit_local(uint32_t field, const NetInput *in);
-/* Fills out[NET_MAX_SLOTS] with field's pads. Waits up to timeout_ms for the other players;
-   NET_WAIT when someone is still missing (net_waiting_for says who), NET_ERROR when not racing. */
-int net_inputs_for_field(uint32_t field, NetPad out[NET_MAX_SLOTS], unsigned timeout_ms);
-uint32_t net_waiting_for(void);   /* slot mask */
-
-/* ---- state sync (finding 044) ---- */
 
 /* Binary frames the relay forwards as they are to every other racer: a snapshot of riders this
    PC owns, an event it decided for another PC's rider. A frame is type, slot (the server sets
@@ -130,27 +98,25 @@ uint32_t net_waiting_for(void);   /* slot mask */
 /* NET_FRAME_MAX: a STATE frame carries all of a player's riders (up to ten snapshots of at most
    255 bytes); the server's MAX_BINARY_BYTES is the same. */
 enum { NET_FRAME_STATE = 5, NET_FRAME_EVENT = 6, NET_FRAME_MAX = 3072, NET_RELAY_QUEUE = 128 };
+/* The race's pings (client.c): type, slot, the send time; the server answers PONG with the rest
+   as it was. */
+enum { NET_FRAME_PING = 3, NET_FRAME_PONG = 4 };
 /* Sends type and payload (at most NET_FRAME_MAX - 2 bytes); 0 when not racing. */
 int net_send_frame(int type, const void *payload, size_t n);
 /* The oldest frame received, whole (out[0] type, out[1] sender's slot); its size, 0 if none. */
 int net_receive_frame(uint8_t *out, size_t max);
 
-/* ---- desync detection ---- */
+/* ---- state hashes ---- */
 
 typedef struct {
     const void *base;
     size_t size;
 } NetRange;
 
-/* A 64-bit hash (XXH64 per range, chained through the seed) of memory ranges. */
+/* A 64-bit hash (XXH64 per range, chained through the seed) of memory ranges: online.c's
+   DHD_HASH_LOG of the race state, every NET_HASH_PERIOD fields. */
+enum { NET_HASH_PERIOD = 60 };
 uint64_t net_hash_ranges(const NetRange *ranges, int n);
 uint64_t net_hash64(const void *data, size_t size, uint64_t seed);  /* XXH64 */
-/* The protocol hashes the state after fields 59, 119, ... */
-static inline int net_hash_due(uint32_t field) { return field % NET_HASH_PERIOD == NET_HASH_PERIOD - 1; }
-/* The local state hash after field ran (only net_hash_due fields are sent). */
-void net_submit_hash(uint32_t field, uint64_t hash);
-/* 1 once the server found differing hashes: the first field and the slots that differ from
-   this PC (or all slots it named, when it had no hash from us). */
-int net_desync(uint32_t *field, uint32_t *slots);
 
 #endif
