@@ -205,7 +205,7 @@ findings 039-047, 053-054, 065 and 072 and in this file's history.
 - Server: `online/server/` (Cloudflare Workers + Durable Objects) at `wss://dhd.skuza.app`, the
   game's built-in default (dhd.ini `server =` or `DHD_NET_SERVER` override it). Lobbies, join
   codes, the public list, the race relay (4 players per room by default), desync reports, usage stats
-  in Workers Analytics Engine. `MIN_VERSION` (`wrangler.jsonc`, now 0.4.0) turns older clients
+  in Workers Analytics Engine. `MIN_VERSION` (`wrangler.jsonc`, now 0.5.0) turns older clients
   away with "update to play online". Protocol: `docs/online-protocol.md`. Steps:
   `online/server/README.md`.
 - Client: `port/net/` (lobby client, WebSocket over WinHTTP, or `ws_posix.c`, hashes; `net.h`), in
