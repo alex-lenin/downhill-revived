@@ -130,8 +130,9 @@ static inline float ps2_vu_rsqrt(float a, float b)
 }
 
 /* VU FMAC clamps its final result. An overflowing single-precision product
-   must keep its sign even when the accumulator has the opposite sign. */
-static inline float ps2_vu_madd(float acc, float a, float b, int subtract)
+   must keep its sign even when the accumulator has the opposite sign.
+   The reference form, in double: ps2_vu_madd below gives the same bits (port/tools/vu_madd_diff.py). */
+static inline float ps2_vu_madd_reference(float acc, float a, float b, int subtract)
 {
     double product = (double)ps2_float_input(a) * (double)ps2_float_input(b);
     if (product > 3.40282346638528859812e38 || product < -3.40282346638528859812e38)
@@ -139,5 +140,73 @@ static inline float ps2_vu_madd(float acc, float a, float b, int subtract)
     float p = ps2_float_input((float)product);
     return subtract ? ps2_float_sub(acc, p) : ps2_float_add(acc, p);
 }
+
+/* The same in single precision (finding 090 SP14). With clamped operands (finite, no denormal):
+   - a float product of two floats is one rounding of the exact product, as (float) of the exact
+     double product is;
+   - a float sum is (float) of the double sum: toward zero, rounding twice truncates as once; to
+     nearest, double (53 bits >= 2*24+2) rounds a float sum innocuously;
+   - an overflowing result is the largest magnitude (toward zero) or infinity (to nearest), which
+     the result clamp turns into the largest magnitude, as ps2_float_result does; a denormal result
+     is flushed by FTZ or by the clamp.
+   Only an overflowing product differs (the reference skips the accumulator): a product of
+   magnitude >= FLT_MAX takes the reference. This holds under any rounding mode, with or without
+   FTZ/DAZ: the EE's MXCSR (toward zero, FTZ, DAZ) and the browser's plain IEEE wasm. */
+static inline uint32_t ps2_float_bits(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
+static inline float ps2_vu_madd(float acc, float a, float b, int subtract)
+{
+    float p = ps2_float_input(a) * ps2_float_input(b);
+    if (__builtin_expect((ps2_float_bits(p) & 0x7fffffffu) >= 0x7f7fffffu, 0))
+        return ps2_vu_madd_reference(acc, a, b, subtract);
+    p = ps2_float_input(p);
+    acc = ps2_float_input(acc);
+    return ps2_float_input(subtract ? acc - p : acc + p);
+}
+
+#if defined(__clang__) || defined(__GNUC__)
+#define PS2_VU_VECTOR 1
+/* Four VU lanes at once (clang/GCC vector extensions: SSE on x86, wasm SIMD, NEON). The lane
+   rules are those of ps2_float_add/sub/mul and ps2_vu_madd above, bit for bit. */
+typedef float ps2_f32x4 __attribute__((vector_size(16), aligned(4)));
+typedef int32_t ps2_i32x4 __attribute__((vector_size(16), aligned(4)));
+/* ps2_float_input per lane: a denormal becomes its signed zero, exponent 255 the largest
+   finite magnitude of its sign. */
+static inline __attribute__((always_inline)) ps2_f32x4 ps2_float_input4(ps2_f32x4 v)
+{
+    ps2_i32x4 bits = (ps2_i32x4)v, magnitude = bits & 0x7fffffff;
+    ps2_i32x4 small = magnitude < 0x00800000, large = magnitude > 0x7f7fffff;
+    return (ps2_f32x4)(bits ^ ((small & magnitude) | (large & (magnitude ^ 0x7f7fffff))));
+}
+enum { PS2_VU4_ADD, PS2_VU4_SUB, PS2_VU4_MUL, PS2_VU4_MADD, PS2_VU4_MSUB };
+/* r = s op t (MADD/MSUB: acc +- s * t) in the lanes of dest (bit c = lane c); the other lanes of r
+   are unspecified. Returns 0, r untouched, when a MADD/MSUB product in dest overflows: the caller
+   then runs the scalar lanes (ps2_vu_madd's rare path). */
+static inline __attribute__((always_inline)) int
+ps2_vu_arith4(int kind, const float *s, const float *t, const float *acc, int dest, float *r)
+{
+    ps2_f32x4 a, b, result;
+    __builtin_memcpy(&a, s, 16); __builtin_memcpy(&b, t, 16);
+    a = ps2_float_input4(a); b = ps2_float_input4(b);
+    switch (kind) {
+    case PS2_VU4_ADD: result = a + b; break;
+    case PS2_VU4_SUB: result = a - b; break;
+    case PS2_VU4_MUL: result = a * b; break;
+    default: {
+        ps2_f32x4 product = a * b, c;
+        ps2_i32x4 lanes = {dest & 1, dest & 2, dest & 4, dest & 8};
+        ps2_i32x4 over = (((ps2_i32x4)product & 0x7fffffff) >= 0x7f7fffff) & (lanes != 0);
+        if (__builtin_expect(over[0] | over[1] | over[2] | over[3], 0))
+            return 0;
+        __builtin_memcpy(&c, acc, 16);
+        c = ps2_float_input4(c);
+        product = ps2_float_input4(product);
+        result = kind == PS2_VU4_MADD ? c + product : c - product;
+    }
+    }
+    result = ps2_float_input4(result);
+    __builtin_memcpy(r, &result, 16);
+    return 1;
+}
+#endif
 
 #endif

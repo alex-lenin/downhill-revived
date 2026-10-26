@@ -104,6 +104,12 @@ pub struct Arenas {
     reversed: Vec<DhdrVertex>,
     reversed_capacity: u32,
     reversed_base: u32,
+    /// An indexed picture's (`reserve_indices`): the index buffer and its bytes (0 before it is
+    /// made), the reversed (second-draw) triangles' indices and where they start (its index count).
+    index_buffer: Option<wgpu::Buffer>,
+    index_capacity: u64,
+    reversed_indices: Vec<u32>,
+    index_base: u32,
 }
 
 impl Default for Arenas {
@@ -123,6 +129,10 @@ impl Arenas {
             reversed: Vec::new(),
             reversed_capacity: 0,
             reversed_base: 0,
+            index_buffer: None,
+            index_capacity: 0,
+            reversed_indices: Vec::new(),
+            index_base: 0,
         }
     }
 
@@ -198,6 +208,75 @@ impl Arenas {
         self.reversed.clear();
         self.reversed_base = vertex_count;
         Ok(())
+    }
+
+    /// An indexed picture (`dhdr_native_picture_indexed`), after `reserve`: room for its
+    /// `index_count` indices and the reversed triangles' indices after them (each draw's count, as
+    /// `reserve` counts reversed vertices). The index buffer grows from 2^18 indices by doubling.
+    pub fn reserve_indices(&mut self, device: &Gpu, commands: &[DhdrCommand], index_count: u32) -> Result<(), String> {
+        let reversed: u64 = commands.iter()
+            .filter(|k| !matches!(k.kind, DHDR_CMD_ALPHA_UPLOAD | DHDR_CMD_IMPORT | DHDR_CMD_COPY))
+            .map(|k| k.count as u64)
+            .sum();
+        let bytes = (index_count as u64 + reversed) * 4;
+        if self.index_capacity == 0 || bytes > self.index_capacity {
+            let mut size = if self.index_capacity != 0 { self.index_capacity } else { (1 << 18) * 4 };
+            while size < bytes {
+                size *= 2;
+            }
+            self.index_buffer = Some(device.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("native indices"),
+                size,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.index_capacity = size;
+        }
+        let n = usize::try_from(reversed).map_err(|_| format!("gs native: {reversed} reversed indices"))?;
+        self.reversed_indices.clear();
+        self.reversed_indices.try_reserve_exact(n)
+            .map_err(|_| "gs native: out of memory (reversed indices)".to_string())?;
+        self.index_base = index_count;
+        Ok(())
+    }
+
+    /// `reverse_triangles` for an indexed picture: the indices `first..first + count` with the
+    /// triangles in reverse order, after the picture's reversed indices so far; the index to draw
+    /// them from. `count` is a multiple of 3.
+    pub fn reverse_triangle_indices(&mut self, indices: &[u32], first: u32, count: u32) -> u32 {
+        let start = self.index_base + self.reversed_indices.len() as u32;
+        if self.reversed_indices.len() + count as usize > self.reversed_indices.capacity() {
+            fatal("gs native: reversed index overflow");
+        }
+        let (first, count) = (first as usize, count as usize);
+        for t in (0..count).step_by(3) {
+            let s = first + count - 3 - t;
+            self.reversed_indices.extend_from_slice(&indices[s..s + 3]);
+        }
+        start
+    }
+
+    /// An indexed picture's indices, then its reversed ones at its index count, into the index
+    /// buffer (with `write_vertices`, which writes its vertices).
+    pub fn write_indices(&self, queue: &wgpu::Queue, indices: &[u32]) {
+        let Some(buffer) = &self.index_buffer else { return };
+        if !indices.is_empty() {
+            queue.write_buffer(buffer, 0, as_bytes(indices));
+        }
+        if !self.reversed_indices.is_empty() {
+            queue.write_buffer(buffer, self.index_base as u64 * 4, as_bytes(&self.reversed_indices));
+        }
+    }
+
+    /// The index buffer (`reserve_indices`), bound whole (`index_capacity` bytes) in an indexed
+    /// picture's draw passes.
+    pub fn index_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.index_buffer.as_ref()
+    }
+
+    /// Bytes of the index buffer.
+    pub fn index_capacity(&self) -> u64 {
+        self.index_capacity
     }
 
     /// `data` at the next 256-byte offset of the constants arena; that offset.

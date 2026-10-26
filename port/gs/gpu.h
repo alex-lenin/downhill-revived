@@ -15,6 +15,10 @@ const char *gs_gpu_backend_name(const Gs *g);
    shows the display picture, or pixels (width x height) when given, stretched over the window's
    width x height client area. */
 int gs_gpu_surface(Gs *g, void *window);
+/* The surface again on a new window, or none (NULL): the OS took the old one (Android, finding 091). */
+int gs_gpu_surface_reset(Gs *g, void *window);
+/* The SDL window's size in pixels (present.c; not on Windows, where the HWND says). */
+void gs_window_pixels(unsigned *width, unsigned *height);
 int gs_gpu_present(Gs *g, const uint32_t *pixels, unsigned width, unsigned height,
                    unsigned window_width, unsigned window_height);
 /* Counts describe submissions, not completed GPU work (the exact front end's, gpu_exact.inc). */

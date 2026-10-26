@@ -40,6 +40,18 @@ void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops);
 }
 #endif
 
+/* An inline asm statement with a literal template (transform.py): fn is the function
+   port/tools/ps2asm_aot.py generates for that template, constraints and count, with the operand
+   binding folded in; it runs ps2_asm the first time and its own code once the run-time parse is
+   found identical (finding 090 SP13). The wasm build (build_wasm.py, PS2_ASM_DIRECT) calls it; the
+   others call ps2_asm. The asm label gives the block-scope declaration C linkage in C++ too. */
+#ifdef PS2_ASM_DIRECT
+#define PS2A(fn, tmpl, constraints, n, ops) do { \
+    void fn(const char *, const char *, int, ps2_op *) __asm__(#fn); fn(tmpl, constraints, n, ops); } while (0)
+#else
+#define PS2A(fn, tmpl, constraints, n, ops) ps2_asm(tmpl, constraints, n, ops)
+#endif
+
 /* Type of an asm input operand's value (arrays decay to pointers, as on the PS2). */
 #ifdef __cplusplus
 #define PS2_INTYPE(e) __typeof__(+(e)) /* unary + also decays void *, which C++ can't add 0 to */

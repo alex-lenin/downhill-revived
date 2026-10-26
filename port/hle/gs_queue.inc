@@ -13,7 +13,11 @@ typedef struct {
 } GsPacket;
 static uint8_t *gs_ring;
 static HANDLE gs_worker, gs_available, gs_retired;
-static volatile LONG gs_written, gs_consumed, gs_stopping, gs_sleeping, gs_waiting;
+QUEUE_COUNTER(gs_written);
+QUEUE_COUNTER(gs_consumed);
+QUEUE_COUNTER(gs_stopping);
+QUEUE_COUNTER(gs_sleeping);
+QUEUE_COUNTER(gs_waiting);
 static uint32_t gs_position(volatile LONG *p)
 {
     return position(p);
@@ -76,8 +80,9 @@ static DWORD WINAPI gs_consume(void *unused)
 {
     (void)unused;
     host_thread_name("gs");
+    tl_role = 2;
     unsigned idle_budget = 1024;
-    _mm_setcsr((_mm_getcsr() | 0x1f80u) & ~(63u | 0xe040u));
+    fp_set_control(FP_IEEE(fp_control()));  /* IEEE (graphics_queue.c's macros: MXCSR, or FPCR on arm64) */
     for (;;) {
         uint32_t at = gs_position(&gs_consumed);
         if (at == gs_position(&gs_written)) {
@@ -105,8 +110,9 @@ void graphics_gs_wait(void)
     if (!gs_worker)
         return;
     uint32_t target = gs_position(&gs_written);
-    while ((int32_t)(gs_position(&gs_consumed) - target) < 0)
-        idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1, NULL);
+    uint32_t observed;
+    while ((int32_t)((observed = gs_position(&gs_consumed)) - target) < 0)
+        idle_wait(&gs_consumed, observed, &gs_waiting, gs_retired, 1, NULL);
 }
 static void gs_queue_shutdown(void)
 {
@@ -158,8 +164,9 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
         unsigned tail = GS_RING_BYTES - (at & (GS_RING_BYTES - 1)), wrap = bytes > tail ? tail : 0;
         if (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap) {
             LONG64 full = tl_begin();
-            while (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap)
-                idle_wait(&gs_consumed, gs_position(&gs_consumed), &gs_waiting, gs_retired, 1, NULL);
+            uint32_t observed;
+            while (GS_RING_BYTES - (at - (observed = gs_position(&gs_consumed))) < bytes + wrap)
+                idle_wait(&gs_consumed, observed, &gs_waiting, gs_retired, 1, NULL);
             tl_add(TL_VU_FULL, full);
         }
         if (wrap) {

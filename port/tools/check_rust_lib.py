@@ -3,8 +3,8 @@
     python port/tools/check_rust_lib.py LIB [LIB ...] [--tree DIR ...] [--extra DIR ...]
                                         [--native-static-libs "kernel32.lib ..."]
 
-LIB is the x64 static library (dhd_render.lib, an archive of COFF objects), a .wasm module or the
-wasm-bindgen glue. Exit 0 when nothing is found; otherwise each problem is printed and the exit is 1.
+LIB is the x64 static library (dhd_render.lib, an archive of COFF objects), the Android one
+(libdhd_render.a, ELF objects), a .wasm module or the wasm-bindgen glue. Exit 0 when nothing is found; otherwise each problem is printed and the exit is 1.
 
 Refused:
 - an absolute drive path (package_release.ABSOLUTE, as the release check reads it: ASCII in the data
@@ -15,7 +15,7 @@ Refused:
   this repository) and any --extra folder, each with and without its drive, in either slash;
 - `/defaultlib:msvcrt` (the dynamic C runtime; the x64 exe links libcmt);
 - a native-static-libs entry (as rustc printed it) outside the list spike S1 recorded
-  (port/render/native-static-libs-x86_64.txt).
+  (port/render/native-static-libs-x86_64.txt; Android's: native-static-libs-aarch64-linux-android.txt).
 The remapped dependency paths (cargo\\registry\\src\\..., rustup\\...) and std's /rustc/<hash>/library/...
 hold no drive and no marker, so they pass; so do drive paths under a build-machine folder of the
 toolchain's own std libraries (compiler_builtins' C objects name Rust CI's C:\\a\\rust\\rust\\...;
@@ -33,6 +33,7 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parents[1]
 ALLOWED_LIBS_FILE = ROOT / 'port' / 'render' / 'native-static-libs-x86_64.txt'
+ALLOWED_LIBS_FILES = {'aarch64-linux-android': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-linux-android.txt'}
 DYNAMIC_CRT = re.compile(rb'[/-]defaultlib:\s*"?msvcrt', re.I)
 SCN_CODE = 0x00000020
 SCN_EXECUTE = 0x20000000
@@ -53,9 +54,13 @@ def sha256(path):
     return h.hexdigest()
 
 
-def allowed_native_libs():
+def allowed_libs_file(triple=None):
+    return ALLOWED_LIBS_FILES.get(triple, ALLOWED_LIBS_FILE)
+
+
+def allowed_native_libs(triple=None):
     words = []
-    for line in ALLOWED_LIBS_FILE.read_text(encoding='utf-8').splitlines():
+    for line in allowed_libs_file(triple).read_text(encoding='utf-8').splitlines():
         if line.strip() and not line.lstrip().startswith('#'):
             words += line.split()
     return {w.lower() for w in words}
@@ -131,6 +136,30 @@ def coff_sections(obj):
     return out
 
 
+SHF_EXECINSTR = 0x4
+
+
+def elf_sections(obj):
+    """[(name, flags, bytes)] of an ELF64 little-endian object; None if it is not one."""
+    if len(obj) < 64 or obj[:4] != b'\x7fELF' or obj[4] != 2 or obj[5] != 1:
+        return None
+    shoff = struct.unpack_from('<Q', obj, 0x28)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', obj, 0x3A)
+    if not shoff or shentsize < 64 or shoff + shnum * shentsize > len(obj):
+        return None
+    heads = [struct.unpack_from('<IIQQQQ', obj, shoff + k * shentsize) for k in range(shnum)]
+    strtab = heads[shstrndx] if shstrndx < shnum else None
+    out = []
+    for name_off, kind, flags, _addr, offset, size in heads:
+        name = ''
+        if strtab:
+            start = strtab[4] + name_off
+            end = obj.find(b'\0', start)
+            name = obj[start:end].decode('latin-1')
+        out.append((name, flags, obj[offset:offset + size] if kind != 8 else b''))  # 8: SHT_NOBITS
+    return out
+
+
 def leb(data, pos):
     value = shift = 0
     while True:
@@ -160,11 +189,15 @@ def units(path):
         out = []
         for name, body in ar_members(data):
             secs = coff_sections(body)
-            if secs is None:
-                out.append((name, body, body))
-            else:
+            elf = elf_sections(body) if secs is None else None
+            if secs is not None:
                 plain = b'\0'.join(b for _, f, b in secs if not f & (SCN_CODE | SCN_EXECUTE))
                 out.append((name, body, plain))
+            elif elf is not None:  # the Android library's members
+                plain = b'\0'.join(b for _, f, b in elf if not f & SHF_EXECINSTR)
+                out.append((name, body, plain))
+            else:
+                out.append((name, body, body))
         return out
     if data[:4] == b'\0asm':
         return [('wasm', data, b'\0'.join(b for sid, b in wasm_sections(data) if sid != 10))]
@@ -194,7 +227,7 @@ def sysroot_lib(triple, cwd=None):
     return Path(r.stdout.strip()) / 'lib' / 'rustlib' / triple / 'lib'
 
 
-def problems(path, trees=(ROOT,), extra=(), native_static_libs=None, sysroot=None):
+def problems(path, trees=(ROOT,), extra=(), native_static_libs=None, sysroot=None, triple=None):
     """The problems of one library, module or glue file. sysroot: <sysroot>/lib/rustlib/<triple>/lib
     of the toolchain that built it (its std's build-machine paths are allowed); None allows none."""
     pr = _release()
@@ -218,11 +251,11 @@ def problems(path, trees=(ROOT,), extra=(), native_static_libs=None, sysroot=Non
         if DYNAMIC_CRT.search(data):
             found.append('%s: /defaultlib:msvcrt (the dynamic C runtime)' % where)
     if native_static_libs is not None:
-        known = allowed_native_libs()
+        known = allowed_native_libs(triple)
         extra_libs = [l for l in native_static_libs if l.lower() not in known]
         if extra_libs:
             found.append('native-static-libs outside the S1 list (%s): %s' % (
-                ALLOWED_LIBS_FILE.relative_to(ROOT).as_posix(), ' '.join(extra_libs)))
+                allowed_libs_file(triple).relative_to(ROOT).as_posix(), ' '.join(extra_libs)))
     return list(dict.fromkeys(found))
 
 

@@ -504,6 +504,23 @@ PATCHES['unsorted/001F94D0.c'] = [('text', 'extern void func_0018E830(void);', '
 # sceMpegAddStrCallback (func_0024C630: mpeg, stream type, channel, callback, data) in the
 # registers they came in; the source names none, so natively the call read through garbage and
 # every movie crashed (round 38).
+# The sound bank path's literals as 16-byte, 16-aligned, zero-padded arrays (finding 090 SP17).
+# strcpy (func_00254544) and strcat (func_002542C4) read their source a word (ld) or a quadword
+# at a time once it is aligned, past the NUL, and those bytes stay in the registers (t0-t2, a0's
+# upper lanes) and in a later sprintf's vararg spill (0x0093C620-0x0093C637). A plain literal sits
+# wherever the module's .rodata puts it (";1" was tail-merged into another path's literal), so
+# those leftovers changed with any data layout change (OP2, SP4's one global, SP1's templates).
+# In the arrays the bytes read past the NUL are always zero. The strings, so the path and the
+# game, are the same.
+PATCHES['unsorted/00208900.c'] = [
+    ('text', 'void func_00208900(SoundBankList *list, int *bank, char *name) {',
+     'static const char port_snd_dir[16] __attribute__((aligned(16))) = "\\\\SND\\\\";\n'
+     'static const char port_iso_version[16] __attribute__((aligned(16))) = ";1";\n'
+     'void func_00208900(SoundBankList *list, int *bank, char *name) {'),
+    ('text', 'strcpy(path, "\\\\SND\\\\");', 'strcpy(path, port_snd_dir);'),
+    ('text', 'func_002542C4(path, ";1");', 'func_002542C4(path, port_iso_version);'),
+]
+
 PATCHES['unsorted/0023C1D0.c'] = [
     ('text', 'extern void func_0024C630(void);', 'extern int func_0024C630(void *, int, int, void (*)(void), int);'),
     ('text', 'int func_0023C1D0(void)\n{\n    func_0024C630();',
@@ -561,19 +578,64 @@ void port_online_choose_end(void) {
     port_main_row = 3;
     D_004C6CA8__cED5B8.x4 = 0;
 }
-void port_online_choose_begin(void) {
+extern int D_004C6910_online[] asm("D_004C6910");  /* each player's place on the rider carousel */
+extern int D_0029DF68_online asm("D_0029DF68");    /* the player choosing */
+extern void func_001F60C8_online(int) asm("func_001F60C8");
+extern "C" int port_online_rider_spot(void);
+extern void func_00203FE0_online(void *, int) asm("func_00203FE0");
+extern void func_00203E10_online(void *, float) asm("func_00203E10");
+extern void func_001F5100_online(void) asm("func_001F5100");
+extern void func_001F65A8_online(int) asm("func_001F65A8");
+extern void func_001F65E0_online(int) asm("func_001F65E0");
+extern void *D_00275BB0_online[] asm("D_00275BB0");  /* each place's stand animation */
+extern int D_00275C30_online[] asm("D_00275C30");
+extern int D_0029E01C_online asm("D_0029E01C");
+extern void func_0021E428_online(int) asm("func_0021E428");  /* the rider screen's camera on (func_001F24B8) */
+/* flight: the camera's flight from the title to the rider screen, as SINGLE PLAYER (the first
+   choice). 0: back from the shop to the room: the rider screen on the player's own rider, as the
+   new/continue screen's Back puts it there (func_001F3B98): the carousel's camera take that ends at
+   that place (place p: take p + 1, the last place 14: take 16) at its end, the statues around it,
+   the rider's stand animation, the rider alive. */
+void port_online_choose_begin(int flight) {
+    int spot = flight ? 1 : port_online_rider_spot();
+    int take = spot == 14 ? 16 : spot + 1;
     func_001F67F0_online(0);
     D_004B25A0__cED5B8.x288 = 1;
-    D_0029DED8__cED5B8 = 32;
-    D_0029DEEC__cED5B8 = 15;
     D_0029DF50__cED5B8 = 2;
-    func_00203590((struct AnimationHandle *)(void *)(D_004C6370__cED5B8), 0x2330, 0, 2);
-    /* The flight to the rider screen from its start: once played it stays at its end, and
-       playing it again would leave the camera where the last screen put it (the sky of the
-       GET READY screen, the title). */
-    func_00203B68_online(D_004C6370__cED5B8, 1, 0.0f);
-    func_002038E0__cED5B8(D_004C6370__cED5B8, 1);
-    func_001F50F0__cED5B8(0x2330, 2);
+    if (flight) {
+        D_0029DED8__cED5B8 = 32;
+        D_0029DEEC__cED5B8 = 15;
+        func_00203590((struct AnimationHandle *)(void *)(D_004C6370__cED5B8), 0x2330, 0, 2);
+        /* The flight from its start: once played it stays at its end, and playing it again would
+           leave the camera where the last screen put it (the sky of the GET READY screen). */
+        func_00203B68_online(D_004C6370__cED5B8, 1, 0.0f);
+        func_002038E0__cED5B8(D_004C6370__cED5B8, 1);
+        func_001F50F0__cED5B8(0x2330, 2);
+    } else {
+        D_0029DF68_online = 0;
+        D_004C6910_online[0] = spot;
+        D_0029DED8__cED5B8 = 3;
+        D_0029DEEC__cED5B8 = 32;
+        func_00203590((struct AnimationHandle *)(void *)(D_004C6370__cED5B8), 0x2330, 0, take);
+        func_00203FE0_online(D_004C6370__cED5B8, 1);
+        func_002038E0__cED5B8(D_004C6370__cED5B8, 0);
+        func_001F50F0__cED5B8(0x2330, take);
+        func_001F5100_online();
+        func_001F65A8_online(1);
+        func_001F65E0_online(0);
+        func_001F60C8_online(spot);
+        if (spot != 14) {
+            struct { int w[4]; } stand;  /* a copy of the handle, as retail passes it */
+            func_00203590((struct AnimationHandle *)D_00275BB0_online[spot], D_00275C30_online[spot], 0, 0);
+            __builtin_memcpy(&stand, D_00275BB0_online[spot], sizeof stand);
+            func_00203E10_online(&stand, 1.0f);
+            __builtin_memcpy(&stand, D_00275BB0_online[spot], sizeof stand);
+            func_002038E0__cED5B8(&stand, 1);
+        }
+        D_0029E01C_online = 0;
+        /* the rider screen's camera on, as the rider screen does once the flight's take is at its end */
+        func_0021E428_online(1);
+    }
     func_001F57D0__cED5B8(0x2329, 0);
     D_0029DF44__cED5B8 = 0;
     D_0029DF40__cED5B8 = 210;
@@ -581,7 +643,7 @@ void port_online_choose_begin(void) {
     func_001C58A8__cED5B8(D_004B25A0__cED5B8.x4F0);
     func_001C5960__cED5B8(D_004B25A0__cED5B8.x4F0);
     func_001C5940__cED5B8(D_004B25A0__cED5B8.x4F0);
-    func_001F6A08__cED5B8(1);
+    func_001F6A08__cED5B8(spot);
 }
 """
 PATCHES['unsorted/001EB1D8.cpp'] += [
@@ -595,7 +657,7 @@ PATCHES['unsorted/001EB1D8.cpp'] += [
              '            func_001F57D0__cED5B8(0x2329, 1);',
      '            int online_action = port_online_menu();\n'
      '            port_main_row = online_action ? 0 : 3;\n'
-     '            if (online_action == 2) port_online_choose_begin();\n'
+     '            if (online_action == 2) port_online_choose_begin(1);\n'
      '            else func_001F57D0__cED5B8(0x2329, 1);'),
 ]
 
@@ -630,6 +692,24 @@ PATCHES['unsorted/001F8920.c'] = PATCHES.get('unsorted/001F8920.c', []) + [
     ('text', '        func_0018E1C0(race);',
      '        func_0018E1C0(race);\n'
      '        if (port_online_guest_track()) func_001F8A08(race);'),
+]
+
+# The mouse on the front end's own menus (port/hle/menu_page.c, finding 092 UI2): each shell frame
+# is marked and the shell's three text helpers report what they draw (to host memory only, no EE
+# state), so the mouse finds the rows the game drew; it acts through pad presses only.
+PATCHES['unsorted/001EB1D8.cpp'] += [
+    ('text', 'extern "C" int port_online_shell(void);\n',
+     'extern "C" int port_online_shell(void);\nextern "C" void port_shell_frame(void);\n'),
+    ('text', '        if (!port_online_shell()) switch (D_0029DED8__target) {',
+     '        port_shell_frame();\n        if (!port_online_shell()) switch (D_0029DED8__target) {'),
+] + [
+    ('text', head + ' {\n',
+     'extern void port_shell_text(int align, int style, int x, int y, const void *text);\n' + head +
+     ' {\n port_shell_text(%d, %s, x, y, (const void *)(%s));\n' % (align, style, text))
+    for head, align, style, text in (
+        ('void func_001F5398__c27(int style,int group,int color,int x,int y,void *text,int target)', 0, 'style', 'text'),
+        ('void func_001F5D08__c33(int style,int group,int color,int x,int y,void *text,int target)', 1, 'style', 'text'),
+        ('void func_001F5EE8__c34(int index,int row,int col,int x,int y,int z,int target)', 2, 'index', '(unsigned long)(unsigned)z'))
 ]
 
 # Online restart lifecycle: hooks at accepted retail actions and actual race initialization.

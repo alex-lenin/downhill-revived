@@ -77,7 +77,7 @@ MODULE_UNITS = [
     'runtime/sha256.c', 'hle/kernel.c', 'hle/timer.c', 'hle/boot.c', 'hle/sif.c', 'hle/cdvd.c', 'hle/game_data.c',
     'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/graphics.c', 'hle/pad.c', 'hle/menu_page.c',
     'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/puppet.c', 'hle/online.c',
-    'hle/online_menu.c', 'hle/autopad.c', 'hle/state_trace.c', 'hle/sound.c', 'hle/game_options.c',
+    'hle/online_menu.c', 'hle/autopad.c', 'hle/state_trace.c', 'hle/rate_audit.c', 'hle/sound.c', 'hle/game_options.c',
     'hle/fps.c', 'hle/keyboard.c', 'hle/vif0.c', 'runtime/wasi_adapter.c',
 ]
 MIRROR_DIRS = ['runtime', 'hle', 'include', 'host', 'gs', 'net']
@@ -646,6 +646,7 @@ def compile_src(job):
         return {'unit': 'src/' + rel, 'status': 'failed', 'stage': 'transform', 'errors': []}
     lang = OPT_LANG_CPP if cpp else OPT_LANG_C
     inc = ['-I', PORT_OUT + '/include', '-I', INC_OUT, '-I', os.path.join(ROOT, 'include'), '-I', SHIM]
+    inc += ['-DPS2_ASM_DIRECT']  # port.h PS2A: inline asm calls its generated function (ps2asm_aot.py)
     front = ['clang'] + [f for f in BASE if f != '-c'] + lang + inc + ['-S', '-emit-llvm', '-Xclang', '-disable-llvm-passes',
                                                                      '-include', HEADER_SHIM[0]] + extra
     rec = {'unit': 'src/' + rel, 'status': 'ok', 'stage': '', 'errors': []}
@@ -1244,7 +1245,10 @@ def main():
     vu1_aot_inc = os.path.join(OUT, 'vu1aot', 'vu1_aot.inc')
     print('VU1 AOT: %d straight-line blocks' % vu1_aot.generate(vu1_aot_inc), flush=True)
     __import__('vu0_native_words').derive(vu1_aot_inc, os.path.join(OUT, 'vu0_native_words.inc'))
-    vu0_native = ['-DPS2_VU0_NATIVE', '-I', OUT]
+    # The VU0 microprograms compiled to C (port/tools/vu0_aot.py, finding 090 SP1), for the entries
+    # without a native routine: the module runs every vcallms.
+    print('VU0 compiled: %d entries' % len(__import__('vu0_aot').generate(os.path.join(OUT, 'vu0_aot.inc'))), flush=True)
+    vu0_native = ['-DPS2_VU0_NATIVE', '-DPS2_VU0_COMPILED', '-I', OUT]
     for rel in MODULE_UNITS:
         src = os.path.join(PORT_OUT, rel)
         extra = vu0_native if rel == 'runtime/vu0_interp.c' else []

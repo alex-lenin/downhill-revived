@@ -11,6 +11,8 @@ output (WASAPI) are built too (finding 083 / W11). No GPU or camera subsystems.
 linux_build() is the same source built for Linux x64 (build_host64_linux.py, WSL only):
 the window (X11 and Wayland where their dev packages are present) and audio
 (PulseAudio/PipeWire and ALSA where present), same SDL version and subsystem selection.
+android_build() (--android) is libSDL3.so for Android arm64 with the NDK, plus SDL's file dialog,
+and the release's Java sources (build_host64_android.py, port/android/build_apk.py; finding 091).
 SDL is zlib-licensed (port/release/THIRD-PARTY-NOTICES.txt).
 
 The download is kept in build/downloads, so a rebuild needs no network. Needs CMake on PATH (or in its default place), LLVM's clang and the
@@ -210,8 +212,78 @@ def linux_build():
     return lib, include, libs
 
 
+ANDROID_API = 30  # Android 11 (memfd_create, the Mi 11i's first release); build_host64_android.py's too
+ANDROID_DIRNAME = '%s-android-arm64' % VERSION  # build/port/sdl3/<version>-android-arm64
+
+
+def android_ndk():
+    """The NDK: ANDROID_NDK_HOME, else the newest under the SDK (ANDROID_HOME/ndk). Never on C:."""
+    named = os.environ.get('ANDROID_NDK_HOME') or os.environ.get('ANDROID_NDK_ROOT')
+    if named:
+        ndk = Path(named)
+    else:
+        sdk = Path(os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT') or Path.home() / 'Android/Sdk')
+        found = sorted((p for p in (sdk / 'ndk').glob('*') if (p / 'source.properties').exists()),
+                       key=lambda p: [int(x) for x in p.name.split('.') if x.isdigit()])
+        if not found:
+            sys.exit('SDL3: no NDK under %s/ndk (docs/findings/091-android.md, Toolchain)' % sdk)
+        ndk = found[-1]
+    if not (ndk / 'build' / 'cmake' / 'android.toolchain.cmake').exists():
+        sys.exit('SDL3: %s is not an NDK' % ndk)
+    return ndk
+
+
+def android_build():
+    """libSDL3.so for Android arm64-v8a (API ANDROID_API), its include directory and the Java
+    sources of the same release (android-project/app/src/main/java: SDLActivity and friends, which
+    build_apk.py puts in the APK). Same subsystem selection as OPTIONS (window, audio, controllers),
+    plus SDL's file dialog (the disc image is chosen through Android's document picker). A shared
+    library, as SDL's Java side loads it (System.loadLibrary("SDL3")); its own libc++ is static.
+    Built with the NDK's CMake toolchain file, CMake and Ninja, under
+    build/port/sdl3/<version>-android-arm64."""
+    base = OUT / ANDROID_DIRNAME
+    src = base / 'src' / ('SDL3-%s' % VERSION)
+    lib = base / 'build' / 'libSDL3.so'
+    include = src / 'include'
+    java = src / 'android-project' / 'app' / 'src' / 'main' / 'java'
+    stamp = base / 'built.txt'
+    ndk = android_ndk()
+    options = {k: v for k, v in OPTIONS.items() if k not in ('HAVE_DINPUT_H', 'HAVE_GAMEINPUT_H')}
+    options.update(SDL_SHARED='ON', SDL_STATIC='OFF', SDL_DIALOG='ON')
+    recipe = repr(sorted(options.items())) + 'android-arm64-%d %s' % (ANDROID_API, ndk.name)
+    if lib.exists() and stamp.exists() and stamp.read_text() == recipe:
+        return lib, include, java
+    tarball = fetch()
+    if src.parent.exists():
+        shutil.rmtree(src.parent)
+    src.parent.mkdir(parents=True)
+    with tarfile.open(tarball) as t:
+        t.extractall(src.parent, filter='data')
+    bld = base / 'build'
+    if bld.exists():
+        shutil.rmtree(bld)
+    import ninja
+    cmake = tool('cmake', CMAKE_DEFAULT)
+    cmd = [cmake, '-S', str(src), '-B', str(bld), '-G', 'Ninja',
+           '-DCMAKE_MAKE_PROGRAM=' + os.path.join(ninja.BIN_DIR, 'ninja.exe' if os.name == 'nt' else 'ninja'),
+           '-DCMAKE_TOOLCHAIN_FILE=' + str(ndk / 'build' / 'cmake' / 'android.toolchain.cmake'),
+           '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-%d' % ANDROID_API,
+           '-DANDROID_STL=c++_static', '-DCMAKE_BUILD_TYPE=Release']
+    cmd += ['-D%s=%s' % kv for kv in sorted(options.items())]
+    for step in (cmd, [cmake, '--build', str(bld), '-j', '2']):
+        p = subprocess.run(step, capture_output=True, text=True)
+        if p.returncode:
+            sys.exit('SDL3 Android build failed:\n' + (p.stdout + p.stderr)[-4000:])
+    if not lib.exists():
+        sys.exit('SDL3: %s missing after the build' % lib)
+    stamp.write_text(recipe)
+    return lib, include, java
+
+
 if __name__ == '__main__':
-    if sys.argv[1:] == ['--linux']:
+    if sys.argv[1:] == ['--android']:
+        print(*android_build(), sep='\n')
+    elif sys.argv[1:] == ['--linux']:
         lib, include, libs = linux_build()
         print('%s\n%s\n%s' % (lib, include, ' '.join(libs)))
     else:

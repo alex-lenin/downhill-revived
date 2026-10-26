@@ -10,7 +10,8 @@
    - the texture packs: a decoded texture's replacement is its pack's (texpack_view), else its
      sharp font; their memory budget is half the device's dedicated memory (DXGI's
      DedicatedVideoMemory, gpu_rust.c's device.memory), or 1 GB when it is unknown;
-   - the window: GetClientRect for DHD_SCALE=window and for each present, pacing (pacing_present,
+   - the window: its size (gpu_rust.c's window_size: GetClientRect, Android: SDL's) for
+     DHD_SCALE=window and for each present, pacing (pacing_present,
      not under DHD_INTERP), dhdr_surface_present and the present counts.
 
    gpu_rust.c's contract with this file (its header): NativeExact is Rust (members x, native,
@@ -30,6 +31,14 @@ typedef Rust NativeExact;
    native_init lowers the scale further on a card with little memory (native_scale_limit). */
 #define NATIVE_SCALE_MAX 8u
 #include "gpu_rust_shared.inc"   /* native_core.inc, native_snapshot.inc, the shared glue */
+#ifdef DHD_GS_TEST_BUILD   /* the GS test programs (replay.c, test_native_*.c) link without present.c */
+static void gs_picture_rect(int left, int top, int right, int bottom, int w, int h)
+{
+    (void)left; (void)top; (void)right; (void)bottom; (void)w; (void)h;
+}
+#else
+void gs_picture_rect(int left, int top, int right, int bottom, int w, int h);  /* present.c: for the mouse */
+#endif
 
 static NativeView native_replacement_view(Native *n, NativeTexture *t)
 {
@@ -41,11 +50,11 @@ static NativeView native_replacement_view(Native *n, NativeTexture *t)
 /* DHD_SCALE=window: the smallest scale whose picture is as tall as the window. */
 static unsigned native_match_window(Native *n, const NativeFrame *f)
 {
-    RECT client = {0, 0, 0, 0};
-    if (n->exact->window) GetClientRect((HWND)n->exact->window, &client);
+    unsigned width, height;
+    window_size(n->exact->window, &width, &height);
     unsigned lines = f->display_surface >= 0 && f->display[6] ? f->display[6] : 448, scale = 1;
-    while (scale < n->scale_limit && scale * lines < (unsigned)client.bottom) scale++;
-    fprintf(stderr, "gs native: resolution scale %u (window %ld lines, picture %u)\n", scale, client.bottom, lines);
+    while (scale < n->scale_limit && scale * lines < height) scale++;
+    fprintf(stderr, "gs native: resolution scale %u (window %u lines, picture %u)\n", scale, height, lines);
     return scale;
 }
 
@@ -62,16 +71,38 @@ static void native_present(Native *n)
 {
     Rust *p = n->exact;
     if (!p->surface || !p->window || n->present_failed) return;
-    RECT client = {0, 0, 0, 0};
-    GetClientRect((HWND)p->window, &client);
-    unsigned w = (unsigned)client.right, h = (unsigned)client.bottom;
+    unsigned w, h;
+    window_size(p->window, &w, &h);
     if (!w || !h) return;  /* minimised */
+    static int spikes = -1;
+    if (spikes < 0) spikes = getenv("DHD_SPIKES") != NULL;
+    double start = spikes ? host_wall_seconds() : 0;
     int drawn = native_present_draw(n, p->surface, w, h, n->resize != 0);
+    double ready = spikes ? host_wall_seconds() : 0;
     if (drawn || n->display_width) n->resize = 0;   /* without a picture yet nothing was configured */
     if (drawn <= 0) return;   /* failed, or skipped: no picture yet, timeout */
+    {   /* where the picture is in the window, for the mouse (present.c) */
+        float viewport[4];
+        NativeRect cut;
+        native_present_rect(n, w, h, viewport, &cut);
+        gs_picture_rect(cut.left, cut.top, cut.right, cut.bottom, (int)w, (int)h);
+    }
     if (!n->interp) pacing_present(n->present_due, n->present_began);  /* holds the picture to its due time */
     dhdr_surface_present(p->surface);
     native_note_presented(n);
+    if (spikes) {
+        double end = host_wall_seconds();
+        if (end - start >= 0.001)
+            fprintf(stderr, "spike_present: field=%u start=%.9f acquire_ms=%.6f pace_present_ms=%.6f\n",
+                    n->field, start, (ready-start)*1e3, (end-ready)*1e3);
+    }
+}
+
+/* A new surface (gs_gpu_surface_reset; context lock held): presents again, configured afresh. */
+static void native_surface_reset(Native *n)
+{
+    n->present_failed = 0;
+    n->resize = 1;
 }
 
 /* The displayed picture (display_width x display_height) into pixels; 0 when there is none. */

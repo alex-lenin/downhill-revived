@@ -7,7 +7,7 @@ import glob, os, re, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, 'build', 'port', 'runtime')
 STR = r'"(?:\\.|[^"\\])*"'
-CALL = re.compile(r'ps2_asm\(((?:%s\s*)+),\s*("[^"]*"),\s*(\d+)' % STR)
+CALL = re.compile(r'(?:ps2_asm\(|PS2A\(\s*\w+\s*,\s*)((?:%s\s*)+),\s*("[^"]*"),\s*(\d+)' % STR)  # PS2A: transform.py's literal templates
 
 # A DMA kick must survive all three native C MMIO lvalue forms.
 from transform import dma_stores

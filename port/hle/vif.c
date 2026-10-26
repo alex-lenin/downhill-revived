@@ -9,6 +9,13 @@
 #include <stdlib.h>
 
 #include "ps2asm.h"
+#if !defined(DHD_VIF0_ONLY) && defined(__aarch64__)
+/* The Android build (finding 091): SIMDe maps the WL=1 unpack's SSE2 integer calls to NEON. */
+#define SIMDE_ENABLE_NATIVE_ALIASES
+#include <simde/x86/sse2.h>
+#elif !defined(DHD_VIF0_ONLY)
+#include <emmintrin.h>
+#endif
 #include "../runtime/memory.h"
 #include "../gs/gs.h"
 #if !defined(DHD_VIF0_ONLY)
@@ -40,7 +47,7 @@ enum { NOP = 0x00, STCYCL = 0x01, OFFSET = 0x02, BASE = 0x03, ITOP = 0x04, STMOD
 #define VU1_MICRO 0x11008000u
 #define VU1_DATA 0x1100C000u
 static uint8_t *micro(int unit) {
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
     if (unit!=1) abort();
     return GUEST(VU1_MICRO);
 #else
@@ -48,7 +55,7 @@ static uint8_t *micro(int unit) {
 #endif
 }
 static uint32_t *data_mem(int unit) {
-#if defined(_WIN64) || defined(__x86_64__)
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
     if (unit!=1) abort();
     return GUEST(VU1_DATA);
 #else
@@ -221,7 +228,7 @@ static void capture_representative(unsigned addr, unsigned top, unsigned itop)
 
 static void run_micro(Vif *v, uint32_t addr)
 {
-#if !defined(_WIN64) && !defined(__x86_64__)
+#if !defined(_WIN64) && !defined(__x86_64__) && !defined(__aarch64__)
     if (v->unit == 0) {
         if (ps2_vu0_run(&ps2, addr))
             hle_log("vif0: microprogram at 0x%X failed\n", addr);
@@ -443,8 +450,108 @@ static inline __attribute__((always_inline)) uint32_t stream_form(Vif *v, uint32
     return n;
 }
 
+#if !defined(DHD_VIF0_ONLY)
+/* The fields of vector k of a WL 1 UNPACK (stream_wl1) as one SIMD value (SSE2: on wasm through
+   simde), sign extended unless USN and spread as unpack_fields does. */
+static inline __attribute__((always_inline)) __m128i wl1_fields(uint32_t cmd, int usn, const uint32_t *words, uint32_t k)
+{
+    const uint8_t *b = (const uint8_t *)words;
+    switch (cmd & 0x0F) {
+    case 0x02: {  /* S-8: the byte in every field */
+        const uint32_t x = usn ? b[k] : (uint32_t)(int32_t)(int8_t)b[k];
+        return _mm_set1_epi32((int)x);
+    }
+    case 0x05: {  /* V2-16: x y x y */
+        uint32_t w;
+        memcpy(&w, b + 4 * k, 4);
+        const __m128i t = _mm_set1_epi32((int)w), low = _mm_slli_epi32(t, 16);
+        return usn ? _mm_unpacklo_epi32(_mm_srli_epi32(low, 16), _mm_srli_epi32(t, 16))
+                   : _mm_unpacklo_epi32(_mm_srai_epi32(low, 16), _mm_srai_epi32(t, 16));
+    }
+    case 0x0C:  /* V4-32 */
+        return _mm_loadu_si128((const __m128i *)(b + 16 * k));
+    case 0x0E: {  /* V4-8: each byte to the top of its lane, then shifted down */
+        uint32_t w;
+        memcpy(&w, b + 4 * k, 4);
+        __m128i t = _mm_cvtsi32_si128((int)w);
+        t = _mm_unpacklo_epi8(t, t);
+        t = _mm_unpacklo_epi16(t, t);
+        return usn ? _mm_srli_epi32(t, 24) : _mm_srai_epi32(t, 24);
+    }
+    default: {  /* V4-5 (5:5:5:1): each field masked in place, moved by a 16-bit multiply, then down 8 */
+        uint16_t c;
+        memcpy(&c, b + 2 * k, 2);
+        const __m128i t = _mm_and_si128(_mm_set1_epi32(c), _mm_setr_epi32(0x1F, 0x3E0, 0x7C00, 0x8000));
+        return _mm_srli_epi32(_mm_mullo_epi16(t, _mm_setr_epi32(2048, 64, 2, 1)), 8);
+    }
+    }
+}
+
+/* stream_form for WL 1 (any CL) and mode 0, the shape of VIF1's common UNPACKs (finding 090 VU1R:
+   V2-16 and S-8 masked, S-8, V4-5, V4-8 and V4-32, all CL 3 WL 1, are 85% of a race's unpack
+   time). Every vector is in cycle 0, so a masked UNPACK takes mask row 0 for all of them: one
+   per-lane blend of the decoded fields, the row/column registers (column 0) and the old memory
+   (write-protected lanes), set up once a command. Each vector advances the address by CL. Writes
+   what stream_form writes, and buffers a vector cut by the end of the transfer the same way. */
+static inline __attribute__((always_inline)) uint32_t stream_wl1(Vif *v, uint32_t cmd, int usn, const uint32_t *words,
+                                                                 uint32_t n, uint32_t num)
+{
+    int bits, count;
+    unpack_format(cmd, &bits, &count);
+    const uint32_t span = (cmd & 3) == 3 ? 16 : (uint32_t)(bits * count), masked = cmd >> 4 & 1;
+    const uint32_t stride = v->cl, last = data_qwords(v->unit) - 1;
+    uint32_t *mem = data_mem(v->unit), addr = v->addr, vectors = num - v->written;
+    if (vectors > n * 32 / span) vectors = n * 32 / span;
+    __m128i take = _mm_set1_epi32(-1), fixed = _mm_setzero_si128(), keep = _mm_setzero_si128();
+    int protect = 0;
+    if (masked) {
+        uint32_t t[4], f[4], p[4];
+        for (int i = 0; i < 4; i++) {
+            const uint32_t m = v->mask >> (i * 2) & 3;
+            t[i] = m == 0 ? ~0u : 0;
+            f[i] = m == 1 ? v->row[i] : m == 2 ? v->col[0] : 0;
+            p[i] = m == 3 ? ~0u : 0;
+            protect |= m == 3;
+        }
+        take = _mm_loadu_si128((const __m128i *)t);
+        fixed = _mm_loadu_si128((const __m128i *)f);
+        keep = _mm_loadu_si128((const __m128i *)p);
+    }
+    for (uint32_t k = 0; k < vectors; k++) {
+        __m128i *dst = (__m128i *)(mem + (addr & last) * 4), out = wl1_fields(cmd, usn, words, k);
+        if (masked) {
+            out = _mm_or_si128(_mm_and_si128(out, take), fixed);
+            if (protect) out = _mm_or_si128(out, _mm_and_si128(_mm_loadu_si128(dst), keep));
+        }
+        _mm_storeu_si128(dst, out);
+        addr += stride;
+    }
+    const uint32_t at = vectors * span;
+    v->written += vectors;
+    v->addr = addr;
+    if (v->written < num && at < n * 32) {  /* the rest of a vector comes with the next transfer */
+        v->bit = (int)(at % 32);
+        for (uint32_t w = at / 32; w < n; w++) v->buf[v->buf_words++] = words[w];
+    }
+    return n;
+}
+#endif
+
 static uint32_t unpack_stream(Vif *v, uint32_t cmd, const uint32_t *words, uint32_t n, uint32_t num)
 {
+#if !defined(DHD_VIF0_ONLY)
+    if (v->mode == 0 && v->wl == 1) {
+        const int usn = v->code >> 14 & 1;
+#define WL1(c) case c: return stream_wl1(v, c, 0, words, n, num)
+#define WL1_USN(c) case c: return usn ? stream_wl1(v, c, 1, words, n, num) : stream_wl1(v, c, 0, words, n, num)
+        switch (cmd & 0x1F) {
+        WL1_USN(0x02); WL1_USN(0x12); WL1_USN(0x05); WL1_USN(0x15); WL1_USN(0x0E); WL1_USN(0x1E);
+        WL1(0x0C); WL1(0x1C); WL1(0x0F); WL1(0x1F);
+        }
+#undef WL1
+#undef WL1_USN
+    }
+#endif
 #define FORM(c) case c: return stream_form(v, c, words, n, num, 0)
     if (v->mode == 0)
         switch (cmd & 0x1F) {
@@ -596,7 +703,7 @@ void vif_feed(int unit, const uint32_t *words, uint32_t n)
 {
 #if defined(DHD_VIF0_ONLY)
     if (unit!=0) abort();
-#elif defined(_WIN64) || defined(__x86_64__)
+#elif defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
     if (unit!=1) abort();
 #endif
     Vif *v = &vif[unit];

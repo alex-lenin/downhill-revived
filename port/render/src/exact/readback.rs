@@ -81,6 +81,7 @@ pub fn map_start(buffer: &wgpu::Buffer, range: std::ops::Range<u64>) -> MapStatu
 /// (its callback runs inside the poll). Err when the poll fails.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn wait(gpu: &Gpu) -> Result<(), String> {
+    let _spike = crate::native::pipelines::SpikeTimer::new("readback", 0);
     gpu.device.poll(wgpu::PollType::wait_indefinitely()).map(|_| ()).map_err(|e| format!("poll: {e}"))
 }
 

@@ -10,7 +10,7 @@
 The matching sources are never modified; the output goes to a separate tree.
 usage: python port/tools/transform.py SRC OUT
 """
-import re, sys
+import hashlib, re, sys
 
 ASM_WORD = re.compile(r'(?:asm|__asm|__asm__)\b')
 CONT = '\\\n'  # backslash-newline: a line continuation
@@ -164,10 +164,18 @@ def asm_statement(tmpl, outs, ins, expr=None):
         else:
             decls.append('PS2_INTYPE(%s) __i%d = (%s);' % (e, k, e))
             ops.append('{(void *)&__i%d, sizeof(__i%d)}' % (k, k))
+    constraints = '|'.join(cons)
+    if expr is None:
+        # A literal template: PS2A names the function ps2asm_aot.py generates for this exact
+        # (template, constraints, count), the run-time parse checked once (port.h, finding 090 SP13).
+        key = '%s\0%s\0%d' % (tmpl, constraints, len(ops))
+        call = 'PS2A(ps2a_%s, %%s, %%s, %%d, %%s)' % hashlib.sha1(key.encode('utf-8', 'surrogateescape')).hexdigest()[:16]
+    else:
+        call = 'ps2_asm(%s, %s, %d, %s)'
     if not ops:
-        return 'ps2_asm(%s, "", 0, 0)' % (expr or c_string(tmpl))
-    return 'do { %s ps2_op __o[] = {%s}; ps2_asm(%s, %s, %d, __o); } while (0)' % (
-        ' '.join(decls), ', '.join(ops), expr or c_string(tmpl), c_string('|'.join(cons)), len(ops))
+        return call % (expr or c_string(tmpl), '""', 0, '0')
+    return 'do { %s ps2_op __o[] = {%s}; %s; } while (0)' % (
+        ' '.join(decls), ', '.join(ops), call % (expr or c_string(tmpl), c_string(constraints), len(ops), '__o'))
 
 
 def in_directive(mask, i):
@@ -766,7 +774,17 @@ def transform(text, cpp=False, label_prefix='', image=None):
         text = gcc_virtuals(gcc_member_pointers(name_anonymous_structs(text)))
     if image:
         text = extern_image_data(text, image)
-    return prefix_asm_labels(text, label_prefix) if label_prefix else text
+    text = prefix_asm_labels(text, label_prefix) if label_prefix else text
+    if cpp:
+        # C++: port.h's PS2A declares its function at block scope, where C++ gives a function
+        # declared inside an extern "C" function C linkage and one in any other C++ linkage. A
+        # file-scope extern "C" declaration first makes every later one the same C function.
+        names = sorted(set(re.findall(r'\bPS2A\((ps2a_\w+)', text)))
+        if names:
+            text = 'extern "C" { %s }\n#line 1\n%s' % (
+                ' '.join('void %s(const char *, const char *, int, ps2_op *) __asm__("%s");' % (n, n)
+                         for n in names), text)
+    return text
 
 
 if __name__ == '__main__':

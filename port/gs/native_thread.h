@@ -11,9 +11,10 @@
                     at its own vsync), and a wait that would need another thread to end it stops
                     the process instead of hanging.
 
-   Linux, Android and iOS get a pthread implementation here later (PLAN.md §1.4); nothing in
-   native_core.inc changes for them. NativeWindow is present.c's window: HWND on Windows,
-   elsewhere opaque. */
+     POSIX          pthreads, atomic builtins, clock_nanosleep (the Android build, finding 091;
+                    Linux and iOS can use it too). Nothing in native_core.inc changes for them.
+
+   NativeWindow is present.c's window: HWND on Windows, elsewhere opaque (Android: ANativeWindow). */
 #ifndef PORT_GS_NATIVE_THREAD_H
 #define PORT_GS_NATIVE_THREAD_H
 
@@ -118,6 +119,68 @@ static inline unsigned native_bit_first(uint32_t bits)
 /* Leaves at once, without atexit handlers (the exit report would wait on the render thread). */
 static inline void native_exit_now(int code) { ExitProcess((UINT)code); }
 static inline int native_stricmp(const char *a, const char *b) { return _stricmp(a, b); }
+
+#elif defined(__unix__) || defined(__ANDROID__)
+
+/* POSIX (the Android build, finding 091): pthreads, C11 atomics' builtins and clock_nanosleep. */
+#include <pthread.h>
+#include <strings.h>
+#include <time.h>
+#include <unistd.h>
+#include <errno.h>
+
+typedef pthread_mutex_t NativeMutex;
+typedef pthread_cond_t NativeCond;
+typedef pthread_t NativeThread;
+typedef int NativeTimer;
+typedef void *NativeWindow;
+#define NATIVE_PATH_MAX 4096
+#define NATIVE_THREAD_RESULT void *
+typedef void *(*NativeThreadProc)(void *argument);
+
+static inline void native_mutex_init(NativeMutex *m) { pthread_mutex_init(m, NULL); }
+static inline void native_mutex_lock(NativeMutex *m) { pthread_mutex_lock(m); }
+static inline void native_mutex_unlock(NativeMutex *m) { pthread_mutex_unlock(m); }
+static inline void native_cond_init(NativeCond *c) { pthread_cond_init(c, NULL); }
+static inline void native_cond_broadcast(NativeCond *c) { pthread_cond_broadcast(c); }
+static inline void native_cond_wait(NativeCond *c, NativeMutex *m) { pthread_cond_wait(c, m); }
+
+/* The render thread (default priority: Android gives no portable way above it without root). */
+static inline NativeThread native_thread_start(NativeThreadProc proc, void *argument)
+{
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, proc, argument)) return 0;
+    pthread_detach(thread);
+    return thread;
+}
+
+static inline void native_atomic_store(volatile long *target, long value) { __atomic_store_n(target, value, __ATOMIC_SEQ_CST); }
+
+/* CLOCK_MONOTONIC sleeps are precise enough: the timer is always there (1). */
+static inline NativeTimer native_timer_create(void) { return 1; }
+static inline int native_timer_wait(NativeTimer timer, double seconds)
+{
+    (void)timer;
+    if (seconds <= 0) return 1;
+    struct timespec t;
+    t.tv_sec = (time_t)seconds;
+    t.tv_nsec = (long)((seconds - (double)t.tv_sec) * 1e9);
+    while (clock_nanosleep(CLOCK_MONOTONIC, 0, &t, &t) == EINTR) {}
+    return 1;
+}
+
+static inline void native_sleep_ms(unsigned ms) { usleep((useconds_t)ms * 1000u); }
+static inline void native_cpu_relax(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("yield");
+#elif defined(__x86_64__)
+    __builtin_ia32_pause();
+#endif
+}
+static inline unsigned native_bit_first(uint32_t bits) { return (unsigned)__builtin_ctz(bits); }
+static inline void native_exit_now(int code) { _exit(code); }
+static inline int native_stricmp(const char *a, const char *b) { return strcasecmp(a, b); }
 
 #else
 #error "native_thread.h: no implementation for this platform yet (define NATIVE_INLINE for one thread)"

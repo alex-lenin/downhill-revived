@@ -4,12 +4,15 @@
     python port/tools/rustgs.py build --target x86_64-pc-windows-msvc [--features test-hooks]
                                       [--profile release|fixloop] [--no-cache] [--report FILE]
     python port/tools/rustgs.py build --target wasm32-unknown-unknown [--profile ...]   # cdylib + wasm-bindgen
+    python port/tools/rustgs.py build --target aarch64-linux-android [--profile ...]    # Android (finding 091)
     python port/tools/rustgs.py test  --target x86_64-pc-windows-msvc [--features ...] -- --test device_smoke [filter]
     python port/tools/rustgs.py run   --target x86_64-pc-windows-msvc --bin optrace_replay -- <args>
     python port/tools/rustgs.py tree  [--target T]      # the version gate, printed
     python port/tools/rustgs.py selftest [--keep]       # port/tools/rustgs_selftest.py
 
-Scope: x64 Windows and the browser (wasm32) only; i686 stays on the C renderer (decision D2 = c).
+Scope: x64 Windows, the browser (wasm32) and Android arm64 (aarch64-linux-android, finding 091: a
+staticlib, libdhd_render.a, linked into libmain.so by build_host64_android.py; Vulkan only). The i686
+build is retired.
 
 What every cargo call gets
 --------------------------
@@ -40,7 +43,7 @@ Gates (each prints `rustgs: refused: ...` and exits 2; a refused or failed build
   after the build, cargo's dep-info must list no input outside the tree, CARGO_HOME, RUSTUP_HOME and
   the target dir;
 - port/tools/check_rust_lib.py on the built library (paths, markers, /defaultlib:msvcrt,
-  native-static-libs outside the S1 list).
+  native-static-libs outside the S1 list; Android: outside native-static-libs-aarch64-linux-android.txt).
 
 The one rewrite of rustc's output (x64): thin LTO re-emits the std crates' modules, which carry
 CodeView, and LLVM writes each object's S_OBJNAME record (in .debug$S, which never reaches the exe's
@@ -59,7 +62,8 @@ versions; paths in it are relative to the tree, so every worktree has the same k
 files out instead of running cargo. `--no-cache` builds with cargo and stores nothing.
 DHD_OBJCACHE=0 turns the cache off (every build a miss).
 
-Outputs: native: <target_dir>/rustgs/<triple>/<profile>/<features>/dhd_render.lib; wasm:
+Outputs: native: <target_dir>/rustgs/<triple>/<profile>/<features>/dhd_render.lib (Android:
+libdhd_render.a); wasm:
 build/web/renderer/. `--report FILE` writes {lib, sha256, cache, key, rustflags, target_dir, glue,
 native_static_libs, triple, profile, features, versions}.
 """
@@ -90,7 +94,8 @@ SEED = CARGO_TARGETS / 'seed'
 WEB_OUT = ROOT / 'build' / 'web' / 'renderer'
 X64 = 'x86_64-pc-windows-msvc'
 WASM = 'wasm32-unknown-unknown'
-TARGETS = (X64, WASM)            # i686 is not built with Rust (D2 = c)
+ANDROID = 'aarch64-linux-android'  # the Android build (build_host64_android.py, finding 091)
+TARGETS = (X64, WASM, ANDROID)   # i686 is retired
 PROFILES = ('release', 'fixloop')
 FEATURES = ('test-hooks',)       # what a caller may add; native / web are rustgs's own
 REFUSED_FEATURES = ('no-fp-guard',)
@@ -507,7 +512,7 @@ def cache_store(key, files, extra):
 
 def common(triple, profile):
     if triple not in TARGETS:
-        refuse('--target %s: rustgs builds %s only (i686 stays on the C renderer, D2 = c)' % (
+        refuse('--target %s: rustgs builds %s only (the i686 build is retired)' % (
             triple, ' and '.join(TARGETS)))
     if profile not in PROFILES:
         refuse('--profile %s: one of %s' % (profile, ', '.join(PROFILES)))
@@ -550,7 +555,7 @@ def build(triple, features=(), profile='release', no_cache=False):
     tdir.mkdir(parents=True, exist_ok=True)
     tag = '+'.join(features) or 'default'
     out_dir = WEB_OUT if triple == WASM else tdir / 'rustgs' / triple / profile / tag
-    lib_name = 'dhd_render_bg.wasm' if triple == WASM else 'dhd_render.lib'
+    lib_name = 'dhd_render_bg.wasm' if triple == WASM else 'libdhd_render.a' if triple == ANDROID else 'dhd_render.lib'
     rep = {'triple': triple, 'profile': profile, 'features': features, 'key': key, 'rustflags': flags,
            'target_dir': str(tdir), 'versions': versions}
     hit = None if no_cache else cache_fetch(key, out_dir)
@@ -573,8 +578,8 @@ def build(triple, features=(), profile='release', no_cache=False):
     if r.returncode:
         raise SystemExit('rustgs: cargo failed (exit %d)' % r.returncode)
     built_dir = tdir / triple / profile
-    raw = built_dir / ('dhd_render.wasm' if triple == WASM else 'dhd_render.lib')
-    inputs_gate(built_dir / 'dhd_render.d')
+    raw = built_dir / ('dhd_render.wasm' if triple == WASM else lib_name)
+    inputs_gate(built_dir / ('libdhd_render.d' if triple == ANDROID else 'dhd_render.d'))
     sysroot = Path(tool_version(['rustc', '--print', 'sysroot'], env).strip()) / 'lib' / 'rustlib' / triple / 'lib'
     native_libs = []
     if triple != WASM:
@@ -605,11 +610,11 @@ def build(triple, features=(), profile='release', no_cache=False):
     else:
         lib = out_dir / lib_name
         shutil.copyfile(raw, lib)
-        renamed = normalise_objnames(lib, tdir)
+        renamed = normalise_objnames(lib, tdir) if triple == X64 else 0  # COFF's records only
         if renamed:
             log('%d S_OBJNAME record(s) normalised to target\\...' % renamed)
         problems = check_rust_lib.problems(lib, trees=[ROOT], extra=[tdir], native_static_libs=native_libs,
-                                           sysroot=sysroot)
+                                           sysroot=sysroot, triple=triple)
         if problems:
             lib.unlink()
             refuse('check_rust_lib: ' + '; '.join(problems[:8]))
@@ -626,7 +631,7 @@ def build(triple, features=(), profile='release', no_cache=False):
 
 def library(target=X64, features=(), profile='release'):
     """The built library's path (for link scripts; A1c). 'x64' / 'wasm' are accepted for the triple."""
-    triple = {'x64': X64, 'x86_64': X64, 'wasm': WASM, 'wasm32': WASM}.get(target, target)
+    triple = {'x64': X64, 'x86_64': X64, 'wasm': WASM, 'wasm32': WASM, 'android': ANDROID}.get(target, target)
     return Path(build(triple, features, profile)['lib'])
 
 

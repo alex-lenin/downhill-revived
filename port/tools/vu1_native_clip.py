@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import struct
 from vudis import walk
-from vu1_aot import WORDS_MACRO, fill_function, fills, program
+from vu1_aot import WORDS_MACRO, fill_function, fills, lazy_flags, program
 ROOT = Path(__file__).resolve().parents[2]
 
 def generate(destination, early_flags=True):
@@ -32,6 +32,8 @@ def generate(destination, early_flags=True):
         ('loop1638',0x1708,0x17b0),
         ('loop17e0',0x18b0,0x1928),
         ('loop800',0x8b0,0x938),
+        ('loop0798',0x798,0x7e0),
+        ('loop3140',0x3140,0x3180),
         ('loop468',0x468,0x578),
         ('loop1430',0x1510,0x1638),
         ('loop2dc8',0x2f00,0x2fc8),
@@ -59,9 +61,14 @@ def generate(destination, early_flags=True):
     # issued its CLIP at least four slots earlier. No status flag reads occur.
     reads={pc*8 for pc in selected if pairs[pc][1]>>31==0 and pairs[pc][0]>>25 in range(0x10,0x1d)}
     assert reads == {0x1970,0x1a58,0x1a68,0x1a78,0x1a88,0x1a98,0x2600}, reads
+    # FMACs whose MAC update the read at 1970 cannot see commit lazily (vu1_aot.py lazy_flags,
+    # finding 090 VU1R), analysed on this closed routine alone: every way out of it (the return
+    # to the kernel, any pair outside it) counts as reaching a read. drain_flags at the return
+    # folds them in before the kernel reads the status again.
+    lazy=lazy_flags({pc:pairs[pc] for pc in selected}) if early_flags else set()
     lines+=['static inline __attribute__((always_inline)) void native_clip_commit(Vu *u, Upper *up) {',
             'if(up->flags==1){unsigned m=up->mac; unsigned st=(m&15?1:0)|(m&240?2:0)|(m&3840?4:0)|(m&61440?8:0);',
-            'u->mac=m;u->status=(u->status&~15u)|st|(st<<6);}',
+            'u->mac=m;u->status=(u->status&~15u)|st|(st<<6);u->lazy_valid=0;}',
             'else if(up->flags==2){u->clip=u->clip_next=((u->clip<<6)|up->clip_bits)&0xffffff;}',
             'up->flags=0;commit_upper(u,up,0);}',
             'static unsigned native_clip_run(Vu *u, unsigned resume) {','unsigned count=0; int target=-1,bad=0; Upper up;','goto L1948;']
@@ -73,7 +80,8 @@ def generate(destination, early_flags=True):
             out+=[f'{{uint32_t word=0x{lo:08x}u;memcpy(&u->c->i,&word,4);}}','target=-1;']
         else:
             out+=[f'target=lower(u,0x{lo:08x}u,{pc},&bad); if(bad)return 0;']
-        out += [('native_clip_commit(u,&up);' if early_flags else f'commit_upper(u,&up,{lo>>16&31});') + 'u->cycle++;count++;']
+        commit='commit_upper_lazy(u,&up,0);' if pc in lazy else 'native_clip_commit(u,&up);' if early_flags else f'commit_upper(u,&up,{lo>>16&31});'
+        out += [commit + 'u->cycle++;count++;']
         return out
     branches=(0x20,0x21,0x24,0x25,0x28,0x29,0x2c,0x2d,0x2e,0x2f)
     for pc in selected:

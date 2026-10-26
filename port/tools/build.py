@@ -35,7 +35,7 @@ CLANG = ['clang', '--target=' + pctarget.TARGET, '-c', '-O' + a.opt, '-w', '-fer
          '-fno-strict-aliasing', '-fwrapv', '-fno-delete-null-pointer-checks',
          '-malign-double',  # 64-bit fields 8-aligned in structs, as on the EE
          # single-precision SSE math, no fused multiply-add: results that don't depend on the
-         # optimizer or the machine (x87 keeps excess precision), as lockstep multiplayer needs
+         # optimizer or the machine (x87 keeps excess precision), so state hashes compare across PCs
          '-msse2', '-mfpmath=sse', '-ffp-contract=off',
          # Locals start as zero, not as whatever host code left on the stack: the game reads some
          # before writing them, and host leftovers (ASLR'd stack and heap pointers) made two runs of

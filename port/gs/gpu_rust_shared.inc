@@ -10,6 +10,8 @@
    native_replacement_view (texture packs), native_match_window, native_present (the window and
    pacing, or the canvas at web_present), native_read_display and native_init. */
 
+#include "dhd_render_ext.h"       /* dhdr_native_picture_indexed (-Iport/render/include) */
+
 typedef DhdrTexture *NativeView;   /* a replacement: a texture pack's or the sharp font's */
 /* A decoded texture: its Rust texture (gpu; native_core.inc asks for it as texture) and its sharp
    font, or NULL. */
@@ -128,7 +130,10 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
     DhdrPictureResult r;
     memset(&r, 0, sizeof r);
     int shown = 0;
-    if (dhdr_native_picture(n->r, picture, &r)) {
+    /* An indexed field's draws are ranges of its indices (native_core.inc's Native indexed). */
+    int drawn = n->indexed ? dhdr_native_picture_indexed(n->r, picture, f->indices, f->index_count, &r)
+                           : dhdr_native_picture(n->r, picture, &r);
+    if (drawn) {
         n->display_width = r.display_width; n->display_height = r.display_height;
         shown = r.shown != 0;
     }

@@ -244,6 +244,21 @@ def prepare_units(units, out, exact_f32=False):
     for header in out.glob('*-impl.h'):
         if '#define MEM_ADDR(mem' in header.read_text():
             prepare(header)
+        header.write_text(builtin_float_tests(header.read_text()))
+
+
+def builtin_float_tests(text):
+    """wasm2c's float helpers (wasm_quietf on every f32.promote, wasm_quiet on every f64.demote,
+    wasm_fabs, floor/ceil/trunc/nearest/sqrt) test for NaN with isnan(), and FMIN/FMAX use
+    signbit(). Under the UCRT headers isnan(x) is fpclassify(x) == FP_NAN: a compare with zero, a
+    NaN compare, an infinity compare and a normal/subnormal compare. With -ffp-model=strict clang
+    keeps every one of those compares, even the unused ones, because a compare may raise a flag.
+    In the race that was about 12% of the EE thread's samples (finding 090 SP11). The compiler's
+    __builtin_isnan / __builtin_signbit give the same answer for every input in one test. The
+    values computed do not change, so neither does the game."""
+    for name in ('isnan', 'signbit'):
+        text = re.sub(r'(?<![\w.])%s\(' % name, '__builtin_%s(' % name, text)
+    return text
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

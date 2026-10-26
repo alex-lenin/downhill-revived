@@ -730,6 +730,11 @@ void kernel_intc_write(uint32_t value)
    field and the game's delta stays 1. DHD_FRAME_CLOCK=1 runs unpaced, DHD_PACE=wall lets wall
    time drive the fields (the game then measures slow frames as 2 or 3 fields). */
 static int paced;
+/* fps.c's wall-clock steps above 60 (port_fps_wall_mode): normal paced play, or a host that paces
+   the fields itself on the frame clock and says so with DHD_FPS_WALL=1 (the browser's worker.js,
+   which then gives host_wall_seconds real time). Deterministic runs (DHD_FRAME_CLOCK=1 alone)
+   keep the nominal step. */
+static int wall_steps;
 static double pace_base;
 
 /* An online race waited `seconds` for the other players: the following fields keep their spacing
@@ -802,11 +807,13 @@ static int jit_on(void)
     return jit && !pace_shared;
 }
 
+int graphics_ordered;  /* hle.h */
+
 static void vsync(void)
 {
     /* The original online clock accounts for this time. Do not charge it
        again if the player returns to an offline high-rate menu/race. */
-    if (pads_online()) port_fps_wall_mode(paced);
+    if (pads_online()) port_fps_wall_mode(wall_steps);
     int fresh = paced && jit_on();
     if (paced && !fresh) pace();
     host_pacing_handoff(fresh);
@@ -840,7 +847,8 @@ static void vsync(void)
     }
     intc_raise(INTC_VBLANK_START);
     run_handlers(intc_handlers, intc_enabled, INTC_VBLANK_START);
-    host_service_graphics_wait(); /* handlers may have submitted another packet */
+    /* handlers may have submitted another packet (graphics_ordered: gs_vsync is queued after it) */
+    if (!graphics_ordered) host_service_graphics_wait();
 #if defined(__wasm__)
     extern int host_widescreen_flat_limit(void);
     host_frame_video(host_widescreen_aspect(),host_widescreen_flat_limit());
@@ -868,12 +876,16 @@ static int deliver(void)
     int any = 0;
     uint64_t now = now_cycles();
     timer_poll(now);
-    Registers rpc_saved;
-    save_registers(&rpc_saved);
-    in_interrupt++;
-    any |= sif_poll();
-    in_interrupt--;
-    load_registers(&rpc_saved);
+    /* With no RPC in flight sif_poll does nothing: skip it and the two register-bank copies
+       (about 1.5 KB of memmove per kernel entry, hundreds per field; finding 090 SP14). */
+    if (sif_next_event() < 1e100) {
+        Registers rpc_saved;
+        save_registers(&rpc_saved);
+        in_interrupt++;
+        any |= sif_poll();
+        in_interrupt--;
+        load_registers(&rpc_saved);
+    }
     if (now >= next_vsync) {
         uint64_t cycles = port_fps_high() ? (uint64_t)(BUS_HZ / port_fps()) : VSYNC_CYCLES;
         next_vsync += cycles;
@@ -1034,7 +1046,9 @@ void kernel_init(void)
     const int unpaced = frame_clock && !strcmp(frame_clock, "1"), wall = pacing && !strcmp(pacing, "wall");
     ee_frame_clock_reset(unpaced || !wall);
     paced = !unpaced && !wall;
-    port_fps_wall_mode(paced);
+    const char *fps_wall = host_getenv("DHD_FPS_WALL");
+    wall_steps = paced || (fps_wall && atoi(fps_wall) == 1);
+    port_fps_wall_mode(wall_steps);
     host_service_host_init();
     host_service_gs_reset();
     state_trace_init();  /* after gs_reset, which clears the GS struct; no-op unless DHD_STATE_TRACE */
@@ -1043,6 +1057,8 @@ void kernel_init(void)
     intc_stat = 0;
     *(volatile uint32_t *)(uintptr_t)PS2_INTC_STAT = 0;
     ps2_graphics_sync = host_service_graphics_threaded() ? host_service_graphics_wait : NULL;
+    /* screenshot runs (DHD_SCREENSHOT) keep every wait */
+    graphics_ordered = ps2_graphics_sync && host_getenv("DHD_GRAPHICS_ORDERED") && !host_getenv("DHD_SCREENSHOT");
     ps2_vu1_regs_sync = ps2_graphics_sync;
     host_seconds();
     kernel_vsync_count = 0;

@@ -5,10 +5,12 @@ Capture first (game data, under build/):
 then
     python port/tools/vu1_seq_diff.py build/port/vu-seq [more capture dirs] [--repeat 20]
 builds the harness with the game's AOT blocks and native kernels (generated from the local
-microcode into OUT, never into tracked files), replays every captured run from its real state with
-the native kernels off (the exact path) and on, and requires every register, the whole data memory
-and every kicked GIF packet to be byte-identical. With --repeat it also times both modes per
-microprogram key (OUT/<capture>.csv). Exit status 1 on any difference.
+microcode into OUT, never into tracked files), replays every captured run from its real state on
+the interpreter alone (the referee), through the translated blocks, and through the blocks with
+the native kernels, and requires every register, the whole data memory and every kicked GIF
+packet of the last two to be byte-identical to the referee's. With --repeat it also times the
+blocks without and with the kernels per microprogram key (OUT/<capture>.csv). Exit status 1 on
+any difference.
 """
 import argparse
 import csv
@@ -35,10 +37,19 @@ def build(out, negative=False):
         header = header.replace(needle, 'return native_result(f, _mm_xor_ps(_mm_add_ps(acc, _mm_mul_ps(operand4(a), operand4(b))), _mm_castsi128_ps(_mm_set1_epi32(1))), d);')
         (runtime / 'vu1_native_geometry.h').write_text(header)
     exe = out / 'vu1_seq_diff.exe'
-    subprocess.run(['clang-cl', '-m32', '/nologo', '/O2', '-Wno-deprecated-declarations', '-msse2', '-mno-fma',
-                    '-mfpmath=sse', '/clang:-ffp-contract=off', '/clang:-w', '-DPS2_VU_AOT', '-DPS2_VU_AOT_EMBED', '/I' + str(out),
-                    '/I' + str(ROOT / 'port/runtime'), str(runtime / 'vu0_interp.c'),
-                    str(ROOT / 'port/runtime/vu1_seq_diff.c'), '/Fe' + str(exe)], cwd=out, check=True, timeout=1200)
+    # x64, with the game build's code generation flags (build_host64.py): the captures come from
+    # dhd.exe (x64), whose ps2_cpu holds 64-bit pointers.
+    from build_host64 import LLVM, MSVC, SDK, VERSION
+    cmd = [str(LLVM / 'clang-cl.exe'), '--target=x86_64-pc-windows-msvc', '/nologo', '/O2', '/clang:-O3',
+           '/clang:-march=x86-64-v2', '/clang:-mtune=znver3', '/clang:-ffp-model=strict', '/clang:-ffp-contract=off',
+           '/clang:-fno-strict-aliasing', '/clang:-fwrapv', '/MT', '/w', '-DPS2_VU_AOT', '-DPS2_VU_AOT_EMBED',
+           '/I' + str(out), '/I' + str(ROOT / 'port/runtime'), '/I' + str(ROOT / 'port/include'),
+           '/I' + str(ROOT / 'port/host'), '/imsvc' + str(MSVC / 'include')]
+    cmd += ['/imsvc' + str(SDK / 'Include' / VERSION / x) for x in ('ucrt', 'um', 'shared')]
+    cmd += [str(runtime / 'vu0_interp.c'), str(ROOT / 'port/runtime/vu1_seq_diff.c'), '/Fe' + str(exe),
+            '/link', '/libpath:' + str(MSVC / 'lib/x64'), '/libpath:' + str(SDK / 'Lib' / VERSION / 'ucrt/x64'),
+            '/libpath:' + str(SDK / 'Lib' / VERSION / 'um/x64')]
+    subprocess.run(cmd, cwd=out, check=True, timeout=1200)
     return exe
 
 

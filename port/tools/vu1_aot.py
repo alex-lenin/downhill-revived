@@ -83,6 +83,122 @@ def delay_slots(pairs):
     return result
 
 
+BRANCH_OPS = (0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f)
+
+
+def mac_writer(hi):
+    """'mac' if the upper instruction is an FMAC that updates the MAC flags (and the status bits
+    they imply), 'op' for OPMULA/OPMSUB (also MAC writers, whose stored result is not the value
+    their flags come from: never lazy), None otherwise. Mirrors upper() in vu0_interp.c."""
+    op = hi & 0x3F
+    if op >= 0x3C:
+        sub = (hi >> 6 & 31) << 2 | (op & 3)
+        if sub == 0x2E:
+            return 'op'
+        if sub < 0x10 or 0x18 <= sub < 0x1C or sub in (0x1C, 0x20, 0x21, 0x24, 0x25, 0x1E, 0x22, 0x23, 0x26, 0x27,
+                                                       0x28, 0x29, 0x2A, 0x2C, 0x2D):
+            return 'mac'
+        return None  # NOP, ITOF, FTOI, ABS, CLIP (clip flags)
+    if op == 0x2E:
+        return 'op'
+    if op < 0x1C:
+        return None if 0x10 <= op < 0x18 else 'mac'  # MAX, MINI set no flags
+    if op in (0x1D, 0x1F, 0x2B, 0x2F):  # MAXi, MINIi, MAX, MINI
+        return None
+    return 'mac'
+
+
+def flag_reads(lo, hi):
+    """('mac', 'sticky') of the lower instruction: whether it reads the MAC flags or the status
+    bits they set (Z S U O), and whether it reads or replaces the sticky bits."""
+    if hi >> 31:
+        return False, False  # the lower word is I's value
+    op = lo >> 25
+    if op in (0x18, 0x1A, 0x1B):  # FMEQ, FMAND, FMOR
+        return True, False
+    if op in (0x14, 0x17):  # FSEQ, FSOR: all twelve status bits
+        return True, True
+    if op == 0x15:  # FSSET replaces the sticky bits
+        return False, True
+    if op == 0x16:  # FSAND imm12
+        imm = (lo >> 10 & 0x800) | (lo & 0x7FF)
+        return bool(imm & 0xF), bool(imm & 0xFC0)
+    return False, False
+
+
+def lazy_flags(pairs):
+    """The pcs of this microcode package whose FMAC need not queue its MAC/status update (finding
+    090 VU1R): no flag read can observe it. The run then only accumulates its sticky bits and
+    keeps the result as the latest MAC, built at the end of the run (drain_flags) or at a native
+    kernel's entry, so the end state stays exact.
+
+    A read at pair R sees the latest MAC update issued at least 4 cycles before it. Each pair
+    takes at least one cycle, so an update at R-1..R-3 may or may not be seen (stalls) and one
+    at R-4 or earlier is landed: an update A is unobservable if on every path from A each read
+    has a MAC writer at least 4 pairs before it and after A. Backward dataflow over the pairs,
+    IN(p) = the distances (0..3, 4 meaning 4 or more) from p to reads reachable without such a
+    writer. The control flow is over-approximated: every pair falls through to the next (an E
+    delay slot or a branch slot may be entered directly), a branch slot also goes to its target,
+    an indirect jump's slot to every pair, and code outside the package is unknown (any read).
+    The end of the run is not a read. A package with any read of the sticky bits (or FSSET) gets
+    no lazy updates; neither overlay has one."""
+    readers, sticky = set(), False
+    for pc, (lo, hi) in pairs.items():
+        mac, s = flag_reads(lo, hi)
+        if mac:
+            readers.add(pc)
+        sticky |= s
+    if sticky:
+        return set()
+    FULL = 0b11111
+
+    def shift(mask):
+        out = 0
+        for d in range(5):
+            if mask >> d & 1:
+                out |= 1 << min(d + 1, 4)
+        return out
+
+    succ = {}
+    for pc in pairs:
+        s = [pc + 1]
+        if pc - 1 in pairs:
+            lo, hi = pairs[pc - 1]
+            if not hi >> 31 and lo >> 25 in BRANCH_OPS:
+                if lo >> 25 in (0x24, 0x25):
+                    s += ['any']
+                else:
+                    imm = lo & 0x7FF
+                    s.append((pc + (imm - 0x800 if imm & 0x400 else imm)) & 0x7FF)
+        succ[pc] = s
+    IN = {pc: 0 for pc in pairs}
+    changed = True
+    while changed:
+        changed = False
+        anywhere = FULL  # indirect jumps can reach a read at any distance
+        for pc in sorted(pairs, reverse=True):
+            out = 0
+            for s in succ[pc]:
+                out |= anywhere if s == 'any' else IN.get(s, FULL)
+            new = shift(out)
+            if mac_writer(pairs[pc][1]):
+                new &= 0b01111
+            if pc in readers:
+                new |= 1
+            if new != IN[pc]:
+                IN[pc], changed = new, True
+    lazy = set()
+    for pc, (lo, hi) in pairs.items():
+        if mac_writer(hi) != 'mac':
+            continue
+        out = 0
+        for s in succ[pc]:
+            out |= FULL if s == 'any' else IN.get(s, FULL)
+        if not out:
+            lazy.add(pc)
+    return lazy
+
+
 def program(data, package):
     """{pc: (lo, hi)} of one microcode package, and {pc: PS2 address of that pair in .vutext}."""
     pairs, where = {}, {}
@@ -130,9 +246,11 @@ def fill_function(name, entries):
     return lines
 
 
-def emit_block(prefix, i, block, unit):
+def emit_block(prefix, i, block, unit, lazy=(), words=None):
     """C for one straight-line block: the interpreter's steps for each pair with the words as
-    constants (pair_stalls only on VU1, as in the interpreter)."""
+    constants (pair_stalls only on VU1, as in the interpreter). Pairs whose offset is in lazy
+    commit their MAC update lazily (commit_upper_lazy); words names the block's word array when
+    another variant of the same block already has one."""
     hint = 'VU1(u); ' if unit else 'VU0(u); '
     fused = len(block) > 1 and ends_block(*block[-2])
     fused_end = fused and bool(block[-2][1] & (1 << 30))
@@ -150,16 +268,19 @@ def emit_block(prefix, i, block, unit):
         else:
             lines += [f'    if (!(up.flags == 2 && {lo >> 25} == 0x11)) {{',
                       f'        {hint}next = lower(u, 0x{lo:08X}u, pc + {offset}, bad);', '    }']
-        lines += ['    if (*bad) return -1;', f'    {hint}commit_upper(u, &up, {lo >> 16 & 31});']
+        commit = 'commit_upper_lazy' if offset in lazy else 'commit_upper'
+        lines += ['    if (*bad) return -1;', f'    {hint}{commit}(u, &up, {lo >> 16 & 31});']
         if fused and offset == len(block) - 2:
             lines += ['    transfer = next;']
         if offset != len(block) - 1:
             lines += [f'    trace_pair(u, pc + {offset});', '    u->cycle++;']
         lines += ['    }']
-    lines += [f'    return {"transfer" if fused else "next"};', '}',
-              f'AOT_WORDS({prefix}_words_{i}, {2 * len(block)}, ' + ','.join(f'0x{w:08X}u' for pair in block for w in pair) + ')',
-              f'static const AotBlock {prefix}_info_{i} = {{{len(block)}, {2 if fused_end else 1 if fused else 0}, '
-              f'{prefix}_words_{i}, {prefix}_block_{i}}};']
+    lines += [f'    return {"transfer" if fused else "next"};', '}']
+    if words is None:
+        words = f'{prefix}_words_{i}'
+        lines += [f'AOT_WORDS({words}, {2 * len(block)}, ' + ','.join(f'0x{w:08X}u' for pair in block for w in pair) + ')']
+    lines += [f'static const AotBlock {prefix}_info_{i} = {{{len(block)}, {2 if fused_end else 1 if fused else 0}, '
+              f'{words}, {prefix}_block_{i}, {1 if lazy else 0}}};']
     return lines
 
 
@@ -168,23 +289,33 @@ def generate(destination):
     if ROOT / 'build' not in destination.parents:
         raise ValueError('game-derived AOT output must stay under build/')
     data = Path(os.environ.get('DHD_VUTEXT', ROOT / 'assets/vutext.bin')).read_bytes()
-    overlays, found = [], {}
+    # Each block is keyed by its pairs and the offsets of those that commit their MAC update
+    # lazily (lazy_flags): the same pairs can be lazy in one package and not in the other.
+    overlays, found, packages = [], {}, []
     for package in (0x265C00, 0x269C50):
         pairs, where = program(data, package)
-        overlays.append((blocks(pairs), delay_slots(pairs)))
-        for table in overlays[-1]:
+        lazy = lazy_flags(pairs)
+        packages.append((pairs, where))
+        tables = []
+        for table in (blocks(pairs), delay_slots(pairs)):
+            tables.append({pc: (block, tuple(k for k in range(len(block)) if pc + k in lazy))
+                           for pc, block in table.items()})
             for pc, block in table.items():
                 found.setdefault(block, [where[pc + k] for k in range(len(block))])
-    unique = sorted(set(block for overlay in overlays for table in overlay for block in table.values()))
-    ids = {block: i for i, block in enumerate(unique)}
+        overlays.append(tables)
+    unique = sorted(set(key for overlay in overlays for table in overlay for key in table.values()))
+    ids = {key: i for i, key in enumerate(unique)}
     lines = ['/* Generated from local microcode. Do not commit. */',
-             '/* fused: 0 = ordinary block, 1 = branch + slot, 2 = E + slot. */',
-             'typedef struct { unsigned count, fused; const uint32_t *words; int (*run)(Vu *, unsigned, int *); } AotBlock;']
+             '/* fused: 0 = ordinary block, 1 = branch + slot, 2 = E + slot. lazy: a pair commits its MAC update',
+             '   lazily, which is valid only while micro memory holds the whole package it was analysed in. */',
+             'typedef struct { unsigned count, fused; const uint32_t *words; int (*run)(Vu *, unsigned, int *); unsigned lazy; } AotBlock;']
     lines += WORDS_MACRO
-    entries = []
-    for i, block in enumerate(unique):
-        lines += emit_block('aot', i, block, 1)
-        entries += fills('aot_words_%d' % i, data, found[block], [w for pair in block for w in pair])
+    entries, words_of = [], {}
+    for i, (block, lazy) in enumerate(unique):
+        lines += emit_block('aot', i, block, 1, lazy, words_of.get(block))
+        if block not in words_of:
+            words_of[block] = 'aot_words_%d' % i
+            entries += fills('aot_words_%d' % i, data, found[block], [w for pair in block for w in pair])
     lines += ['static const AotBlock *const aot_blocks[2][2][2048] = {  /* [overlay][delay slot][pc] */']
     for overlay in overlays:
         lines.append(' {')
@@ -193,21 +324,62 @@ def generate(destination):
             lines += [f'   &aot_info_{ids[table[pc]]},' if pc in table else '   NULL,' for pc in range(2048)]
             lines.append('  },')
         lines.append(' },')
+    lines.append('};')
+    # Each package's own words, by runs of consecutive pairs: the lazy blocks run only while micro
+    # memory holds one of them in full (checked once per ps2_vu1_code_version).
+    for k, (pairs, where) in enumerate(packages):
+        runs = []
+        for pc in sorted(pairs):
+            if runs and runs[-1][0] + runs[-1][1] == pc:
+                runs[-1][1] += 1
+            else:
+                runs.append([pc, 1])
+        words = [w for pc in sorted(pairs) for w in pairs[pc]]
+        lines += [f'AOT_WORDS(aot_package{k}_words, {len(words)}, ' + ','.join(f'0x{w:08X}u' for w in words) + ')']
+        entries += fills(f'aot_package{k}_words', data, [where[pc] for pc in sorted(pairs)], words)
+        spans, offset = [], 0
+        for pc, count in runs:
+            spans.append(f'{{{pc}, {count}, {offset}}}')
+            offset += 2 * count
+        lines += [f'static const unsigned aot_package{k}_runs[{len(runs)}][3] = {{' + ', '.join(spans) + '};  /* pc, pairs, word */']
+    lines += ['static int aot_package_match(const uint32_t *code, const unsigned (*runs)[3], unsigned n, const uint32_t *words) {',
+              '    for (unsigned i = 0; i < n; i++)',
+              '        if (memcmp(code + 2 * runs[i][0], words + runs[i][2], runs[i][1] * 8)) return 0;',
+              '    return 1;', '}',
+              '/* The package micro memory holds in full (0 or 1), or -1. */',
+              'static int aot_package(const uint32_t *code) {',
+              '    if (aot_package_match(code, aot_package0_runs, sizeof aot_package0_runs / sizeof *aot_package0_runs, aot_package0_words)) return 0;',
+              '    if (aot_package_match(code, aot_package1_runs, sizeof aot_package1_runs / sizeof *aot_package1_runs, aot_package1_words)) return 1;',
+              '    return -1;', '}']
     # A block runs only where micro memory holds its exact words. In the game's VU1 micro memory
     # (0x11008000, changed only by VIF1 MPG, which bumps ps2_vu1_code_version) the block found
     # (or none) is remembered until the next change; any other code buffer (the oracle tests)
     # compares each time. The micro memory is a guest address: GADDR (identity on i686) also
     # recognises it on a 64-bit host, where it sits at guest_base + 0x11008000.
-    lines += ['};', 'static struct { uint64_t version; const AotBlock *block; } aot_resolved[2][2048];  /* version + 1 */',
+    # A block with lazy pairs runs only where micro memory holds the whole package whose control
+    # flow lazy_flags analysed; the others wherever their own words match. The package held is
+    # tried first. Other code buffers (the oracle tests) look the package up every time.
+    lines += ['static struct { uint64_t version; const AotBlock *block; } aot_resolved[2][2048];  /* version + 1 */',
+              'static uint64_t aot_package_version;  /* version + 1 */',
+              'static int aot_package_held;',
               'static const AotBlock *aot_find(unsigned pc, const uint32_t *words, unsigned remaining, int slot) {',
               '    const int game = GADDR(words - pc * 2) == 0x11008000;',
               '    const AotBlock *found = NULL;',
               '    if (game && aot_resolved[slot][pc].version == ps2_vu1_code_version + 1)',
               '        found = aot_resolved[slot][pc].block;',
               '    else {',
-              '        for (unsigned overlay = 0; overlay < 2 && !found; overlay++) {',
+              '        int held;',
+              '        if (!game) held = aot_package(words - pc * 2);',
+              '        else {',
+              '            if (aot_package_version != ps2_vu1_code_version + 1)',
+              '                aot_package_held = aot_package(words - pc * 2), aot_package_version = ps2_vu1_code_version + 1;',
+              '            held = aot_package_held;',
+              '        }',
+              '        for (unsigned k = 0; k < 2 && !found; k++) {',
+              '            const unsigned overlay = held == 1 ? 1 - k : k;',
               '            const AotBlock *block = aot_blocks[overlay][slot][pc];',
-              '            if (block && !memcmp(words, block->words, block->count * 8)) found = block;',
+              '            if (block && (!block->lazy || (int)overlay == held) && !memcmp(words, block->words, block->count * 8))',
+              '                found = block;',
               '        }',
               '        if (game) aot_resolved[slot][pc].version = ps2_vu1_code_version + 1, aot_resolved[slot][pc].block = found;',
               '    }',

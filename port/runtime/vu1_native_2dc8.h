@@ -122,7 +122,7 @@ static unsigned native_geometry_2dc8(Vu *u) {
         next_q =
             denominator == 0
                 ? vu_max(signbit(denominator))
-                : _mm_cvtss_f32(arithmetic4(_mm_div_ss(_mm_set_ss(1), _mm_set_ss(denominator))));
+                : _mm_cvtss_f32(arithmetic4(VU_DIV_SS(_mm_set_ss(1), _mm_set_ss(denominator))));
         acc = NMADD(acc, v[8], lane4(v[20], 1), 15);
         index = (index + 3) & 65535;
         vi[8] = (uint16_t)index;

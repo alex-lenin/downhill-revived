@@ -51,6 +51,7 @@ TexPackEntry *texpack_find(const Gs *g, unsigned ctxt);
 void *texpack_view(TexPackEntry *e, uint64_t field);
 void texpack_field(uint64_t field);
 void texpack_report(void);
+int texpack_open(const void *device, uint64_t video_memory);  /* texpack_linux.c: no packs */
 #endif
 #include "font_sharp.h"
 #include "native_frontend.h"
@@ -65,6 +66,7 @@ typedef struct {
     float x, y, z, s, t, q, fog;
     uint32_t rgba;
 } NativeVertex;
+_Static_assert(sizeof(NativeVertex) == 32, "NativeVertex is eight 4-byte words (native_same_vertex)");
 
 typedef struct {
     float target[2]; uint32_t flags, atst;
@@ -105,7 +107,7 @@ typedef struct {
     NativeView replacement;            /* texpack.c: drawn instead of texture (flag 2048) */
     NativeRect scissor;
     NativeConstants constants;
-    uint32_t first, count;
+    uint32_t first, count;             /* vertices, or indices in an indexed field (Native indexed) */
     /* NATIVE_COPY: source surface rectangle to (x, y) in target; NATIVE_IMPORT: pixels. */
     int16_t source;
     int x, y, w, h, sx, sy;
@@ -136,6 +138,8 @@ typedef struct {
 typedef struct {
     NativeVertex *vertices;
     unsigned vertex_count, vertex_capacity;
+    uint32_t *indices;               /* an indexed field (Native indexed): the draws' vertices */
+    unsigned index_count, index_capacity;
     NativeCommand *commands;
     unsigned command_count, command_capacity;
     NativeConvert *converts;
@@ -207,6 +211,13 @@ typedef struct Native {
     uint64_t state_version, written;
     unsigned state_ctxt, state_prim;
     float zscale; uint32_t zmax;
+    float uv_scale[2];                /* FST: reciprocal GS texture dimensions, including 1/16 */
+    float vertex_fog[256];            /* same rounded fog/255 values, shared by all vertices */
+    int vertex_fog_ready, field_trace_on;
+    /* Draws are indexed (dhdr_native_picture_indexed): a vertex a strip or fan shares with the
+       previous triangle, and a quad's shared corners, are stored once. Off with DHD_INTERP (its
+       mix pairs and moves vertices by their recorded order) and with DHD_NATIVE_INDEXED=0. */
+    int indexed;
     int skip;                        /* the current state draws nothing */
     int box[4];                      /* pixels the open draw has touched */
     unsigned target_psm, depth_psm;
@@ -283,7 +294,8 @@ typedef struct Native {
     float intervals[NATIVE_INTERVALS];   /* ms between presents, a ring */
     uint64_t interval_count;
     uint64_t bench_presented, bench_interp;  /* counters at the DHD_BENCH window's first field */
-    /* DHD_NATIVE_TRACE=prefix: prefix-fields.csv, a line per recorded field (GS worker at vsync),
+    /* DHD_NATIVE_TRACE=prefix: prefix-fields.csv, a line per recorded field (GS worker at vsync;
+       vertices are the stored ones, indices 0 unless the field is indexed),
        and prefix-pictures.csv, a line per picture (render thread) with its GPU time. */
     FILE *trace_fields, *trace_pictures;
     NativeStats trace_last;
@@ -640,8 +652,11 @@ static void native_texture(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
     gs_mark_pages(pages, psm, tbp, tbw ? tbw : 1, 0, 0, w - 1, h - 1);
     uint64_t key = native_mix(native_mix(tex0 & 0x7FFFFFFFFFFull, (uint64_t)w << 32 | h), psm == GS_PSMCT24 || psm_wide(psm) ? g->reg[GS_TEXA] : 0);
     unsigned gpu_pages = 0, gpu_page = 0;
-    for (unsigned p = 0; p < 512; p++)
-        if (pages[p / 32] & (1u << (p & 31))) {
+    /* Visit set pages in the same ascending order as the key's original scan.
+       Most textures touch only a handful of the 512 GS pages. */
+    for (unsigned word = 0; word < 16; word++)
+        for (uint32_t bits = pages[word]; bits; bits &= bits - 1) {
+            unsigned p = word * 32 + native_bit_first(bits);
             key = native_mix(key, native_page_hash(n, g, p));
             if (native_owner(n, g, p) >= 0 && !gpu_pages++) gpu_page = p;
         }
@@ -712,6 +727,12 @@ static uint32_t native_blend(Native *n, uint64_t alpha)
 
 static void native_state(Native *n, Gs *g, unsigned prim, unsigned ctxt)
 {
+    /* Initialize on the GS worker, in the same host FP mode as native_set.
+       Creation can run on the EE thread with its different rounding mode. */
+    if (!n->vertex_fog_ready) {
+        for (unsigned i = 0; i < 256; i++) n->vertex_fog[i] = (float)i / 255.0f;
+        n->vertex_fog_ready = 1;
+    }
     NativeCommand *c = &n->current;
     uint64_t frame = g->reg[GS_FRAME_1 + ctxt], zbuf = g->reg[GS_ZBUF_1 + ctxt], test = g->reg[GS_TEST_1 + ctxt];
     uint64_t scissor = g->reg[GS_SCISSOR_1 + ctxt];
@@ -752,6 +773,12 @@ static void native_state(Native *n, Gs *g, unsigned prim, unsigned ctxt)
     k->target[0] = k->target[1] = 2048;
     if ((prim & 7) == 6) k->flags |= 1024;   /* a sprite: whole pixels when upscaled */
     if (prim & 16) native_texture(n, g, ctxt, c);
+    /* GS dimensions are powers of two (native_texture); a missing texture uses 1.
+       Scaling by their reciprocal is exact, including the fixed-point UV shift. */
+    if (prim & 256) {
+        n->uv_scale[0] = 1.0f / (16.0f * (k->tex_size[0] ? k->tex_size[0] : 1));
+        n->uv_scale[1] = 1.0f / (16.0f * (k->tex_size[1] ? k->tex_size[1] : 1));
+    }
     if (prim & 32) {
         uint64_t fog = g->reg[GS_FOGCOL];
         k->flags |= 16;
@@ -797,20 +824,38 @@ static void native_reserve(NativeFrame *f, unsigned more)
     f->vertices = grown; f->vertex_capacity = capacity;
 }
 
+static void native_reserve_indices(NativeFrame *f, unsigned more)
+{
+    if (f->index_count + more <= f->index_capacity) return;
+    unsigned capacity = f->index_capacity ? f->index_capacity * 2 : 1 << 16;
+    while (capacity < f->index_count + more) capacity *= 2;
+    uint32_t *grown = realloc(f->indices, capacity * sizeof *grown);
+    if (!grown) native_oom("indices");
+    f->indices = grown; f->index_capacity = capacity;
+}
+
+/* Where the open draw's vertices (indices, in an indexed field) go next. */
+static unsigned native_next(const Native *n, const NativeFrame *f)
+{
+    return n->indexed ? f->index_count : f->vertex_count;
+}
+
 static void native_open(Native *n)
 {
     n->upload_epoch++;
     NativeFrame *f = n->recording;
     NativeCommand *c = native_command(n);
     *c = n->current;
-    c->first = f->vertex_count; c->count = 0;
+    c->first = native_next(n, f); c->count = 0;
     if (n->passes) {
         NativeCommand *second = native_command(n);
         *second = n->second;
-        second->first = f->vertex_count; second->count = 0;
+        second->first = native_next(n, f); second->count = 0;
     }
     n->current_valid = 1;
     n->box[0] = n->box[1] = 4096; n->box[2] = n->box[3] = -4096;
+    n->stats.commands += 1 + n->passes;
+    if (!n->interp) return;  /* only interpolation consumes the segment hash */
     /* Not the target: the game draws alternate fields into its two frame buffers. */
     uint32_t key = 2166136261u;
     /* the texture is a host pointer: a 64-bit host hashes its high half as well (none on 32-bit) */
@@ -823,7 +868,6 @@ static void native_open(Native *n)
     for (unsigned i = 0; i < sizeof parts / sizeof *parts; i++) key = (key ^ parts[i]) * 16777619u;
     n->segment_key = key;
     n->segment_tags = UINT64_MAX;
-    n->stats.commands += 1 + n->passes;
 }
 
 /* DHD_NATIVE_SURFACES: a finished draw (the open state's primitive type). */
@@ -837,7 +881,9 @@ static void native_note_usage(Native *n, const NativeCommand *c)
     n->usage[s].sampled++;
     u->pair[s]++;
     if ((n->state_prim & 7) != 6) return;
-    const NativeVertex *a = &n->recording->vertices[c->first], *b = a + 5;
+    const NativeFrame *f = n->recording;
+    const NativeVertex *a = n->indexed ? &f->vertices[f->indices[c->first]] : &f->vertices[c->first];
+    const NativeVertex *b = n->indexed ? &f->vertices[f->indices[c->first + 5]] : a + 5;
     float tw = (float)c->constants.tex_size[0];
     float ua = a->s / (a->q ? a->q : 1) * tw, ub = b->s / (b->q ? b->q : 1) * tw, dx = fabsf(b->x - a->x);
     float ratio = dx > 0 ? fabsf(ub - ua) / dx : 0;
@@ -858,7 +904,7 @@ static void native_close(Native *n, Gs *g)
     unsigned draws = 1 + n->passes, at = f->command_count - draws;
     NativeCommand saved[2];
     memcpy(saved, &f->commands[at], draws * sizeof *saved);
-    unsigned count = f->vertex_count - saved[0].first;
+    unsigned count = native_next(n, f) - saved[0].first;
     if (!count) { f->command_count = at; return; }
     saved[0].count = saved[draws - 1].count = count;
     const NativeRect *s = &saved[0].scissor;
@@ -873,17 +919,57 @@ static void native_close(Native *n, Gs *g)
     if (n->usage) native_note_usage(n, &saved[0]);
 }
 
-static void native_set(NativeVertex *o, const GsVertex *v, const GsVertex *colour, uint64_t offset, const Native *n,
-                       int fst, float tw, float th, float x, float y)
+static void native_set(NativeVertex *o, const GsVertex *v, const GsVertex *colour, const Native *n,
+                       int fst, float x, float y)
 {
     uint32_t z = v->z > n->zmax ? n->zmax : v->z;
-    (void)offset;
     o->x = x; o->y = y;
-    o->z = (float)((double)z * n->zscale);
-    if (fst) { o->s = (float)v->u / 16.0f / tw; o->t = (float)v->v / 16.0f / th; o->q = 1; }
+    /* zscale is 2^-16, 2^-24 or 2^-32: integer rounding commutes with this
+       exact exponent shift; all intermediate values are normal floats. */
+    o->z = (float)z * n->zscale;
+    if (fst) { o->s = (float)v->u * n->uv_scale[0]; o->t = (float)v->v * n->uv_scale[1]; o->q = 1; }
     else { o->s = v->s; o->t = v->t; o->q = v->q; }
-    o->fog = (float)(v->fog & 255) / 255.0f;
+    o->fog = n->vertex_fog[v->fog & 255];
     o->rgba = colour->rgba;
+}
+
+static int native_same_vertex(const NativeVertex *a, const NativeVertex *b)
+{
+    uint64_t p[4], q[4];
+    memcpy(p, a, sizeof p); memcpy(q, b, sizeof q);
+    return ((p[0] ^ q[0]) | (p[1] ^ q[1]) | (p[2] ^ q[2]) | (p[3] ^ q[3])) == 0;
+}
+
+/* The field's index of vertex t: `at` when that vertex has the same bytes, else t stored. */
+static uint32_t native_index_of(NativeFrame *f, const NativeVertex *t, uint32_t at)
+{
+    if (at != UINT32_MAX && native_same_vertex(&f->vertices[at], t)) return at;
+    f->vertices[f->vertex_count] = *t;
+    return f->vertex_count++;
+}
+
+/* An indexed field's triangle of GS primitive type `type`. A strip's (4) first two vertices are
+   the previous triangle's last two, a fan's (5) its first and last: each is drawn from that one
+   when their bytes are the same; the others are stored. The previous triangle may be another
+   primitive's (equal bytes draw the same either way), so the picture is the expanded one. */
+static void native_triangle_indexed(NativeFrame *f, unsigned type, const NativeVertex t[3])
+{
+    uint32_t *o = f->indices + f->index_count, a = UINT32_MAX, b = UINT32_MAX;
+    if ((type == 4 || type == 5) && f->index_count >= 3) a = o[type == 4 ? -2 : -3], b = o[-1];
+    o[0] = native_index_of(f, &t[0], a);
+    o[1] = native_index_of(f, &t[1], b);
+    o[2] = native_index_of(f, &t[2], UINT32_MAX);
+    f->index_count += 3;
+}
+
+/* An indexed field's quad: corners 0 1 2 3 (two triangles, 0 1 2 and 2 1 3, as expanded). */
+static void native_quad_indexed(NativeFrame *f, const NativeVertex q[4])
+{
+    uint32_t base = f->vertex_count, *o = f->indices + f->index_count;
+    memcpy(f->vertices + base, q, 4 * sizeof *q);
+    f->vertex_count += 4;
+    o[0] = base; o[1] = base + 1; o[2] = base + 2; o[3] = base + 2; o[4] = base + 1; o[5] = base + 3;
+    f->index_count += 6;
 }
 
 /* Bounded field diagnostics: no EE/GS state is changed. Coordinates are logged before
@@ -911,7 +997,7 @@ static FILE *native_field_trace(const char *kind)
 
 static void native_record(Native *n, Gs *g, unsigned type, const GsVertex *v, unsigned count, unsigned prim, unsigned ctxt)
 {
-    FILE *trace = native_field_trace("draws");
+    FILE *trace = n->field_trace_on ? native_field_trace("draws") : NULL;
     if (trace) {
         extern uint64_t kernel_vsync_count;
         for (unsigned i = 0; i < count; i++)
@@ -939,25 +1025,25 @@ static void native_record(Native *n, Gs *g, unsigned type, const GsVertex *v, un
        Remove only the half-line component on screen-sized targets, before rounding.
        Small offscreen targets (shadows/blur) keep their own coordinates. This local
        offset never reaches the exact GS rasterizer, probe replay or EE readbacks. */
-    if ((offset >> 32 & 15) == 8 && (gs_priv_read(g, GS_SMODE2) & 3) == 3 &&
+    if ((offset >> 32 & 15) == 8 && (g->privileged[GS_SMODE2 / 16] & 3) == 3 &&
         (g->reg[GS_FRAME_1 + ctxt] >> 16 & 63) >= 8)
         offset -= UINT64_C(8) << 32;
     int fst = prim >> 8 & 1, flat = !(prim >> 3 & 1);
-    float tw = (float)n->current.constants.tex_size[0], th = (float)n->current.constants.tex_size[1];
-    if (tw == 0) tw = 1;
-    if (th == 0) th = 1;
     float x[3], y[3];
+    int left = n->box[0], top = n->box[1], right = n->box[2], bottom = n->box[3];
     for (unsigned i = 0; i < count; i++) {
         x[i] = (float)((int)v[i].x - (int)(offset & 65535)) / 16.0f + 0.5f;
         y[i] = (float)((int)v[i].y - (int)(offset >> 32 & 65535)) / 16.0f + 0.5f;
         int px = (int)x[i], py = (int)y[i];
-        if (px - 1 < n->box[0]) n->box[0] = px - 1;
-        if (py - 1 < n->box[1]) n->box[1] = py - 1;
-        if (px + 1 > n->box[2]) n->box[2] = px + 1;
-        if (py + 1 > n->box[3]) n->box[3] = py + 1;
+        if (px - 1 < left) left = px - 1;
+        if (py - 1 < top) top = py - 1;
+        if (px + 1 > right) right = px + 1;
+        if (py + 1 > bottom) bottom = py + 1;
     }
+    n->box[0] = left; n->box[1] = top; n->box[2] = right; n->box[3] = bottom;
     const GsVertex *last = &v[count - 1];
     native_reserve(f, 6);
+    if (n->indexed) native_reserve_indices(f, 6);
     if (n->interp) {
         uint64_t tags = g->packets[0] + g->packets[1] + g->packets[2];
         if (tags != n->segment_tags || !f->segment_count) {
@@ -973,34 +1059,48 @@ static void native_record(Native *n, Gs *g, unsigned type, const GsVertex *v, un
     }
     NativeVertex *o = &f->vertices[f->vertex_count];
     if (type >= 3 && type <= 5 && count == 3) {
-        for (unsigned i = 0; i < 3; i++) native_set(&o[i], &v[i], flat ? last : &v[i], offset, n, fst, tw, th, x[i], y[i]);
-        f->vertex_count += 3;
+        if (n->indexed) {
+            NativeVertex t[3];
+            for (unsigned i = 0; i < 3; i++) native_set(&t[i], &v[i], flat ? last : &v[i], n, fst, x[i], y[i]);
+            native_triangle_indexed(f, type, t);
+        } else {
+            for (unsigned i = 0; i < 3; i++) native_set(&o[i], &v[i], flat ? last : &v[i], n, fst, x[i], y[i]);
+            f->vertex_count += 3;
+        }
     } else if (type == 6 && count == 2) {
         /* Sprites: the second vertex supplies Z, fog and colour; texture coordinates span the corners. */
         NativeVertex a, b;
-        native_set(&a, &v[0], last, offset, n, fst, tw, th, x[0], y[0]);
-        native_set(&b, &v[1], last, offset, n, fst, tw, th, x[1], y[1]);
+        native_set(&a, &v[0], last, n, fst, x[0], y[0]);
+        native_set(&b, &v[1], last, n, fst, x[1], y[1]);
         a.z = b.z; a.fog = b.fog;
         if (!fst) a.q = b.q, a.s *= b.q / (v[0].q ? v[0].q : 1), a.t *= b.q / (v[0].q ? v[0].q : 1);
         NativeVertex c0 = a, c1 = b, c2 = a, c3 = b;
         c1.y = a.y; c1.t = a.t;   /* top right */
         c2.y = b.y; c2.t = b.t;   /* bottom left */
-        o[0] = c0; o[1] = c1; o[2] = c2; o[3] = c2; o[4] = c1; o[5] = c3;
-        f->vertex_count += 6;
+        if (n->indexed) {
+            NativeVertex q[4] = {c0, c1, c2, c3};
+            native_quad_indexed(f, q);
+        } else {
+            o[0] = c0; o[1] = c1; o[2] = c2; o[3] = c2; o[4] = c1; o[5] = c3;
+            f->vertex_count += 6;
+        }
     } else {
         /* Points and lines: one-pixel quads along the major axis. */
         NativeVertex a, b;
-        native_set(&a, &v[0], flat ? last : &v[0], offset, n, fst, tw, th, x[0] - 0.5f, y[0] - 0.5f);
+        native_set(&a, &v[0], flat ? last : &v[0], n, fst, x[0] - 0.5f, y[0] - 0.5f);
         b = a;
-        if (count == 2) native_set(&b, &v[1], last, offset, n, fst, tw, th, x[1] - 0.5f, y[1] - 0.5f);
+        if (count == 2) native_set(&b, &v[1], last, n, fst, x[1] - 0.5f, y[1] - 0.5f);
         int horizontal = fabsf(b.x - a.x) >= fabsf(b.y - a.y);
         NativeVertex q[4] = {a, a, b, b};
         if (count == 1) { q[1].x += 1; q[2].y += 1; q[3].x += 1; q[3].y += 1; }
         else if (horizontal) { q[1].y += 1; q[3].y += 1; }
         else { q[1].x += 1; q[3].x += 1; }
         for (unsigned i = 0; i < 4; i++) q[i].x += 0.5f, q[i].y += 0.5f;
-        o[0] = q[0]; o[1] = q[1]; o[2] = q[2]; o[3] = q[2]; o[4] = q[1]; o[5] = q[3];
-        f->vertex_count += 6;
+        if (n->indexed) native_quad_indexed(f, q);
+        else {
+            o[0] = q[0]; o[1] = q[1]; o[2] = q[2]; o[3] = q[2]; o[4] = q[1]; o[5] = q[3];
+            f->vertex_count += 6;
+        }
     }
     if (n->interp) f->segments[f->segment_count - 1].count = f->vertex_count - f->segments[f->segment_count - 1].first;
     n->stats.primitives++;
@@ -1571,7 +1671,7 @@ static void native_present_rect(const Native *n, unsigned w, unsigned h, float v
 static void native_recycle(NativeFrame *f)
 {
     for (unsigned i = 0; i < f->command_count; i++) free(f->commands[i].pixels);
-    f->command_count = 0; f->vertex_count = 0; f->segment_count = 0; f->convert_count = 0;
+    f->command_count = 0; f->vertex_count = 0; f->index_count = 0; f->segment_count = 0; f->convert_count = 0;
     f->path1 = 0;
 }
 
@@ -1810,14 +1910,56 @@ static int native_drawn_surface(Native *n, const NativeFrame *f)
     return -1;
 }
 
+/* Android: the exact renderer's submits run on the render thread (dhdr_exact_set_submitter,
+   port/render/src/exact/encoder.rs). On the Adreno 660 (driver 512) exact compute work recorded
+   and submitted from the GS worker while this thread recorded its passes crashed this thread
+   inside the driver (vkCmdBindPipeline, vkEndCommandBuffer) a picture or so after the first Z
+   probe; a context lock around both sides did not help, one recording thread does (finding 091,
+   AND3). The GS worker posts the submit and waits; this thread runs it between pictures. */
+#if defined(__ANDROID__) && !defined(NATIVE_INLINE)
+#define NATIVE_EXACT_ON_RENDER 1
+void dhdr_exact_set_submitter(void (*run)(void (*call)(void *), void *arg, void *context), void *context);
+static struct { void (*call)(void *); void *arg; int posted, done, live; } native_call;  /* queue_lock */
+static _Thread_local int native_on_render;
+
+static void native_exact_run(void (*call)(void *), void *arg, void *context)
+{
+    Native *n = context;
+    if (native_on_render) { call(arg); return; }
+    native_mutex_lock(&n->queue_lock);
+    if (!native_call.live) { native_mutex_unlock(&n->queue_lock); call(arg); return; }
+    while (native_call.posted) native_cond_wait(&n->queue_changed, &n->queue_lock);
+    native_call.call = call, native_call.arg = arg, native_call.posted = 1, native_call.done = 0;
+    native_cond_broadcast(&n->queue_changed);
+    while (!native_call.done) native_cond_wait(&n->queue_changed, &n->queue_lock);
+    native_call.posted = 0;
+    native_cond_broadcast(&n->queue_changed);
+    native_mutex_unlock(&n->queue_lock);
+}
+
+/* The render thread, queue_lock held: runs a posted call (the lock released meanwhile). */
+static void native_serve_call(Native *n)
+{
+    if (!native_call.posted || native_call.done) return;
+    native_mutex_unlock(&n->queue_lock);
+    native_call.call(native_call.arg);
+    native_mutex_lock(&n->queue_lock);
+    native_call.done = 1;
+    native_cond_broadcast(&n->queue_changed);
+}
+#define NATIVE_WAIT(n, idle) \
+    for (native_serve_call(n); (idle); native_serve_call(n)) native_cond_wait(&(n)->queue_changed, &(n)->queue_lock)
+#else
+#define NATIVE_WAIT(n, idle) while (idle) native_cond_wait(&(n)->queue_changed, &(n)->queue_lock)
+#endif
+
 /* DHD_INTERP: one picture per display refresh (or DHD_INTERP_HZ tick) from the two held fields. */
 static void native_interp_thread(Native *n)
 {
     double next = 0;
     for (;;) {
         native_mutex_lock(&n->queue_lock);
-        while (!n->pending_count && !n->newer && !n->quit)
-            native_cond_wait(&n->queue_changed, &n->queue_lock);
+        NATIVE_WAIT(n, !n->pending_count && !n->newer && !n->quit);
         if (n->quit) { native_mutex_unlock(&n->queue_lock); return; }
         /* One new field per picture: every field's uploads and copies reach the surfaces. */
         int fresh = 0;
@@ -1874,7 +2016,7 @@ void host_thread_name(const char *name);  /* port/hle/host.c */
 static int native_render_next(Native *n)
 {
     native_mutex_lock(&n->queue_lock);
-    while (!n->pending_count && !n->quit) native_cond_wait(&n->queue_changed, &n->queue_lock);
+    NATIVE_WAIT(n, !n->pending_count && !n->quit);
     if (n->quit) { native_mutex_unlock(&n->queue_lock); return 0; }
     NativeFrame *f = n->pending[0];
     n->pending[0] = n->pending[1];
@@ -1899,6 +2041,14 @@ static NATIVE_THREAD_RESULT native_thread(void *argument)
 {
     Native *n = argument;
     host_thread_name("native");
+#ifdef NATIVE_EXACT_ON_RENDER
+    native_on_render = 1;
+    native_mutex_lock(&n->queue_lock);
+    native_call.live = 1;
+    native_mutex_unlock(&n->queue_lock);
+    dhdr_exact_set_submitter(native_exact_run, n);
+    fprintf(stderr, "gs: exact submits run on the render thread\n");
+#endif
     if (n->interp) { native_interp_thread(n); return 0; }
     while (native_render_next(n)) {}
     return 0;
@@ -1985,12 +2135,13 @@ void gs_native_vsync(Gs *g, unsigned *width, unsigned *height, int resize)
     if (n->trace_fields) {
         extern uint64_t kernel_vsync_count;
         const NativeStats *s = &n->stats, *l = &n->trace_last;
-        fprintf(n->trace_fields, "%llu,%llu,%.6f,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d\n",
+        fprintf(n->trace_fields, "%llu,%llu,%.6f,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%u\n",
                 (unsigned long long)f->field, (unsigned long long)kernel_vsync_count, f->time, f->command_count,
                 f->vertex_count, s->primitives - l->primitives, s->decoded - l->decoded, s->decoded_texels - l->decoded_texels,
                 s->texture_from_surface - l->texture_from_surface, s->texture_unsupported - l->texture_unsupported,
                 s->imports - l->imports, s->copies - l->copies, s->copy_fallbacks - l->copy_fallbacks,
-                s->exact_draws - l->exact_draws, s->color_reads - l->color_reads, n->field <= n->full_until);
+                s->exact_draws - l->exact_draws, s->color_reads - l->color_reads, n->field <= n->full_until,
+                f->index_count);
         n->trace_last = *s;
     }
     /* Hand the field to the render thread; at most one waits. */
@@ -2207,6 +2358,7 @@ static Native *native_create(NativeExact *exact)
     Native *n = calloc(1, sizeof *n);
     if (!n) return NULL;
     n->exact = exact;
+    n->field_trace_on = getenv("DHD_FIELD_TRACE") && getenv("DHD_FIELD_TRACE_FIELDS");
     native_mutex_init(&n->context_lock);
     native_mutex_init(&n->queue_lock);
     native_cond_init(&n->queue_changed);
@@ -2218,6 +2370,8 @@ static Native *native_create(NativeExact *exact)
     n->interp = 0;  /* its pictures come between fields, from a thread of their own */
 #endif
     n->interp_hz = n->interp && hz ? atof(hz) : 0;
+    const char *indexed = getenv("DHD_NATIVE_INDEXED");
+    n->indexed = !n->interp && !(indexed && atoi(indexed) == 0);
     if (n->interp_hz) n->timer = native_timer_create();
     n->logs[1].state_version = UINT64_MAX;
     for (unsigned i = 0; i < 512; i++) n->owner[i] = n->top_owner[i] = -1;
@@ -2272,7 +2426,7 @@ static void native_install(Gs *g, NativeExact *exact, Native *n, const char *api
         snprintf(path, sizeof path, "%s-fields.csv", trace);
         if ((n->trace_fields = fopen(path, "w")))
             fputs("field,vsync,time,commands,vertices,primitives,decoded,decoded_texels,from_surface,unsupported,"
-                  "imports,copies,copy_fallbacks,exact_draws,color_reads,full\n", n->trace_fields);
+                  "imports,copies,copy_fallbacks,exact_draws,color_reads,full,indices\n", n->trace_fields);
         snprintf(path, sizeof path, "%s-pictures.csv", trace);
         if ((n->trace_pictures = fopen(path, "w")))
             fputs("field,t,cpu_ms,gpu_ms,draws,self_copies,self_copy_px,copies,copy_px,imports,import_px\n", n->trace_pictures);

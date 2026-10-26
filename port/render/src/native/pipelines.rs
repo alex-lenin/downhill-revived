@@ -236,6 +236,8 @@ impl Pipelines {
     /// The pipeline for `key`, built on first use (Err: the key has none, or it failed).
     pub fn get(&mut self, gpu: &Gpu, objects: &Objects, key: u32) -> Result<&wgpu::RenderPipeline, String> {
         let built = self.built.entry(key).or_insert_with(|| {
+            #[cfg(not(target_arch = "wasm32"))]
+            let _spike = SpikeTimer::new("pipeline", key);
             let d = describe(key)?;
             #[cfg(not(target_arch = "wasm32"))]
             let start = std::time::Instant::now();
@@ -250,5 +252,63 @@ impl Pipelines {
             Ok(pipe)
         });
         built.as_ref().map_err(|e| e.clone())
+    }
+}
+
+/// DHD_NATIVE_PIPELOG (diagnostics, AND3): the keys each picture binds, one log line per submit.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod pipelog {
+    use std::sync::{Mutex, OnceLock};
+    static KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static PICTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DHD_NATIVE_PIPELOG").is_some())
+    }
+    pub(crate) fn bind(key: u32) {
+        if on() {
+            let mut k = KEYS.lock().unwrap_or_else(|p| p.into_inner());
+            if !k.contains(&key) {
+                k.push(key);
+            }
+        }
+    }
+    pub(crate) fn submit() {
+        if on() {
+            let mut k = KEYS.lock().unwrap_or_else(|p| p.into_inner());
+            let n = PICTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let list: Vec<String> = k.iter().map(|x| format!("{x:07X}")).collect();
+            crate::host::log(&format!("pipelog {n}: {}", list.join(" ")));
+            k.clear();
+        }
+    }
+}
+
+/// Opt-in spike attribution; no clocks or formatting when DHD_SPIKES is absent.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct SpikeTimer {
+    start: Option<std::time::Instant>,
+    tag: &'static str,
+    key: u32,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl SpikeTimer {
+    pub(crate) fn new(tag: &'static str, key: u32) -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Self { start: ENABLED.get_or_init(|| std::env::var_os("DHD_SPIKES").is_some())
+                   .then(std::time::Instant::now), tag, key }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SpikeTimer {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            if ms >= 1.0 || self.tag == "pipeline" {
+                let end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64();
+                crate::host::log(&format!("spike_gpu: end_unix={end:.6} ms={ms:.6} tag={} key={:X}", self.tag, self.key));
+            }
+        }
     }
 }

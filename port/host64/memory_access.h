@@ -68,6 +68,14 @@ host64_memory_address_full(uint8_t *base, uint64_t address, uint64_t size) {
    to the caller's alias analysis, and so is the pointer it returns. */
 static __attribute__((noinline, cold)) uint8_t *
 host64_memory_address_slow(uint8_t *base, uint64_t address, uint64_t size) {
+    /* The two views the game reaches RAM through (finding 090 SP14: 84% low view, 16% the
+       0x38000000 mirror of the race's slow calls) first, by the full adapter's own rules: a span
+       inside the low view [0x00400000, 0x02000000) or inside [0x38000000, 0x3a000000) crosses
+       nothing and folds to canonical RAM at 0x08000000 + (address & 0x1ffffff). */
+    uint64_t offset = address & 0x1ffffffull, window = address >> 25;
+    if (size <= 0x2000000ull - offset &&
+        ((window == 0 && offset >= 0x400000) || window == 0x38000000ull >> 25))
+        return base + 0x08000000ull + offset;
     return host64_memory_address_full(base, address, size);
 }
 /* A span of any size (wasm2c's MEM_ADDR: memory.fill, data segments, memory.copy). */

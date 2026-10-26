@@ -36,6 +36,10 @@
    operand4): an empty asm on x86, and a volatile round trip where there is no inline asm. */
 #if defined(__i386__) || defined(__x86_64__)
 #define PS2_OPAQUE_M128(v) __asm__("" : "+x"(v))
+#elif defined(__aarch64__)
+/* the value stays in its NEON register (the volatile round trip below cost a 16-byte store and
+   reload per VU operand on the phone, finding 091 AND3) */
+#define PS2_OPAQUE_M128(v) __asm__("" : "+w"(v))
 #else
 #define PS2_OPAQUE_M128(v) do { volatile __typeof__(v) ps2_opaque_ = (v); (v) = ps2_opaque_; } while (0)
 #endif

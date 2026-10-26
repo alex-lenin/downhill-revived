@@ -84,7 +84,7 @@ void ps2_divu(uint32_t a, uint32_t b)
 uint64_t ps2_ldl(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 7);
-    uint64_t d = *(uint64_t *)(addr & ~(uintptr_t)7);
+    uint64_t d = *(uint64_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)7);
     unsigned keep = (7 - s) * 8;
     return keep ? (d << keep) | (rt & ((1ull << keep) - 1)) : d;
 }
@@ -92,14 +92,14 @@ uint64_t ps2_ldl(uint64_t rt, uintptr_t addr)
 uint64_t ps2_ldr(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 7);
-    uint64_t d = *(uint64_t *)(addr & ~(uintptr_t)7);
+    uint64_t d = *(uint64_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)7);
     return s ? (d >> (s * 8)) | (rt & ~(~0ull >> (s * 8))) : d;
 }
 
 uint64_t ps2_lwl(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 3);
-    uint32_t w = *(uint32_t *)(addr & ~(uintptr_t)3);
+    uint32_t w = *(uint32_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)3);
     unsigned keep = (3 - s) * 8;
     uint32_t r = keep ? (w << keep) | ((uint32_t)rt & ((1u << keep) - 1)) : w;
     return S32(r);
@@ -108,7 +108,7 @@ uint64_t ps2_lwl(uint64_t rt, uintptr_t addr)
 uint64_t ps2_lwr(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 3);
-    uint32_t w = *(uint32_t *)(addr & ~(uintptr_t)3);
+    uint32_t w = *(uint32_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)3);
     uint32_t r = s ? (w >> (s * 8)) | ((uint32_t)rt & ~(~0u >> (s * 8))) : w;
     /* lwr with s != 0 leaves the upper 32 bits alone on the EE; s == 0 sign-extends */
     return s ? (rt & ~0xFFFFFFFFull) | r : S32(r);
@@ -119,7 +119,7 @@ uint64_t ps2_lwr(uint64_t rt, uintptr_t addr)
 void ps2_sdl(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 7);
-    uint64_t *d = (uint64_t *)(addr & ~(uintptr_t)7);
+    uint64_t *d = (uint64_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)7);
     uint64_t mask = ~0ull >> ((7 - s) * 8);
     *d = (*d & ~mask) | (rt >> ((7 - s) * 8));
 }
@@ -127,7 +127,7 @@ void ps2_sdl(uint64_t rt, uintptr_t addr)
 void ps2_sdr(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 7);
-    uint64_t *d = (uint64_t *)(addr & ~(uintptr_t)7);
+    uint64_t *d = (uint64_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)7);
     uint64_t keep = s ? ~0ull >> ((8 - s) * 8) : 0;
     *d = (*d & keep) | (rt << (s * 8));
 }
@@ -135,7 +135,7 @@ void ps2_sdr(uint64_t rt, uintptr_t addr)
 void ps2_swl(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 3);
-    uint32_t *w = (uint32_t *)(addr & ~(uintptr_t)3);
+    uint32_t *w = (uint32_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)3);
     uint32_t mask = ~0u >> ((3 - s) * 8);
     *w = (*w & ~mask) | ((uint32_t)rt >> ((3 - s) * 8));
 }
@@ -143,7 +143,7 @@ void ps2_swl(uint64_t rt, uintptr_t addr)
 void ps2_swr(uint64_t rt, uintptr_t addr)
 {
     unsigned s = (unsigned)(addr & 3);
-    uint32_t *w = (uint32_t *)(addr & ~(uintptr_t)3);
+    uint32_t *w = (uint32_t *)(ps2_ram_canonical(addr) & ~(uintptr_t)3);
     uint32_t keep = s ? ~0u >> ((4 - s) * 8) : 0;
     *w = (*w & keep) | ((uint32_t)rt << (s * 8));
 }

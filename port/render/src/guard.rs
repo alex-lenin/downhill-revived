@@ -7,8 +7,9 @@
 //! 244df66db class). `Guard::enter` saves MXCSR, sets IEEE (`ieee(csr)`: round to nearest, no FTZ,
 //! no DAZ, every exception masked, flags clear) and restores the caller's value on drop, on every
 //! return path. The `no-fp-guard` feature keeps the caller's MXCSR: the negative control of
-//! `tests/device_smoke.rs`'s guard tests, which rustgs refuses outside its selftest. On wasm there is
-//! no MXCSR and the guard only names the export.
+//! `tests/device_smoke.rs`'s guard tests, which rustgs refuses outside its selftest. On aarch64
+//! (Android) the same guard holds FPCR instead (`ieee_fpcr`: the EE thread's round toward zero and
+//! flush to zero off). On wasm there is no control register and the guard only names the export.
 //!
 //! **Fatal path.** A panic is logged through `host::log` (naming the export), then the
 //! `panic = "abort"` profile ends the process. An uncaptured device error is logged, then the
@@ -23,7 +24,25 @@ pub const fn ieee(csr: u32) -> u32 {
     (csr | 0x1F80) & !(0x3F | 0xE040)
 }
 
-/// MXCSR now (0 on targets without one).
+/// IEEE mode for an aarch64 FPCR (the Android build, finding 091): the EE thread runs with RMode 3
+/// (round toward zero) and FZ (fp_mode.c); this is round to nearest (RMode 0), no flush to zero
+/// (FZ, FZ16), no default NaN (DN), no alternate handling (AH, FIZ, NEP) and every trap disabled
+/// (IOE, DZE, OFE, UFE, IXE, IDE). The status flags are FPSR's, not touched.
+pub const fn ieee_fpcr(fpcr: u32) -> u32 {
+    fpcr & !((3 << 22) | (1 << 24) | (1 << 25) | (1 << 19) | 0x7 | 0x9F00)
+}
+
+/// The IEEE mode of this target's control register (MXCSR, or FPCR on aarch64).
+#[inline]
+pub const fn ieee_mode(csr: u32) -> u32 {
+    if cfg!(target_arch = "aarch64") {
+        ieee_fpcr(csr)
+    } else {
+        ieee(csr)
+    }
+}
+
+/// MXCSR now (FPCR on aarch64; 0 on targets with neither).
 #[inline]
 pub fn mxcsr() -> u32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -33,13 +52,20 @@ pub fn mxcsr() -> u32 {
         unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut v, options(nostack, preserves_flags)) };
         v
     }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        // SAFETY: reading FPCR has no side effects.
+        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v as u32
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     {
         0
     }
 }
 
-/// Sets MXCSR (nothing on targets without one).
+/// Sets MXCSR (FPCR on aarch64; nothing on targets with neither).
 #[inline]
 pub fn set_mxcsr(v: u32) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -47,7 +73,12 @@ pub fn set_mxcsr(v: u32) {
     unsafe {
         core::arch::asm!("ldmxcsr [{}]", in(reg) &v, options(nostack, readonly, preserves_flags))
     };
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the values written are the caller's own FPCR or ieee_fpcr of it (traps stay off).
+    unsafe {
+        core::arch::asm!("msr fpcr, {}", "isb", in(reg) v as u64, options(nostack, preserves_flags))
+    };
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = v;
 }
 
@@ -74,7 +105,7 @@ impl Guard {
         install_hooks();
         let csr = mxcsr();
         if !cfg!(feature = "no-fp-guard") {
-            set_mxcsr(ieee(csr));
+            set_mxcsr(ieee_mode(csr));
         }
         let outer = EXPORT.with(|e| e.replace(export));
         Guard { csr, outer }

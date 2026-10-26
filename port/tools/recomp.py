@@ -4,7 +4,7 @@ ELF) becomes <OUT>/<name>.c (build_wasm.py: build/wasm/recomp, signatures from b
 
 - rc_<name>(void) runs the instructions on the emulated register file (port/runtime/recomp.h):
   integer, FPU, memory and control flow as C statements, VU0/MMI instructions through the asm
-  runtime (ps2_exec). Delay slots run before their branch, branch-likely slots only when taken.
+  runtime (ps2_exec; PS2X in the wasm build). Delay slots run before their branch, branch-likely slots only when taken.
 - <name>(...) is a wrapper with the function's C signature (from the callers' declarations,
   read with clang), so native C calls it as usual: it puts the arguments in $a0-$t3 / $f12-$f19,
   runs rc_<name> and returns $v0 / $f0.
@@ -15,7 +15,7 @@ ELF) becomes <OUT>/<name>.c (build_wasm.py: build/wasm/recomp, signatures from b
   (port/tools/data.py).
 This is a bridge to a running game, not readable code: a function's matching C replaces it.
 usage: python port/tools/recomp.py NAME...   (normally run by port/tools/build_wasm.py)"""
-import glob, json, os, re, subprocess, sys
+import glob, hashlib, json, os, re, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pctarget import LABEL_PREFIX as P, TARGET  # noqa: E402
@@ -247,8 +247,53 @@ class Func:
         if rd:
             self.lines.append('GPR(%d) = %s;' % (rd, expr))
 
+    def cop2_move(self, op, a, text):
+        """A COP2 register move (qmtc2, qmfc2, cfc2, ctc2) or a vcallms as C, or None to leave it
+        on ps2_exec.
+
+        The C does what ps2asm.c's run_ins does for the move, without ps2_exec's template lookup
+        and program call (finding 090 SP11). The literal stays in the code through
+        ps2_exec_kept(): its .rodata bytes keep their place, and ps2asm_aot.py still generates its
+        program, so the module's data and function table do not move (SP1 found that dropping
+        the templates changes the race trace by layout alone). Control registers with side effects
+        or float views (R, I, Q, FBRST, VPU-STAT: 20, 21, 22, 28, 29), moves to $zero and any other
+        spelling stay on ps2_exec."""
+        if op == 'vcallms' and len(a) == 1 and re.fullmatch(r'0x[0-9A-Fa-f]+|\d+', a[0]):
+            return 'ps2_exec_kept("%s"); ps2_vcallms("%s", %su);' % (text, text, a[0])
+        move = op.split('.')[0]
+        if move not in ('qmtc2', 'qmfc2', 'cfc2', 'ctc2') or op.count('.') > 1 or len(a) != 2:
+            return None
+        if op != move and op.split('.')[1] not in ('i', 'ni'):
+            return None
+        m = re.match(r'^\$v([fi])(\d+)$', a[1])
+        rt = GPR.get(a[0][1:]) if a[0].startswith('$') else None
+        if not m or rt is None or (m.group(1) == 'f') != (move in ('qmtc2', 'qmfc2')):
+            return None
+        n = int(m.group(2))
+        if n > 31 or (rt == 0 and move in ('qmfc2', 'cfc2')):
+            return None
+        keep = 'ps2_exec_kept("%s"); ' % text
+        if move == 'qmtc2':
+            return keep + ('ps2.vf[%d] = ps2.gpr[%d];' % (n, rt) if n else '')
+        if move == 'qmfc2':
+            if n:
+                return keep + 'ps2.gpr[%d] = ps2.vf[%d];' % (rt, n)
+            return keep + ('ps2.gpr[%d].d[0] = 0; ps2.gpr[%d].d[1] = 0x3F80000000000000ull;' % (rt, rt))
+        if n in (20, 21, 22, 28, 29):
+            return None
+        reg = 'ps2.vi[%d]' % n if n < 16 else 'ps2.vu0_ctrl[%d]' % (n - 16)
+        if move == 'cfc2':
+            return keep + 'ps2.gpr[%d].d[0] = %s;' % (rt, reg)
+        if n == 0:
+            return keep
+        return keep + '%s = (%s)ps2.gpr[%d].d[0];' % (reg, 'uint16_t' if n < 16 else 'uint32_t', rt)
+
     def insn(self, op, a, text):
         g, f, L = self.gpr, self.fpr, self.lines
+        # the wasm build's inline forms (recomp.h, finding 090 SP15); the same results
+        STORE = 'rc' if WASM_EMIT else 'ps2'
+        EE_ADD, EE_SUB, EE_MUL = ('rc_ee_add', 'rc_ee_sub', 'rc_float_mul') if WASM_EMIT else             ('ps2_ee_add', 'ps2_ee_sub', 'ps2_float_mul')
+        EE_DIV, EE_SQRT, EE_CVT_W = ('ps2_ee_div', 'ps2_ee_sqrt', 'ps2_float_to_int') if WASM_EMIT else             ('ps2_fdiv', 'ps2_fsqrt', 'ps2_cvt_w_s')
         if op in ('nop', 'sync', 'sync.p', 'sync.l', 'break', 'ssnop'):
             return
         if op in ('addu', 'add'):
@@ -339,7 +384,7 @@ class Func:
         stores = {'sb': 'MU8', 'sh': 'MU16', 'sw': 'MU32', 'sd': 'M64'}
         if op in stores:
             if op in ('sw', 'sd'):
-                L.append('ps2_store%d(%s, GPR(%d));' % (32 if op == 'sw' else 64, self.addr(a[1]), g(a[0])))
+                L.append('%s_store%d(%s, GPR(%d));' % (STORE, 32 if op == 'sw' else 64, self.addr(a[1]), g(a[0])))
             else:
                 L.append('%s(%s) = GPR(%d);' % (stores[op], self.addr(a[1]), g(a[0])))
             return
@@ -348,7 +393,7 @@ class Func:
                 L.append('ps2.gpr[%d] = M128(%s);' % (g(a[0]), self.addr(a[1])))
             return
         if op == 'sq':
-            L.append('ps2_store128((%s) & ~(uintptr_t)15, &ps2.gpr[%d]);' % (self.addr(a[1]), g(a[0])))
+            L.append('%s_store128((%s) & ~(uintptr_t)15, &ps2.gpr[%d]);' % (STORE, self.addr(a[1]), g(a[0])))
             return
         if op in ('ldl', 'ldr', 'lwl', 'lwr'):
             return self.set64(g(a[0]), 'ps2_%s(GPR(%d), %s)' % (op, g(a[0]), self.addr(a[1])))
@@ -380,17 +425,18 @@ class Func:
             L.append('M32(%s) = FPRW(%d);' % (self.addr(a[1]), f(a[0])))
             return
         if op == 'mtc1':
-            L.append('FPRW(%d) = (int32_t)UW(%d);' % (f(a[1]), g(a[0])))
+            L.append(('FPRW(%d) = rc_opaque32((int32_t)UW(%d));' if WASM_EMIT else 'FPRW(%d) = (int32_t)UW(%d);')
+                     % (f(a[1]), g(a[0])))
             return
         if op == 'mfc1':
             return self.set32(g(a[0]), 'FPRW(%d)' % f(a[1]))
-        binf = {'add.s': 'ps2_ee_add(%s, %s)', 'sub.s': 'ps2_ee_sub(%s, %s)',
-                'mul.s': 'ps2_float_mul(%s, %s)', 'div.s': 'ps2_fdiv(%s, %s)',
+        binf = {'add.s': EE_ADD + '(%s, %s)', 'sub.s': EE_SUB + '(%s, %s)',
+                'mul.s': EE_MUL + '(%s, %s)', 'div.s': EE_DIV + '(%s, %s)',
                 'max.s': 'ps2_float_minmax(%s, %s, 1)', 'min.s': 'ps2_float_minmax(%s, %s, 0)'}
         if op in binf:
             L.append('FPR(%d) = %s;' % (f(a[0]), binf[op] % ('FPR(%d)' % f(a[1]), 'FPR(%d)' % f(a[2]))))
             return
-        unf = {'mov.s': '%s', 'neg.s': '-%s', 'abs.s': '__builtin_fabsf(%s)', 'sqrt.s': 'ps2_fsqrt(%s)'}
+        unf = {'mov.s': '%s', 'neg.s': '-%s', 'abs.s': '__builtin_fabsf(%s)', 'sqrt.s': EE_SQRT + '(%s)'}
         if op in unf:
             L.append('FPR(%d) = %s;' % (f(a[0]), unf[op] % ('FPR(%d)' % f(a[1]))))
             return
@@ -401,19 +447,19 @@ class Func:
             L.append('FPR(%d) = (float)FPRW(%d);' % (f(a[0]), f(a[1])))
             return
         if op == 'cvt.w.s':
-            L.append('FPRW(%d) = ps2_cvt_w_s(FPR(%d));' % (f(a[0]), f(a[1])))
+            L.append('FPRW(%d) = %s(FPR(%d));' % (f(a[0]), EE_CVT_W, f(a[1])))
             return
-        accf = {'mula.s': 'ps2.fpu_acc = ps2_float_mul(%s, %s)',
-                'madda.s': 'ps2.fpu_acc = ps2_ee_add(ps2.fpu_acc, ps2_float_mul(%s, %s))',
-                'msuba.s': 'ps2.fpu_acc = ps2_ee_sub(ps2.fpu_acc, ps2_float_mul(%s, %s))',
-                'adda.s': 'ps2.fpu_acc = ps2_ee_add(%s, %s)',
-                'suba.s': 'ps2.fpu_acc = ps2_ee_sub(%s, %s)'}
+        accf = {'mula.s': 'ps2.fpu_acc = ' + EE_MUL + '(%s, %s)',
+                'madda.s': 'ps2.fpu_acc = ' + EE_ADD + '(ps2.fpu_acc, ' + EE_MUL + '(%s, %s))',
+                'msuba.s': 'ps2.fpu_acc = ' + EE_SUB + '(ps2.fpu_acc, ' + EE_MUL + '(%s, %s))',
+                'adda.s': 'ps2.fpu_acc = ' + EE_ADD + '(%s, %s)',
+                'suba.s': 'ps2.fpu_acc = ' + EE_SUB + '(%s, %s)'}
         if op in accf:
             L.append(accf[op] % ('FPR(%d)' % f(a[0]), 'FPR(%d)' % f(a[1])) + ';')
             return
         if op in ('madd.s', 'msub.s'):
-            L.append('FPR(%d) = ps2_ee_%s(ps2.fpu_acc, ps2_float_mul(FPR(%d), FPR(%d)));' % (f(a[0]), 'add' if op == 'madd.s' else 'sub',
-                                                                       f(a[1]), f(a[2])))
+            L.append('FPR(%d) = %s(ps2.fpu_acc, %s(FPR(%d), FPR(%d)));' % (f(a[0]), EE_ADD if op == 'madd.s' else EE_SUB,
+                                                                EE_MUL, f(a[1]), f(a[2])))
             return
         cmp = {'c.lt.s': '<', 'c.le.s': '<=', 'c.eq.s': '=='}
         if op in cmp:
@@ -426,16 +472,131 @@ class Func:
         if op in ('lqc2', 'sqc2'):
             vf = int(re.match(r'^\$vf(\d+)$', a[0]).group(1))
             if op == 'sqc2':
-                L.append('ps2_store128((%s) & ~(uintptr_t)15, &ps2.vf[%d]);' % (self.addr(a[1]), vf))
+                L.append('%s_store128((%s) & ~(uintptr_t)15, &ps2.vf[%d]);' % (STORE, self.addr(a[1]), vf))
             elif vf:
                 L.append('ps2.vf[%d] = M128(%s);' % (vf, self.addr(a[1])))
+            return
+        inline = self.cop2_move(op, a, text)
+        if inline is not None:
+            L.append(inline)
             return
         if op.startswith('v') or op.split('.')[0] in ('qmtc2', 'qmfc2', 'cfc2', 'ctc2') or op.startswith('p'):
             if any('%' in x for x in a):
                 raise Fail('%s: relocation in %s' % (self.name, text))
-            L.append('ps2_exec("%s");' % text)
+            if WASM_EMIT:  # straight to its generated code (ps2asm_aot.py), no run-time lookup
+                L.append('PS2X(ps2x_%s, "%s");' % (hashlib.sha1(text.encode()).hexdigest()[:16], text))
+                L.append(reload_named(a))
+            else:
+                L.append('ps2_exec("%s");' % text)
             return
         raise Fail('%s: no translation for %r' % (self.name, text))
+
+
+# ---- guest registers in locals (the wasm build, finding 090 SP15) ----
+
+RELOAD_ALL = 'RC_RELOAD_ALL;'
+RELOAD_SOME = re.compile(r'^RC_RELOAD\(([\d,]*)\);$')
+
+
+def reload_named(args):
+    """The marker after an instruction run through its generated code (PS2X): the GPRs its
+    operands name are read back, as the code works on ps2. An FPU operand (none of the VU0/MMI
+    instructions has one) reads everything back."""
+    regs = set()
+    for x in args:
+        for r in re.findall(r'\$(\w+)', x):
+            if re.fullmatch(r'f\d+', r):
+                return RELOAD_ALL
+            if r.isdigit():
+                regs.add(int(r))
+            elif r in GPR:
+                regs.add(GPR[r])
+    return 'RC_RELOAD(%s);' % ','.join(str(r) for r in sorted(regs - {0}))
+
+
+REG_USE = re.compile(r'\b(GPR|UW|SW|FPR|FPRW)\((\d+)\)|\bADDR\((\d+),')
+REG_SET = re.compile(r'\b(GPR|FPR|FPRW)\((\d+)\)\s*=(?!=)')
+# ps2.gpr[n] written in place (lq, por, qmfc2, cfc2, a quadword result), or passed by address to
+# anything but a store
+DIRECT_GPR = re.compile(r'\bps2\.gpr\[(\d+)\](?:\.d\[\d\])?\s*=(?!=)|(?<!_store128\()(?<!, )&ps2\.gpr\[(\d+)\]')
+ACC_SET = re.compile(r'\bps2\.fpu_acc\s*=(?!=)')
+
+
+def cache_registers(lines):
+    """The body with the GPRs (their low 64 bits), FPRs and the FPU accumulator it uses in locals:
+    (declarations, lines). A write sets the local and ps2 (store-through), a read takes the
+    local; the locals are read back from ps2 after a call (RC_RELOAD_ALL), after an instruction
+    run through its generated code (RC_RELOAD(n...)) and after a line that writes ps2.gpr[n]
+    itself (lq, por, qmfc2, cfc2, a quadword result). ps2 therefore always holds
+    the registers, as before: interrupts and fiber switches (an INTC_STAT read, an MMIO store)
+    save and restore them around the game code they run, the state trace reads them there, and
+    ps2_exec sees them. The upper 64 bits of the GPRs, LO/HI and the VU registers stay in ps2."""
+    gprs, fprs, acc = set(), set(), False
+    for l in lines:
+        for m in REG_USE.finditer(l):
+            if m.group(3) is not None:
+                gprs.add(int(m.group(3)))
+            elif m.group(1) in ('FPR', 'FPRW'):
+                fprs.add(int(m.group(2)))
+            else:
+                gprs.add(int(m.group(2)))
+        if 'ps2.fpu_acc' in l:
+            acc = True
+        if 'ps2.fpr[' in l:
+            raise Fail('ps2.fpr named directly: %s' % l)
+    gprs.discard(0)
+
+    def reload(regs, floats=(), with_acc=False):
+        out = ['rg%d = ps2.gpr[%d].d[0];' % (n, n) for n in sorted(regs & gprs)]
+        out += ['rf%d.w = *(int32_t *)&ps2.fpr[%d];' % (n, n) for n in sorted(set(floats) & fprs)]
+        if with_acc and acc:
+            out.append('rfacc = ps2.fpu_acc;')
+        return out
+
+    def assign(m):
+        kind, n = m.group(1), int(m.group(2))
+        if kind == 'GPR':
+            if n == 0:
+                raise Fail('write to $zero: %s' % m.string)
+            return 'ps2.gpr[%d].d[0] = rg%d =' % (n, n)
+        if kind == 'FPR':
+            return 'ps2.fpr[%d] = rf%d.f =' % (n, n)
+        return '*(int32_t *)&ps2.fpr[%d] = rf%d.w =' % (n, n)
+
+    def use(m):
+        if m.group(3) is not None:
+            n = int(m.group(3))
+            return 'RADDR(%s,' % ('rg%d' % n if n else '0')
+        kind, n = m.group(1), int(m.group(2))
+        if kind == 'FPR':
+            return 'rf%d.f' % n
+        if kind == 'FPRW':
+            return 'rf%d.w' % n
+        if n == 0:
+            return {'GPR': '((uint64_t)0)', 'UW': '0u', 'SW': '0'}[kind]
+        return {'GPR': 'rg%d', 'UW': '((uint32_t)rg%d)', 'SW': '((int32_t)rg%d)'}[kind] % n
+
+    out = []
+    for l in lines:
+        if l == RELOAD_ALL:
+            out += reload(gprs, fprs, True)
+            continue
+        m = RELOAD_SOME.match(l)
+        if m:
+            out += reload({int(x) for x in m.group(1).split(',') if x})
+            continue
+        direct = {int(x or y) for x, y in DIRECT_GPR.findall(l)}
+        l = ACC_SET.sub('\x01', l)
+        l = REG_SET.sub(lambda m: assign(m).replace('ps2.', '\x02'), l)
+        l = REG_USE.sub(use, l)
+        l = l.replace('ps2.fpu_acc', 'rfacc').replace('\x01', 'ps2.fpu_acc = rfacc =').replace('\x02', 'ps2.')
+        out.append(l)
+        out += reload(direct)
+    decls = ['uint64_t rg%d = ps2.gpr[%d].d[0];' % (n, n) for n in sorted(gprs)]
+    decls += ['rc_fpr rf%d; rf%d.w = *(int32_t *)&ps2.fpr[%d];' % (n, n, n) for n in sorted(fprs)]
+    if acc:
+        decls.append('float rfacc = ps2.fpu_acc;')
+    return decls, out
 
 
 def c_ident(name):
@@ -768,6 +929,8 @@ def translate(name, recompiled, sigs):
         if callee in recompiled:
             fn.callees.add(callee)
             L.append('rc_%s();' % callee)
+            if WASM_EMIT:
+                L.append(RELOAD_ALL)
             return
         sig = sigs[callee]
         fn.callees.add(callee)
@@ -775,6 +938,8 @@ def translate(name, recompiled, sigs):
         if sig['variadic'] or (sig['from'] is None and not WASM_EMIT):
             srcs = srcs + ['UW(%d)' % r for r in INT_ARGS[len(srcs):]]  # pass every argument register
         L.append(ret % ('%s(%s)' % (callee, ', '.join(srcs))))
+        if WASM_EMIT:
+            L.append(RELOAD_ALL)
 
     labels.add(start)
     i = 0
@@ -878,6 +1043,8 @@ def translate(name, recompiled, sigs):
             L.append('GPR(2) = S32(((uint32_t (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, '
                      'uint32_t, uint32_t))(uintptr_t)UW(%d))(UW(4), UW(5), UW(6), UW(7), UW(8), UW(9), UW(10), '
                      'UW(11)));' % reg)
+            if WASM_EMIT:
+                L.append(RELOAD_ALL)
         elif op == 'jr':
             reg = fn.gpr(a[0])
             if reg == 31:
@@ -914,8 +1081,10 @@ def write(name, recompiled, sigs):
         else:
             out.append('extern %s;' % prototype(c, sigs[c]))
     sig = sigs[name]
+    decls, body = cache_registers(fn.lines) if WASM_EMIT else ([], fn.lines)
     out += ['', 'void rc_%s(void)' % name, '{', '    int fcc = 0;', '    (void)fcc;']
-    out += ['    ' + l if not re.match(r'^L_\w+:;$', l) else l for l in fn.lines]
+    out += ['    ' + l for l in decls]
+    out += ['    ' + l if not re.match(r'^L_\w+:;$', l) else l for l in body]
     out += ['    return;', '}', '']
     # the wrapper native callers see
     places, body = arg_places(sig), []
@@ -962,7 +1131,7 @@ def write(name, recompiled, sigs):
            'double': '    return ps2_u2d(GPR(2));'}.get(
         sig['ret'], '    return (%s)UW(2);' % CTYPE[sig['ret']])
     out += [prototype(name, dict(sig, variadic=sig['variadic'] and bool(sig['args'])), params=True), '{',
-            '    ps2_recomp_enter();'] + body + \
+            '    ps2_recomp_enter_inline();'] + body + \
            ([ret] if ret else []) + ['}', '']
     os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, name + '.c')

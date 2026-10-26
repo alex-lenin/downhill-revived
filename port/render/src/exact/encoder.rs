@@ -21,6 +21,56 @@ use crate::abi::*;
 use crate::device::Gpu;
 use crate::exact::Exact;
 
+/// Android, native renderer: the thread an exact submit runs on. wgpu records a command buffer
+/// at `finish`, so the submit is where the exact renderer's Vulkan commands are made. On the
+/// Adreno 660 (driver 512) compute work recorded and submitted from the GS worker, while the
+/// render thread recorded the native renderer's passes, crashed the render thread in the driver
+/// (finding 091, AND3); the native renderer registers its render thread here
+/// (`dhdr_exact_set_submitter`), which then makes every exact command buffer.
+#[cfg(target_os = "android")]
+pub mod submitter {
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    /// `run(call, arg, context)`: runs `call(arg)` on the render thread (or right here when that
+    /// thread is the caller or gone) and returns once it has run.
+    pub type Run = unsafe extern "C" fn(call: unsafe extern "C" fn(*mut c_void), arg: *mut c_void, context: *mut c_void);
+
+    struct Submitter {
+        run: Run,
+        context: *mut c_void,
+    }
+    // SAFETY: the context is the native renderer's, which `run` serializes itself.
+    unsafe impl Send for Submitter {}
+
+    static SUBMITTER: Mutex<Option<Submitter>> = Mutex::new(None);
+
+    /// Registers (or with `run` NULL, removes) the thread exact submits run on.
+    #[no_mangle]
+    pub unsafe extern "C" fn dhdr_exact_set_submitter(run: Option<Run>, context: *mut c_void) {
+        *SUBMITTER.lock().unwrap_or_else(|p| p.into_inner()) = run.map(|run| Submitter { run, context });
+    }
+
+    unsafe extern "C" fn trampoline(arg: *mut c_void) {
+        // SAFETY: arg is `run`'s `&mut &mut dyn FnMut()`, alive until `run` returns.
+        let job = unsafe { &mut *(arg as *mut &mut dyn FnMut()) };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job())).is_err() {
+            crate::guard::fatal("dhd_render: exact submit panicked on the render thread");
+        }
+    }
+
+    /// Runs `job` through the registered submitter, if any (the caller then runs it, a no-op).
+    pub fn run(job: &mut dyn FnMut()) {
+        let (run, context) = match SUBMITTER.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            Some(s) => (s.run, s.context),
+            None => return,
+        };
+        let mut job = job;
+        // SAFETY: `run` returns only after the call has run; `job` outlives it.
+        unsafe { run(trampoline, &mut job as *mut &mut dyn FnMut() as *mut c_void, context) };
+    }
+}
+
 pub struct Encoder {
     /// The open compute pass (main set), if any. Declared before `encoder`: a pass must end (drop)
     /// before its encoder finishes or drops.
@@ -74,7 +124,15 @@ impl Encoder {
         self.end_pass();
         match self.encoder.take() {
             Some(e) => {
-                gpu.queue.submit([e.finish()]);
+                let mut e = Some(e);
+                let mut job = || {
+                    if let Some(e) = e.take() {
+                        gpu.queue.submit([e.finish()]);
+                    }
+                };
+                #[cfg(target_os = "android")]
+                submitter::run(&mut job);
+                job();
                 true
             }
             None => false,

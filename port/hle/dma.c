@@ -151,7 +151,7 @@ int sceGsSyncPath(int mode, int timeout)
 {
     (void)mode, (void)timeout;
     kernel_poll();  /* tight render loops still deliver vsync and window messages */
-    host_service_graphics_wait();
+    if (!graphics_ordered) host_service_graphics_wait();   /* hle.h: the DMA data is copied already */
     return 0;
 }
 

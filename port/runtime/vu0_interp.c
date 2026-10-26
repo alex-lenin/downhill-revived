@@ -25,8 +25,68 @@
 #include <stddef.h>
 #include <string.h>
 #include <time.h>
+#if defined(__aarch64__)
+/* The Android build (finding 091): SIMDe maps these SSE calls to NEON, the same IEEE single
+   operations (under FPCR instead of MXCSR). */
+#define SIMDE_ENABLE_NATIVE_ALIASES
+#include <simde/x86/sse2.h>
+#include <arm_neon.h>
+/* Native NEON for the SSE idioms the VU1 kernels lean on (AND3, finding 091). The build's
+   -ffp-model=strict makes clang split a vector float compare into four scalar compares (a
+   constrained fcmp has no vector lowering on AArch64), so the float compares are the NEON
+   instructions themselves: FCMEQ/FCMGT/FCMGE, what SIMDe's vceqq/vcgtq/vcgeq_f32 are, and like
+   CMPPS under DAZ they read a denormal as zero under FPCR.FZ. */
+static inline __attribute__((always_inline)) uint32x4_t vu_neon_cmpeq(float32x4_t a, float32x4_t b)
+{
+    uint32x4_t r;
+    __asm__("fcmeq %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(a), "w"(b));
+    return r;
+}
+static inline __attribute__((always_inline)) uint32x4_t vu_neon_cmpgt(float32x4_t a, float32x4_t b)
+{
+    uint32x4_t r;
+    __asm__("fcmgt %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(a), "w"(b));
+    return r;
+}
+static inline __attribute__((always_inline)) uint32x4_t vu_neon_cmpge(float32x4_t a, float32x4_t b)
+{
+    uint32x4_t r;
+    __asm__("fcmge %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(a), "w"(b));
+    return r;
+}
+#undef _mm_cmpeq_ps
+#undef _mm_cmplt_ps
+#undef _mm_cmpgt_ps
+#undef _mm_cmple_ps
+#undef _mm_cmpge_ps
+#define _mm_cmpeq_ps(a, b) vreinterpretq_f32_u32(vu_neon_cmpeq((a), (b)))
+#define _mm_cmplt_ps(a, b) vreinterpretq_f32_u32(vu_neon_cmpgt((b), (a)))
+#define _mm_cmpgt_ps(a, b) vreinterpretq_f32_u32(vu_neon_cmpgt((a), (b)))
+#define _mm_cmple_ps(a, b) vreinterpretq_f32_u32(vu_neon_cmpge((b), (a)))
+#define _mm_cmpge_ps(a, b) vreinterpretq_f32_u32(vu_neon_cmpge((a), (b)))
+/* The MAC flag bits of a lane mask, x bit 3 .. w bit 0 (SSE: reverse[_mm_movemask_ps(m)]). */
+static inline __attribute__((always_inline)) unsigned vu_neon_lanes(uint32x4_t m)
+{
+    const uint32x4_t weight = {8, 4, 2, 1};
+    return vaddvq_u32(vandq_u32(m, weight));
+}
+/* _mm_cvttps_epi32: FCVTZS, and INT32_MIN where CVTTPS gives its integer indefinite (NaN, or
+   at least 2^31; below -2^31 FCVTZS saturates to INT32_MIN itself). Integer tests on the bits,
+   so no float compare. */
+static inline __attribute__((always_inline)) __m128i vu_neon_cvttps_epi32(__m128 a)
+{
+    int32x4_t bits = vreinterpretq_s32_f32(a);
+    uint32x4_t big = vcgeq_s32(bits, vdupq_n_s32(0x4f000000));  /* +2^31 .. +inf, +NaN */
+    uint32x4_t nan = vcgtq_u32(vreinterpretq_u32_f32(a), vdupq_n_u32(0xff800000u));  /* -NaN */
+    int32x4_t r = vbslq_s32(vorrq_u32(big, nan), vdupq_n_s32(INT32_MIN), vcvtq_s32_f32(a));
+    return vreinterpretq_s64_s32(r);
+}
+#undef _mm_cvttps_epi32
+#define _mm_cvttps_epi32(a) vu_neon_cvttps_epi32(a)
+#else
 #include <xmmintrin.h>
 #include <emmintrin.h>
+#endif
 
 enum { FMAC_LATENCY = 4, FLAG_LATENCY = 4, DIV_LATENCY = 7, RSQRT_LATENCY = 13 };
 enum { MAX_STEPS = 1 << 20 };  /* a program that never ends (bad upload) gives up */
@@ -60,6 +120,14 @@ typedef struct {
     uint16_t vi_previous_value;
     uint32_t vi_written_at;
     int vu1_used;
+#ifdef PS2_VU_AOT
+    /* MAC updates the translated blocks made lazily (commit_upper_lazy): the sticky Z and S lanes
+       so far, and the latest result with its dest, valid while no queued MAC update is newer.
+       drain_flags folds them in. */
+    __m128i lazy_sign, lazy_zero;
+    __m128 lazy_last;
+    int lazy_dest, lazy_valid, lazy_used;
+#endif
     ps2_q128 vu1_file[64]; /* VU0 only: VU1 VF/VI as VU0 addresses them at 0x4000, filled on first use */
 } Vu;
 
@@ -179,9 +247,9 @@ static inline void vu_ieee_probe_result(__m128 v, int d)
    the largest finite magnitude). On an operand it is DAZ and the operand clamp. On an FMAC result
    (fmac_flags4, native_result) it is FTZ and what toward-zero rounding makes of an overflow; the
    race measured 53k denormal and 280k inf result lanes in 4000 fields (--vu-ieee-probe), and
-   80M denormal and 2.7M exponent-255 operand lanes, so neither clamp is dead. The only difference
-   left is the rounding of finite results (nearest instead of toward zero: the last bit). No
-   optimizer barrier: there is no host rounding mode for constant folding to disagree with. */
+   80M denormal and 2.7M exponent-255 operand lanes, so neither clamp is dead. The rounding (toward
+   zero) is vu_add4 and the others below. No optimizer barrier: there is no host rounding mode for
+   constant folding to disagree with. */
 static inline __attribute__((always_inline)) __m128 ieee_clamp4(__m128 value)
 {
     __m128i bits = _mm_castps_si128(value), magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7fffffff));
@@ -203,6 +271,110 @@ static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
 #endif
     return ieee_clamp4(value);
 }
+/* Toward-zero rounding without a rounding mode (WB1, finding 090). wasm has only round to
+   nearest, so the VU mode's rounding was the one difference left above, and it is not just the last
+   bit of a picture: a program that turns a float into a count or an index (FTOI) can be one off,
+   and the stream it kicks then comes apart (the browser's exploding triangles after an Adrenaline
+   Boost pickup). Each operation here is done to nearest, its exact error is found without a rounding
+   mode, and a result that went away from zero steps back one unit (its bits minus one: the next
+   value toward zero, inf to FLT_MAX). Exact for every input:
+   - add/sub: TwoSum's error term (exact under round to nearest); the result went away from zero when
+     the error has the other sign;
+   - mul, div, sqrt, int to float: the operands' exact product (24 x 24 bits) in double, compared
+     with the result (div: the result times the divisor against the dividend);
+   so the VU1 results are bit for bit the x64 build's (VU mode: toward zero, FTZ/DAZ), at a few
+   SIMD ops each instead of the --exact-float helpers' calls. Operands are already clamped finite
+   (operand4/arithmetic), and results still go through ieee_clamp4 (FTZ, overflow). */
+static inline __attribute__((always_inline)) __m128 vu_toward_zero4(__m128 r, __m128 away)
+{
+    return _mm_castsi128_ps(_mm_add_epi32(_mm_castps_si128(r), _mm_castps_si128(away)));  /* -1: one unit down */
+}
+static inline __attribute__((always_inline)) __m128 vu_add4(__m128 a, __m128 b)
+{
+    __m128 s = _mm_add_ps(a, b), bb = _mm_sub_ps(s, a);
+    __m128 err = _mm_add_ps(_mm_sub_ps(a, _mm_sub_ps(s, bb)), _mm_sub_ps(b, bb));
+    __m128i bits = _mm_castps_si128(s);
+    __m128i other = _mm_srai_epi32(_mm_xor_si128(bits, _mm_castps_si128(err)), 31);
+    __m128i away = _mm_and_si128(other, _mm_castps_si128(_mm_cmpneq_ps(err, _mm_setzero_ps())));
+    __m128i inf = _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7fffffff)), _mm_set1_epi32(0x7f800000));
+    return vu_toward_zero4(s, _mm_castsi128_ps(_mm_or_si128(away, inf)));
+}
+static inline __attribute__((always_inline)) __m128 vu_sub4(__m128 a, __m128 b)
+{
+    return vu_add4(a, _mm_xor_ps(b, _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000))));
+}
+/* lanes where |r| > |exact|, exact given as two double pairs (lanes 0-1, 2-3) */
+static inline __attribute__((always_inline)) __m128 vu_away4(__m128 r, __m128d lo, __m128d hi)
+{
+    const __m128d magnitude = _mm_castsi128_pd(_mm_set1_epi64x(0x7fffffffffffffffLL));
+    __m128d rlo = _mm_and_pd(_mm_cvtps_pd(r), magnitude), rhi = _mm_and_pd(_mm_cvtps_pd(_mm_movehl_ps(r, r)), magnitude);
+    __m128d alo = _mm_cmpgt_pd(rlo, _mm_and_pd(lo, magnitude)), ahi = _mm_cmpgt_pd(rhi, _mm_and_pd(hi, magnitude));
+    return _mm_shuffle_ps(_mm_castpd_ps(alo), _mm_castpd_ps(ahi), _MM_SHUFFLE(2, 0, 2, 0));
+}
+static inline __attribute__((always_inline)) __m128 vu_mul4(__m128 a, __m128 b)
+{
+    __m128 r = _mm_mul_ps(a, b);
+    __m128d lo = _mm_mul_pd(_mm_cvtps_pd(a), _mm_cvtps_pd(b));
+    __m128d hi = _mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(a, a)), _mm_cvtps_pd(_mm_movehl_ps(b, b)));
+    return vu_toward_zero4(r, vu_away4(r, lo, hi));
+}
+static inline __attribute__((always_inline)) __m128 vu_itof4(__m128i i)
+{
+    __m128 r = _mm_cvtepi32_ps(i);
+    return vu_toward_zero4(r, vu_away4(r, _mm_cvtepi32_pd(i), _mm_cvtepi32_pd(_mm_shuffle_epi32(i, _MM_SHUFFLE(1, 0, 3, 2)))));
+}
+static inline float vu_toward_zero(float r)
+{
+    uint32_t bits; memcpy(&bits, &r, 4); bits--; memcpy(&r, &bits, 4); return r;
+}
+static inline float vu_addf(float a, float b)
+{
+    float s = a + b, bb = s - a, err = (a - (s - bb)) + (b - bb);
+    return isinf(s) || (err != 0 && signbit(err) != signbit(s)) ? vu_toward_zero(s) : s;
+}
+static inline float vu_mulf(float a, float b)
+{
+    float r = a * b;
+    return fabs((double)r) > fabs((double)a * (double)b) ? vu_toward_zero(r) : r;
+}
+static inline float vu_divf(float a, float b)  /* b != 0 */
+{
+    float r = a / b;
+    return fabs((double)r * (double)b) > fabs((double)a) ? vu_toward_zero(r) : r;
+}
+static inline float vu_sqrtf(float x)  /* x >= 0 */
+{
+    float r = sqrtf(x);
+    return (double)r * (double)r > (double)x ? vu_toward_zero(r) : r;
+}
+static inline float vu_itof(int32_t i)
+{
+    float r = (float)i;
+    return fabs((double)r) > fabs((double)i) ? vu_toward_zero(r) : r;
+}
+static inline float vu_daz(float x)
+{
+    uint32_t bits; memcpy(&bits, &x, 4);
+    if (!(bits & 0x7f800000)) bits &= 0x80000000;
+    memcpy(&x, &bits, 4); return x;
+}
+#define VU_ADD4(a, b) vu_add4((a), (b))
+#define VU_SUB4(a, b) vu_sub4((a), (b))
+#define VU_MUL4(a, b) vu_mul4((a), (b))
+#define VU_ITOF4(i) vu_itof4(i)
+#define VU_DIV_SS(a, b) _mm_set_ss(vu_divf(_mm_cvtss_f32(a), _mm_cvtss_f32(b)))
+#define VU_ADDF(a, b) vu_addf((a), (b))
+#define VU_MULF(a, b) vu_mulf((a), (b))
+#define VU_DIVF(a, b) vu_divf((a), (b))
+#define VU_SQRTF(x) vu_sqrtf(x)
+#define VU_ITOF(i) vu_itof(i)
+#define VU_DAZ(x) vu_daz(x)
+/* An intermediate result inside one VU operation (the product of MADD/MSUB, OPMSUB's, the EFU's
+   partial results) is flushed and clamped as the VU mode does before the next step: a plain
+   product that overflowed to inf would otherwise swallow the accumulator (-FLT_MAX + inf clamps to
+   +FLT_MAX where the VU gives -FLT_MAX + FLT_MAX = 0). */
+#define VU_PRODUCT4(a, b) ieee_clamp4(vu_mul4((a), (b)))
+#define VU_STEP(u, x) arithmetic((u), (x))
 #else
 static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
 {
@@ -212,6 +384,20 @@ static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
     PS2_OPAQUE_M128(result);
     return result;
 }
+/* The VU mode (toward zero, FTZ/DAZ) already rounds and flushes every result, intermediate too. */
+#define VU_ADD4(a, b) _mm_add_ps((a), (b))
+#define VU_SUB4(a, b) _mm_sub_ps((a), (b))
+#define VU_MUL4(a, b) _mm_mul_ps((a), (b))
+#define VU_ITOF4(i) _mm_cvtepi32_ps(i)
+#define VU_DIV_SS(a, b) _mm_div_ss((a), (b))
+#define VU_ADDF(a, b) ((a) + (b))
+#define VU_MULF(a, b) ((a) * (b))
+#define VU_DIVF(a, b) ((a) / (b))
+#define VU_SQRTF(x) sqrtf(x)
+#define VU_ITOF(i) ((float)(i))
+#define VU_DAZ(x) (x)
+#define VU_PRODUCT4(a, b) _mm_mul_ps((a), (b))
+#define VU_STEP(u, x) (x)
 #endif
 
 static __m128 minmax4(__m128 a, __m128 b, int maximum)
@@ -265,6 +451,9 @@ static inline __attribute__((always_inline)) void flags_now(Vu *u)
 static inline __attribute__((always_inline)) void queue_flags(Vu *u, const Upper *up)
 {
     uint32_t mac, clip, st;
+#ifdef PS2_VU_AOT
+    if (up->flags == 1) u->lazy_valid = 0;  /* this update is newer than any lazy one */
+#endif
     if (u->n_flags == 16)
         flags_now(u);
     if (u->n_flags == 16)
@@ -290,12 +479,37 @@ static inline __attribute__((always_inline)) void queue_flags(Vu *u, const Upper
     u->n_flags++;
 }
 
-/* Latest flag values once every queued one lands (the program's end). */
+#ifdef PS2_VU_AOT
+/* The lazy MAC updates, once every queued one has landed: their sticky bits, and the MAC and
+   Z S U O status bits of the latest, if no queued update came after it. */
+static void lazy_fold(Vu *u)
+{
+    static const unsigned reverse[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
+    if (u->lazy_valid) {
+        __m128 v = u->lazy_last;
+        unsigned d = (unsigned)u->lazy_dest;
+        unsigned mac = (reverse[_mm_movemask_ps(_mm_cmpeq_ps(v, _mm_setzero_ps()))] & d) |
+                       (reverse[_mm_movemask_ps(v)] & d) << 4;
+        unsigned st = (mac & 0xF ? 1 : 0) | (mac & 0xF0 ? 2 : 0);
+        u->mac = mac;
+        u->status = (u->status & ~0xFu) | st;
+    }
+    u->status |= (_mm_movemask_ps(_mm_castsi128_ps(u->lazy_zero)) ? 0x40u : 0) |
+                 (_mm_movemask_ps(_mm_castsi128_ps(u->lazy_sign)) ? 0x80u : 0);
+    u->lazy_zero = u->lazy_sign = _mm_setzero_si128();
+    u->lazy_valid = u->lazy_used = 0;
+}
+#endif
+
+/* Latest flag values once every queued one lands (the program's end, a native kernel's entry). */
 static void drain_flags(Vu *u)
 {
     u->cycle += 64;
     apply_flags(u);
     flags_now(u);
+#ifdef PS2_VU_AOT
+    if (u->lazy_used) lazy_fold(u);
+#endif
 }
 
 /* The MAC flags of an FMAC result written to the fields in d. Every caller passes the result of
@@ -309,6 +523,12 @@ static inline __attribute__((always_inline)) void fmac_flags4(Upper *out, __m128
 #ifdef PS2_VU_IEEE  /* FTZ and the overflow clamp of plain IEEE results (ieee_clamp4) */
     v = ieee_clamp4(v);
 #endif
+#if defined(__aarch64__)
+    out->mac = (vu_neon_lanes(vu_neon_cmpeq(v, vdupq_n_f32(0.0f))) & d) |
+               (vu_neon_lanes(vcltzq_s32(vreinterpretq_s32_f32(v))) & d) << 4;
+    out->flags = 1;
+    _mm_storeu_ps(out->v, v);  /* an operation on operand4 values needs no result clamp */
+#else
     {
         static const unsigned reverse[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15};
         __m128 zero = _mm_cmpeq_ps(v, _mm_setzero_ps());
@@ -317,6 +537,7 @@ static inline __attribute__((always_inline)) void fmac_flags4(Upper *out, __m128
         out->flags = 1;
         _mm_storeu_ps(out->v, v);  /* an operation on operand4 values needs no result clamp */
     }
+#endif
 }
 
 static inline __attribute__((always_inline)) void fmac_flags(Vu *u, Upper *out, const float r[4], int d)
@@ -395,6 +616,7 @@ ps2_cpu *ps2_vu1_regs;
 uint64_t ps2_vu1_code_version;
 uint64_t ps2_vu0_code_version;
 int ps2_vu1_native_mode = -1;
+int ps2_vu1_aot_mode = -1;  /* tests: 0 runs VU1 on the interpreter only, 1 through the blocks, else DHD_VU_INTERPRETER */
 int ps2_vu0_aot_mode = -1;
 int ps2_vu0_native_mode = -1;
 unsigned long long ps2_vu0_native_runs;
@@ -454,7 +676,7 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
         case 0x10: case 0x11: case 0x12: case 0x13: {  /* ITOF0/4/12/15 */
             static const float scale[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
             for (comp = 0; comp < 4; comp++)
-                out->v[comp] = (float)(int32_t)vf_bits(u, fs, comp) / scale[bc];
+                out->v[comp] = VU_ITOF((int32_t)vf_bits(u, fs, comp)) / scale[bc];
             out->reg = ft, out->dest = d;
             return 0;
         }
@@ -526,9 +748,9 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
                 t[comp] = vf(u, ft, comp);
         } else if (sub == 0x2E) {  /* OPMULA ACC.xyz = fs.yzx * ft.zxy */
             stall_for(u, ft);
-            r[0] = arithmetic(u, s[1]) * arithmetic_vf(u, ft, 2);
-            r[1] = arithmetic(u, s[2]) * arithmetic_vf(u, ft, 0);
-            r[2] = arithmetic(u, s[0]) * arithmetic_vf(u, ft, 1);
+            r[0] = VU_MULF(arithmetic(u, s[1]), arithmetic_vf(u, ft, 2));
+            r[1] = VU_MULF(arithmetic(u, s[2]), arithmetic_vf(u, ft, 0));
+            r[2] = VU_MULF(arithmetic(u, s[0]), arithmetic_vf(u, ft, 1));
             r[3] = 0;
             out->to_acc = 1, out->dest = d & 0xE;
             memcpy(out->v, r, sizeof r);
@@ -566,9 +788,9 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
         } else if (op == 0x2E) {  /* OPMSUB fd.xyz = ACC.xyz - fs.yzx * ft.zxy */
             stall_for(u, fs);
             stall_for(u, ft);
-            r[0] = arithmetic(u, u->c->vacc[0]) - arithmetic_vf(u, fs, 1) * arithmetic_vf(u, ft, 2);
-            r[1] = arithmetic(u, u->c->vacc[1]) - arithmetic_vf(u, fs, 2) * arithmetic_vf(u, ft, 0);
-            r[2] = arithmetic(u, u->c->vacc[2]) - arithmetic_vf(u, fs, 0) * arithmetic_vf(u, ft, 1);
+            r[0] = VU_ADDF(arithmetic(u, u->c->vacc[0]), -VU_STEP(u, VU_MULF(arithmetic_vf(u, fs, 1), arithmetic_vf(u, ft, 2))));
+            r[1] = VU_ADDF(arithmetic(u, u->c->vacc[1]), -VU_STEP(u, VU_MULF(arithmetic_vf(u, fs, 2), arithmetic_vf(u, ft, 0))));
+            r[2] = VU_ADDF(arithmetic(u, u->c->vacc[2]), -VU_STEP(u, VU_MULF(arithmetic_vf(u, fs, 0), arithmetic_vf(u, ft, 1))));
             r[3] = 0;
             out->reg = fd, out->dest = d & 0xE;
             memcpy(out->v, r, sizeof r);
@@ -585,13 +807,13 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
         b = from == 0 ? lane4(vf4(u, ft), bc) : from == 1 ? _mm_set1_ps(q) : from == 2 ? _mm_set1_ps(i) : vf4(u, ft);
         if (kind != MAX && kind != MINI) { a = operand4(a); b = operand4(b); }
         switch (kind) {
-        case ADD: result = _mm_add_ps(a,b); break;
-        case SUB: result = _mm_sub_ps(a,b); break;
-        case MUL: result = _mm_mul_ps(a,b); break;
+        case ADD: result = VU_ADD4(a,b); break;
+        case SUB: result = VU_SUB4(a,b); break;
+        case MUL: result = VU_MUL4(a,b); break;
         case MAX: result = minmax4(a,b,1); sets_flags = 0; break;
         case MINI: result = minmax4(a,b,0); sets_flags = 0; break;
-        case MADD: result = _mm_add_ps(operand4(_mm_loadu_ps(u->c->vacc)), _mm_mul_ps(a,b)); break;
-        default: result = _mm_sub_ps(operand4(_mm_loadu_ps(u->c->vacc)), _mm_mul_ps(a,b)); break;
+        case MADD: result = VU_ADD4(operand4(_mm_loadu_ps(u->c->vacc)), VU_PRODUCT4(a,b)); break;
+        default: result = VU_SUB4(operand4(_mm_loadu_ps(u->c->vacc)), VU_PRODUCT4(a,b)); break;
         }
         out->dest = d;
         if (sets_flags)
@@ -624,11 +846,37 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
     return 0;
 }
 
+static inline __attribute__((always_inline)) void commit_result(Vu *u, const Upper *up, int lower_reg);
+
 static inline __attribute__((always_inline)) void commit_upper(Vu *u, const Upper *up, int lower_reg)
 {
-    int comp;
     if (up->flags)
         queue_flags(u, up);
+    commit_result(u, up, lower_reg);
+}
+
+#ifdef PS2_VU_AOT
+/* commit_upper for an FMAC no flag read can observe (vu1_aot.py lazy_flags): no queued update,
+   only its sticky lanes and the result kept as the latest MAC for drain_flags. Its result is
+   the value fmac_flags4 took the MAC flags from (never OPMULA/OPMSUB, whose stored result is
+   clamped after). */
+static inline __attribute__((always_inline)) void commit_upper_lazy(Vu *u, const Upper *up, int lower_reg)
+{
+    if (up->flags == 1) {
+        const int d = up->dest;
+        const __m128i lanes = _mm_setr_epi32(d & 8 ? -1 : 0, d & 4 ? -1 : 0, d & 2 ? -1 : 0, d & 1 ? -1 : 0);
+        const __m128 v = _mm_loadu_ps(up->v);
+        u->lazy_sign = _mm_or_si128(u->lazy_sign, _mm_and_si128(_mm_castps_si128(v), lanes));
+        u->lazy_zero = _mm_or_si128(u->lazy_zero, _mm_and_si128(_mm_castps_si128(_mm_cmpeq_ps(v, _mm_setzero_ps())), lanes));
+        u->lazy_last = v; u->lazy_dest = d; u->lazy_valid = u->lazy_used = 1;
+    } else if (up->flags)
+        queue_flags(u, up);
+    commit_result(u, up, lower_reg);
+}
+#endif
+
+static inline __attribute__((always_inline)) void commit_result(Vu *u, const Upper *up, int lower_reg)
+{
     if (up->to_acc) {
         store_fields(u->c->vacc, _mm_loadu_si128((const __m128i *)up->v), up->dest);
         return;
@@ -735,20 +983,20 @@ static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsign
             if ((sub & 3) == 2) {
                 if (t < 0.0f)
                     fl |= 0x10;
-                t = sqrtf(fabsf(t));
+                t = VU_SQRTF(fabsf(t));
             }
             if (t == 0.0f) {
                 fl |= s == 0.0f && (sub & 3) == 0 ? 0x10 : 0x20;
                 start_q(u, vu_max(signbit(s) != signbit(t)), (sub & 3) ? RSQRT_LATENCY : DIV_LATENCY, fl);
             } else
-                start_q(u, s / t, (sub & 3) ? RSQRT_LATENCY : DIV_LATENCY, fl);
+                start_q(u, VU_DIVF(s, t), (sub & 3) ? RSQRT_LATENCY : DIV_LATENCY, fl);
             return -1;
         }
         case 0x39: {  /* SQRT Q, ft.ftf */
             float t;
             stall_for(u, it);
             t = arithmetic_vf(u, it, w >> 23 & 3);
-            start_q(u, sqrtf(fabsf(t)), DIV_LATENCY, t < 0.0f ? 0x10 : 0);
+            start_q(u, VU_SQRTF(fabsf(t)), DIV_LATENCY, t < 0.0f ? 0x10 : 0);
             return -1;
         }
         case 0x3B:  /* WAITQ */
@@ -827,17 +1075,17 @@ static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsign
             }
             x = vf(u, is, 0); y = vf(u, is, 1); z = vf(u, is, 2);
             if (efu <= 0x73) {
-                float xx = x * x, yy = y * y, zz = z * z;
-                p = (xx + yy) + zz;
+                float xx = VU_STEP(u, VU_MULF(x, x)), yy = VU_STEP(u, VU_MULF(y, y)), zz = VU_STEP(u, VU_MULF(z, z));
+                p = VU_STEP(u, VU_ADDF(VU_STEP(u, VU_ADDF(xx, yy)), zz));
                 latency = efu == 0x70 ? 11 : efu == 0x73 ? 24 : 18;
-                if (efu == 0x72 || efu == 0x73) p = sqrtf(p);
-                if ((efu == 0x71 || efu == 0x73) && p != 0) p = 1.0f / p;
+                if (efu == 0x72 || efu == 0x73) p = VU_SQRTF(p);
+                if ((efu == 0x71 || efu == 0x73) && p != 0) p = VU_STEP(u, VU_DIVF(1.0f, p));
             } else if (efu == 0x76)
-                p = ((x + y) + z) + vf(u, is, 3);
+                p = VU_STEP(u, VU_ADDF(VU_STEP(u, VU_ADDF(VU_STEP(u, VU_ADDF(VU_DAZ(x), VU_DAZ(y))), VU_DAZ(z))), VU_DAZ(vf(u, is, 3))));
             else {
                 p = vf(u, is, w >> 21 & 3);
-                if ((efu == 0x78 || efu == 0x79) && p >= 0) p = sqrtf(p);
-                if ((efu == 0x79 || efu == 0x7A) && p != 0) p = 1.0f / p;
+                if ((efu == 0x78 || efu == 0x79) && VU_DAZ(p) >= 0) p = VU_SQRTF(VU_DAZ(p));
+                if ((efu == 0x79 || efu == 0x7A) && VU_DAZ(p) != 0) p = VU_STEP(u, VU_DIVF(1.0f, p));
                 if (efu == 0x79) latency = 18;
             }
             u->p_next = p; u->p_ready = u->cycle + latency;
@@ -1022,7 +1270,7 @@ static inline void trace_pair(Vu *u, unsigned pc)
    code buffer (the replay tests) is compared each time. */
 static int native_code_compare(const uint8_t *code, unsigned kind, unsigned start, unsigned end)
 {
-    const uint32_t *words = kind == 2048 ? native_loop2e48_words : kind == 1024 ? native_loop0e10_words : kind == 512 ? native_loop2dc8_words : kind == 256 ? native_loop1430_words : kind == 128 ? native_loop468_words : kind == 64 ? native_loop800_words : kind == 16 ? native_loop20c_words :
+    const uint32_t *words = kind == 8192 ? native_loop3140_words : kind == 4096 ? native_loop0798_words : kind == 2048 ? native_loop2e48_words : kind == 1024 ? native_loop0e10_words : kind == 512 ? native_loop2dc8_words : kind == 256 ? native_loop1430_words : kind == 128 ? native_loop468_words : kind == 64 ? native_loop800_words : kind == 16 ? native_loop20c_words :
                             kind == 32 ? native_loop260_words : kind == 4 ? native_loop1638_words :
                             kind == 8 ? native_loop17e0_words : native_loop_words;
     /* 1430's signature includes its short exit through 1630. Bulk flags have
@@ -1035,7 +1283,7 @@ static int native_code_compare(const uint8_t *code, unsigned kind, unsigned star
     if (kind == 512 && memcmp(code + 0x2fc8, native_tail2dc8_words, sizeof native_tail2dc8_words)) return 0;
     if (kind == 1024 && memcmp(code + 0xfd0, native_tail0e10_words, sizeof native_tail0e10_words)) return 0;
     if (kind == 2048 && memcmp(code + 0x30c0, native_tail2e48_words, sizeof native_tail2e48_words)) return 0;
-    if (kind == 64 || kind == 128 || kind == 1024 || kind == 2048) return 1;  /* no clipping path */
+    if (kind == 64 || kind == 128 || kind >= 1024) return 1;  /* no clipping path */
     if (kind <= 8 && (kind == 4 ? memcmp(code + 0x17c0, native_zero1638_words, sizeof native_zero1638_words) :
                       kind == 8 ? memcmp(code + 0x1938, native_zero17e0_words, sizeof native_zero17e0_words) :
                       memcmp(code + 0x270, native_zero_words, sizeof native_zero_words)))
@@ -1046,14 +1294,15 @@ static int native_code_compare(const uint8_t *code, unsigned kind, unsigned star
 
 static int native_code_matches(const uint8_t *code, unsigned kind, unsigned start, unsigned end)
 {
-    static uint64_t checked[4096];  /* ps2_vu1_code_version + 1 */
-    static uint8_t matched[4096];
+    static uint64_t checked[PS2_VU1_NATIVE_KINDS];  /* ps2_vu1_code_version + 1 */
+    static uint8_t matched[PS2_VU1_NATIVE_KINDS];
     if (GADDR(code) != 0x11008000) return native_code_compare(code, kind, start, end);
-    if (checked[kind] != ps2_vu1_code_version + 1) {
-        matched[kind] = (uint8_t)native_code_compare(code, kind, start, end);
-        checked[kind] = ps2_vu1_code_version + 1;
+    const unsigned at = (unsigned)__builtin_ctz(kind);
+    if (checked[at] != ps2_vu1_code_version + 1) {
+        matched[at] = (uint8_t)native_code_compare(code, kind, start, end);
+        checked[at] = ps2_vu1_code_version + 1;
     }
-    return matched[kind];
+    return matched[at];
 }
 #endif
 
@@ -1063,8 +1312,157 @@ static int native_code_matches(const uint8_t *code, unsigned kind, unsigned star
 #include "vu0_native_words.inc"
 #endif
 
+#if defined(PS2_VU0_COMPILED) && !defined(PS2_VU_REFERENCE)
+/* The compiled VU0 microprograms (port/tools/vu0_aot.py, finding 090 SP1): one C function per
+   vcallms entry, with the interpreter's timing (stalls, the flag queue) resolved when it was
+   generated. These are its operations, the VU0 path of upper() in vector form: operands through
+   arithmetic4 (the per-lane arithmetic() clamp), one operation each, MADD/MSUB as ACC +- (a * b).
+   opaque: both operands are known to the C compiler (VF0, LOI constants), which must not fold the
+   operation in its own rounding mode. */
+#define VU0C_VF0 _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f)
+#define VU0C_INLINE static inline __attribute__((always_inline))
+VU0C_INLINE __m128 vu0c_lanes(int d)
+{
+    return _mm_castsi128_ps(_mm_setr_epi32(d & 8 ? -1 : 0, d & 4 ? -1 : 0, d & 2 ? -1 : 0, d & 1 ? -1 : 0));
+}
+VU0C_INLINE __m128 vu0c_blend(__m128 old, __m128 v, int d)
+{
+    const __m128 m = vu0c_lanes(d);
+    return _mm_or_ps(_mm_and_ps(m, v), _mm_andnot_ps(m, old));
+}
+VU0C_INLINE void vu0c_store(float *p, __m128 v, int d) { store_fields(p, _mm_castps_si128(v), d); }
+VU0C_INLINE __m128 vu0c_add(__m128 a, __m128 b, int opaque)
+{
+    if (opaque) PS2_OPAQUE_M128(a);
+    return _mm_add_ps(arithmetic4(a), arithmetic4(b));
+}
+VU0C_INLINE __m128 vu0c_sub(__m128 a, __m128 b, int opaque)
+{
+    if (opaque) PS2_OPAQUE_M128(a);
+    return _mm_sub_ps(arithmetic4(a), arithmetic4(b));
+}
+VU0C_INLINE __m128 vu0c_mul(__m128 a, __m128 b, int opaque)
+{
+    if (opaque) PS2_OPAQUE_M128(a);
+    return _mm_mul_ps(arithmetic4(a), arithmetic4(b));
+}
+VU0C_INLINE __m128 vu0c_madd(__m128 acc, __m128 a, __m128 b, int opaque)
+{
+    if (opaque) PS2_OPAQUE_M128(a);
+    return _mm_add_ps(arithmetic4(acc), _mm_mul_ps(arithmetic4(a), arithmetic4(b)));
+}
+VU0C_INLINE __m128 vu0c_msub(__m128 acc, __m128 a, __m128 b, int opaque)
+{
+    if (opaque) PS2_OPAQUE_M128(a);
+    return _mm_sub_ps(arithmetic4(acc), _mm_mul_ps(arithmetic4(a), arithmetic4(b)));
+}
+/* ITOF and FTOI: upper()'s VU0 expressions, lane by lane. */
+VU0C_INLINE __m128 vu0c_itof(__m128 a, int bc, int opaque)
+{
+    static const float scale[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+    uint32_t bits[4];
+    float r[4];
+    if (opaque) PS2_OPAQUE_M128(a);
+    _mm_storeu_ps((float *)bits, a);
+    for (int comp = 0; comp < 4; comp++)
+        r[comp] = (float)(int32_t)bits[comp] / scale[bc];
+    return _mm_loadu_ps(r);
+}
+VU0C_INLINE __m128 vu0c_ftoi(__m128 a, int bc)
+{
+    static const int shift[4] = {0, 4, 12, 15};
+    float s[4];
+    uint32_t r[4];
+    _mm_storeu_ps(s, a);
+    for (int comp = 0; comp < 4; comp++) {
+        double x = (double)s[comp] * (double)(1 << shift[bc]);
+        int32_t v = x >= 2147483647.0 ? 2147483647 : x <= -2147483648.0 ? INT32_MIN : (int32_t)x;
+        r[comp] = (uint32_t)v;
+    }
+    return _mm_loadu_ps((const float *)r);
+}
+VU0C_INLINE uint32_t vu0c_lane_bits(__m128 v, int comp)
+{
+    uint32_t bits[4];
+    _mm_storeu_ps((float *)bits, v);
+    return bits[comp];
+}
+/* The MAC flags of an FMAC result (fmac_flags4: Z and S of the fields in d) and the status bits
+   they imply. */
+VU0C_INLINE unsigned vu0c_mac(__m128 v, int d)
+{
+    Upper up;
+    fmac_flags4(&up, v, d);
+    return up.mac;
+}
+VU0C_INLINE unsigned vu0c_status(unsigned mac)
+{
+    return (mac & 0xF ? 1u : 0) | (mac & 0xF0 ? 2u : 0) | (mac & 0xF00 ? 4u : 0) | (mac & 0xF000 ? 8u : 0);
+}
+/* Every FMAC's sticky Z and S bits, which the end of the run folds into the status flag. */
+#define VU0C_STICKY(v, d) \
+    (sticky_zero = _mm_or_ps(sticky_zero, _mm_and_ps(_mm_cmpeq_ps((v), _mm_setzero_ps()), vu0c_lanes(d))), \
+     sticky_sign = _mm_or_ps(sticky_sign, _mm_and_ps((v), vu0c_lanes(d))))
+#define VU0C_STICKY_BITS() \
+    ((_mm_movemask_ps(sticky_zero) ? 0x40u : 0u) | (_mm_movemask_ps(sticky_sign) ? 0x80u : 0u))
+#include "vu0_aot.inc"
+#ifdef PS2_VU_AOT_EMBED
+static int vu0c_loaded = 1;
+#else
+static int vu0c_loaded;  /* the words came from the game's .vutext (ps2_vu_aot_load) */
+#endif
+int ps2_vu0_compiled_mode = -1;
+unsigned long long ps2_vu0_compiled_runs;
+
+static int vu0_compiled_compare(const ps2_cpu *cpu, unsigned k)
+{
+    for (unsigned i = 0; i < vu0c_programs[k].n_runs; i++) {
+        const unsigned *run = vu0c_programs[k].runs[i];
+        if (memcmp(cpu->vu0_code + run[0] * 8, vu0c_programs[k].words + run[2], run[1] * 8)) return 0;
+    }
+    return 1;
+}
+
+/* The compiled program for a vcallms at addr, or -1. It runs only where micro memory holds the
+   exact words of every pair it can reach: for the game's VU0 micro memory the answer is kept per
+   ps2_vu0_code_version (as vu0_native_code does), other code buffers (the tests) compare each time. */
+static int vu0_compiled_find(const ps2_cpu *cpu, unsigned addr)
+{
+    static signed char index[512];
+    static int indexed, verify = -1;
+    static uint64_t checked[VU0C_PROGRAMS];  /* ps2_vu0_code_version + 1 */
+    static uint8_t matched[VU0C_PROGRAMS];
+    if (!indexed) {
+        memset(index, -1, sizeof index);
+        for (unsigned k = 0; k < VU0C_PROGRAMS; k++) index[vu0c_programs[k].entry / 8] = (signed char)k;
+        indexed = 1;
+    }
+    const int k = index[(addr / 8) & 511];
+    if (k < 0 || !vu0c_loaded || cpu->vi[0]) return -1;
+    if (GADDR(cpu->vu0_code) != 0x11000000u) return vu0_compiled_compare(cpu, (unsigned)k) ? k : -1;
+    if (checked[k] != ps2_vu0_code_version + 1) {
+        matched[k] = (uint8_t)vu0_compiled_compare(cpu, (unsigned)k);
+        checked[k] = ps2_vu0_code_version + 1;
+    }
+    if (verify < 0) { const char *value = getenv("DHD_VU0_CODE_CHECK"); verify = value && atoi(value); }
+    if (verify) {
+        const uint8_t now = (uint8_t)vu0_compiled_compare(cpu, (unsigned)k);
+        if (now != matched[k]) {
+            fprintf(stderr, "vu0: micro memory changed without VIF0 MPG (compiled %04X: %d -> %d)\n",
+                    vu0c_programs[k].entry, matched[k], now);
+            matched[k] = now;
+        }
+    }
+    return matched[k] ? k : -1;
+}
+#endif
+
 void ps2_vu_aot_load(const void *vutext)
 {
+#if defined(PS2_VU0_COMPILED) && !defined(PS2_VU_REFERENCE) && !defined(PS2_VU_AOT_EMBED)
+    vu0c_words_load(vutext);
+    vu0c_loaded = 1;
+#endif
 #if defined(PS2_VU_AOT) && !defined(PS2_VU_AOT_EMBED)
     aot_words_load(vutext);
 #if !defined(PS2_VU_GEOMETRY_BENCH) && !defined(PS2_VU_REFERENCE)
@@ -1101,7 +1499,11 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
 #ifndef PS2_VU_REFERENCE
     if (!unit && ps2_vu0_aot_mode >= 0) vu0_aot = ps2_vu0_aot_mode;
 #endif
+#ifndef PS2_VU_REFERENCE
+    const int use_aot = unit ? (ps2_vu1_aot_mode >= 0 ? ps2_vu1_aot_mode : !interpreter_only) : vu0_aot;
+#else
     const int use_aot = unit ? !interpreter_only : vu0_aot;
+#endif
 #if !defined(PS2_VU_GEOMETRY_BENCH) && !defined(PS2_VU_REFERENCE)
     static int native_enabled = -1;
     static unsigned native_mask;
@@ -1109,11 +1511,14 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         const char *value = getenv("DHD_VU1_NATIVE");
         native_enabled = (!value || atoi(value)) && !getenv("DHD_VU_TRACE");
         const char *mask = getenv("DHD_VU1_NATIVE_MASK");
-        native_mask = mask ? (unsigned)strtoul(mask, NULL, 0) : 4095;
+        native_mask = mask ? (unsigned)strtoul(mask, NULL, 0) : (1u << PS2_VU1_NATIVE_KINDS) - 1;
     }
     unsigned native_kind = 0;
-    if (use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && (addr == 0x1040 || addr == 0x1cb0)) {
-        if (cpu->vi[13] == 0x11) native_kind = addr == 0x1040 ? 1 : 2;
+    /* The mesh programs' dispatch `JR vi13` at 1040, 1CB0 and 12E0 (B0040's MSCNT continuation,
+       finding 090 VU1R): each kernel starts at its loop's first pair from the live state, so the
+       entry that led there does not matter. */
+    if (use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && (addr == 0x1040 || addr == 0x1cb0 || addr == 0x12e0)) {
+        if (cpu->vi[13] == 0x11) native_kind = addr == 0x1040 ? 1 : addr == 0x1cb0 ? 2 : 0;
         else if (cpu->vi[13] == 0x2c9) native_kind = 4;
         else if (cpu->vi[13] == 0x2fe) native_kind = 8;
         else if (cpu->vi[13] == 0x20c) native_kind = 16;
@@ -1121,6 +1526,8 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         else if (cpu->vi[13] == 0x100) native_kind = 64;
         else if (cpu->vi[13] == 0x288) native_kind = 256;
         else if (cpu->vi[13] == 0x5bd) native_kind = 512;
+        else if (cpu->vi[13] == 0x0e0) native_kind = 4096;
+        else if (cpu->vi[13] == 0x616) native_kind = 8192;
     }
     /* MSCAL 0010/0020 branch to the skinning setup at 03C8 (overlay 2), then its loop. */
     if (use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && (addr == 0x10 || addr == 0x20))
@@ -1128,12 +1535,14 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
     if (unit && use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && addr == 0xe10) native_kind = 1024;
     if (unit && use_aot && (ps2_vu1_native_mode >= 0 ? ps2_vu1_native_mode : native_enabled) && addr == 0x2e48) native_kind = 2048;
     const int native_geometry = (native_kind & native_mask) != 0;
-    unsigned native_start = native_kind == 2048 ? 0x2f90 : native_kind == 1024 ? 0xee0 : native_kind == 512 ? 0x2f00 : native_kind == 256 ? 0x1510 : native_kind == 128 ? 0x468 : native_kind == 64 ? 0x8b0 : native_kind == 16 ? 0x1110 : native_kind == 32 ? 0x13a0 : native_kind == 4 ? 0x1708 : native_kind == 8 ? 0x18b0 : 0x170;
-    unsigned native_end = native_kind == 2048 ? 0x30c0 : native_kind == 1024 ? 0xfd0 : native_kind == 512 ? 0x2fc8 : native_kind == 256 ? 0x1628 : native_kind == 128 ? 0x578 : native_kind == 64 ? 0x938 : native_kind == 16 ? 0x11d8 : native_kind == 32 ? 0x1420 : native_kind == 4 ? 0x17b0 : native_kind == 8 ? 0x1928 : 0x260;
+    unsigned native_start = native_kind == 8192 ? 0x3140 : native_kind == 4096 ? 0x798 : native_kind == 2048 ? 0x2f90 : native_kind == 1024 ? 0xee0 : native_kind == 512 ? 0x2f00 : native_kind == 256 ? 0x1510 : native_kind == 128 ? 0x468 : native_kind == 64 ? 0x8b0 : native_kind == 16 ? 0x1110 : native_kind == 32 ? 0x13a0 : native_kind == 4 ? 0x1708 : native_kind == 8 ? 0x18b0 : 0x170;
+    unsigned native_end = native_kind == 8192 ? 0x3180 : native_kind == 4096 ? 0x7e0 : native_kind == 2048 ? 0x30c0 : native_kind == 1024 ? 0xfd0 : native_kind == 512 ? 0x2fc8 : native_kind == 256 ? 0x1628 : native_kind == 128 ? 0x578 : native_kind == 64 ? 0x938 : native_kind == 16 ? 0x11d8 : native_kind == 32 ? 0x1420 : native_kind == 4 ? 0x17b0 : native_kind == 8 ? 0x1928 : 0x260;
     static unsigned long long native_target_calls;
-    static unsigned long long native_key_targets[4096], native_key_calls[4096], native_key_vertices[4096], native_key_clipped[4096];
+    static unsigned long long native_key_targets[PS2_VU1_NATIVE_KINDS], native_key_calls[PS2_VU1_NATIVE_KINDS],
+                              native_key_vertices[PS2_VU1_NATIVE_KINDS], native_key_clipped[PS2_VU1_NATIVE_KINDS];
+    const unsigned native_index = native_kind ? (unsigned)__builtin_ctz(native_kind) : 0;
     if (native_geometry) native_target_calls++;
-    if (native_geometry) native_key_targets[native_kind]++;
+    if (native_geometry) native_key_targets[native_index]++;
 #endif
 #endif
     memset(&u, 0, offsetof(Vu, vu1_file));  /* about 60k VU0 and 30k VU1 runs a second in a race */
@@ -1155,7 +1564,8 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         if (native_geometry && pc == native_start / 8 && branch < 0 && !ending &&
             steps < MAX_STEPS - (native_kind >= 256 ? 262144 : 16384) &&
             native_code_matches(cpu->vu0_code, native_kind, native_start, native_end) &&
-            ((native_count = native_kind == 2048 ? native_particles_2e48(&u) : native_kind == 1024 ? native_particles_0e10(&u) : native_kind == 512 ? native_geometry_2dc8(&u) : native_kind == 256 ? native_geometry_1430(&u) : native_kind == 128 ? native_skin_468(&u) : native_kind == 64 ? native_geometry_800(&u) : native_kind == 16 ? native_geometry_20c(&u) :
+            ((native_count = native_kind == 8192 ? native_geometry_3140(&u) : native_kind == 4096 ? native_geometry_0798(&u) :
+                             native_kind == 2048 ? native_particles_2e48(&u) : native_kind == 1024 ? native_particles_0e10(&u) : native_kind == 512 ? native_geometry_2dc8(&u) : native_kind == 256 ? native_geometry_1430(&u) : native_kind == 128 ? native_skin_468(&u) : native_kind == 64 ? native_geometry_800(&u) : native_kind == 16 ? native_geometry_20c(&u) :
                              native_kind == 32 ? native_geometry_260(&u) : native_kind == 4 ? native_geometry_1638(&u) :
                              native_kind == 8 ? native_geometry_17e0(&u) : native_geometry_loop(&u)) ||
              native_kind < 64)) {  /* 08B0 and 0468 decline before writing anything: then they run pair by pair */
@@ -1166,13 +1576,13 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
             }
             static unsigned long long native_calls;
             native_calls++;
-            ps2_vu1_native_runs[__builtin_ctz(native_kind)]++;
-            native_key_calls[native_kind]++;
-            native_key_vertices[native_kind] += native_vertices-before_vertices;
-            native_key_clipped[native_kind] += native_clipped_vertices-before_clipped;
-            if ((native_key_calls[native_kind] < 3 || !(native_key_calls[native_kind] % 4096)) && getenv("DHD_VU1_NATIVE_STATS"))
+            ps2_vu1_native_runs[native_index]++;
+            native_key_calls[native_index]++;
+            native_key_vertices[native_index] += native_vertices-before_vertices;
+            native_key_clipped[native_index] += native_clipped_vertices-before_clipped;
+            if ((native_key_calls[native_index] < 3 || !(native_key_calls[native_index] % 4096)) && getenv("DHD_VU1_NATIVE_STATS"))
                 fprintf(stderr, "native key=%u calls=%llu target_calls=%llu vertices=%llu clipped=%llu\n", native_kind,
-                        native_key_calls[native_kind], native_key_targets[native_kind], native_key_vertices[native_kind], native_key_clipped[native_kind]);
+                        native_key_calls[native_index], native_key_targets[native_index], native_key_vertices[native_index], native_key_clipped[native_index]);
             if ((native_calls < 3 || !(native_calls % 4096)) && getenv("DHD_VU1_NATIVE_STATS"))
                 fprintf(stderr, "native geometry calls=%llu target_calls=%llu vertices=%llu "
                         "clipped=%llu rollback=0 fallback=0\n", native_calls, native_target_calls,
@@ -1366,10 +1776,26 @@ int ps2_vu0_run(ps2_cpu *cpu, unsigned addr)
         timing = value && atoll(value) != 0;
     }
     unsigned long long start = timing ? host_cycles() : 0;
-    /* VU0 micro mode rounds like VU1 (PCSX2's default VU0FPCR is toward zero, FTZ/DAZ). */
+    /* VU0 micro mode rounds like VU1 (PCSX2's default VU0FPCR is toward zero, FTZ/DAZ). The EE's
+       own mode (fp_mode.c HOST_FP_EE) is the same word but for the sticky exception flags, which
+       nothing reads: under it, and under a vcallms (ps2asm.c), the word stays as it is (finding
+       090 SP15: two host calls per call). */
     unsigned control = host_fp_csr();
-    host_fp_set_csr((control & ~0x603F) | 0xFFC0);
+    const int set_mode = (control & ~0x3Fu) != 0xFFC0u;
+    if (set_mode)
+        host_fp_set_csr((control & ~0x603F) | 0xFFC0);
     int result;
+#if defined(PS2_VU0_COMPILED) && !defined(PS2_VU_REFERENCE)
+    /* The compiled microprograms (vu0_aot.inc), after the native routines. DHD_VU0_COMPILED=0,
+       DHD_VU_INTERPRETER or DHD_VU_TRACE keep them off. */
+    static int compiled = -1;
+    if (compiled < 0) {
+        const char *value = getenv("DHD_VU0_COMPILED");
+        compiled = (!value || atoi(value)) && !getenv("DHD_VU_INTERPRETER") && !getenv("DHD_VU_TRACE");
+    }
+    const int use_compiled = ps2_vu0_compiled_mode >= 0 ? ps2_vu0_compiled_mode : compiled;
+    int program;
+#endif
 #if (defined(PS2_VU_AOT) || defined(PS2_VU0_NATIVE)) && !defined(PS2_VU_REFERENCE)
     /* Native VU0 routines (vu0_native.h, finding 066). DHD_VU0_NATIVE=0, DHD_VU_INTERPRETER
        or DHD_VU_TRACE keep every program on the interpreter. */
@@ -1410,8 +1836,16 @@ int ps2_vu0_run(ps2_cpu *cpu, unsigned addr)
         result = 0;
     } else
 #endif
+#if defined(PS2_VU0_COMPILED) && !defined(PS2_VU_REFERENCE)
+    if (use_compiled && (program = vu0_compiled_find(cpu, addr)) >= 0) {
+        vu0c_run((unsigned)program, cpu);
+        ps2_vu0_compiled_runs++;
+        result = 0;
+    } else
+#endif
         result = run(cpu, addr, 0, 0, 0, NULL, NULL);
-    host_fp_set_csr(control);
+    if (set_mode)
+        host_fp_set_csr(control);
     if (timing) vu0_stats(addr, host_cycles() - start);
     return result;
 }

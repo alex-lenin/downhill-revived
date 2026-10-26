@@ -464,12 +464,23 @@ static struct {
     Prog *prog;
 } table[TABLE_SIZE];
 
+/* One-entry cache: hot loops re-execute the same call site (the same literal
+   pointers and operand count) thousands of times in a row. The full table
+   below stays the authority on a miss. */
+static Prog *last_prog;
+static const char *last_tmpl, *last_cons;
+static int last_n;
+
 static Prog *lookup(const char *tmpl, const char *cons, int n)
 {
+    if (tmpl == last_tmpl && cons == last_cons && n == last_n)
+        return last_prog;
     unsigned h = (unsigned)(((uintptr_t)tmpl >> 2) * 2654435761u ^ ((uintptr_t)cons >> 2)) % TABLE_SIZE;
     while (table[h].tmpl) {
-        if (table[h].tmpl == tmpl && table[h].cons == cons)
-            return table[h].prog;
+        if (table[h].tmpl == tmpl && table[h].cons == cons) {
+            last_tmpl = tmpl; last_cons = cons; last_n = n;
+            return last_prog = table[h].prog;
+        }
         h = (h + 1) % TABLE_SIZE;
     }
     table[h].tmpl = tmpl;
@@ -479,7 +490,8 @@ static Prog *lookup(const char *tmpl, const char *cons, int n)
         p->fast_kind = select_fast_program(p);
         p->aot = select_aot_program(p);
     }
-    return p;
+    last_tmpl = tmpl; last_cons = cons; last_n = n;
+    return last_prog = p;
 }
 
 /* ---- execution ---- */
@@ -489,6 +501,29 @@ static ps2_vu0_micro_fn micro[0x1000 / 8];
 void ps2_vu0_register_micro(unsigned addr, ps2_vu0_micro_fn fn)
 {
     micro[(addr / 8) % (sizeof micro / sizeof *micro)] = fn;
+}
+
+/* vcallms: the native microprogram registered for addr, else VU0's micro memory. Nonzero when
+   the microcode failed. Native microprograms are host implementations of a coprocessor: they
+   round like VU0 micro mode (toward zero, denormals flushed; ps2_vu0_run) and keep their
+   intermediates outside EE first-fault diagnostics. */
+static int vcallms(unsigned addr)
+{
+    ps2_vu0_micro_fn fn = micro[(addr / 8) % (sizeof micro / sizeof *micro)];
+    unsigned control = host_fp_csr();
+    int failed = 0;
+    /* The EE's mode (fp_mode.c HOST_FP_EE) is this word but for the sticky exception flags, which
+       nothing reads: then it stays as it is (finding 090 SP15). */
+    const int set_mode = (control & ~0x3Fu) != 0xFFC0u;
+    if (set_mode)
+        host_fp_set_csr((control & ~0x603Fu) | 0xFFC0u);
+    if (fn)
+        fn(&ps2);
+    else
+        failed = ps2_vu0_run(&ps2, addr);
+    if (set_mode)
+        host_fp_set_csr(control);
+    return failed;
 }
 
 static float ee_div(float a, float b)
@@ -609,6 +644,22 @@ PS2_ASM_INLINE void vu_arith(const Ins *in)
         else
             t[c] = vcomp(ft->reg, c);
     }
+#ifdef PS2_VU_VECTOR
+    /* All four lanes at once, the same bits (ps2float.h; vu_madd_diff.py). MADD/MSUB return 0
+       on an overflowing product, which the scalar lanes below then handle. */
+    {
+        int k = -1;
+        switch (in->op) {
+        case V_ADD: case V_ADDA: k = PS2_VU4_ADD; break;
+        case V_SUB: case V_SUBA: k = PS2_VU4_SUB; break;
+        case V_MUL: case V_MULA: k = PS2_VU4_MUL; break;
+        case V_MADD: case V_MADDA: k = PS2_VU4_MADD; break;
+        case V_MSUB: case V_MSUBA: k = PS2_VU4_MSUB; break;
+        }
+        if (k >= 0 && ps2_vu_arith4(k, s, t, ps2.vacc, in->dest, r))
+            goto write;
+    }
+#endif
     for (c = 0; c < 4; c++) {
         float prod;
         if (!(in->dest & (1 << c)))
@@ -623,6 +674,9 @@ PS2_ASM_INLINE void vu_arith(const Ins *in)
         case V_MSUB: case V_MSUBA: r[c] = ps2_vu_madd(ps2.vacc[c], s[c], t[c], 1); break;
         }
     }
+#ifdef PS2_VU_VECTOR
+write:
+#endif
     if (acc) {
         for (c = 0; c < 4; c++)
             if (in->dest & (1 << c))
@@ -822,17 +876,31 @@ PS2_ASM_INLINE void run_ins(Prog *p, const Ins *in, ps2_op *ops)
         case V_OPMULA: /* ACC = fs.yzx * ft.zxy */
             vread(b->reg, v);
             vread(c->reg, w);
+#ifdef PS2_VU_VECTOR
+            {
+                float s3[4] = {v[1], v[2], v[0], 0}, t3[4] = {w[2], w[0], w[1], 0}, r[4];
+                ps2_vu_arith4(PS2_VU4_MUL, s3, t3, ps2.vacc, 7, r);  /* MUL never declines */
+                ps2.vacc[0] = r[0]; ps2.vacc[1] = r[1]; ps2.vacc[2] = r[2];
+            }
+#else
             ps2.vacc[0] = ps2_float_mul(v[1], w[2]);
             ps2.vacc[1] = ps2_float_mul(v[2], w[0]);
             ps2.vacc[2] = ps2_float_mul(v[0], w[1]);
+#endif
             break;
         case V_OPMSUB: { /* fd = ACC - fs.yzx * ft.zxy: with vopmula, the cross product */
             float r[4];
             vread(b->reg, v);
             vread(c->reg, w);
-            r[0] = ps2_vu_madd(ps2.vacc[0], v[1], w[2], 1);
-            r[1] = ps2_vu_madd(ps2.vacc[1], v[2], w[0], 1);
-            r[2] = ps2_vu_madd(ps2.vacc[2], v[0], w[1], 1);
+#ifdef PS2_VU_VECTOR
+            float s3[4] = {v[1], v[2], v[0], 0}, t3[4] = {w[2], w[0], w[1], 0};
+            if (!ps2_vu_arith4(PS2_VU4_MSUB, s3, t3, ps2.vacc, 7, r))
+#endif
+            {
+                r[0] = ps2_vu_madd(ps2.vacc[0], v[1], w[2], 1);
+                r[1] = ps2_vu_madd(ps2.vacc[1], v[2], w[0], 1);
+                r[2] = ps2_vu_madd(ps2.vacc[2], v[0], w[1], 1);
+            }
             r[3] = 0;
             vwrite(a->reg, in->dest & 7, r);
             break;
@@ -918,23 +986,13 @@ PS2_ASM_INLINE void run_ins(Prog *p, const Ins *in, ps2_op *ops)
                 ps2.vi[m->reg]++;
             break;
         }
-        case V_CALLMS: {
-            ps2_vu0_micro_fn fn = micro[((unsigned)a->imm / 8) % (sizeof micro / sizeof *micro)];
-            /* Native microprograms are host implementations of a coprocessor: they round
-               like VU0 micro mode (toward zero, denormals flushed; ps2_vu0_run) and keep
-               their intermediates outside EE first-fault diagnostics. */
-            unsigned control = host_fp_csr();
-            host_fp_set_csr((control & ~0x603Fu) | 0xFFC0u);
-            if (fn)
-                fn(&ps2);
-            else if (ps2_vu0_run(&ps2, (unsigned)a->imm)) {
+        case V_CALLMS:
+            if (vcallms((unsigned)a->imm)) {
                 char at[16];
                 sprintf(at, "0x%x", (unsigned)a->imm);
                 report(p, "vcallms: the microcode failed at", at);
             }
-            host_fp_set_csr(control);
             break;
-        }
         }
         memset(&ps2.gpr[0], 0, sizeof ps2.gpr[0]); /* $zero */
     }
@@ -953,6 +1011,33 @@ static void run(Prog *p, ps2_op *ops)
    uses it only when its parsed instruction sequence is byte-for-byte the one the code was
    generated from; run_ins makes it the interpreter's own code, with the decoding folded away. */
 #ifdef PS2_ASM_AOT
+static Prog *exec_first(const char *insn, const Ins *ins, int n);
+static Prog *asm_first(const char *tmpl, const char *cons, int n, const Ins *ins, int n_ins, const int8_t *desc);
+void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops);
+/* ps2_asm's operand binding and write-back, for transform.py's PS2A functions (ps2asm_aot.py):
+   the same bytes, with the usual sizes as fixed-size copies. */
+PS2_ASM_INLINE void asm_bind_gpr(ps2_q128 *g, const void *src, unsigned size)
+{
+    int32_t w;
+    switch (size) {
+    case 4: memcpy(&w, src, 4); g->d[0] = (uint64_t)(int64_t)w; g->d[1] = 0; break; /* sign-extended */
+    case 8: memcpy(&g->d[0], src, 8); g->d[1] = 0; break;
+    case 16: memcpy(g, src, 16); break;
+    default:
+        memset(g, 0, sizeof *g);
+        memcpy(g, src, size > 16 ? 16 : size);
+    }
+}
+PS2_ASM_INLINE void asm_put(void *dst, const void *src, unsigned size, unsigned max)
+{
+    if (size > max) size = max;
+    switch (size) {
+    case 4: memcpy(dst, src, 4); break;
+    case 8: memcpy(dst, src, 8); break;
+    case 16: memcpy(dst, src, 16); break;
+    default: memcpy(dst, src, size);
+    }
+}
 #include "ps2asm_aot.inc"
 static void (*select_aot_program(const Prog *p))(struct Prog *, ps2_op *)
 {
@@ -994,6 +1079,50 @@ void ps2_exec(const char *insn)
         run_program(p, NULL);
 }
 
+#ifdef PS2_ASM_AOT
+/* First call of a recompiled instruction's generated function (ps2asm_aot.inc, recomp.py's PS2X):
+   runs it as ps2_exec does and returns its program when the run-time parse is byte-for-byte the
+   generated sequence, so later calls run the generated code directly with no lookup; NULL keeps
+   every call on ps2_exec (a different parse, or DHD_ASM_GENERIC=1). */
+static Prog *exec_first(const char *insn, const Ins *ins, int n)
+{
+    Prog *p = lookup(insn, RECOMPILED, 0);
+    ps2_exec(insn);
+    return !p->bad && asm_fast_enabled() && p->n_ins == n &&
+           !memcmp(p->ins, ins, (size_t)n * sizeof *ins) ? p : NULL;
+}
+
+/* The same for a game inline asm statement's PS2A function (transform.py, ps2asm_aot.py), after
+   its first call has run through ps2_asm: its program when the run-time parse is the generated
+   one, instructions and operands alike (desc: kind, tie, input, output of each operand). */
+static Prog *asm_first(const char *tmpl, const char *cons, int n, const Ins *ins, int n_ins, const int8_t *desc)
+{
+    Prog *p = lookup(tmpl, cons, n);
+    int k;
+    if (p->bad || !p->aot || !asm_fast_enabled() || p->n_ops != n || p->n_ins != n_ins ||
+        memcmp(p->ins, ins, (size_t)n_ins * sizeof *ins))
+        return NULL;
+    for (k = 0; k < n; k++)
+        if (p->kind[k] != (uint8_t)desc[4 * k] || p->alias[k] != desc[4 * k + 1] ||
+            p->in[k] != desc[4 * k + 2] || p->out[k] != desc[4 * k + 3])
+            return NULL;
+    return p;
+}
+#endif
+
+/* An operand copy of 1..16 bytes. Operands are 4, 8 or 16 bytes almost always: those become
+   plain loads and stores, where a variable-size memcpy is a wasm memory.copy, which the x64 host
+   runs as checks and a memmove call (78% of the race's memory.copy calls; finding 090 SP14). */
+static inline __attribute__((always_inline)) void operand_copy(void *dst, const void *src, unsigned size)
+{
+    switch (size) {
+    case 4: memcpy(dst, src, 4); break;
+    case 8: memcpy(dst, src, 8); break;
+    case 16: memcpy(dst, src, 16); break;
+    default: memcpy(dst, src, size); break;
+    }
+}
+
 void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops)
 {
     Prog *p = lookup(tmpl, constraints, n);
@@ -1006,7 +1135,7 @@ void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops)
         if (p->kind[r] == OPK_GPR) {
             ps2_q128 *g = &ps2.gpr[32 + r];
             memset(g, 0, sizeof *g);
-            memcpy(g, ops[k].p, size > 16 ? 16 : size);
+            operand_copy(g, ops[k].p, size > 16 ? 16 : size);
             if (size == 4) /* EE registers hold 32-bit values sign-extended */
                 g->d[0] = (uint64_t)(int64_t)g->sw[0];
         } else if (p->kind[r] == OPK_FPR)
@@ -1015,16 +1144,29 @@ void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops)
     if (p->bad)
         return; /* reported when parsed */
     asm_caller = PS2_CALLER_ADDRESS();
-    if (!run_fast_program(p, ops)) run_program(p, ops);
+    /* run_fast_program returns 0 at once when fast_kind is 0; skip the
+       noinline call for the (majority) unspecialised templates. */
+    if (!p->fast_kind || !run_fast_program(p, ops)) run_program(p, ops);
     for (k = 0; k < p->n_ops; k++) { /* write outputs back */
         unsigned size = ops[k].size;
         if (!p->out[k])
             continue;
         switch (p->kind[k]) {
-        case OPK_GPR: memcpy(ops[k].p, &ps2.gpr[32 + k], size > 16 ? 16 : size); break;
+        case OPK_GPR: operand_copy(ops[k].p, &ps2.gpr[32 + k], size > 16 ? 16 : size); break;
         case OPK_FPR: memcpy(ops[k].p, &ps2.fpr[32 + k], 4); break;
-        case OPK_LO: memcpy(ops[k].p, &ps2.lo, size > 8 ? 8 : size); break;
-        case OPK_HI: memcpy(ops[k].p, &ps2.hi, size > 8 ? 8 : size); break;
+        case OPK_LO: operand_copy(ops[k].p, &ps2.lo, size > 8 ? 8 : size); break;
+        case OPK_HI: operand_copy(ops[k].p, &ps2.hi, size > 8 ? 8 : size); break;
         }
+    }
+}
+
+/* A recompiled vcallms (recomp.py, finding 090 SP11): run_ins's V_CALLMS without ps2_exec's
+   template lookup. The template only names the call site when the microcode fails. */
+void ps2_vcallms(const char *tmpl, unsigned addr)
+{
+    if (vcallms(addr)) {
+        char at[16];
+        sprintf(at, "0x%x", addr);
+        report(lookup(tmpl, RECOMPILED, 0), "vcallms: the microcode failed at", at);
     }
 }

@@ -20,6 +20,12 @@
 /* Logs to stderr; DHD_LOG set in the environment turns on the verbose messages. */
 void hle_log(const char *fmt, ...);
 extern int hle_verbose;
+/* DHD_GRAPHICS_ORDERED (the browser's threaded build sets it, port/web/www/worker.js): the graphics
+   workers run every queued call in the order it was made (port/web/web_queue.h), so the waits that
+   only put earlier graphics work before a later queued call are skipped (kernel.c's vsync after the
+   VBLANK handlers, sceGsSyncPath). Every read of graphics state still waits: the GS calls that
+   return a value, and ps2_graphics_sync before the EE touches mapped VU1/VIF1/GIF/GS state. */
+extern int graphics_ordered;
 
 /* getenv for a variable read every field (pads, the vsync). getenv crosses into the host, which
    scans the whole environment: these read it once, and again only after the core changed its
@@ -175,6 +181,10 @@ int cdvd_read(uint32_t lsn, uint32_t count, void *dst);           /* 2048-byte s
 void rpc_pad(int fno, void *send, int ssize, void *recv, int rsize);
 void rpc_pad_ext(int fno, void *send, int ssize, void *recv, int rsize);
 void pad_vsync(void);  /* refreshes the controllers' frames in EE memory */
+/* The mouse in the game's popup menus (menu_page.c, finding 092): read once a field (pad_vsync),
+   and the presses it makes added to player 1's pad (pads_read, pad_refresh). */
+void menu_mouse_field(void);
+void menu_mouse_merge(int player, HostPad *out);
 void pad_refresh(void);  /* the newest frames' input read again (just-in-time frames, kernel.c) */
 
 /* ---- online.c: where the pads' input comes from ---- */

@@ -26,7 +26,11 @@ NO_COMP = 0xFF
 OPK_GPR, OPK_FPR, OPK_MEM, OPK_LO, OPK_HI = 1, 2, 3, 4, 5
 STRING = r'"(?:\\.|[^"\\\n])*"'
 ASM_CALL = re.compile(r'\bps2_asm\(\s*((?:%s\s*)+),\s*((?:%s\s*)+),\s*(\d+)\s*,' % (STRING, STRING))
-EXEC_CALL = re.compile(r'\bps2_exec\(\s*((?:%s\s*)+)\)' % STRING)
+# ps2_exec_kept: a recompiled COP2 move done in C (recomp.h). Its program is still generated, so
+# the function table and the templates' order stay as they were (finding 090 SP11).
+EXEC_CALL = re.compile(r'\bps2_exec(?:_kept)?\(\s*((?:%s\s*)+)\)' % STRING)
+DIRECT_CALL = re.compile(r'\bPS2X\(\s*(ps2x_\w+)\s*,\s*((?:%s\s*)+)\)' % STRING)  # recomp.py, wasm build
+ASM_DIRECT = re.compile(r'\bPS2A\(\s*(ps2a_\w+)\s*,\s*((?:%s\s*)+),\s*((?:%s\s*)+),\s*(\d+)\s*,' % (STRING, STRING))  # transform.py
 
 
 def tables(source):
@@ -113,12 +117,16 @@ class Prog:
     def __init__(self, cons, n):
         self.n_ops = n
         self.kind, self.alias = [0] * 32, [-1] * 32
+        self.inp, self.out = [0] * 32, [0] * 32
         c = 0
         for k in range(min(n, 32)):
             self.alias[k] = -1
+            out = inout = False
             while c < len(cons) and cons[c] != '|':
                 ch = cons[c]
-                if ch in 'rd': self.kind[k] = OPK_GPR
+                if ch == '=': out = True
+                elif ch == '+': inout = True
+                elif ch in 'rd': self.kind[k] = OPK_GPR
                 elif ch == 'f': self.kind[k] = OPK_FPR
                 elif ch == 'm': self.kind[k] = OPK_MEM
                 elif ch == 'l': self.kind[k] = OPK_LO
@@ -129,6 +137,8 @@ class Prog:
                 c += 1
             if c < len(cons) and cons[c] == '|':
                 c += 1
+            self.out[k] = int(out or inout)
+            self.inp[k] = int(not out or inout)
 
 
 def operand(p, t):
@@ -266,20 +276,31 @@ def compile_program(tmpl, cons, n, recompiled):
     return tuple(ins) or None
 
 
-def templates(dirs):
-    found = set()
+def templates(dirs, asm_direct=None):
+    found, direct = set(), {}
+    asm_direct = {} if asm_direct is None else asm_direct
     for d in dirs:
         for path in Path(d).rglob('*'):
             if path.suffix not in ('.c', '.cpp', '.h', '.inc') or not path.is_file():
                 continue
             text = path.read_text(encoding='utf-8', errors='replace')
-            if 'ps2_asm(' not in text and 'ps2_exec(' not in text:
+            if 'ps2_asm(' not in text and 'ps2_exec' not in text and 'PS2X(' not in text and 'PS2A(' not in text:
                 continue
             for m in ASM_CALL.finditer(text):
                 found.add((c_literals(m.group(1)), c_literals(m.group(2)), int(m.group(3)), False))
+            for m in ASM_DIRECT.finditer(text):
+                site = (c_literals(m.group(2)), c_literals(m.group(3)), int(m.group(4)), False)
+                if asm_direct.setdefault(m.group(1), site) != site:
+                    sys.exit('%s: %s names two templates' % (path, m.group(1)))
+                found.add(site)
             for m in EXEC_CALL.finditer(text):
                 found.add((c_literals(m.group(1)), '', 0, True))
-    return found
+            for m in DIRECT_CALL.finditer(text):
+                insn = c_literals(m.group(2))
+                if direct.setdefault(m.group(1), insn) != insn:
+                    sys.exit('%s: %s names "%s" and "%s"' % (path, m.group(1), direct[m.group(1)], insn))
+                found.add((insn, '', 0, True))
+    return found, direct
 
 
 def opd(o):
@@ -287,13 +308,54 @@ def opd(o):
     return '{%d, %d, 0x%X, %d, %d}' % (kind, reg, comp, step, imm)
 
 
+def asm_direct_function(fn, tmpl, cons, n, programs):
+    """transform.py's PS2A(fn, ...): ps2_asm with this site's (template, constraints, count) folded
+    in. The first call runs ps2_asm and asm_first checks that the run-time parse (instructions,
+    operand kinds, ties, directions) is the one this code was generated from; until it is, or with
+    DHD_ASM_GENERIC=1, or for a template not generated, every call stays on ps2_asm. The binding
+    and write-back are ps2_asm's own, operand by operand; the program runs as run_program would."""
+    ins = compile_program(tmpl, cons, n, False)
+    head = 'void %s(const char *t, const char *c, int n, ps2_op *ops)' % fn
+    if ins is None or n > 32:
+        return '%s { ps2_asm(t, c, n, ops); }' % head
+    p = Prog(cons, n)
+    desc = ', '.join('%d, %d, %d, %d' % (p.kind[k], p.alias[k], p.inp[k], p.out[k]) for k in range(n))
+    body = []
+    for k in range(n):  # bind inputs, in ps2_asm's order
+        if not p.inp[k]:
+            continue
+        r = p.alias[k] if p.alias[k] >= 0 else k
+        if p.kind[r] == OPK_GPR:
+            body.append('asm_bind_gpr(&ps2.gpr[%d], ops[%d].p, ops[%d].size);' % (32 + r, k, k))
+        elif p.kind[r] == OPK_FPR:
+            body.append('memcpy(&ps2.fpr[%d], ops[%d].p, 4);' % (32 + r, k))
+    i = programs[ins]
+    body.append('asm_caller = PS2_CALLER_ADDRESS();')
+    body.append('if (!p->fast_kind || !run_fast_program(p, ops)) aot_run_%d(p, ops);' % i)
+    for k in range(n):  # write outputs back
+        if not p.out[k]:
+            continue
+        src = {OPK_GPR: ('&ps2.gpr[%d]' % (32 + k), 16), OPK_FPR: ('&ps2.fpr[%d]' % (32 + k), 4),
+               OPK_LO: ('&ps2.lo', 8), OPK_HI: ('&ps2.hi', 8)}.get(p.kind[k])
+        if src:
+            body.append('asm_put(ops[%d].p, %s, ops[%d].size, %d);' % (k, src[0], k, src[1]))
+    statics = 'static Prog *p; static int generic;' + (' static const int8_t d[] = {%s};' % desc if n else '')
+    return ('%s {\n    %s\n    if (p) { %s }\n'
+            '    else if (generic) ps2_asm(t, c, n, ops);\n'
+            '    else { ps2_asm(t, c, n, ops); p = asm_first(t, c, n, aot_ins_%d, %d, %s); generic = !p; }\n}'
+            % (head, statics, ' '.join(body), i, len(ins), 'd' if n else '0'))
+
+
 def generate(out, dirs):
-    programs = {}
-    found = templates(dirs)
+    programs, parsed = {}, {}
+    asm_direct = {}
+    found, direct = templates(dirs, asm_direct)
     for tmpl, cons, n, recompiled in sorted(found):
         ins = compile_program(tmpl, cons, n, recompiled)
         if ins:
             programs.setdefault(ins, len(programs))
+            if recompiled:
+                parsed[tmpl] = ins
     lines = ['/* Generated by port/tools/ps2asm_aot.py from the transformed sources: %d templates, '
              '%d instruction sequences. Do not commit. */' % (len(found), len(programs))]
     for ins, i in programs.items():
@@ -308,6 +370,20 @@ def generate(out, dirs):
                  'aot_programs[] = {')
     lines += ['    {%d, aot_ins_%d, aot_run_%d},' % (len(ins), i, i) for ins, i in programs.items()]
     lines += ['};', '']
+    # recomp.py's PS2X(fn, text): fn runs the generated code of its text once the first call
+    # (exec_first, through ps2_exec) found the run-time parse identical; a text not generated
+    # here stays on ps2_exec. The texts are recomp.py's instruction text: no quote or backslash.
+    for fn, insn in sorted(direct.items()):
+        ins = parsed.get(insn)
+        if ins is None:
+            lines.append('void %s(void) { ps2_exec("%s"); }' % (fn, insn))
+        else:
+            lines.append('void %s(void) { static Prog *p; if (p) aot_run_%d(p, 0); '
+                         'else p = exec_first("%s", aot_ins_%d, %d); }' % (fn, programs[ins], insn,
+                                                                          programs[ins], len(ins)))
+    for fn, (tmpl, cons, n, _) in sorted(asm_direct.items()):
+        lines.append(asm_direct_function(fn, tmpl, cons, n, programs))
+    lines.append('')
     Path(out).write_text('\n'.join(lines), encoding='utf-8')
     return len(found), len(programs)
 

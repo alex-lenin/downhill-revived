@@ -42,9 +42,33 @@ typedef struct {
 extern ps2_cpu ps2;
 extern void (*ps2_mmio_write)(uintptr_t address, uint64_t value, unsigned size);
 extern void (*ps2_graphics_sync)(void);
+/* The game also reaches RAM through two other views of the same bytes: the low view
+   [0x00400000, 0x02000000) (PS2 physical addresses) and the uncached-accelerated mirror
+   [0x38000000, 0x3a000000). Each host maps them onto canonical RAM at 0x08000000 + (address &
+   0x1ffffff): the x64/Linux hosts by OS views, folded per access out of line
+   (port/host64/memory_access.h), and the browser by the same constant folds (port/web/postlink.py).
+   Recompiled code and the runtime's helpers take the canonical address here instead: the same
+   bytes, but the access stays on the hosts' inline path (finding 090 SP14: about 70% of the x64
+   slow-path calls, 48k per race field). Only the module's guest addresses fold; native test
+   builds pass host pointers. */
+static inline uintptr_t ps2_ram_canonical(uintptr_t address)
+{
+#if defined(__wasm__)
+    /* one bit test for the two 32-MiB windows (0 and 28) that hold these views */
+    if (__builtin_expect((0x10000001ull >> ((address >> 25) & 63)) & 1, 0)) {
+        if (address - 0x00400000u < 0x01c00000u) return address + 0x08000000u;
+        if (address - 0x38000000u < 0x02000000u) return address - 0x30000000u;
+    }
+#endif
+    return address;
+}
 /* Fence mapped VU1/VIF1/GS state before the EE reads or changes it. */
 static inline uintptr_t ps2_memory_address(uintptr_t address)
 {
+    /* Every fenced range lies in [0x10000000, 0x12001100); one test rejects
+       the RAM and mirror addresses that make up nearly every access. */
+    if (address < 0x10000000u || address >= 0x12001100u)
+        return ps2_ram_canonical(address);
     if (ps2_graphics_sync && ((address >= 0x11008000 && address < 0x11010000) ||
          (address >= 0x10003C00 && address < 0x10004000) ||
          (address >= 0x10005000 && address < 0x10005010) ||
@@ -91,7 +115,10 @@ extern ps2_cpu *ps2_vu1_regs;
 extern uint64_t ps2_vu1_code_version;  /* bumped when VIF1 MPG changes VU1 micro memory */
 extern uint64_t ps2_vu0_code_version;  /* bumped when VIF0 MPG changes VU0 micro memory, or the native words load */
 extern int ps2_vu1_native_mode;  /* -1: DHD_VU1_NATIVE decides; 0 or 1 forces the native kernels off or on (tests) */
+extern int ps2_vu1_aot_mode;  /* -1: DHD_VU_INTERPRETER decides; 0 or 1 forces the VU1 blocks off or on (tests) */
 extern int ps2_vu0_native_mode;  /* same override for DHD_VU0_NATIVE */
+extern int ps2_vu0_compiled_mode;  /* same override for DHD_VU0_COMPILED (vu0_aot.inc, PS2_VU0_COMPILED builds) */
+extern unsigned long long ps2_vu0_compiled_runs;
 extern unsigned long long ps2_vu0_native_runs;
 extern void (*ps2_vu1_regs_sync)(void);
 void ps2_vu0_vu1_file(ps2_q128 file[64]);
@@ -105,7 +132,7 @@ void ps2_vu1_set_kick_trace(ps2_vu_kick_trace_fn trace);
 int ps2_vu1_run(ps2_cpu *cpu, unsigned addr, unsigned top, unsigned itop,
                 ps2_vu_kick_fn kick, void *opaque);
 /* Native-loop coverage, indexed by the dispatch kind's bit number. */
-enum { PS2_VU1_NATIVE_KINDS = 12 };
+enum { PS2_VU1_NATIVE_KINDS = 14 };
 extern unsigned long long ps2_vu1_native_runs[PS2_VU1_NATIVE_KINDS];
 
 
@@ -113,6 +140,7 @@ extern unsigned long long ps2_vu1_native_runs[PS2_VU1_NATIVE_KINDS];
    "vmulx.xyz $vf1, $vf2, $vf3x". Unlike ps2_asm it may read the argument registers. */
 void ps2_exec(const char *insn);
 int ps2_exec_check(const char *insn); /* parse only; returns the number of problems */
+void ps2_vcallms(const char *tmpl, unsigned addr); /* recompiled vcallms; tmpl names the site */
 
 /* Count of templates that failed to parse or ran something unsupported (bring-up diagnostics). */
 int ps2_asm_problems(void);

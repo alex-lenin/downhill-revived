@@ -20,11 +20,20 @@
    (its members x, native, clip_on, clip[4] and window), native_core.inc's gs_gpu_native and gs_native_*
    hooks are gpu.h's, and it defines static int native_init(Gs *g, Rust *exact) (1: native_install ran) and
    static int native_waits_for_vsync(struct Native *n); native_capture and native_profile are
-   native_core.inc's. */
+   native_core.inc's.
+
+   Android (finding 091): the same file over the Android build's libdhd_render.a. No DXGI (the
+   device is Vulkan's, its memory unknown), the surface is on SDL's ANativeWindow
+   (DHDR_WINDOW_ANDROID), the window's size is present.c's (gs_window_pixels), and
+   gs_gpu_surface_reset swaps the surface when the app goes to the background and back. */
 #define COBJMACROS
 #include "gpu.h"
+#ifdef _WIN32
 #include <windows.h>
 #include <dxgi.h>
+#else
+#include "../host/win32_compat.h"  /* QueryPerformanceCounter and friends */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,6 +142,7 @@ static int op_draw_skipped(const Gs *g)
    pack's and the resolution scale's budget, gpu_rust_native.inc) and the user-mode driver version. */
 static struct { int made; uint32_t flags, vendor_id, device_id; uint64_t memory, driver_version; } device;
 
+#ifdef _WIN32
 /* A DXGI adapter's description and UMD version: the first adapter (Windows' default, the game's
    GPU) when vendor is 0, else the one with these PCI ids. 0 when there is none. */
 static int dxgi_adapter(unsigned vendor, unsigned id, DXGI_ADAPTER_DESC1 *desc, uint64_t *umd)
@@ -155,6 +165,7 @@ static int dxgi_adapter(unsigned vendor, unsigned id, DXGI_ADAPTER_DESC1 *desc, 
     IDXGIFactory1_Release(factory);
     return found;
 }
+#endif
 
 /* The device's settings as DhdrDeviceDesc flags: DHD_WGPU_BACKEND=vulkan, DHD_WGPU_COMPILER=fxc
    (else DXC when dxcompiler.dll is beside the exe), DHD_WGPU_DEBUG, DHD_WGPU_DUAL_SOURCE=0, and the
@@ -176,6 +187,14 @@ static int device_init(void)
     if (getenv("DHD_WGPU_DEBUG")) d.flags |= DHDR_DEV_DEBUG | DHDR_DEV_VALIDATION;
     if (dual && !atoi(dual)) d.flags |= DHDR_DEV_NO_DUAL_SOURCE;
     d.log_level = getenv("DHD_WGPU_DEBUG") ? DHDR_LOG_WARN : DHDR_LOG_ERROR;
+#ifndef _WIN32
+    /* Android: Vulkan, wgpu's high-performance adapter (the only one) */
+    (void)compiler; (void)choice;
+    d.flags |= DHDR_DEV_VULKAN;
+    if (!dhdr_device_init(&d)) return 0;
+    device.made = 1;
+    device.flags = d.flags;
+#else
     static char dxc[MAX_PATH + 16];
     DWORD length = GetModuleFileNameA(NULL, dxc, MAX_PATH);
     char *slash = length && length < MAX_PATH ? strrchr(dxc, '\\') : NULL;
@@ -202,6 +221,7 @@ static int device_init(void)
     else { device.vendor_id = d.vendor_id; device.device_id = d.device_id; }
     if (device.vendor_id && dxgi_adapter(device.vendor_id, device.device_id, &desc, &device.driver_version))
         device.memory = (uint64_t)desc.DedicatedVideoMemory;
+#endif
     fprintf(stderr, "gs: renderer %s on %s\n", dhdr_version(), dhdr_adapter_name());
     fflush(stderr);
     return 1;
@@ -234,6 +254,20 @@ static void op_adapter(const Exact *gpu, ExactAdapter *a)
     snprintf(a->name, sizeof a->name, "%s", dhdr_adapter_name());
 }
 #endif
+
+/* The window's client size in pixels: GetClientRect of the HWND; elsewhere present.c's SDL window
+   (gs_window_pixels). 0 x 0 when there is none (minimised, or the app in the background). */
+static void window_size(void *window, unsigned *width, unsigned *height)
+{
+#ifdef _WIN32
+    RECT client = {0, 0, 0, 0};
+    if (window) GetClientRect((HWND)window, &client);
+    *width = (unsigned)client.right; *height = (unsigned)client.bottom;
+#else
+    *width = *height = 0;
+    if (window) gs_window_pixels(width, height);
+#endif
+}
 
 /* ---- the native renderer (DHD_RENDER=native) ---- */
 
@@ -316,8 +350,9 @@ int gs_gpu_capture(Gs *g, uint32_t *pixels)
     return 1;
 }
 
-/* A surface on the window's HWND (SDL's, present.c): frame latency 1, Immediate unless
-   DHD_TEARING=0, else Mailbox, else Fifo; Fifo when the native renderer waits for vsync. */
+/* A surface on the window's HWND (SDL's, present.c; Android: its ANativeWindow): frame latency 1,
+   Immediate unless DHD_TEARING=0, else Mailbox, else Fifo; Fifo when the native renderer waits
+   for vsync. */
 int gs_gpu_surface(Gs *g, void *window)
 {
     Rust *p = g->backend;
@@ -325,9 +360,14 @@ int gs_gpu_surface(Gs *g, void *window)
     p->window = window;
     DhdrWindow w;
     memset(&w, 0, sizeof w);
+#ifdef _WIN32
     w.kind = DHDR_WINDOW_WIN32;
     w.a = (uint64_t)(uintptr_t)window;
     w.b = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
+#else
+    w.kind = DHDR_WINDOW_ANDROID;
+    w.a = (uint64_t)(uintptr_t)window;
+#endif
     const char *tearing = getenv("DHD_TEARING");
     uint32_t flags = tearing && !atoi(tearing) ? DHDR_PRESENT_NO_TEARING : 0;
     if (p->native && native_waits_for_vsync(p->native)) flags |= DHDR_PRESENT_VSYNC;
@@ -336,6 +376,24 @@ int gs_gpu_surface(Gs *g, void *window)
         fprintf(stderr, "gs: WebGPU surface (dhd_render), present flags %u, usage %u\n", flags,
                 dhdr_surface_usage(p->surface));
     return p->surface != NULL;
+}
+
+/* The surface again on a new window, or none (window NULL): the OS took the old one (Android: the
+   app went to the background; its surface comes back new). The native renderer's render thread
+   is held off meanwhile (its context lock); a native present that failed on the lost surface is
+   forgiven, and the next one reconfigures. */
+int gs_gpu_surface_reset(Gs *g, void *window)
+{
+    Rust *p = g->backend;
+    if (!p) return 0;
+    if (p->native) gs_native_lock(g, 1);
+    dhdr_surface_destroy(p->surface);
+    p->surface = NULL;
+    p->window = NULL;
+    int ok = !window || gs_gpu_surface(g, window);
+    if (p->native) native_surface_reset(p->native);
+    if (p->native) gs_native_lock(g, 0);
+    return ok;
 }
 
 /* 0 makes present.c stop presenting (-1 from Rust, or no picture yet); a skipped frame (minimised,

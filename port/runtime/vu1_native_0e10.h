@@ -28,7 +28,7 @@ static unsigned native_particles_0e10(Vu *u) {
 #define NMADD(a, b, c, d) native_madd(&flags, (a), (b), (c), (d))
 #define NMSUB(a, b, c, d)                                                      \
   native_result(&flags,                                                        \
-                _mm_sub_ps(operand4(a), _mm_mul_ps(operand4(b), operand4(c))), \
+                VU_SUB4(operand4(a), VU_PRODUCT4(operand4(b), operand4(c))), \
                 (d))
 #define SET(r, x, d) v[r] = native_merge(v[r], (x), (d))
 #define LOAD(a) _mm_loadu_ps(memory[(a) & 1023].f)
@@ -39,7 +39,7 @@ static unsigned native_particles_0e10(Vu *u) {
     float denominator = _mm_cvtss_f32(arithmetic4(lane4(v[6], 3)));
     q_flags = denominator == 0 ? 0x20 : 0;
     q = denominator == 0 ? vu_max(signbit(denominator))
-                         : _mm_cvtss_f32(arithmetic4(_mm_div_ss(
+                         : _mm_cvtss_f32(arithmetic4(VU_DIV_SS(
                                _mm_set_ss(1), _mm_set_ss(denominator))));
     SET(9, NADD(v[28], lane4(v[6], 3), 2), 2);
     SET(18, minmax4(v[18], lane4(v[18], 2), 0), 1);

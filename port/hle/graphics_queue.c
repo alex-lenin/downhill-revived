@@ -9,7 +9,23 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#if defined(__aarch64__)
+/* The Android build (finding 091): FPCR for MXCSR; isb for pause: yield is a no-op on the Cortex
+   cores, so the 4096-step spins before a sleep lasted ~2 us instead of x86's ~100 us and the
+   workers slept and were woken (a futex call each side) far more often (AND2). */
+static inline unsigned fp_control(void) { unsigned long v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return (unsigned)v; }
+/* skipped when unchanged (the usual case on the workers): the write and its isb serialize the core */
+static inline void fp_set_control(unsigned v) { if (v != fp_control()) __asm__ volatile("msr fpcr, %0\n\tisb" :: "r"((unsigned long)v) : "memory"); }
+/* IEEE: nearest (RMode 0), no flush to zero (FZ, FZ16), no default NaN, no AH/FIZ/NEP, no traps */
+#define FP_IEEE(c) ((c) & ~((3u << 22) | (1u << 24) | (1u << 25) | (1u << 19) | 0x9F07u))
+#define cpu_pause() __asm__ volatile("isb" ::: "memory")
+#else
 #include <xmmintrin.h>
+#define fp_control() _mm_getcsr()
+#define fp_set_control(v) _mm_setcsr(v)
+#define FP_IEEE(c) (((c) | 0x1F80u) & ~(63u | 0xE040u))  /* IEEE: nearest, no FTZ/DAZ */
+#define cpu_pause() _mm_pause()
+#endif
 #include "hle.h"
 #include "../gs/gs.h"
 #include "graphics_profile.h"
@@ -23,12 +39,20 @@ enum { RING_BYTES = 8 * 1024 * 1024 };
 typedef struct { uint32_t bytes, unit, words, padding; } Packet;
 static uint8_t *ring;
 static HANDLE worker, available, retired;
-static volatile LONG written, consumed, stopping;
+/* Producer/consumer writes must not invalidate each other's publication line.
+   Keep announcements separate too: both threads poll them for every packet. */
+#define QUEUE_COUNTER(name) static volatile LONG name __attribute__((aligned(64)))
+QUEUE_COUNTER(written);
+QUEUE_COUNTER(consumed);
+QUEUE_COUNTER(stopping);
 /* Each side signals only when the other sleeps: an event per packet (thousands a
    frame) cost a kernel call and a thread wake each. */
-static volatile LONG sleeping, waiting;
+QUEUE_COUNTER(sleeping);
+QUEUE_COUNTER(waiting);
 static int initialized;
 static int adaptive_waits;
+static int spike_waits;
+static double spin_seconds = -1;  /* DHD_SPIN_US, read at the first long wait (idle_wait) */
 
 /* Reads only acquire ownership published by the other side. A locked RMW here
    unnecessarily takes exclusive ownership of its cache line on every poll.
@@ -36,33 +60,85 @@ static int adaptive_waits;
    barriers also order each publication before the subsequent waiter check. */
 static uint32_t position(volatile LONG *p) { return (uint32_t)__atomic_load_n(p, __ATOMIC_ACQUIRE); }
 
+#include "graphics_timeline.h"
+
 /* Spin briefly before sleeping until *p moves away from at. *flag announces the sleep;
    the interlocked store and reread pair with the other side's publish-then-read. */
 static void idle_wait(volatile LONG *p, uint32_t at, volatile LONG *flag, HANDLE event, DWORD timeout, unsigned *budget)
 {
-    unsigned limit = budget && adaptive_waits ? *budget : 4096;
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    LONG64 spin_start = tl_begin();
+#endif
+    unsigned limit = budget ? (adaptive_waits ? *budget : 4096) : 512;
     for (unsigned spin = 0; spin < limit; spin++) {
         if (position(p) != at) {
             if (budget && adaptive_waits) {
                 unsigned next = spin * 2 + 128;
                 *budget = next < 4096 ? next : 4096;
             }
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+            tl_add(TL_EE_SPIN + 2 * tl_role, spin_start);
+#endif
             return;
         }
-        _mm_pause();
+        cpu_pause();
     }
-    /* Only empty consumer waits adapt. Retired/full waits keep their original
-       budget and timeout. Publication and lost-wakeup handshake are unchanged. */
+    /* DHD_SPIN_US (finding 091 AND2): the producer's waits (retired/full, the game thread's) spin
+       that long before sleeping, so a phone's governor sees a busy core and keeps its clock up.
+       Android's default 3000 (+4% race fields/s on the Mi 11i, p99 down); elsewhere 0. */
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    if (!budget && spin_seconds) {
+        if (spin_seconds < 0) {
+            const char *us = getenv("DHD_SPIN_US");
+#ifdef __ANDROID__
+            spin_seconds = (us ? atof(us) : 3000) * 1e-6;
+#else
+            spin_seconds = us ? atof(us) * 1e-6 : 0;
+#endif
+        }
+        for (double end = spin_seconds > 0 ? host_wall_seconds() + spin_seconds : 0; end;) {
+            for (unsigned spin = 0; spin < 256; spin++) {
+                if (position(p) != at) {
+                    tl_add(TL_EE_SPIN + 2 * tl_role, spin_start);
+                    return;
+                }
+                cpu_pause();
+            }
+            if (host_wall_seconds() >= end) break;
+        }
+    }
+#endif
+    /* Only empty consumer waits adapt. Retired/full waits spin at most 512 pauses
+       before parking. Their timeout and lost-wakeup handshake are unchanged. */
     if (budget && adaptive_waits) *budget = limit > 256 ? limit / 2 : 128;
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    tl_add(TL_EE_SPIN + 2 * tl_role, spin_start);
+#endif
     InterlockedIncrement(flag);
-    if (position(p) == at) WaitForSingleObject(event, timeout);
+    if (position(p) == at) {
+#ifndef GRAPHICS_QUEUE_TEST
+        double start = spike_waits ? host_wall_seconds() : 0;
+#endif
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+        LONG64 park_start = tl_begin();
+#endif
+        DWORD result = WaitForSingleObject(event, timeout);
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+        tl_add(TL_EE_PARK + 2 * tl_role, park_start);
+#endif
+#ifndef GRAPHICS_QUEUE_TEST
+        if (spike_waits && result == WAIT_TIMEOUT)
+            fprintf(stderr, "spike_queue: start=%.9f ms=%.6f moved=%u\n", start,
+                    (host_wall_seconds()-start)*1e3, position(p) != at);
+#endif
+    }
     InterlockedDecrement(flag);
 }
 
 /* Retired-side waits share one auto-reset event; the short timeout covers two waiters. */
-static void wait_retired(void) { idle_wait(&consumed, position(&consumed), &waiting, retired, 1, NULL); }
-
-#include "graphics_timeline.h"
+/* Wait on the same observation that failed the caller's predicate. A fresh load here
+   can already equal its target: no packet follows it until the EE starts the next field. */
+static void wait_retired(uint32_t at) { idle_wait(&consumed, at, &waiting, retired, 1, NULL); }
 
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
 #include "gs_queue.inc"
@@ -72,8 +148,8 @@ static void execute(unsigned unit, const uint32_t *words, unsigned count)
 {
     /* VIF1/GIF execute VU1 and host rendering, not EE game code. Host IEEE
        exceptional values must not inherit the game's diagnostic SSE mask. */
-    unsigned control = _mm_getcsr();
-    _mm_setcsr((control | 0x1F80u) & ~(63u | 0xE040u));  /* IEEE: nearest, no FTZ/DAZ */
+    unsigned control = fp_control();
+    fp_set_control(FP_IEEE(control));  /* IEEE: nearest, no FTZ/DAZ */
     if (unit == 2) {
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
         double start = worker_profile_start && worker_profile ? host_wall_seconds() : 0;
@@ -84,13 +160,16 @@ static void execute(unsigned unit, const uint32_t *words, unsigned count)
 #endif
     }
     else vif_feed((int)unit, words, count);
-    _mm_setcsr(control);
+    fp_set_control(control);
 }
 
 static DWORD WINAPI consume(void *unused)
 {
     (void)unused;
     host_thread_name("vu");
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    tl_role = 1;
+#endif
     unsigned idle_budget = 1024;
     for (;;) {
         uint32_t at = position(&consumed);
@@ -118,8 +197,9 @@ void graphics_wait(void)
     uint32_t target = position(&written);
     LONG64 start = tl_begin();
     int pending = (int32_t)(position(&consumed) - target) < 0;
-    while ((int32_t)(position(&consumed) - target) < 0)
-        wait_retired();
+    uint32_t observed;
+    while ((int32_t)((observed = position(&consumed)) - target) < 0)
+        wait_retired(observed);
     tl_add(TL_EE_VU, start);
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
     LONG64 gs_start = tl_begin();
@@ -156,6 +236,7 @@ int graphics_threaded(void)
 static void initialize(void)
 {
     initialized = 1;
+    spike_waits = getenv("DHD_SPIKES") != NULL;
     /* DHD_FIFO_ADAPTIVE=0 keeps the fixed 4096-spin budget for the consumers' empty waits (finding 069). */
     const char *adaptive = getenv("DHD_FIFO_ADAPTIVE");
     adaptive_waits = !adaptive || strcmp(adaptive, "0");
@@ -199,8 +280,9 @@ void graphics_feed(int unit, uint32_t guest_words, uint32_t count)
         unsigned wrap = bytes > tail ? tail : 0;
         if (RING_BYTES - (at - position(&consumed)) < bytes + wrap) {
             LONG64 full = tl_begin();
-            while (RING_BYTES - (at - position(&consumed)) < bytes + wrap)
-                wait_retired();
+            uint32_t observed;
+            while (RING_BYTES - (at - (observed = position(&consumed))) < bytes + wrap)
+                wait_retired(observed);
             tl_add(TL_EE_FULL, full);
         }
         if (wrap) {

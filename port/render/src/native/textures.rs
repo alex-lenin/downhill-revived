@@ -31,6 +31,8 @@ pub struct Tex {
 impl Tex {
     /// A decoded texture: `rgba` is w x h pixels, rows unpadded.
     pub fn create(gpu: &Gpu, rgba: &[u32], w: u32, h: u32) -> Result<Tex, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _spike = crate::native::pipelines::SpikeTimer::new("texture", 0);
         check_size(gpu, w, h)?;
         let count = w as usize * h as usize;
         if rgba.len() < count {

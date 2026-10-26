@@ -1,9 +1,10 @@
 /* Native VU1 kernels against the exact path, on captured run sequences (DHD_VU_SEQ, port/hle/vif.c).
 
-   Every captured run starts from its real registers and data memory and runs twice: with the
-   native kernels off (the exact AOT/interpreter path, the referee) and on. The whole register
-   file (ps2_cpu), all 16 KB of data memory and every GIF packet it kicks (the bytes, in order,
-   with their addresses) must be identical. The code sits at the game's VU1 micro memory address
+   Every captured run starts from its real registers and data memory and runs three times: on
+   the interpreter alone (the referee), through the translated blocks with the native kernels
+   off, and with them on. The blocks (with their lazy MAC updates, finding 090 VU1R) and the
+   kernels must each leave the whole register file (ps2_cpu), all 16 KB of data memory and every
+   GIF packet it kicks (the bytes, in order, with their addresses) identical to the referee's. The code sits at the game's VU1 micro memory address
    (0x11008000) and ps2_vu1_code_version changes with it, so the block and kernel caches behave
    as in the game. Each run is then timed in both modes (DIFF_REPEAT times, state restored
    outside the timed part), per microprogram key. Inputs are local game captures; nothing here
@@ -15,6 +16,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <xmmintrin.h>
+#include <intrin.h>
+
+/* The host functions vu0_interp.c calls (host_win32.c's, in the game). Guest address 0 is host
+   address 0 here: micro memory is mapped at its PS2 address (main). */
+uintptr_t guest_base;
+unsigned host_fp_csr(void) { return _mm_getcsr(); }
+void host_fp_set_csr(unsigned csr) { _mm_setcsr(csr); }
+uint64_t host_cycles(void) { return __rdtsc(); }
+void host_vu1_file(uint32_t address) { (void)address; }
 
 typedef struct { unsigned header[8]; ps2_cpu cpu; ps2_q128 data[1024]; } Run;
 enum { GIF_MAX = 1 << 20 };
@@ -124,32 +135,40 @@ int main(int argc, char **argv)
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return 2; }
     static Run run;
-    static Result exact, native;
+    static Result referee, exact, native;
     unsigned n = 0, differing = 0;
     unsigned long long native_before[PS2_VU1_NATIVE_KINDS], coverage[PS2_VU1_NATIVE_KINDS] = {0};
     while (n < max && fread(&run, sizeof run, 1, f) == 1) {
         if (run.header[3] != sizeof(ps2_cpu)) { fprintf(stderr, "capture register size %u, this build %u\n", run.header[3], (unsigned)sizeof(ps2_cpu)); return 2; }
         load_code(run.header[4]);
-        ps2_vu1_native_mode = 0;
+        ps2_vu1_aot_mode = 0; ps2_vu1_native_mode = 0;
+        execute(&run, &referee);
+        ps2_vu1_aot_mode = 1;
         execute(&run, &exact);
         memcpy(native_before, ps2_vu1_native_runs, sizeof native_before);
         ps2_vu1_native_mode = 1;
         execute(&run, &native);
         for (unsigned i = 0; i < PS2_VU1_NATIVE_KINDS; i++) coverage[i] += ps2_vu1_native_runs[i] - native_before[i];
-        long cpu = first_difference(&exact.cpu, &native.cpu, sizeof exact.cpu);
-        long mem = first_difference(exact.data, native.data, sizeof exact.data);
-        long gif = exact.gif_bytes != native.gif_bytes || exact.kicks != native.kicks ? 0 :
-                   first_difference(exact.gif, native.gif, exact.gif_bytes);
-        if (cpu >= 0 || mem >= 0 || gif >= 0) {
-            if (differing++ < 20)
-                fprintf(stderr, "run %u (field %u, program %04X entry %04X vi13 %04X): registers %ld, data %ld (qword %ld), gif %ld (%u/%u bytes, %u/%u kicks)\n",
-                        n, run.header[5], run.header[6], run.header[0], run.cpu.vi[13], cpu, mem, mem >= 0 ? mem / 16 : -1,
-                        gif, exact.gif_bytes, native.gif_bytes, exact.kicks, native.kicks);
+        const Result *checked[2] = {&exact, &native};
+        int bad = 0;
+        for (unsigned c = 0; c < 2; c++) {
+            const Result *x = checked[c];
+            long cpu = first_difference(&referee.cpu, &x->cpu, sizeof referee.cpu);
+            long mem = first_difference(referee.data, x->data, sizeof referee.data);
+            long gif = referee.gif_bytes != x->gif_bytes || referee.kicks != x->kicks ? 0 :
+                       first_difference(referee.gif, x->gif, referee.gif_bytes);
+            if (cpu < 0 && mem < 0 && gif < 0) continue;
+            if (differing + bad < 20)
+                fprintf(stderr, "run %u (field %u, program %04X entry %04X vi13 %04X), %s: registers %ld, data %ld (qword %ld), gif %ld (%u/%u bytes, %u/%u kicks)\n",
+                        n, run.header[5], run.header[6], run.header[0], run.cpu.vi[13], c ? "blocks + kernels" : "blocks",
+                        cpu, mem, mem >= 0 ? mem / 16 : -1, gif, referee.gif_bytes, x->gif_bytes, referee.kicks, x->kicks);
+            bad = 1;
         }
+        differing += bad;
         Key *k = key_of(&run);
         k->runs++;
         if (repeat) {
-            ps2_vu1_native_mode = 0; k->exact += timed(&run, repeat);
+            ps2_vu1_native_mode = 0; k->exact += timed(&run, repeat);  /* the blocks, no kernels */
             ps2_vu1_native_mode = 1; k->native += timed(&run, repeat);
         }
         n++;

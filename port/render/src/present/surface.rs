@@ -96,12 +96,37 @@ fn write_pixels(gpu: &Gpu, texture: &wgpu::Texture, pixels: &[u32], w: u32, h: u
 impl Surface {
     /// `dhdr_surface_create`: present.wgsl's pipeline, then a surface on the Win32 window.
     pub fn create(gpu: &'static Gpu, window: &DhdrWindow, present_flags: u32) -> Result<Surface, String> {
-        if window.kind != DHDR_WINDOW_WIN32 {
+        if window.kind != DHDR_WINDOW_WIN32 && window.kind != DHDR_WINDOW_ANDROID {
             return Err(format!("window kind {} is not supported", window.kind));
         }
         let pipe = PresentPipe::create(gpu).ok_or("no present pipeline")?;
-        let surface = Self::win32(gpu, window)?;
+        let surface = if window.kind == DHDR_WINDOW_ANDROID { Self::android(gpu, window)? } else { Self::win32(gpu, window)? };
         Self::from_wgpu(gpu, surface, present_flags, pipe)
+    }
+
+    /// `DHDR_WINDOW_ANDROID`: a = the ANativeWindow (SDL's SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER),
+    /// on Vulkan (finding 091). The Vulkan surface holds its own reference to the window.
+    #[cfg(target_os = "android")]
+    fn android(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
+        let native = std::ptr::NonNull::new(window.a as usize as *mut std::ffi::c_void).ok_or("NULL ANativeWindow")?;
+        let handle = raw_window_handle::AndroidNdkWindowHandle::new(native);
+        // SAFETY: C keeps the window alive until dhdr_surface_destroy (present.c drops the surface
+        // when the app goes to the background, before SDL releases the window).
+        unsafe {
+            gpu.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(raw_window_handle::RawDisplayHandle::Android(
+                    raw_window_handle::AndroidDisplayHandle::new(),
+                )),
+                raw_window_handle: raw_window_handle::RawWindowHandle::AndroidNdk(handle),
+            })
+        }
+        .map_err(|e| format!("create_surface: {e}"))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn android(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
+        let _ = (gpu, window);
+        Err("Android windows are the Android build's only".into())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -195,6 +220,25 @@ impl Surface {
         if window_w == 0 || window_h == 0 {
             return Ok(None);
         }
+        // Android destroys the window's surface on its own thread when the app leaves the screen;
+        // a present racing it gets validation errors (configure: "Surface does not support the
+        // adapter's queue family"). There they fail this present instead of the process; the C
+        // side recreates the surface when the app comes back (gs_gpu_surface_reset).
+        #[cfg(target_os = "android")]
+        {
+            let scope = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let acquired = self.acquire_unscoped(window_w, window_h, reconfigure);
+            if let Some(e) = pollster::block_on(scope.pop()) {
+                self.frame = None;
+                return Err(format!("the surface is gone: {e}"));
+            }
+            acquired
+        }
+        #[cfg(not(target_os = "android"))]
+        self.acquire_unscoped(window_w, window_h, reconfigure)
+    }
+
+    fn acquire_unscoped(&mut self, window_w: u32, window_h: u32, reconfigure: bool) -> Result<Option<wgpu::TextureView>, String> {
         let max = self.gpu.device.limits().max_texture_dimension_2d;
         if reconfigure || (window_w.min(max), window_h.min(max)) != (self.width, self.height) {
             self.configure(window_w, window_h);

@@ -342,8 +342,10 @@ pub unsafe extern "C" fn dhdr_surface_create(w: *const DhdrWindow, present_flags
         log_err(E, "NULL window");
         return std::ptr::null_mut();
     };
-    if w.kind != DHDR_WINDOW_WIN32 {
-        log_err(E, &format!("window kind {} is not supported here (version 1: WIN32; the browser's \
+    // WIN32 on Windows, ANDROID (an ANativeWindow, finding 091) on Android
+    let supported = if cfg!(target_os = "android") { DHDR_WINDOW_ANDROID } else { DHDR_WINDOW_WIN32 };
+    if w.kind != supported {
+        log_err(E, &format!("window kind {} is not supported here (this build: {supported}; the browser's \
                              canvas surface comes from dhdr_web_surface)", w.kind));
         return std::ptr::null_mut();
     }

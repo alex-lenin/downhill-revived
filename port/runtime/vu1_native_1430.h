@@ -57,7 +57,7 @@ static unsigned native_geometry_1430(Vu *u) {
         unsigned issued = q_flags ? 35 : 34;
         q = denominator == 0
                 ? vu_max(signbit(denominator))
-                : _mm_cvtss_f32(arithmetic4(_mm_div_ss(_mm_set_ss(1), _mm_set_ss(denominator))));
+                : _mm_cvtss_f32(arithmetic4(VU_DIV_SS(_mm_set_ss(1), _mm_set_ss(denominator))));
         SET(30, lane4(v[25], 3), 1);
         SET(23, NMUL(v[23], lane4(v[23], 3), 1), 1);
         SET(16, lane4(v[0], 3), 1);

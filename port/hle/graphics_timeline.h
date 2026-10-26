@@ -1,17 +1,30 @@
 /* DHD_TIMELINE=1 (or a CSV path): where each graphics-pipeline thread spends the fields of the
-   DHD_BENCH window. Measures only waits (idle/blocked time) with the performance counter, so busy
+   DHD_BENCH window. Measures waits (idle/blocked time) with the performance counter, so busy
    time per thread is the field's wall time minus its waits; nothing is timed when it is unset.
    - game (EE): waiting in graphics_wait for the VU worker, then for the GS worker, by call site
      (host return address, see the link map), and for room in the VU ring;
    - vu: idle (no packet queued) and blocked on a full GS ring;
    - gs: idle (no packet queued).
+   Each thread also splits idle_wait into spin wall time and event-wait wall time (park).
+   These are subsets of the waits above: do not subtract them again from busy.
+   CPU milliseconds include spins, handoffs and driver work. Busy is outside queue waits,
+   not pure game computation: descheduling and GPU/API blocking remain inside it.
+   Windows also samples scheduled CPU cycles for game/vu/gs/native (columns in millions of
+   cycles, NOT milliseconds). They help distinguish work from descheduling, but are not
+   context-switch traces and cannot by themselves distinguish changes in CPU frequency.
    bench_vsync calls graphics_timeline at every field of the window; at its end the medians and
    means go to stderr ("bench timeline:" lines) and, with a path, one CSV row per field. */
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
-enum { TL_EE_VU, TL_EE_GS, TL_EE_FULL, TL_VU_IDLE, TL_VU_FULL, TL_GS_IDLE, TL_COUNT };
+enum { TL_EE_VU, TL_EE_GS, TL_EE_FULL, TL_VU_IDLE, TL_VU_FULL, TL_GS_IDLE,
+       TL_EE_CYCLES, TL_VU_CYCLES, TL_GS_CYCLES, TL_NATIVE_CYCLES,
+       TL_EE_CPU, TL_VU_CPU, TL_GS_CPU,
+       TL_EE_SPIN, TL_EE_PARK, TL_VU_SPIN, TL_VU_PARK, TL_GS_SPIN, TL_GS_PARK, TL_COUNT };
 static const char *const tl_names[TL_COUNT] = {"ee_wait_vu", "ee_wait_gs", "ee_ring_full", "vu_idle", "vu_gs_full",
-                                              "gs_idle"};
+                                              "gs_idle", "ee_mcycles", "vu_mcycles", "gs_mcycles", "native_mcycles", "ee_cpu_ms", "vu_cpu_ms", "gs_cpu_ms",
+                                              "ee_spin", "ee_park", "vu_spin", "vu_park", "gs_spin", "gs_park"};
 static int tl_on = -1;
+/* One role per host thread: EE=0, VU=1, GS=2. */
+static _Thread_local unsigned tl_role;
 static volatile LONG64 tl_ticks[TL_COUNT];
 enum { TL_SITES = 32 };
 static struct { void *site; unsigned calls, pending; LONG64 ticks; } tl_sites[TL_SITES];
@@ -67,11 +80,36 @@ void graphics_timeline(int phase, unsigned field, double wall_seconds)
         QueryPerformanceFrequency(&f);
         frequency = (double)f.QuadPart;
     }
-    LONG64 now[TL_COUNT];
+    extern unsigned host_thread_cycles(const char **names, uint64_t *cycles, unsigned max);
+    LONG64 now[TL_COUNT] = {0};
     for (unsigned i = 0; i < TL_COUNT; i++) now[i] = InterlockedCompareExchange64(&tl_ticks[i], 0, 0);
+    const char *names[16]; uint64_t cycles[16];
+#ifdef GRAPHICS_QUEUE_TEST
+    unsigned threads = 0;
+#else
+    unsigned threads = host_thread_cycles(names, cycles, 16);
+#endif
+    const char *wanted[] = {"game", "vu", "gs", "native"};
+    for (unsigned i = 0; i < threads; i++)
+        for (unsigned j = 0; j < 4; j++)
+            if (!strcmp(names[i], wanted[j])) now[TL_EE_CYCLES + j] = cycles[i];
+#ifndef GRAPHICS_QUEUE_TEST
+    extern unsigned host_thread_cpu(const char **names, double *seconds, unsigned max);
+    double seconds[16];
+    threads = host_thread_cpu(names, seconds, 16);
+    for (unsigned i = 0; i < threads; i++)
+        for (unsigned j = 0; j < 3; j++)
+            if (!strcmp(names[i], wanted[j])) now[TL_EE_CPU + j] = (LONG64)(seconds[i] * 1e7);
+#endif
     if (phase == 0) {
+        fprintf(stderr, "bench timeline: clock field=%u host_s=%.9f\n", field, host_wall_seconds());
         memcpy(last, now, sizeof last);
         memset(tl_sites, 0, sizeof tl_sites);
+#ifdef _WIN32
+        FILETIME utc; GetSystemTimePreciseAsFileTime(&utc);
+        double unix_s = ((double)(((uint64_t)utc.dwHighDateTime << 32) | utc.dwLowDateTime) - 116444736000000000.0) * 1e-7;
+        fprintf(stderr, "bench timeline: clock unix_s=%.9f host_s=%.9f\n", unix_s, host_wall_seconds());
+#endif
         first = field, count = 0;
         return;
     }
@@ -82,7 +120,7 @@ void graphics_timeline(int phase, unsigned field, double wall_seconds)
     }
     double *row = rows + count++ * (TL_COUNT + 1);
     row[0] = wall_seconds * 1e3;
-    for (unsigned i = 0; i < TL_COUNT; i++) row[i + 1] = (double)(now[i] - last[i]) * 1e3 / frequency;
+    for (unsigned i = 0; i < TL_COUNT; i++) row[i + 1] = (double)(now[i] - last[i]) * ((i >= TL_EE_CYCLES && i <= TL_NATIVE_CYCLES) ? 1e-6 : (i >= TL_EE_CPU && i <= TL_GS_CPU) ? 1e-4 : 1e3 / frequency);
     memcpy(last, now, sizeof last);
     if (phase != 2) return;
     /* Report: mean and median of each column, then the busy share of each thread. */

@@ -78,6 +78,9 @@ pub struct Pass {
     constants: Option<(DhdrNativeConstants, u32)>,
     /// A draw not issued yet (first vertex, count): see `draw`.
     pending: Option<(u32, u32)>,
+    /// The picture is indexed (`dhdr_native_picture_indexed`): a draw's first and count are
+    /// indices into the index buffer, which every draw pass binds.
+    indexed: bool,
 }
 
 /// The state set in the open draw pass (see `Pass::state`); None: not set yet.
@@ -107,6 +110,7 @@ impl Pass {
             state: PassState::default(),
             constants: None,
             pending: None,
+            indexed: false,
         }
     }
 
@@ -200,10 +204,11 @@ impl Pass {
     }
 
     /// native_begin_pass (once `open_on` said no): a pass into `color` (and `z`), loading and
-    /// storing both, with the whole vertex buffer at slot 0.
+    /// storing both, with the whole vertex buffer at slot 0 (and in an indexed picture the whole
+    /// index buffer).
     #[allow(clippy::too_many_arguments)]
     fn begin(&mut self, gpu: &Gpu, target: i32, depth: i32, color: &wgpu::TextureView, z: Option<&wgpu::TextureView>,
-             vertices: &wgpu::Buffer, vertex_bytes: u64) {
+             vertices: &wgpu::Buffer, vertex_bytes: u64, indices: Option<&(wgpu::Buffer, u64)>) {
         let keep = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
         let encoder = self.encoder(gpu);
         let mut pass = encoder
@@ -226,6 +231,9 @@ impl Pass {
             })
             .forget_lifetime();
         pass.set_vertex_buffer(0, vertices.slice(0..vertex_bytes));
+        if let Some((buffer, bytes)) = indices {
+            pass.set_index_buffer(buffer.slice(0..*bytes), wgpu::IndexFormat::Uint32);
+        }
         self.pass = Some(pass);
         self.target = target;
         self.depth = depth;
@@ -244,6 +252,8 @@ impl Pass {
                 self.flush();
                 if let Some(pass) = self.pass.as_mut() {
                     pass.set_pipeline(pipe);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    crate::native::pipelines::pipelog::bind(key);
                 }
                 self.pipe = Some(key);
                 true
@@ -257,10 +267,11 @@ impl Pass {
         }
     }
 
-    /// One draw of `vertices` in the open pass. It waits in `pending`: a next draw that starts
-    /// where it ends, with nothing set in the pass between them, extends it (draw(a..b) then
-    /// draw(b..c) with the same state is draw(a..c): the triangles in the same order). Every
-    /// call that sets state in the pass, and the pass's end, issues it first (`flush`).
+    /// One draw of `vertices` (of indices, in an indexed picture) in the open pass. It waits in
+    /// `pending`: a next draw that starts where it ends, with nothing set in the pass between
+    /// them, extends it (draw(a..b) then draw(b..c) with the same state is draw(a..c): the
+    /// triangles in the same order). Every call that sets state in the pass, and the pass's end,
+    /// issues it first (`flush`).
     fn draw(&mut self, first: u32, count: u32) {
         if self.pass.is_none() {
             return;
@@ -282,7 +293,11 @@ impl Pass {
     fn flush(&mut self) {
         if let Some((first, count)) = self.pending.take() {
             if let Some(pass) = self.pass.as_mut() {
-                pass.draw(first..first.saturating_add(count), 0..1);
+                if self.indexed {
+                    pass.draw_indexed(first..first.saturating_add(count), 0, 0..1);
+                } else {
+                    pass.draw(first..first.saturating_add(count), 0..1);
+                }
             }
         }
     }
@@ -294,6 +309,8 @@ impl Pass {
         let encoder = self.encoder.take().unwrap_or_else(|| {
             gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("native picture") })
         });
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::native::pipelines::pipelog::submit();
         gpu.queue.submit([encoder.finish()]);
     }
 }
@@ -329,12 +346,32 @@ fn constant_bytes(c: &DhdrNativeConstants) -> &[u8] {
 impl Native {
     /// `dhdr_native_picture`: draws, scans out (or shows the movie) and submits.
     pub fn picture(&mut self, p: &Picture) -> Result<DhdrPictureResult, String> {
+        self.picture_indexed(p, None)
+    }
+
+    /// `picture`, or with `indices` (`dhdr_native_picture_indexed`) an indexed picture: each
+    /// DRAW's first and count are a range of `indices`, which index `p.vertices`. The triangles,
+    /// their order and their vertices' bytes are those of the expanded picture.
+    pub fn picture_indexed(&mut self, p: &Picture, indices: Option<&[u32]>) -> Result<DhdrPictureResult, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _spike = crate::native::pipelines::SpikeTimer::new("picture", 0);
         let gpu = self.gpu;
         let shared = NativeShared::get(gpu)?;
         self.arenas.reserve(Some((gpu, &self.objects.uniform_layout)), p.commands, p.vertices.len() as u32)?;
+        if let Some(indices) = indices {
+            let count = u32::try_from(indices.len()).map_err(|_| format!("gs native: {} indices", indices.len()))?;
+            self.arenas.reserve_indices(gpu, p.commands, count)?;
+        }
         let uniforms = self.arenas.uniform_group().cloned().ok_or("gs native: no constants bind group")?;
         let vertices = self.arenas.vertex_buffer().cloned().ok_or("gs native: no vertex buffer")?;
         let vertex_bytes = self.arenas.vertex_capacity();
+        let index_buffer = match indices {
+            Some(_) => Some((self.arenas.index_buffer().cloned().ok_or("gs native: no index buffer")?,
+                             self.arenas.index_capacity())),
+            None => None,
+        };
+        self.pass.end();
+        self.pass.indexed = indices.is_some();
         self.pass.drawn = DhdrPictureResult::default();
         self.pass.constants = None; // reserve emptied the arena
         {
@@ -343,10 +380,13 @@ impl Native {
             let mut kit = Kit::new(gpu, &self.objects, shared, &mut self.arenas, encoder);
             self.surfaces.prepare(&mut kit)?;
         }
-        let views = Views { shared, uniforms, vertices, vertex_bytes };
-        self.render(p, &views);
+        let views = Views { shared, uniforms, vertices, vertex_bytes, indices: index_buffer };
+        self.render(p, indices, &views);
         self.pass.end();
         self.arenas.write_vertices(&gpu.queue, p.vertices);
+        if let Some(indices) = indices {
+            self.arenas.write_indices(&gpu.queue, indices);
+        }
         let shown = match p.movie {
             Some((w, h, pixels)) => self.display.movie(gpu, w, h, pixels),
             None => self.scan_out(p),
@@ -359,7 +399,7 @@ impl Native {
     }
 
     /// native_render's command loop.
-    fn render(&mut self, p: &Picture, v: &Views) {
+    fn render(&mut self, p: &Picture, indices: Option<&[u32]>, v: &Views) {
         let gpu = self.gpu;
         let mut last_convert: i32 = -1;
         let mut converted: Option<wgpu::BindGroup> = None;
@@ -446,7 +486,8 @@ impl Native {
                     },
                     None => None,
                 };
-                self.pass.begin(gpu, k.target as i32, depth_index, &color, z.as_ref(), &v.vertices, v.vertex_bytes);
+                self.pass.begin(gpu, k.target as i32, depth_index, &color, z.as_ref(), &v.vertices, v.vertex_bytes,
+                                v.indices.as_ref());
             }
             let mut constants = k.constants;
             constants.scale = big_t | big_s << 8 | big_s.min(big_t) << 16;
@@ -467,7 +508,7 @@ impl Native {
             }
             let scissor = [left as u32, top as u32, (right - left) as u32, (bottom - top) as u32];
             self.pass.set_state(tw, th, scissor, uses_constant(k.blend_key).then_some(k.blend_fix));
-            self.draw_passes(k, p.vertices, depth.is_some(), offset, &v.uniforms, &group);
+            self.draw_passes(k, p.vertices, indices, depth.is_some(), offset, &v.uniforms, &group);
             self.pass.drawn.draws += 1;
         }
     }
@@ -561,8 +602,9 @@ impl Native {
     /// first draw wrote. The second draw's Z test picks those pixels: with Z writes, EQUAL against
     /// what the first draw left (in reverse triangle order for GREATER, where a later triangle at
     /// an equal Z lost); without, the same test on the unchanged Z buffer.
-    fn draw_passes(&mut self, k: &DhdrCommand, vertices: &[DhdrVertex], has_depth: bool, offset: u32,
-                   uniforms: &wgpu::BindGroup, group: &wgpu::BindGroup) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_passes(&mut self, k: &DhdrCommand, vertices: &[DhdrVertex], indices: Option<&[u32]>, has_depth: bool,
+                   offset: u32, uniforms: &wgpu::BindGroup, group: &wgpu::BindGroup) {
         let gpu = self.gpu;
         let (blend_key, mask, dk) = (k.blend_key, k.color_mask as u32, k.depth_key as u32);
         let (src, dst) = (blend_key >> 1 & 31, blend_key >> 6 & 31);
@@ -590,10 +632,14 @@ impl Native {
         let (mut second, mut first) = (0u32, k.first);
         if has_depth {
             second = 16 | if dk & 4 != 0 { 4 } else { dk & 3 }; // no write; EQUAL after a write
-            let in_range = (k.first as u64 + k.count as u64) <= vertices.len() as u64;
+            let len = indices.map_or(vertices.len(), |i| i.len());
+            let in_range = (k.first as u64 + k.count as u64) <= len as u64;
             if dk & 7 == (4 | 3) && k.count.is_multiple_of(3) && k.count > 3 && in_range {
                 // GREATER with writes
-                first = self.arenas.reverse_triangles(vertices, k.first, k.count);
+                first = match indices {
+                    Some(indices) => self.arenas.reverse_triangle_indices(indices, k.first, k.count),
+                    None => self.arenas.reverse_triangles(vertices, k.first, k.count),
+                };
             }
         }
         if self.pass.set_pipeline(gpu, &mut self.pipelines, &self.objects,
@@ -610,4 +656,74 @@ struct Views {
     uniforms: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     vertex_bytes: u64,
+    /// An indexed picture's index buffer and its bytes.
+    indices: Option<(wgpu::Buffer, u64)>,
+}
+
+/// `len` elements at `p` (NULL only for 0; else fatal), as `ffi.rs`'s slice.
+///
+/// # Safety
+/// A non-NULL `p` points at `len` readable elements, alive for `'a`.
+unsafe fn slice<'a, T>(p: *const T, len: usize, export: &'static str) -> &'a [T] {
+    if len == 0 {
+        return &[];
+    }
+    if p.is_null() {
+        crate::guard::fatal(&format!("dhd_render: {export}: NULL data for {len} elements"));
+    }
+    // SAFETY: the caller's contract.
+    unsafe { std::slice::from_raw_parts(p, len) }
+}
+
+/// `dhdr_native_picture` for an indexed picture (`include/dhd_render_ext.h`, outside the frozen
+/// v1 header): each DRAW's first and count are a range of `indices[0..index_count)`, and the
+/// indices name the picture's `vertex_count` vertices. Everything else is as
+/// `dhdr_native_picture` (`ffi.rs`), whose checks and conversion this repeats.
+///
+/// # Safety
+/// As `dhdr_native_picture`; `indices` holds `index_count` indices, alive for the call.
+#[no_mangle]
+pub unsafe extern "C" fn dhdr_native_picture_indexed(n: *mut DhdrNative, p: *const DhdrPicture, indices: *const u32,
+                                                     index_count: u32, out: *mut DhdrPictureResult) -> i32 {
+    const E: &str = "dhdr_native_picture_indexed";
+    let _g = crate::guard::Guard::enter(E);
+    // SAFETY: p and out are a picture and an output (the header), or NULL (fatal).
+    let (Some(p), Some(out)) = (unsafe { p.as_ref() }, unsafe { out.as_mut() }) else {
+        crate::guard::fatal(&format!("dhd_render: {E}: NULL picture or result"))
+    };
+    if p.size as usize != std::mem::size_of::<DhdrPicture>() {
+        crate::host::log(&format!("dhd_render: {E}: DhdrPicture.size {} (this library's is {})", p.size,
+                                  std::mem::size_of::<DhdrPicture>()));
+        return 0;
+    }
+    // SAFETY: native_snapshot.inc fills every array with its count, alive for the call; C keeps
+    // `indices` alive for it too.
+    let (pic, indices) = unsafe {
+        (Picture {
+            vertices: slice(p.vertices, p.vertex_count as usize, E),
+            commands: slice(p.commands, p.command_count as usize, E),
+            converts: slice(p.converts, p.convert_count as usize, E),
+            surfaces: slice(p.surfaces, p.surface_count as usize, E),
+            display_surface: p.display_surface,
+            display: p.display,
+            movie: (p.movie_on != 0).then(|| {
+                (p.movie_width, p.movie_height, slice(p.movie, p.movie_width as usize * p.movie_height as usize, E))
+            }),
+            scale: p.scale,
+        }, slice(indices, index_count as usize, E))
+    };
+    // SAFETY: n is a live DhdrNative (`ffi.rs`: an `Owned<Native>` behind the handle), or NULL.
+    let Some(owned) = (unsafe { (n as *const crate::guard::Owned<Native>).as_ref() }) else {
+        crate::guard::fatal(&format!("dhd_render: {E}: NULL handle"))
+    };
+    owned.with(E, |n| match n.picture_indexed(&pic, Some(indices)) {
+        Ok(r) => {
+            *out = r;
+            1
+        }
+        Err(e) => {
+            crate::host::log(&format!("dhd_render: {E}: {e}"));
+            0
+        }
+    })
 }
