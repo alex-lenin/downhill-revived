@@ -929,6 +929,7 @@ static void apply_setting(const char *key, const char *value)
         {"font", "DHD_FONT"},  /* the sharp font (port/gs/font_sharp.c) */
         {"fps", "DHD_FPS"},
         {"vsync", "DHD_VSYNC"},  /* 1: no tearing (port/gs/gpu_rust.c) */
+        {"unlock_all", "DHD_UNLOCK_ALL"},  /* 1: every track, rider, bike (port_unlock_all, pc_settings.c) */
     };
     if (!_strnicmp(key, "DHD_", 4)) { setting(key, value); return; }
     if (!_stricmp(key, "renderer")) { setting("DHD_RENDER", _stricmp(value, "native") ? "exact" : "native"); return; }

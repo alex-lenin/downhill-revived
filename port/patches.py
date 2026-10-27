@@ -416,6 +416,18 @@ PATCHES['unsorted/00235F38.c'] = [('text', 'if (fabsf(step) < minStep) {', 'if (
 # in 32-bit address arithmetic (EE, i686). wasm32 folds the index into the store's unsigned offset,
 # which never wraps: the 64-bit build wrote 4 GiB past p and crashed late in races; write p[-1].
 PATCHES['unsorted/00224CC8.c'] = [('text', '((float *)p)[0x3fffffff]=', '((float *)p)[-1]=')]
+# Tracks at 3-4 players (public issue #1): the PS2 offered only a fixed five (mask 0x020001C2:
+# MOAB, ALPINEMX, MOABMX, JUNGLEMX, BCTDX), whatever the save had unlocked, most likely for its
+# frame rate with four views; every track loads the same "2" level files at 2-4 players (CITYMX
+# and CITYTDH their 1-player ones, as at 2 players). Here 3-4 players get the save's tracks, as
+# 1-2 players do. PC SETTINGS > Unlock All (port_unlock_all, pc_settings.c) adds every track the
+# game's unlock cheat gives (all but 21 DUAL and 23 MOSH) without writing the save.
+PATCHES['unsorted/00193F38.c'] = [
+    ('text', 'extern int D_004B2828[];', 'extern int port_unlock_all(void);'),
+    ('body', 'func_00193F38', '{\n    return *(int *)(obj + 0x12114) | (port_unlock_all() ? 0x35FFFFF : 0);\n}')]
+PATCHES['unsorted/00193F68.c'] = [
+    ('text', 'extern int D_004B2828[];\n', ''),
+    ('body', 'func_00193F68', '{\n    return ((1 << bit) & func_00193F38(obj)) != 0;\n}')]
 # ONLINE (port/hle/online_menu.c): a fourth main menu row (func_001ED5B8) under OPTIONS that opens
 # the online pages, run by the game's popup menus as PC SETTINGS is. Its label is the host's (the
 # game's table has three). Back from the pages the cursor stays on ONLINE; when a room's race
@@ -569,6 +581,8 @@ import patches_options
 patches_options.add(PATCHES)
 import patches_fps
 patches_fps.add(PATCHES)
+import patches_unlock  # PC SETTINGS Unlock All: the unlock readers (finding 095)
+patches_unlock.add(PATCHES)
 
 # Online's retail preview flow (finding 065). These hooks return immediately offline.
 _ONLINE_SELECT_BEGIN = r"""
