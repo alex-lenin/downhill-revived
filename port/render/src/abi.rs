@@ -369,6 +369,9 @@ pub type dhdr_native_present_fn =
 pub type dhdr_native_read_begin_fn = unsafe extern "C" fn(n: *mut DhdrNative, w: *mut u32, h: *mut u32) -> i32;
 pub type dhdr_native_read_finish_fn = unsafe extern "C" fn(n: *mut DhdrNative, pixels: *mut u32) -> i32;
 pub type dhdr_native_options_fn = unsafe extern "C" fn(n: *mut DhdrNative, flags: u32);
+pub type dhdr_native_zread_start_fn = unsafe extern "C" fn(n: *mut DhdrNative, index: u32, rect: *const u32, tag: u64) -> i32;
+pub type dhdr_native_zread_take_fn =
+    unsafe extern "C" fn(n: *mut DhdrNative, out: *mut u32, cap: u32, rect_out: *mut u32, tag_out: *mut u64) -> i32;
 
 /// wasm only.
 pub type dhdr_web_surface_fn = unsafe extern "C" fn() -> *mut DhdrSurface;

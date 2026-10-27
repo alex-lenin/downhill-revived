@@ -433,6 +433,8 @@ const _: dhdr_native_present_fn = dhdr_native_present;
 const _: dhdr_native_read_begin_fn = dhdr_native_read_begin;
 const _: dhdr_native_read_finish_fn = dhdr_native_read_finish;
 const _: dhdr_native_options_fn = dhdr_native_options;
+const _: dhdr_native_zread_start_fn = dhdr_native_zread_start;
+const _: dhdr_native_zread_take_fn = dhdr_native_zread_take;
 
 /// # Safety
 /// `n` is NULL or a live `DhdrNative`.
@@ -631,6 +633,33 @@ pub unsafe extern "C" fn dhdr_native_read_finish(n: *mut DhdrNative, pixels: *mu
         let pixels = unsafe { slice_mut(pixels, w as usize * h as usize, E) };
         n.read_finish(pixels) as i32
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dhdr_native_zread_start(n: *mut DhdrNative, index: u32, rect: *const u32, tag: u64) -> i32 {
+    const E: &str = "dhdr_native_zread_start";
+    let _g = Guard::enter(E);
+    // SAFETY: rect is uint32_t[4] (the header).
+    let rect = unsafe { slice(rect, 4, E) };
+    let rect = [rect[0], rect[1], rect[2], rect[3]];
+    // SAFETY: as native().
+    unsafe { native(n, E) }.with(E, |n| n.zread_start(index, rect, tag))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dhdr_native_zread_take(n: *mut DhdrNative, out: *mut u32, cap: u32, rect_out: *mut u32,
+                                                tag_out: *mut u64) -> i32 {
+    const E: &str = "dhdr_native_zread_take";
+    let _g = Guard::enter(E);
+    // SAFETY: out holds cap words, rect_out 4, tag_out one (the header).
+    let (out, rect_out, tag_out) = unsafe { (slice_mut(out, cap as usize, E), slice_mut(rect_out, 4, E), must(tag_out, E)) };
+    let mut rect = [0u32; 4];
+    // SAFETY: as native().
+    let taken = unsafe { native(n, E) }.with(E, |n| n.zread_take(out, &mut rect, tag_out));
+    if taken == 1 {
+        rect_out.copy_from_slice(&rect);
+    }
+    taken
 }
 
 #[no_mangle]

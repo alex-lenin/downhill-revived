@@ -91,6 +91,7 @@ pub mod native {
     pub mod shared;
     pub mod surfaces;
     pub mod textures;
+    pub mod zread;
 
     use crate::abi::*;
     use crate::device::Gpu;
@@ -112,6 +113,7 @@ pub mod native {
         pub display: scanout::Display,
         pub pass: render::Pass,
         pub presenter: present::Presenter,
+        pub zread: zread::ZRead,
     }
 
     /// One picture as C handed it over (`DhdrPicture`), with its arrays as slices. Built by

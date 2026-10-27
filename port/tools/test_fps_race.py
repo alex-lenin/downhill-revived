@@ -33,7 +33,7 @@ IGNORED = {'wall'}  # host time, not game state
 def run(exe, out, rate, ticks, timeout):
     settings = argparse.Namespace(exe=exe.resolve(), nav=rc.NAV, race_pad='0:900:cross', window=0,
                                   race_seed=rc.RETAIL_RACE_SEED, dump=False, no_gsdump=True,
-                                  port_env={'DHD_FPS': str(rate), 'DHD_RENDER': 'native',
+                                  port_env={'DHD_FPS': str(rate), 'DHD_RENDER': 'native', 'DHD_EXACT_PROBE': '1',
                                             'DHD_FPS_TRACE': str(out / 'trace.csv'), 'DHD_FPS_STOP': str(ticks)})
     start = time.monotonic()
     process, digest = rc.launch_port(settings, out, rc.clock_events(settings.race_pad), [])

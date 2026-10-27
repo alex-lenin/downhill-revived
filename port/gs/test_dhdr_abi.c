@@ -94,6 +94,7 @@ const void *const dhdr_abi_functions[] = {
     E(dhdr_native_create) E(dhdr_native_destroy) E(dhdr_texture_create) E(dhdr_replace_create)
     E(dhdr_texture_retain) E(dhdr_texture_release) E(dhdr_native_surface) E(dhdr_native_picture)
     E(dhdr_native_present) E(dhdr_native_read_begin) E(dhdr_native_read_finish) E(dhdr_native_options)
+    E(dhdr_native_zread_start) E(dhdr_native_zread_take)
 #if defined(__wasm__)
     E(dhdr_web_surface)
 #else

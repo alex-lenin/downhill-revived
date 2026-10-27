@@ -265,6 +265,13 @@ DHDR_FN(dhdr_native_present) int dhdr_native_present(DhdrNative *n, DhdrSurface 
 DHDR_FN(dhdr_native_read_begin)  int dhdr_native_read_begin(DhdrNative *n, uint32_t *w, uint32_t *h);
 DHDR_FN(dhdr_native_read_finish) int dhdr_native_read_finish(DhdrNative *n, uint32_t *pixels);
 DHDR_FN(dhdr_native_options) void dhdr_native_options(DhdrNative *n, uint32_t flags);   /* DHDR_NATIVE_POINT_FILTER */
+/* The Z probe from native depth (finding 097). start copies the centre texel of each GS pixel of
+   rect (x, y, w, h; at most 64 x 64) of Z surface index and maps it without waiting: 1 started,
+   0 not. take never waits: the newest finished copy's w * h depth32float bit patterns (row-major,
+   at most cap) in out, its rect and tag; 1 a new copy, 0 none. */
+DHDR_FN(dhdr_native_zread_start) int dhdr_native_zread_start(DhdrNative *n, uint32_t index, const uint32_t rect[4], uint64_t tag);
+DHDR_FN(dhdr_native_zread_take) int dhdr_native_zread_take(DhdrNative *n, uint32_t *out, uint32_t cap, uint32_t rect_out[4],
+                                                           uint64_t *tag_out);
 
 #if defined(__wasm__)
 /* The surface the async dhdr_web_init made on the OffscreenCanvas, or NULL. */

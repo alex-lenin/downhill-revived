@@ -253,6 +253,18 @@ typedef struct Native {
     unsigned full_hold;              /* fields they run on after the probe leaves the edge */
     unsigned band_count, band_key;   /* the Z buffer (base, width, rows) the band follows */
     int trace_probes;
+    /* The Z probe from native depth (finding 097), unless DHD_EXACT_PROBE=1 keeps the exact path
+       above (the state-trace tools: game state as the PS2's). The EE asks for the probe's
+       neighbourhood (zread_want); the render thread copies it from the Z surface after each
+       picture and hands back the newest finished copy (zread); the EE's read gets those values,
+       a field or two late, written over the CPU image in native_fetch_pages (zread_pending). */
+    int exact_probe;
+    struct { int on; unsigned zbp; int surface; int rect[4]; } zread_want;                        /* queue_lock */
+    struct { int valid; unsigned zbp; uint32_t rect[4]; uint32_t bits[64 * 64]; } zread;          /* queue_lock */
+    uint64_t zread_tag;              /* render thread */
+    uint32_t zread_bits[64 * 64];    /* render thread: dhdr_native_zread_take's scratch */
+    struct { unsigned psm, bp, bw, x, y; uint32_t value, mask; } zread_pending[1024];  /* mask: the Z bits */
+    unsigned zread_pending_count;
     FILE *texlog;                    /* DHD_NATIVE_TEXLOG: textures drawn without their pixels */
     NativeUsage *usage;              /* DHD_NATIVE_SURFACES */
     uint64_t replay_version;
@@ -1376,6 +1388,10 @@ static void native_exact(Native *n, Gs *g, unsigned type, const GsVertex *v, uns
     const NativeExactState *state = native_exact_state(&n->exact_state, zbuf, test, frame, abe);
     if (state->never) return;                                   /* ZTST NEVER: nothing is written */
     unsigned zbp = state->zbp, fbp = state->fbp, fbw = state->fbw;
+    if (!n->exact_probe) {   /* the probe reads native depth: no exact draws (finding 097) */
+        if (state->zwrite) n->zbw[zbp] = (uint8_t)fbw;
+        return;
+    }
     uint64_t offset = g->reg[GS_XYOFFSET_1 + ctxt], scissor = g->reg[GS_SCISSOR_1 + ctxt];
     unsigned zpsm = state->zpsm, fpsm = state->fpsm;
     int zwrite = state->zwrite, colour = state->colour;
@@ -1449,16 +1465,6 @@ static void native_exact(Native *n, Gs *g, unsigned type, const GsVertex *v, uns
             if (!n->watch.valid && d->unconditional) native_watch_cover(n, d, log->states[d->state].reg, ctxt);
         }
     }
-    /* DHD_DIAG_NO_EXACT=1 (diagnostics only: the Z probe then reads stale depth, so the flare
-       and game state differ): no exact draws, to measure what they cost the GPU; =full keeps
-       the watched draws and drops only whole targets and the band. */
-    static int no_exact = -1;
-    if (no_exact < 0) {
-        const char *diag = getenv("DHD_DIAG_NO_EXACT");
-        no_exact = !diag ? 0 : !strcmp(diag, "full") ? 2 : 1;
-    }
-    if (no_exact == 1) return;
-    if (no_exact == 2) target = banded = 0;
     /* Each pixel is drawn once: an exact target is drawn whole, overlapping clips merge into
        their bounding box. */
     if (target) {
@@ -1518,6 +1524,156 @@ static unsigned native_probe_pieces(const int rect[4], unsigned psm, unsigned sb
     return count;
 }
 
+/* The Z surface the scene draws at page zbp, bw pages wide in psm's layout, or -1 (other Z
+   surfaces can start at the same page: a small one at 64 x 64 does). */
+static int native_zsurface(const Native *n, unsigned zbp, unsigned bw, unsigned psm)
+{
+    unsigned count = (unsigned)n->surface_count;
+    for (unsigned i = 0; i < count; i++) {
+        const NativeSurface *s = &n->surfaces[i];
+        if (s->depth && s->page == zbp && s->bw == bw && s->wide == (unsigned)psm_wide(psm)) return (int)i;
+    }
+    return -1;
+}
+
+/* A Z read (the lens flare's probe) from native depth (finding 097): asks the render thread for
+   the read's neighbourhood, and answers each pixel the newest copy holds; the others keep the CPU
+   image. The answered pixels' pages are staged: native_fetch_pages writes the values there. The
+   depth is the Z surface's own format: the probe reads the Z24 buffer as PSMZ32, whose top byte
+   (other data; Z24 draws leave it) stays the CPU image's. */
+static void native_zread_stage(Native *n, unsigned psm, unsigned sbp, unsigned sbw, const int rect[4], uint32_t staged[16])
+{
+    enum { MARGIN = 16 };
+    unsigned zbp = sbp / 32, rbw = sbw ? sbw : 1, fbw = n->zbw[zbp] ? n->zbw[zbp] : rbw;
+    int pw = 64, ph = (psm & 7) == 2 ? 64 : 32, surface = native_zsurface(n, zbp, fbw, psm);
+    unsigned zpsm = surface >= 0 && n->surfaces[surface].zpsm ? n->surfaces[surface].zpsm : psm;
+    double unit = zpsm == GS_PSMZ32 ? 4294967296.0 : zpsm == GS_PSMZ24 ? 16777216.0 : 65536.0;
+    uint32_t zmax = zpsm == GS_PSMZ32 ? UINT32_MAX : zpsm == GS_PSMZ24 ? 0xFFFFFF : 0xFFFF;
+    uint32_t mask = zmax & (psm == GS_PSMZ32 ? UINT32_MAX : psm == GS_PSMZ24 ? 0xFFFFFF : 0xFFFF);
+    int box[4] = {INT_MAX, INT_MAX, INT_MIN, INT_MIN}, answered = 0;
+    memset(staged, 0, 16 * sizeof *staged);
+    native_mutex_lock(&n->queue_lock);
+    for (int y = rect[1]; y <= rect[3]; y++)
+        for (int x = rect[0]; x <= rect[2]; x++) {
+            /* The read's pixel in the Z buffer's own layout (fbw pages wide): the same GS page. */
+            unsigned page = (unsigned)(y / ph) * rbw + (unsigned)(x / pw);
+            int dx = (int)(page % fbw) * pw + x % pw, dy = (int)(page / fbw) * ph + y % ph;
+            if (dx < box[0]) box[0] = dx;
+            if (dy < box[1]) box[1] = dy;
+            if (dx > box[2]) box[2] = dx;
+            if (dy > box[3]) box[3] = dy;
+            const uint32_t *r = n->zread.rect;
+            if (!n->zread.valid || n->zread.zbp != zbp || dx < (int)r[0] || dy < (int)r[1] ||
+                dx >= (int)(r[0] + r[2]) || dy >= (int)(r[1] + r[3]) || n->zread_pending_count == 1024) continue;
+            float d;
+            memcpy(&d, &n->zread.bits[(unsigned)(dy - (int)r[1]) * r[2] + (unsigned)(dx - (int)r[0])], 4);
+            uint32_t value = d >= 1.0f ? zmax : d <= 0.0f ? 0 : (uint32_t)(d * unit);
+            n->zread_pending[n->zread_pending_count].psm = psm;
+            n->zread_pending[n->zread_pending_count].bp = sbp;
+            n->zread_pending[n->zread_pending_count].bw = sbw;
+            n->zread_pending[n->zread_pending_count].x = (unsigned)x;
+            n->zread_pending[n->zread_pending_count].y = (unsigned)y;
+            n->zread_pending[n->zread_pending_count].mask = mask;
+            n->zread_pending[n->zread_pending_count++].value = value;
+            unsigned at = gs_pixel_address(psm, sbp, sbw, (unsigned)x & 2047, (unsigned)y & 2047) / (8192 * 8);
+            staged[at / 32 & 15] |= 1u << (at & 31);
+            answered++;
+        }
+    n->zread_want.on = surface >= 0;
+    n->zread_want.zbp = zbp;
+    n->zread_want.surface = surface;
+    n->zread_want.rect[0] = box[0] - MARGIN < 0 ? 0 : box[0] - MARGIN;
+    n->zread_want.rect[1] = box[1] - MARGIN < 0 ? 0 : box[1] - MARGIN;
+    n->zread_want.rect[2] = box[2] + MARGIN - n->zread_want.rect[0] + 1;
+    n->zread_want.rect[3] = box[3] + MARGIN - n->zread_want.rect[1] + 1;
+    native_mutex_unlock(&n->queue_lock);
+    if (answered == (rect[2] - rect[0] + 1) * (rect[3] - rect[1] + 1)) n->stats.probe_hits++;
+    else n->stats.probe_uncovered++;
+    if (n->trace_probes)
+        fprintf(stderr, "native zread: field %llu read psm %#x zbp %u sbw %u fbw %u %d,%d-%d,%d at %d,%d-%d,%d surface %d; "
+                "copy %d zbp %u %u,%u %ux%u; answered %d first %#x\n", (unsigned long long)n->field, psm, zbp, sbw, fbw,
+                rect[0], rect[1], rect[2], rect[3], box[0], box[1], box[2], box[3], surface, n->zread.valid, n->zread.zbp,
+                n->zread.rect[0], n->zread.rect[1], n->zread.rect[2], n->zread.rect[3], answered,
+                n->zread_pending_count ? n->zread_pending[0].value : 0);
+}
+
+/* gs_settle_reads: the staged pages from the CPU image with the answered Z pixels written over;
+   with DHD_EXACT_PROBE the exact device's staged pages (=2: the native answers are compared with
+   them, a "native zread: compare" line per read on stderr). */
+static void native_fetch_pages(Gs *g, const uint32_t staged[16], uint32_t *image)
+{
+    Native *n = ((NativeExact *)g->backend)->native;
+    if (n->exact_probe) {
+        fetch_pages(g, staged, image);
+        if (n->exact_probe == 2 && n->zread_pending_count) {
+            unsigned exact_covered = 0, native_covered = 0, differ = 0;
+            uint32_t worst = 0;
+            for (unsigned i = 0; i < n->zread_pending_count; i++) {
+                unsigned psm = n->zread_pending[i].psm;
+                uint32_t at = gs_pixel_address(psm, n->zread_pending[i].bp, n->zread_pending[i].bw,
+                                               n->zread_pending[i].x & 2047, n->zread_pending[i].y & 2047);
+                uint32_t mask = n->zread_pending[i].mask;
+                uint32_t exact = image[(at / 32) & (GS_VRAM_SIZE / 4 - 1)] >> (at & 31) & mask;
+                uint32_t mine = n->zread_pending[i].value & mask, gap = exact > mine ? exact - mine : mine - exact;
+                exact_covered += exact != 0;
+                native_covered += mine != 0;
+                differ += gap > (exact >> 6);  /* over 1/64 of the value apart */
+                if (gap > worst) worst = gap;
+            }
+            fprintf(stderr, "native zread: compare field %llu pixels %u exact covered %u native covered %u differ %u worst %#x\n",
+                    (unsigned long long)n->field, n->zread_pending_count, exact_covered, native_covered, differ, worst);
+            if (exact_covered > native_covered + 7 || native_covered > exact_covered + 7) {
+                fprintf(stderr, "native zread: at %u,%u exact/native", n->zread_pending[0].x, n->zread_pending[0].y);
+                for (unsigned i = 0; i < n->zread_pending_count; i++) {
+                    unsigned psm = n->zread_pending[i].psm;
+                    uint32_t at = gs_pixel_address(psm, n->zread_pending[i].bp, n->zread_pending[i].bw,
+                                                   n->zread_pending[i].x & 2047, n->zread_pending[i].y & 2047);
+                    fprintf(stderr, " %x/%x", image[(at / 32) & (GS_VRAM_SIZE / 4 - 1)] >> (at & 31), n->zread_pending[i].value);
+                }
+                fputc('\n', stderr);
+                /* The logged draws writing the first pixel's Z, newest first. */
+                static int dumped;
+                int px = (int)n->zread_pending[0].x, py = (int)n->zread_pending[0].y, shown = 0;
+                unsigned zbp = n->zread_pending[0].bp / 32, total = n->logs[0].draw_count + n->logs[1].draw_count;
+                for (unsigned i = total; dumped < 30 && i-- > 0 && shown < 12;) {
+                    NativeLog *log = i < n->logs[0].draw_count ? &n->logs[0] : &n->logs[1];
+                    NativeLogDraw *d = &log->draws[i < n->logs[0].draw_count ? i : i - n->logs[0].draw_count];
+                    if (px < d->box[0] || px > d->box[2] || py < d->box[1] || py > d->box[3] || !native_writes(d, zbp)) continue;
+                    const uint64_t *reg = log->states[d->state].reg;
+                    unsigned ctxt = native_log_context(reg);
+                    uint64_t zbuf = reg[GS_ZBUF_1 + ctxt], frame = reg[GS_FRAME_1 + ctxt], test = reg[GS_TEST_1 + ctxt];
+                    fprintf(stderr, "native zread:   draw %u type %u zbp %u fbp %u covers %d zpsm %u zmsk %u test %llx fpsm %u "
+                            "fbw %u fbmsk %08x box %d,%d-%d,%d z %u\n", i, d->type, d->zbp, d->fbp,
+                            native_covers(d, reg, ctxt, px, py), (unsigned)(zbuf >> 24) & 15, (unsigned)(zbuf >> 32) & 1,
+                            (unsigned long long)test, (unsigned)(frame >> 24) & 63, (unsigned)(frame >> 16) & 63,
+                            (unsigned)(frame >> 32), d->box[0], d->box[1], d->box[2], d->box[3], d->v[d->count - 1].z);
+                    shown++;
+                }
+                if (dumped < 30)
+                    for (unsigned i = 0; i < (unsigned)n->surface_count; i++)
+                        if (n->surfaces[i].depth && n->surfaces[i].page == zbp)
+                            fprintf(stderr, "native zread:   z surface %u bw %u wide %u zpsm %u\n", i, n->surfaces[i].bw,
+                                    n->surfaces[i].wide, n->surfaces[i].zpsm);
+                dumped++;
+            }
+        }
+        n->zread_pending_count = 0;
+        return;
+    }
+    for (unsigned page = 0; page < 512; page++)
+        if (staged[page / 32] & (1u << (page & 31)))
+            memcpy((uint8_t *)image + page * 8192, (const uint8_t *)g->vram + page * 8192, 8192);
+    for (unsigned i = 0; i < n->zread_pending_count; i++) {
+        unsigned psm = n->zread_pending[i].psm;
+        uint32_t at = gs_pixel_address(psm, n->zread_pending[i].bp, n->zread_pending[i].bw,
+                                       n->zread_pending[i].x & 2047, n->zread_pending[i].y & 2047);
+        uint32_t shift = at & 31, mask = n->zread_pending[i].mask;
+        uint32_t *word = &image[(at / 32) & (GS_VRAM_SIZE / 4 - 1)];
+        *word = (*word & ~(mask << shift)) | (n->zread_pending[i].value & mask) << shift;
+    }
+    n->zread_pending_count = 0;
+}
+
 /* Deferred reads: a Z probe gets exact pixels; colour reads keep the CPU image (counted). */
 static void native_stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[16])
 {
@@ -1527,6 +1683,11 @@ static void native_stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[1
     unsigned psm = (unsigned)(blt >> 24) & 63, sbp = (unsigned)blt & 0x3FFF, sbw = (unsigned)(blt >> 16) & 63;
     int rect[4] = {(int)(pos & 2047), (int)(pos >> 16 & 2047), 0, 0};
     rect[2] = rect[0] + (int)(size & 4095) - 1; rect[3] = rect[1] + (int)(size >> 32 & 4095) - 1;
+    if ((psm & 0x30) == 0x30 && sbp % 32 == 0 && n->exact_probe != 1) {
+        uint32_t compare[16];
+        native_zread_stage(n, psm, sbp, sbw, rect, n->exact_probe ? compare : staged);
+        if (!n->exact_probe) return;
+    }
     if ((psm & 0x30) == 0x30 && sbp % 32 == 0) {
         unsigned zbp = sbp / 32;
         if (n->band_count && (n->band_key & 511) == zbp && rect[3] + 32 >= (int)(n->band_key >> 15) * 32)
@@ -2081,6 +2242,45 @@ static void native_interp_thread(Native *n)
 
 void host_thread_name(const char *name);  /* port/hle/host.c */
 
+/* Render thread, after a picture (context lock held): the newest finished Z copy to the EE, and a
+   copy of what the EE's probe asks for now, from the Z surface just drawn (finding 097). */
+static void native_zread_after(Native *n)
+{
+    if (n->exact_probe == 1) return;
+    uint32_t rect[4];
+    uint64_t tag;
+    if (dhdr_native_zread_take(n->r, n->zread_bits, 64 * 64, rect, &tag)) {
+        native_mutex_lock(&n->queue_lock);
+        n->zread.valid = 1;
+        n->zread.zbp = (unsigned)(tag >> 32);
+        memcpy(n->zread.rect, rect, sizeof rect);
+        memcpy(n->zread.bits, n->zread_bits, (size_t)rect[2] * rect[3] * 4);
+        native_mutex_unlock(&n->queue_lock);
+        if (n->trace_probes) {
+            float lo = 2, hi = -1, d;
+            for (uint32_t i = 0; i < rect[2] * rect[3]; i++) {
+                memcpy(&d, &n->zread_bits[i], 4);
+                if (d < lo) lo = d;
+                if (d > hi) hi = d;
+            }
+            fprintf(stderr, "native zread: took tag %llu zbp %u %u,%u %ux%u depth %g..%g\n", (unsigned long long)(tag & 0xFFFFFFFFu),
+                    (unsigned)(tag >> 32), rect[0], rect[1], rect[2], rect[3], lo, hi);
+        }
+    }
+    native_mutex_lock(&n->queue_lock);
+    int on = n->zread_want.on, surface = n->zread_want.surface;
+    unsigned zbp = n->zread_want.zbp;
+    uint32_t want[4] = {(uint32_t)n->zread_want.rect[0], (uint32_t)n->zread_want.rect[1],
+                        (uint32_t)n->zread_want.rect[2], (uint32_t)n->zread_want.rect[3]};
+    native_mutex_unlock(&n->queue_lock);
+    if (want[2] > 64) want[2] = 64;
+    if (want[3] > 64) want[3] = 64;
+    int started = on ? dhdr_native_zread_start(n->r, (uint32_t)surface, want, (uint64_t)zbp << 32 | (n->zread_tag++ & 0xFFFFFFFFu)) : 0;
+    if (n->trace_probes && on)
+        fprintf(stderr, "native zread: picture surface %d zbp %u want %u,%u %ux%u started %d\n", surface, zbp, want[0], want[1],
+                want[2], want[3], started);
+}
+
 /* The next handed field drawn and its frame recycled; 0 once told to quit. The render thread's
    loop, or with NATIVE_INLINE the field's own vsync (the field is already pending, so no wait). */
 static int native_render_next(Native *n)
@@ -2102,6 +2302,7 @@ static int native_render_next(Native *n)
                 (host_wall_seconds() - asked) * 1e3);
     n->present_due = f->due, n->present_began = f->began;
     native_picture(n, f, f->vertices, 1);
+    native_zread_after(n);
     native_mutex_unlock(&n->context_lock);
     native_recycle(f);
     native_mutex_lock(&n->queue_lock);
@@ -2498,6 +2699,9 @@ static void native_install(Gs *g, NativeExact *exact, Native *n, const char *api
     g->flush_draw = native_flush_draw;
     g->write_high = native_write_high;
     g->stage_pages = native_stage_pages;
+    g->fetch_pages = native_fetch_pages;
+    const char *exact_probe = getenv("DHD_EXACT_PROBE");
+    n->exact_probe = exact_probe ? atoi(exact_probe) : 0;
     n->trace_probes = getenv("DHD_NATIVE_PROBES") != NULL;
     if (getenv("DHD_NATIVE_SURFACES") && !(n->usage = calloc(NATIVE_SURFACES, sizeof *n->usage))) native_oom("usage");
     const char *texlog = getenv("DHD_NATIVE_TEXLOG");

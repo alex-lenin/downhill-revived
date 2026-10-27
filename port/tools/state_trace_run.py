@@ -90,7 +90,7 @@ SCENARIOS = {
 def build_env(args, out_prefix, sha, fields):
     env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
     env.update(DHD_ISO=args.iso, DHD_HEADLESS='1', DHD_FRAME_CLOCK='1', DHD_SKIP_MOVIES='1',
-               DHD_MEMCARD='0', DHD_SND_OFF='1', DHD_RENDER='native', DHD_SETTINGS='none',
+               DHD_MEMCARD='0', DHD_SND_OFF='1', DHD_RENDER='native', DHD_EXACT_PROBE='1', DHD_SETTINGS='none',
                DHD_STATE_TRACE=str(out_prefix), DHD_STATE_STOP=str(fields), DHD_STATE_EXE=sha)
     if args.scenario == 'boot':
         env['DHD_NAV'] = BOOT_NAV

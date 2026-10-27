@@ -584,6 +584,7 @@ impl Native {
             display: crate::native::scanout::Display::new(),
             pass: crate::native::render::Pass::new(),
             presenter: crate::native::present::Presenter::new(),
+            zread: crate::native::zread::ZRead::new(),
         };
         n.options(flags); // the present filter, as native_objects' native_present_options
         Ok(n)
