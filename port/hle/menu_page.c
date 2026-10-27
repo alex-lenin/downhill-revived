@@ -487,13 +487,20 @@ typedef struct { short align, style, x, y; char text[SHELL_TEXT]; } ShellText;
 static ShellText shell_texts[2][SHELL_TEXTS];
 static int shell_count[2], shell_fill;  /* shell_fill: the frame being drawn; the other is the last one */
 static unsigned fields, shell_seen;     /* fields: menu_mouse_field's count; shell_seen: at the last shell frame */
+static int shell_ran;                   /* a shell frame has run: the game's views exist (issue #11) */
 
 void port_shell_frame(void)
 {
     shell_fill ^= 1;
     shell_count[shell_fill] = 0;
     shell_seen = fields;
+    shell_ran = 1;
 }
+
+/* The front end runs: a shell frame in the last 8 fields. Before the first one there are no views
+   yet (func_0023D650 would read view 0's missing object): a mouse moved over the window as the
+   game started crashed it there. */
+static int shell_running(void) { return shell_ran && fields - shell_seen < 8; }
 
 void port_shell_text(int align, int style, int x, int y, const void *text)
 {
@@ -690,7 +697,7 @@ static void trace_screens(void)
         } else
             hle_log("mouse trace: popup closed\n");
     }
-    if (fields - shell_seen < 8 && D_0029DED8 != last_screen && shell_count[shell_fill ^ 1]) {
+    if (shell_running() && D_0029DED8 != last_screen && shell_count[shell_fill ^ 1]) {
         last_screen = D_0029DED8;
         hle_log("mouse trace: screen %d\n", last_screen);
         const ShellText *t = shell_texts[shell_fill ^ 1];
@@ -735,6 +742,6 @@ void menu_mouse_field(void)
         return;
     }
     list_target = -1;
-    if (fields - shell_seen < 8) shell_mouse(news, moved, left, right, wheel);  /* the front end runs */
+    if (shell_running()) shell_mouse(news, moved, left, right, wheel);
     else shell_target = -1;
 }

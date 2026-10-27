@@ -72,4 +72,26 @@ The second run's extra slow frames came in the 10 s before the start, while shad
 load. The median stays 6.95 ms (144 fps).
 
 `port/tools/zprobe_compare.py` compares the Z reads of two `DHD_GS_READBACK_TRACE` files. Two runs
-drift apart in time, though, so the per-read comparison of `DHD_EXACT_PROBE=2` is the one to trust. 
+drift apart in time, though, so the per-read comparison of `DHD_EXACT_PROBE=2` is the one to trust.
+
+## Log writes froze the game (0.6.4)
+
+With `DHD_SPIKES = 1` (about 80 lines a second) a player's race had freezes of 100-520 ms, about 30
+s apart. The render thread was stuck in the gap where it writes a log line: `dhd.log` was opened
+unbuffered and written by the game's own threads, and a write to the disk sometimes took half a
+second. Without the logs the same race had none (1% low 126 fps at 144 Hz).
+
+Now, when dhd.exe opens `dhd.log` itself (started from Explorer or the launcher, or relaunched after
+an update), stdout and stderr write into a named pipe and a thread copies it to the file
+(`log_start` in `port/hle/host.c`). The pipe's reading end is overlapped: on a synchronous one,
+`PeekNamedPipe` waited for the thread's pending read, and the exit hung. The tail reaches the file
+at exit (atexit), on a crash or abort (`log_settle`), and in ExitProcess (`log_last_words`, a TLS
+callback). A console or a tool's file or pipe stays as it was.
+
+## The mouse at startup crashed the game (issue #11)
+
+Started from Explorer, the game crashed in about half of the starts with "read of uncommitted guest
+address 0x4" in `menu_mouse_field`. A mouse move over the window in the first fields reached
+`shell_mouse`, whose "the front end runs" test (`fields - shell_seen < 8`) passed before any shell
+frame had run, and `func_0023D650` read view 0's object before the game had made it. The test now
+also needs a shell frame to have run (`shell_running` in `port/hle/menu_page.c`). 
