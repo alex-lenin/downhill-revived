@@ -16,6 +16,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>        /* _get_osfhandle */
+#include <fcntl.h>     /* _O_WRONLY, _O_TEXT (the log's pipe) */
+#include <signal.h>
 #include <commdlg.h>  /* the file-open dialog's struct; comdlg32 itself is loaded when needed */
 #else
 #include "../host/win32_compat.h"
@@ -217,6 +219,128 @@ static void peek(void)
 }
 
 #ifdef _WIN32
+/* The log dhd.exe opens itself (dhd.log): the C library's stdout and stderr write into a pipe and
+   a thread copies it to the file, so a slow write to the disk (half a second at times on a
+   player's PC, with DHD_SPIKES' many lines) holds up only that thread, never the game's. The
+   rest reaches the file at exit (atexit), on a crash or an abort (log_settle) and in ExitProcess
+   (log_last_words, a TLS callback: the copying thread is gone by then). The pipe's reading end is
+   overlapped: a synchronous one would make PeekNamedPipe wait for the thread's pending read. */
+static HANDLE log_read, log_file, log_event;
+static char log_chunk[1 << 16];
+static volatile LONG log_chunk_at, log_chunk_end;  /* what the thread read and has not written yet */
+
+static void log_write(void)
+{
+    DWORD put;
+    while (log_chunk_at < log_chunk_end &&
+           WriteFile(log_file, log_chunk + log_chunk_at, (DWORD)(log_chunk_end - log_chunk_at), &put, NULL) && put)
+        InterlockedExchangeAdd(&log_chunk_at, (LONG)put);
+}
+
+/* Up to a chunk from the pipe into log_chunk, waiting at most wait ms; the bytes read (0: none,
+   or the pipe is gone). */
+static DWORD log_read_chunk(DWORD wait)
+{
+    OVERLAPPED o;
+    DWORD got = 0;
+    memset(&o, 0, sizeof o);
+    o.hEvent = log_event;
+    if (!ReadFile(log_read, log_chunk, sizeof log_chunk, NULL, &o)) {
+        if (GetLastError() != ERROR_IO_PENDING) return 0;
+        if (WaitForSingleObject(log_event, wait) != WAIT_OBJECT_0) CancelIo(log_read);
+    }
+    return GetOverlappedResult(log_read, &o, &got, TRUE) ? got : 0;
+}
+
+static DWORD WINAPI log_copy(void *unused)
+{
+    (void)unused;
+    for (DWORD got; (got = log_read_chunk(INFINITE)) != 0;) {
+        InterlockedExchange(&log_chunk_at, 0);
+        InterlockedExchange(&log_chunk_end, (LONG)got);
+        log_write();
+    }
+    return 0;
+}
+
+/* Waits (at most 2 s) until the pipe is empty and the thread has written what it read. */
+static void log_settle(void)
+{
+    if (!log_read) return;
+    fflush(stdout), fflush(stderr);
+    for (int i = 0, quiet = 0; i < 200 && quiet < 2; i++) {
+        DWORD waiting = 0;
+        if (!PeekNamedPipe(log_read, NULL, 0, NULL, &waiting, NULL)) return;
+        quiet = !waiting && log_chunk_at >= log_chunk_end ? quiet + 1 : 0;
+        if (quiet < 2) Sleep(10);
+    }
+}
+
+static void NTAPI log_last_words(PVOID module, DWORD reason, PVOID reserved)
+{
+    (void)module, (void)reserved;
+    if (reason != DLL_PROCESS_DETACH || !log_read) return;
+    log_write();  /* the chunk the thread was writing when it was stopped */
+    DWORD waiting = 0, got;
+    while (PeekNamedPipe(log_read, NULL, 0, NULL, &waiting, NULL) && waiting && (got = log_read_chunk(100)) != 0) {
+        log_chunk_at = 0, log_chunk_end = (LONG)got;
+        log_write();
+    }
+}
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:dhd_log_tls")
+#pragma section(".CRT$XLD", long, read)
+__declspec(allocate(".CRT$XLD")) const PIMAGE_TLS_CALLBACK dhd_log_tls = log_last_words;
+
+static void log_atexit(void) { log_settle(); }
+
+static void log_aborted(int sig)
+{
+    (void)sig;
+    log_settle();
+}
+
+/* stdout and stderr, both on the file just opened, into the pipe. Kept on the file if anything
+   fails. */
+static void log_start(void)
+{
+    char name[64];
+    snprintf(name, sizeof name, "\\\\.\\pipe\\dhd-log-%lu", GetCurrentProcessId());
+    HANDLE read = CreateNamedPipeA(name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                   1, 0, 1 << 20, 0, NULL);
+    if (read == INVALID_HANDLE_VALUE) return;
+    HANDLE write = CreateFileA(name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    int file = _dup(_fileno(stderr)), fd = -1;
+    if (write != INVALID_HANDLE_VALUE && event && file >= 0)
+        fd = _open_osfhandle((intptr_t)write, _O_WRONLY | _O_TEXT);
+    if (fd < 0) {
+        if (write != INVALID_HANDLE_VALUE) CloseHandle(write);
+        if (event) CloseHandle(event);
+        if (file >= 0) _close(file);
+        CloseHandle(read);
+        return;
+    }
+    log_file = (HANDLE)_get_osfhandle(file);
+    LARGE_INTEGER end = {0};
+    SetFilePointerEx(log_file, end, NULL, FILE_END);  /* appended: stdout's own handle may have written */
+    log_read = read, log_event = event;
+    HANDLE copier = CreateThread(NULL, 0, log_copy, NULL, 0, NULL);
+    if (!copier) { log_read = NULL; CloseHandle(read), CloseHandle(event), _close(fd), _close(file); return; }
+    SetThreadPriority(copier, THREAD_PRIORITY_BELOW_NORMAL);
+    CloseHandle(copier);
+    fflush(stdout), fflush(stderr);
+    _dup2(fd, _fileno(stderr));
+    _dup2(fd, _fileno(stdout));
+    _close(fd);
+    /* Direct handle writes (and a relaunch after an update, update.c start_again) use the file. */
+    SetStdHandle(STD_ERROR_HANDLE, log_file);
+    SetStdHandle(STD_OUTPUT_HANDLE, log_file);
+    atexit(log_atexit);
+    signal(SIGABRT, log_aborted);
+}
+
 static LONG WINAPI crashed(EXCEPTION_POINTERS *e)
 {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
@@ -228,6 +352,7 @@ static LONG WINAPI crashed(EXCEPTION_POINTERS *e)
     fprintf(stderr, "\n");
     report(e->ContextRecord);
     peek();
+    log_settle();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #else
@@ -517,15 +642,15 @@ void host_init(void)
 
 /* dhd.exe is a Windows program (/subsystem:windows), so a double-click opens no console window.
    Its log (stderr, stdout) goes where the starter put it: the tools' files and pipes as before;
-   started from a console window, that console; else (Explorer) dhd.log beside dhd.exe, which the
-   relaunched process appends to. A start with the launcher beside dhd.exe (not by the launcher)
-   appends too: it most likely only opens the launcher (update.c start_launcher), and the last
-   game's log, the one players attach to a report, stays. Before anything prints. */
+   started from a console window, that console; else (the launcher, Explorer) a new dhd.log beside
+   dhd.exe. Before anything prints. */
 void host_console_init(void)
 {
 #ifdef _WIN32
     HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
-    if (err && err != INVALID_HANDLE_VALUE && GetFileType(err) != FILE_TYPE_UNKNOWN) return;
+    DWORD type = err && err != INVALID_HANDLE_VALUE ? GetFileType(err) : FILE_TYPE_UNKNOWN;
+    if (type != FILE_TYPE_UNKNOWN) return;
+    int opened = 0;
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "w", stderr);
         freopen("CONOUT$", "w", stdout);
@@ -533,21 +658,15 @@ void host_console_init(void)
         char path[MAX_PATH];
         DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
         while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
-        snprintf(path + n, sizeof path - n, "DownhillRevived.exe");
-        int append = getenv("DHD_RELAUNCHED") != NULL;
-        if (!append && !getenv("DHD_LAUNCHER") && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
-            WIN32_FILE_ATTRIBUTE_DATA log;
-            snprintf(path + n, sizeof path - n, "dhd.log");
-            append = !GetFileAttributesExA(path, GetFileExInfoStandard, &log) ||
-                     (!log.nFileSizeHigh && log.nFileSizeLow < (1u << 20));  /* launcher = off: kept under 1 MB */
-        }
         snprintf(path + n, sizeof path - n, "dhd.log");
-        if (!freopen(path, append ? "a" : "w", stderr)) return;
+        if (!freopen(path, "w", stderr)) return;
         freopen(path, "a", stdout);
+        opened = 1;
     }
     setvbuf(stderr, NULL, _IONBF, 0);
     SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
     SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout)));
+    if (opened) log_start();
 #else
     /* A console (or the tools' pipes) owns the log already; keep it unbuffered. */
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -926,6 +1045,7 @@ static void setting(const char *name, const char *value)
 static void apply_setting(const char *key, const char *value)
 {
     if (!_stricmp(key, "game_options")) return; /* read after the game's own boot/load */
+    if (!_stricmp(key, "auto_update") || !_stricmp(key, "update_url")) return; /* the launcher's (port/launcher) */
     static const struct { const char *key, *name; } plain[] = {
         {"iso", "DHD_ISO"}, {"skip_movies", "DHD_SKIP_MOVIES"}, {"window", "DHD_WINDOW"},
         {"width", "DHD_WINDOW_WIDTH"}, {"height", "DHD_WINDOW_HEIGHT"}, {"monitor", "DHD_MONITOR"},
@@ -933,8 +1053,6 @@ static void apply_setting(const char *key, const char *value)
         {"memory_card", "DHD_MEMCARD"},
         {"sound_latency_ms", "DHD_SND_LATENCY_MS"},
         {"server", "DHD_NET_SERVER"}, {"name", "DHD_NET_NAME"}, {"rider", "DHD_NET_RIDER"},  /* online (port/net) */
-        {"update_url", "DHD_UPDATE_URL"}, {"auto_update", "DHD_AUTO_UPDATE"},  /* the updater (update.c) */
-        {"launcher", "DHD_LAUNCHER_MODE"},  /* off: dhd.exe doesn't open the launcher (update.c) */
         {"texture_pack", "DHD_TEXTURE_PACK"}, {"textures", "DHD_TEXTURES"},  /* texture packs (port/gs/texpack.c) */
         {"texture_cache_mb", "DHD_TEXTURE_CACHE_MB"},
         {"font", "DHD_FONT"},  /* the sharp font (port/gs/font_sharp.c) */
@@ -987,15 +1105,13 @@ static char *setting_value(char *value)
 static int iso_from_environment;  /* DHD_ISO was set before dhd.ini was read: it overrides the file */
 
 /* The PC settings the environment sets (so dhd.ini can't), for the settings page to show them
-   locked. The first process looks before reading dhd.ini; the relaunched one, whose environment
-   already holds dhd.ini's values, is told in DHD_ENV_OVERRIDES. */
+   locked: looked at before reading dhd.ini, kept in DHD_ENV_OVERRIDES. */
 static void note_overrides(void)
 {
     static const char *const names[] = {"DHD_SCALE", "DHD_WINDOW", "DHD_WINDOW_WIDTH", "DHD_WINDOW_HEIGHT",
                                         "DHD_ASPECT", "DHD_PRESENT_FILTER", "DHD_WIDESCREEN", "DHD_SKIP_MOVIES",
                                         "DHD_VIBRATION", "DHD_RENDER", "DHD_TEXTURES", "DHD_FONT"};
     char list[256] = ",";
-    if (getenv("DHD_RELAUNCHED")) return;
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
         if (getenv(names[i]) && strlen(list) + strlen(names[i]) + 2 < sizeof list)
             strcat(strcat(list, names[i]), ",");
@@ -1105,15 +1221,12 @@ static const char settings_template[] =
     ";   server = wss://races.example.org\n"
     "server =\n"
     "\n"
-    "; At start the game looks for a newer release and offers it; online races need the newest.\n"
-    "; auto_update = ask (asks first), on (updates without asking) or off (never looks).\n"
+    "; The launcher (DownhillRevived) looks for a newer release and offers it; online races need\n"
+    "; the newest. auto_update = ask (asks first), on (updates without asking) or off (never looks).\n"
     "; update_url: where to look, a latest.json or a GitHub releases API address; empty means\n"
-    "; the official releases. An update replaces dhd.exe and the text files, never dhd.ini or saves.\n"
+    "; the official releases. An update replaces the game's files, never dhd.ini or saves.\n"
     "update_url =\n"
     "auto_update = ask\n"
-    "; launcher: on (dhd.exe opens DownhillRevived.exe, the launcher, when it is beside it) or off\n"
-    "; (dhd.exe starts the game straight away).\n"
-    "launcher = on\n"
     "\n"
     "; A texture pack (upscale mod) made for PCSX2 works unchanged: texture_pack is its folder of\n"
     "; PNGs, the full path of PCSX2's textures\\SCUS-97177\\replacements folder for example (in\n"
