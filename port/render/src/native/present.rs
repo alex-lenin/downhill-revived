@@ -158,7 +158,12 @@ impl Native {
         };
         // Minimised (0 x 0) skips; a new size or `resize` reconfigures; Outdated / Lost reconfigure
         // once; Timeout skips.
-        let target = match surface.acquire(r.window_w, r.window_h, r.resize != 0) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let acquiring = crate::native::pipelines::SpikeTimer::new("acquire", 0);
+        let acquired = surface.acquire(r.window_w, r.window_h, r.resize != 0);
+        #[cfg(not(target_arch = "wasm32"))]
+        drop(acquiring);
+        let target = match acquired {
             Ok(Some(view)) => view,
             Ok(None) => return 0,
             Err(e) => {
@@ -211,6 +216,8 @@ impl Native {
                 pass.draw(0..3, 0..1);
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _spike = crate::native::pipelines::SpikeTimer::new("present_submit", 0);
         gpu.queue.submit([encoder.finish()]);
         1
     }

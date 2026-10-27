@@ -1449,6 +1449,16 @@ static void native_exact(Native *n, Gs *g, unsigned type, const GsVertex *v, uns
             if (!n->watch.valid && d->unconditional) native_watch_cover(n, d, log->states[d->state].reg, ctxt);
         }
     }
+    /* DHD_DIAG_NO_EXACT=1 (diagnostics only: the Z probe then reads stale depth, so the flare
+       and game state differ): no exact draws, to measure what they cost the GPU; =full keeps
+       the watched draws and drops only whole targets and the band. */
+    static int no_exact = -1;
+    if (no_exact < 0) {
+        const char *diag = getenv("DHD_DIAG_NO_EXACT");
+        no_exact = !diag ? 0 : !strcmp(diag, "full") ? 2 : 1;
+    }
+    if (no_exact == 1) return;
+    if (no_exact == 2) target = banded = 0;
     /* Each pixel is drawn once: an exact target is drawn whole, overlapping clips merge into
        their bounding box. */
     if (target) {
@@ -2083,7 +2093,13 @@ static int native_render_next(Native *n)
     n->pending_count--;
     native_cond_broadcast(&n->queue_changed);
     native_mutex_unlock(&n->queue_lock);
+    static int spikes = -1;
+    if (spikes < 0) spikes = getenv("DHD_SPIKES") != NULL;
+    double asked = spikes ? host_wall_seconds() : 0;
     native_mutex_lock(&n->context_lock);
+    if (spikes && host_wall_seconds() - asked >= 0.002)   /* another thread held the context */
+        fprintf(stderr, "spike_lock: field=%llu start=%.9f ms=%.3f\n", (unsigned long long)f->field, asked,
+                (host_wall_seconds() - asked) * 1e3);
     n->present_due = f->due, n->present_began = f->began;
     native_picture(n, f, f->vertices, 1);
     native_mutex_unlock(&n->context_lock);

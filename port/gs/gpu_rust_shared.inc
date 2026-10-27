@@ -123,10 +123,14 @@ static unsigned native_match_window(Native *n, const NativeFrame *f);
    native_present (x64: presented at once; the browser: shown by the web_present that follows). */
 static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertices, float t)
 {
-    double start = n->trace_pictures ? host_wall_seconds() : 0;
+    static int spikes = -1;
+    if (spikes < 0) spikes = getenv("DHD_SPIKES") != NULL;
+    double start = n->trace_pictures || spikes ? host_wall_seconds() : 0;
     if (!n->scale) n->scale = n->scale_setting ? n->scale_setting : native_match_window(n, f);
     native_prepare_surfaces(n, f);
+    double prepared = spikes ? host_wall_seconds() : 0;
     const DhdrPicture *picture = native_snapshot(n->snapshot, n, f, vertices);
+    double snapped = spikes ? host_wall_seconds() : 0;
     DhdrPictureResult r;
     memset(&r, 0, sizeof r);
     int shown = 0;
@@ -138,6 +142,7 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
         shown = r.shown != 0;
     }
     native_note_flat(n, f);
+    double encoded = spikes ? host_wall_seconds() : 0;
     if (n->trace_pictures) {   /* no GPU timestamps on WebGPU yet: gpu_ms -1 */
         fprintf(n->trace_pictures, "%llu,%.3f,%.3f,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
                 (unsigned long long)f->field, t, (host_wall_seconds() - start) * 1000, -1.0,
@@ -150,6 +155,13 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
         if (f->movie_on && aspect > 4.0f / 3) n->aspect = 4.0f / 3;
         native_present(n);
         n->aspect = aspect;
+    }
+    if (spikes) {   /* the render thread's picture by part: surfaces, snapshot, draw, present */
+        double end = host_wall_seconds();
+        if (end - start >= 0.004)
+            fprintf(stderr, "spike_render: field=%llu start=%.9f ms=%.3f prepare_ms=%.3f snapshot_ms=%.3f draw_ms=%.3f present_ms=%.3f\n",
+                    (unsigned long long)f->field, start, (end - start) * 1e3, (prepared - start) * 1e3,
+                    (snapped - prepared) * 1e3, (encoded - snapped) * 1e3, (end - encoded) * 1e3);
     }
 }
 
