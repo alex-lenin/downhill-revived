@@ -16,6 +16,7 @@
 use crate::abi::{DhdrConvert, DhdrConvertConstants};
 use crate::device::Gpu;
 use crate::native::arenas::Arenas;
+use crate::native::init::INVERSE_WORDS;
 
 /// NATIVE_CONVERTS: conversions a picture holds at most (native_core.inc).
 pub const CONVERTS: usize = 64;
@@ -26,7 +27,7 @@ pub struct ConvertObjects<'a> {
     pub pipeline: &'a wgpu::ComputePipeline,
     /// Group 1 of the convert pipeline (convert_layout: inverse, base, 4 colour, 4 depth, output).
     pub layout: &'a wgpu::BindGroupLayout,
-    /// The inverse table (4096 u32, native_inverse_table).
+    /// The inverse table (init.rs INVERSE_WORDS u32, inverse_table).
     pub inverse: &'a wgpu::Buffer,
     /// The draw texture layout and its nearest sampler (native_texture_group).
     pub texture_layout: &'a wgpu::BindGroupLayout,
@@ -148,7 +149,7 @@ impl Converts {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: o.inverse,
                     offset: 0,
-                    size: wgpu::BufferSize::new(4096 * 4),
+                    size: wgpu::BufferSize::new(INVERSE_WORDS as u64 * 4),
                 }),
             },
             wgpu::BindGroupEntry { binding: 1, resource: tv(base.unwrap_or(o.dummy_view)) },

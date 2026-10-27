@@ -170,7 +170,7 @@ pub struct DhdrNativeConstants {
 pub struct DhdrConvertConstants {
     pub tex: [u32; 4],
     pub size: [u32; 4],
-    /// Per source surface: page, bw, 1 for depth, Z units (float bits).
+    /// Per source surface: page, bw, 1 for depth or 2 for 16-bit colour, Z units (float bits).
     pub slot: [[u32; 4]; 4],
     /// Per GS page: 0 the decoded base, 1-4 a source slot.
     pub pages: [u8; 512],

@@ -44,11 +44,25 @@ pub(crate) fn compilation_options() -> wgpu::PipelineCompilationOptions<'static>
     wgpu::PipelineCompilationOptions { constants: &[], zero_initialize_workgroup_memory: false }
 }
 
+/// The inverse table's length in u32 words (`inverse_table`).
+pub const INVERSE_WORDS: usize = 8192;
+
 /// The inverse table's words (native_core.inc native_inverse_table): for the colour (PSMCT32) and
 /// Z (PSMZ32) layouts, the word in a page (as gs_pixel_address(psm, 0, 1, x, y) >> 5 & 2047) to
-/// the pixel holding it, x | y << 8; colour then Z.
-pub fn inverse_table() -> [u32; 4096] {
-    let mut inverse = [0u32; 4096];
+/// the pixel holding it, x | y << 8; colour then Z. Then for the 16-bit colour layout (PSMCT16,
+/// 64 x 64 pages), the 16-bit half in a page (gs_pixel_address >> 4 & 4095) to its pixel: what
+/// native_convert reads from a 16-bit surface.
+pub fn inverse_table() -> [u32; INVERSE_WORDS] {
+    let mut inverse = [0u32; INVERSE_WORDS];
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            // memory.c pixel_address for PSMCT16, bp 0, bw 1, inside page 0.
+            let (bx, by) = (x / 16, y / 8);
+            let block = (by & 1) | (bx & 1) << 1 | (by & 2) << 1 | (bx & 2) << 2 | (by & 4) << 2;
+            let column = (x & 1) << 1 | (x & 2) << 2 | (x & 4) << 2 | (x & 8) >> 3 | (y & 1) << 2 | (y & 6) << 4;
+            inverse[(4096 + block * 128 + column) as usize] = x | y << 8;
+        }
+    }
     for layout in 0..2u32 {
         for y in 0..32u32 {
             for x in 0..64u32 {
@@ -110,7 +124,7 @@ pub struct Objects {
     pub scanout_pipe: wgpu::ComputePipeline,
     /// `native_convert` (convert layout)
     pub convert_pipe: wgpu::ComputePipeline,
-    /// The inverse table (`inverse_table`), 16384 bytes, Storage | CopyDst, written at creation.
+    /// The inverse table (`inverse_table`), 32768 bytes, Storage | CopyDst, written at creation.
     pub inverse: wgpu::Buffer,
 }
 
@@ -579,6 +593,22 @@ impl Native {
 #[cfg(test)]
 mod tests {
     use super::parenthesize_shifts;
+
+    /// Each layout's part of the inverse table names every pixel of its page once.
+    #[test]
+    fn inverse_table_covers_pages() {
+        let table = super::inverse_table();
+        for (start, words, height) in [(0, 2048, 32), (2048, 2048, 32), (4096, 4096, 64)] {
+            let mut seen = vec![false; 64 * height];
+            for &at in &table[start..start + words] {
+                let (x, y) = ((at & 255) as usize, (at >> 8) as usize);
+                assert!(x < 64 && y < height && !seen[y * 64 + x], "layout at {start}: pixel {x}, {y}");
+                seen[y * 64 + x] = true;
+            }
+        }
+        // PSMCT16: pixel (1, 0) is the page's third half-word (memory.c pixel_address: column 2).
+        assert_eq!(table[4096 + 2], 1);
+    }
 
     #[test]
     fn shifts_get_parentheses() {

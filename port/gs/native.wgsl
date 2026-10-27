@@ -300,6 +300,14 @@ fn convert_word(slot: u32, xy: vec2<i32>, depth: bool, unit: f32) -> u32 {
     return u.r | u.g << 8u | u.b << 16u | u.a << 24u;
 }
 
+// A 16-bit surface's pixel at `at` (x | y << 8) of the page at `origin` (GS pixels), as the GS
+// stores it: 5 bits a colour and the alpha bit.
+fn convert_half(slot: u32, origin: vec2<u32>, at: u32, scale: u32) -> u32 {
+    let p = (origin + vec2<u32>(at & 255u, at >> 8u)) * scale + scale / 2u;
+    let w = convert_word(slot, vec2<i32>(p), false, 0.0);
+    return (w >> 3u & 31u) | (w >> 11u & 31u) << 5u | (w >> 19u & 31u) << 10u | (w >> 31u) << 15u;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn native_convert(@builtin(global_invocation_id) tid: vec3<u32>) {
     if (tid.x >= convert.size.x || tid.y >= convert.size.y) { return; }
@@ -315,11 +323,20 @@ fn native_convert(@builtin(global_invocation_id) tid: vec3<u32>) {
     let s = convert.slot[source - 1u];
     let rel = (page - s.x) & 511u;
     let bw = s.y;
-    let at = native_inverse[select(0u, 2048u, s.z != 0u) + (word & 2047u)];
     let scale = convert.tex.w >> ((source - 1u) * 8u) & 255u;
-    let xy = vec2<i32>(i32(((rel % bw) * 64u + (at & 255u)) * scale + scale / 2u),
-                       i32(((rel / bw) * 32u + (at >> 8u)) * scale + scale / 2u));
-    var value = convert_word(source - 1u, xy, s.z != 0u, bitcast<f32>(s.w));
+    var value: u32;
+    if (s.z == 2u) {
+        // A 16-bit colour surface (64 x 64 pixel pages): the word's two pixels, the low half first.
+        let origin = vec2<u32>((rel % bw) * 64u, (rel / bw) * 64u);
+        let half = 4096u + (word & 2047u) * 2u;
+        value = convert_half(source - 1u, origin, native_inverse[half], scale) |
+                convert_half(source - 1u, origin, native_inverse[half + 1u], scale) << 16u;
+    } else {
+        let at = native_inverse[select(0u, 2048u, s.z == 1u) + (word & 2047u)];
+        let xy = vec2<i32>(i32(((rel % bw) * 64u + (at & 255u)) * scale + scale / 2u),
+                           i32(((rel / bw) * 32u + (at >> 8u)) * scale + scale / 2u));
+        value = convert_word(source - 1u, xy, s.z == 1u, bitcast<f32>(s.w));
+    }
     let bits = bits_per_pixel(psm);
     let texa = convert.size.z;
     value = (value >> (a & 31u)) & select((1u << bits) - 1u, 0xFFFFFFFFu, bits == 32u);

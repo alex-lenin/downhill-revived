@@ -125,7 +125,7 @@ typedef struct {
    native_convert); the constants match its Convert struct. */
 typedef struct {
     uint32_t tex[4], size[4];
-    uint32_t slot[4][4];               /* per source surface: page, bw, 1 for depth, Z units (float bits) */
+    uint32_t slot[4][4];               /* per source surface: page, bw, 1 for depth or 2 for 16-bit colour, Z units (float bits) */
     uint8_t pages[512];                /* per GS page: 0 the CPU copy (the decoded base), 1-4 a source slot */
     uint32_t palette[256];
 } NativeConvertConstants;
@@ -379,24 +379,84 @@ static NativeCommand *native_command(Native *n)
     return c;
 }
 
-/* CPU memory (uploads, or nothing yet) becomes the surface's starting content for that page. */
+static void native_reserve(NativeFrame *f, unsigned more);
+static void native_reserve_indices(NativeFrame *f, unsigned more);
+static void native_quad_indexed(NativeFrame *f, const NativeVertex q[4]);
+static unsigned native_next(const Native *n, const NativeFrame *f);
+
+/* A page another colour surface drew in the other pixel layout: the rider shadow's 64x64 buffer
+   is drawn as 32-bit, then through a 16-bit view of the same memory (moving bits into the 32-bit
+   alpha), then as 32-bit again (finding 096). The GS memory holds what the last draw left; the CPU
+   copy holds none of it (native draws never reach it). So the GPU rebuilds the page from the
+   surface that drew it, in this surface's layout (native.wgsl's native_convert), and a sprite draws
+   it in. 0 when the field has no conversion left. */
+static int native_import_converted(Native *n, int surface, unsigned page, int previous, int x, int y, unsigned w,
+                                   unsigned h)
+{
+    NativeFrame *f = n->recording;
+    if (f->convert_count == NATIVE_CONVERTS) return 0;
+    if (!f->converts && !(f->converts = malloc(NATIVE_CONVERTS * sizeof *f->converts))) native_oom("conversions");
+    const NativeSurface *s = &n->surfaces[surface], *from = &n->surfaces[previous];
+    NativeConvert *v = &f->converts[f->convert_count];
+    memset(v, 0, sizeof *v);
+    for (unsigned i = 0; i < 4; i++) v->surface[i] = -1;
+    v->surface[0] = (int16_t)previous;
+    if (n->usage) n->usage[previous].converted++;
+    v->constants.slot[0][0] = from->page; v->constants.slot[0][1] = from->bw; v->constants.slot[0][2] = from->wide ? 2 : 0;
+    v->constants.pages[page] = 1;
+    v->constants.tex[0] = s->wide ? GS_PSMCT16 : GS_PSMCT32; v->constants.tex[1] = page * 32; v->constants.tex[2] = 1;
+    v->constants.size[0] = w; v->constants.size[1] = h;
+    v->constants.size[3] = 0x80;  /* TEXA TA0 0, TA1 0x80: a 16-bit pixel's alpha bit as 16-bit draws leave it */
+    NativeCommand *c = native_command(n);
+    c->kind = NATIVE_DRAW; c->target = (int16_t)surface; c->convert = (int16_t)f->convert_count++;
+    c->color_mask = 15;
+    c->scissor = (NativeRect){x, y, x + (int)w, y + (int)h};
+    NativeConstants *k = &c->constants;
+    k->flags = 1 | 2 | 1 << 2 | 1024;  /* textured, RGBA as the texture has it (TCC, DECAL), a sprite */
+    k->alpha_scale = 255;
+    k->tex_size[0] = w; k->tex_size[1] = h;
+    k->wrap[0] = k->wrap[1] = 1;
+    k->target[0] = k->target[1] = 2048;
+    NativeVertex q[4];  /* corners 0 1 2 3, at GS pixel centres as native_record places them */
+    for (unsigned i = 0; i < 4; i++)
+        q[i] = (NativeVertex){(float)x + (float)(i & 1 ? w : 0) + 0.5f, (float)y + (float)(i & 2 ? h : 0) + 0.5f, 0,
+                              (float)(i & 1), (float)(i >> 1), 1, 1, 0x80808080u};
+    c->first = native_next(n, f); c->count = 6;
+    native_reserve(f, 6);
+    if (n->indexed) {
+        native_reserve_indices(f, 6);
+        native_quad_indexed(f, q);
+    } else {
+        NativeVertex *o = &f->vertices[f->vertex_count];
+        o[0] = q[0]; o[1] = q[1]; o[2] = q[2]; o[3] = q[2]; o[4] = q[1]; o[5] = q[3];
+        f->vertex_count += 6;
+    }
+    n->stats.converted++;
+    return 1;
+}
+
+/* The surface's starting content for a page: what another surface of the same layout drew there,
+   or that surface's page converted to this layout, else CPU memory (uploads, or nothing yet). */
 static void native_import_page(Native *n, Gs *g, int surface, unsigned page)
 {
     NativeSurface *s = &n->surfaces[surface];
     int x, y;
     if (s->depth || !native_page_origin(s, page, &x, &y)) return;
     unsigned w = 64, h = s->wide ? 64 : 32, psm = s->wide ? GS_PSMCT16 : GS_PSMCT32;
-    int previous = native_owner(n, g, page);
+    int previous = native_owner(n, g, page), sx, sy;
+    if (previous >= 0 && previous != surface && !n->surfaces[previous].depth) {
+        if (n->surfaces[previous].wide == s->wide && native_page_origin(&n->surfaces[previous], page, &sx, &sy)) {
+            NativeCommand *c = native_command(n);
+            c->kind = NATIVE_COPY; c->source = (int16_t)previous; c->target = (int16_t)surface;
+            c->x = x; c->y = y; c->w = (int)w; c->h = (int)h; c->sx = sx; c->sy = sy;
+            n->stats.copies++;
+            if (n->usage) n->usage[previous].copied_out++, n->usage[surface].copied_in++;
+            return;
+        }
+        if (native_import_converted(n, surface, page, previous, x, y, w, h)) return;
+    }
     NativeCommand *c = native_command(n);
     c->target = (int16_t)surface; c->x = x; c->y = y; c->w = (int)w; c->h = (int)h;
-    if (previous >= 0 && previous != surface && !n->surfaces[previous].depth &&
-        n->surfaces[previous].wide == s->wide &&
-        native_page_origin(&n->surfaces[previous], page, &c->sx, &c->sy)) {
-        c->kind = NATIVE_COPY; c->source = (int16_t)previous;
-        n->stats.copies++;
-        if (n->usage) n->usage[previous].copied_out++, n->usage[surface].copied_in++;
-        return;
-    }
     c->kind = NATIVE_IMPORT;
     c->pixels = malloc(w * h * 4);
     if (!c->pixels) native_oom("import");
