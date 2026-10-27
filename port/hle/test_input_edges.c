@@ -99,6 +99,7 @@ int pads_multitap(void) { abort(); }
 void pads_read(int i,HostPad *p) { abort(); }
 int pads_online(void) { return 0; }
 int pads_connected(void) { abort(); }
+int pads_live(void) { return 0; }
 void host_pad_device(int i,HostPad *p) { abort(); }
 void host_pad_vibrate(int i,int a,int b) { abort(); }
 void rpc_unknown(const char *s,int f,void *a,int n,void *b,int m) { abort(); }

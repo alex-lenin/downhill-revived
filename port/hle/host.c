@@ -815,7 +815,7 @@ static void keyboard_merge(HostPad *out)
 /* Without SDL (DHD_SDL=0, or it didn't start): XInput pad `port`, else (port 0) a DualSense or
    DualShock 4 over raw HID. */
 #ifdef _WIN32
-static void direct_pad(int port, HostPad *out)
+static int direct_pad(int port, HostPad *out)
 {
     XInputGetStateFn get = xinput();
     XState x;
@@ -839,7 +839,7 @@ static void direct_pad(int port, HostPad *out)
             out->pressure[i] = pressure_order[i] == PAD_L2 ? x.left_trigger
                              : pressure_order[i] == PAD_R2 ? x.right_trigger
                              : out->buttons & pressure_order[i] ? 255 : 0;
-        return;
+        return 1;
     }
     SonyState sony;
     if (port == 0 && sony_read(&sony)) {
@@ -867,13 +867,16 @@ static void direct_pad(int port, HostPad *out)
             out->pressure[i] = pressure_order[i] == PAD_L2 ? sony.l2
                              : pressure_order[i] == PAD_R2 ? sony.r2
                              : out->buttons & pressure_order[i] ? 255 : 0;
+        return 1;
     }
+    return 0;
 }
 #else
-static void direct_pad(int port, HostPad *out)
+static int direct_pad(int port, HostPad *out)
 {
     (void)port;
     (void)out;
+    return 0;
 }
 #endif
 
@@ -883,9 +886,9 @@ void host_pad_device(int port, HostPad *out)
 {
     memset(out, 0, sizeof *out);
     out->right_x = out->right_y = out->left_x = out->left_y = 128;
-    if (gamepad_start()) gamepad_read(port, out);
-    else direct_pad(port, out);
+    int connected = gamepad_start() ? gamepad_read(port, out) : direct_pad(port, out);
     if (port == 0) keyboard_merge(out);
+    out->connected = (uint8_t)(connected || port == 0);  /* player 1 always has the keyboard */
 }
 
 /* The startup movies (func_001EBFD8: the logos, then the attract movie) play unless dhd.ini's

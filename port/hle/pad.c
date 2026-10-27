@@ -5,7 +5,8 @@
    those frames from the host's controller (host_pad_read) at each VBLANK. Request and frame
    layouts as Sony's libpad uses them (ps2sdk's ee/rpc/pad documents the same protocol).
    Every pad is a DualShock 2. One pad is port 0 slot 0; two are ports 0 and 1; three or four
-   sit in a multitap on port 0, slots 0-3 (DHD_PADS, 4 online; finding 040). Player i's input
+   sit in a multitap on port 0, slots 0-3 (DHD_PADS; finding 040). Played by hand there are
+   always four, each connected while its player has a controller (pads_live). Player i's input
    comes from online.c's pads_read: the host's controller or a script (online too: the race is
    this PC's own, the others' riders are puppets). */
 #include "hle.h"
@@ -17,7 +18,7 @@
 enum { PAD_OPEN = 0x01, PAD_SET_MMODE = 0x06, PAD_SET_ACTDIR = 0x07, PAD_SET_ACTALIGN = 0x08,
        PAD_GET_BTNMASK = 0x09, PAD_SET_BTNINFO = 0x0A, PAD_SET_VREF = 0x0B, PAD_GET_PORTMAX = 0x0C,
        PAD_GET_SLOTMAX = 0x0D, PAD_CLOSE = 0x0E, PAD_END = 0x0F, PAD_INIT = 0x10, PAD_GET_MODVER = 0x12 };
-enum { STATE_STABLE = 6, RSTAT_COMPLETE = 0 };
+enum { STATE_DISCONN = 0, STATE_STABLE = 6, RSTAT_COMPLETE = 0 };
 enum { ID_DIGITAL = 0x41, ID_ANALOG = 0x73, ID_PRESSURE = 0x79 };
 
 typedef struct {                 /* one frame of the EE's pad area */
@@ -78,7 +79,10 @@ static void fill(Pad *p, PadFrame *f, int player)
     f->num_act_comb = 1;
     f->mode = (uint8_t)p->analog;
     f->lock = (uint8_t)p->locked;
-    f->state = STATE_STABLE;
+    /* played by hand, players 2-4's pads without a controller are unplugged (pads_live; player 1
+       always has the keyboard, and online scripts drive it); the game's pad loop sets a pad up
+       again when its controller comes back */
+    f->state = pads_live() && player > 0 && !in.connected ? STATE_DISCONN : STATE_STABLE;
     f->req_state = RSTAT_COMPLETE;
     f->current_task = 1;  /* stable: the info reads are allowed */
     f->run_task = 0;

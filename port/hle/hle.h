@@ -96,6 +96,7 @@ typedef struct {
     uint16_t buttons;
     uint8_t right_x, right_y, left_x, left_y;
     uint8_t pressure[12];
+    uint8_t connected;  /* host_pad_device: a controller for that player (for player 1 also the keyboard) */
 } HostPad;
 void host_pad_read(int port, HostPad *out);  /* a script if one is set, else the controller */
 int host_pad_script(int player, HostPad *out);  /* DHD_NAV / DHD_AUTOPAD / DHD_RACE_PAD; 0 if none */
@@ -188,7 +189,8 @@ void menu_mouse_merge(int player, HostPad *out);
 void pad_refresh(void);  /* the newest frames' input read again (just-in-time frames, kernel.c) */
 
 /* ---- online.c: where the pads' input comes from ---- */
-int pads_connected(void);   /* controllers plugged in: DHD_PADS (1-4), 4 in an online race */
+int pads_connected(void);   /* pads the game can open: DHD_PADS (1-4), 1 online, else 4 (pads_live) */
+int pads_live(void);        /* played by hand: no DHD_PADS, script or DHD_NET_*; each pad then follows its controller */
 int pads_multitap(void);    /* 3-4 pads: a multitap on port 0, player i in slot i */
 void pads_begin_field(void);                /* each vsync, before the pads are read */
 void pads_read(int player, HostPad *out);   /* player i's controller for this field */

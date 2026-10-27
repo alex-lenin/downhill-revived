@@ -80,11 +80,30 @@ void hle_online_from_menu(void)
     from_menu = 1;
 }
 
+/* Played by hand, the game finds a multitap with four pads at boot, as it only looks once, and
+   each pad reads as connected while that player has a controller (pad.c), so the 2-4 player
+   modes take controllers plugged in at any time (issue #7: with one pad the game said "TWO
+   CONTROLLERS MUST BE CONNECTED" whatever SDL had found). Tools, scripts and DHD_NET_* races keep
+   DHD_PADS (default 1), whose pads are always connected. */
+int pads_live(void)
+{
+    static int live = -1;
+    if (live < 0) {
+        static const char *const scripted[] = {"DHD_PADS", "DHD_NAV", "DHD_AUTOPAD", "DHD_AUTOPAD_FRAMES",
+                                               "DHD_RACE_PAD", "DHD_RACE_PAD1", "DHD_RACE_PAD2",
+                                               "DHD_RACE_PAD3", "DHD_RACE_SYNC", "DHD_KEYS"};
+        live = !online_mode();
+        for (size_t i = 0; i < sizeof scripted / sizeof *scripted; i++)
+            if (getenv(scripted[i])) live = 0;
+    }
+    return live;
+}
+
 int pads_connected(void)
 {
     if (npads < 0) {
         const char *s = getenv("DHD_PADS");
-        npads = online_mode() ? 1 : s && *s ? atoi(s) : 1;
+        npads = online_mode() ? 1 : pads_live() ? 4 : s && *s ? atoi(s) : 1;
         if (npads < 1) npads = 1;
         if (npads > 4) npads = 4;
     }
