@@ -195,6 +195,9 @@ impl Surface {
         (self.width, self.height)
     }
 
+    /// DHD_FRAME_LATENCY (1-3, default 1): pictures the swapchain may hold. 1 has the least input
+    /// delay, but each acquire then waits until the compositor (G-Sync, overlays) has released the
+    /// last picture; 2 or 3 give the render thread room when that release is late (stutter tests).
     fn configure(&mut self, width: u32, height: u32) {
         let max = self.gpu.device.limits().max_texture_dimension_2d;
         let (width, height) = (width.min(max), height.min(max));
@@ -204,7 +207,7 @@ impl Surface {
             width,
             height,
             present_mode: self.present_mode,
-            desired_maximum_frame_latency: 1,
+            desired_maximum_frame_latency: frame_latency(),
             alpha_mode: self.alpha_mode,
             view_formats: vec![],
         });
@@ -339,4 +342,12 @@ impl Surface {
             frame.present();
         }
     }
+}
+
+/// DHD_FRAME_LATENCY, read once (Surface::configure).
+fn frame_latency() -> u32 {
+    static LATENCY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LATENCY.get_or_init(|| {
+        std::env::var("DHD_FRAME_LATENCY").ok().and_then(|s| s.trim().parse::<u32>().ok()).map_or(1, |n| n.clamp(1, 3))
+    })
 }
