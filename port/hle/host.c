@@ -518,7 +518,9 @@ void host_init(void)
 /* dhd.exe is a Windows program (/subsystem:windows), so a double-click opens no console window.
    Its log (stderr, stdout) goes where the starter put it: the tools' files and pipes as before;
    started from a console window, that console; else (Explorer) dhd.log beside dhd.exe, which the
-   relaunched process appends to. Before anything prints. */
+   relaunched process appends to. A start with the launcher beside dhd.exe (not by the launcher)
+   appends too: it most likely only opens the launcher (update.c start_launcher), and the last
+   game's log, the one players attach to a report, stays. Before anything prints. */
 void host_console_init(void)
 {
 #ifdef _WIN32
@@ -531,8 +533,16 @@ void host_console_init(void)
         char path[MAX_PATH];
         DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
         while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
+        snprintf(path + n, sizeof path - n, "DownhillRevived.exe");
+        int append = getenv("DHD_RELAUNCHED") != NULL;
+        if (!append && !getenv("DHD_LAUNCHER") && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+            WIN32_FILE_ATTRIBUTE_DATA log;
+            snprintf(path + n, sizeof path - n, "dhd.log");
+            append = !GetFileAttributesExA(path, GetFileExInfoStandard, &log) ||
+                     (!log.nFileSizeHigh && log.nFileSizeLow < (1u << 20));  /* launcher = off: kept under 1 MB */
+        }
         snprintf(path + n, sizeof path - n, "dhd.log");
-        if (!freopen(path, getenv("DHD_RELAUNCHED") ? "a" : "w", stderr)) return;
+        if (!freopen(path, append ? "a" : "w", stderr)) return;
         freopen(path, "a", stdout);
     }
     setvbuf(stderr, NULL, _IONBF, 0);
