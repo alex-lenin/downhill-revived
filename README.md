@@ -6,8 +6,10 @@ Downhill Revived is a native 64-bit Windows port of *Downhill Domination* (PlayS
 Entertainment / SCEA, 2003). It is built on a matching decompilation: C/C++ source that
 compiles back to the original game program byte for byte. The port takes that source, builds it
 for the PC and replaces the PS2 hardware with native code. It adds a modern renderer, PC display
-options, the game's movies, memory card saves, texture packs, online races and automatic
-updates.
+options, the game's movies, memory card saves, texture packs, online races, a launcher and
+automatic updates.
+
+News, help and races: the [Discord server](https://discord.gg/XrSeTyzfr2).
 
 ## Legal notice
 
@@ -25,6 +27,9 @@ updates.
 
 What works today:
 
+- **A launcher**, `DownhillRevived.exe`: it opens before the game and holds the settings, your
+  rider name for online races, the disc image, updates, the release notes, the public races on
+  the server and a link to the [Discord server](https://discord.gg/XrSeTyzfr2). It works with a controller too.
 - **Native renderer** on Direct3D 12 or Vulkan, written in Rust on [wgpu](https://wgpu.rs). The
   original PS2 graphics hardware is reproduced on the GPU. An exact emulation path stays in the
   code as the reference it is tested against.
@@ -41,7 +46,10 @@ What works today:
   libmpeg2 from your disc. Skip Movies in PC SETTINGS (on in a new install) skips them.
 - **PC SETTINGS in the game's own OPTIONS menu**: resolution, display mode, window size, picture
   shape, scaling, widescreen, skip movies, vibration, texture pack and font, drawn with the
-  game's own menus and font. Changes are saved to `dhd.ini`.
+  game's own menus and font. Changes are saved to `dhd.ini`. V-Sync (on in a new install) shows
+  each picture without tearing.
+- **Unlock All** (PC SETTINGS, off by default): every track, rider, bike and shop item reads as
+  unlocked while it is on. Your save isn't changed, so turning it off brings your own progress back.
 - **A sharp font**: the game's text is drawn with clean edges at any resolution, made in memory
   from the font on your disc (PC SETTINGS > Font: Sharp or Original).
 - **Texture packs**: replacement packs made for PCSX2 (PNG files named by PCSX2's texture hash)
@@ -59,7 +67,8 @@ What works today:
 - **Memory card saves**, stored as plain files beside the game.
 - **Controllers**: Xbox pads, DualSense, DualShock 4, Switch Pro, 8BitDo and most other USB or
   Bluetooth pads (through SDL3 and its controller database), with vibration where the pad has
-  motors. Buttons go by position, as on a PlayStation pad.
+  motors. Buttons go by position, as on a PlayStation pad. The 2-4 player modes use every
+  connected controller.
 - **Keyboard play**: a whole race on the keyboard, with gradual steering; letters go by their
   place on the keyboard, so AZERTY and QWERTZ work too (see [Controls](#controls)).
 - **Sound**: the game's sound driver is replaced by a native mixer, with music, effects and reverb.
@@ -78,13 +87,15 @@ Known gaps:
 ## Playing
 
 1. Download `DownhillRevived-<version>-win.zip` from the [Releases](../../releases) page and
-   unzip it into a folder you can write to (not Program Files). It holds `dhd.exe`,
-   `dxcompiler.dll` (Microsoft's shader compiler), `README.txt`, `LICENSE.txt` and
-   `THIRD-PARTY-NOTICES.txt`; nothing else is needed.
-2. Run `dhd.exe`.
-3. The first time, the game asks for your disc image. Pick your `.iso` of the USA disc. It is
-   checked and remembered in `dhd.ini`, which the game writes then; you won't be asked again
-   unless the file moves or changes.
+   unzip it into a folder you can write to (not Program Files). It holds `DownhillRevived.exe`
+   (the launcher), `dhd.exe` (the game), `dxcompiler.dll` (Microsoft's shader compiler),
+   `README.txt`, `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt`; nothing else is needed.
+2. Run `DownhillRevived.exe` (`dhd.exe` opens it too) and press PLAY.
+3. The first time, choose your disc image: your `.iso` of the USA disc. It is checked and
+   remembered in `dhd.ini`; you won't be asked again unless the file moves or changes.
+
+To start the game without the launcher, turn off Settings > Game > Open the launcher first in the
+launcher (or put `launcher = off` in `dhd.ini`); `dhd.exe` then starts the game straight away.
 
 Files the game keeps beside `dhd.exe`:
 
@@ -97,10 +108,11 @@ Files the game keeps beside `dhd.exe`:
 
 ### Updates
 
-At start the game looks for a newer release. If there is one it asks: **Update now** downloads
-it, checks its SHA-256, puts it in place and starts the game again; **Later** starts this
-version. Without a network the game just starts. An update replaces `dhd.exe` and the other files
-of the release (the text files, `dxcompiler.dll`), never `dhd.ini` or `saves\`. You can also
+The launcher looks for a newer release when it opens and shows **Update** when there is one; it
+downloads the release, checks its SHA-256, puts it in place and opens again (`auto_update = on`
+installs without asking). Without the launcher the game itself asks at start: **Update now** or
+**Later**. Without a network the game just starts. An update replaces `dhd.exe`, the launcher and
+the other files of the release (the text files, `dxcompiler.dll`), never `dhd.ini` or `saves\`. You can also
 update by hand: copy the files of a newer release over your folder (a release holds no `dhd.ini`
 and no saves, so yours are kept). Online races need the newest version; an older one is offered
 Update Now in the ONLINE menu.
@@ -176,6 +188,10 @@ first start. The PC SETTINGS page writes most of them for you.
 | `update_url` | (empty) | where to look for updates; empty: this project's GitHub releases |
 | `server` | (empty) | the online server; empty: the official one |
 | `font` | `sharp` | `original` draws the game's font as the PS2 does |
+| `vsync` | `1` | `1` shows each picture without tearing, `0` sends it at once (may tear) |
+| `unlock_all` | `0` | `1`: everything reads as unlocked, without changing the save |
+| `name` | (empty) | your rider name in online races |
+| `launcher` | on | `off`: `dhd.exe` starts the game without opening the launcher |
 
 Each key has a `DHD_*` environment variable (`scale` is `DHD_SCALE`, `server` is
 `DHD_NET_SERVER`; see [docs/BUILDING.md](docs/BUILDING.md)), which wins over the file.
