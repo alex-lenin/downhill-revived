@@ -189,6 +189,16 @@ void race_sync_vsync(unsigned long long field)
             race_started[i] = 1;
             fprintf(stderr, "compare: race anchor=%c field=%llu clock=%d\n", "cg"[i], field, race_clock);
         }
+    /* DHD_RACE_FINISH_AT=seconds (tests): player 1's rider finishes at that race-clock time through
+       the game's own finish-now flag (0x43EF22 + slot, as online.c's DHD_NET_TEST_FINISH), so a
+       scripted race can end in any place, ahead of or behind the AI riders. */
+    static HleEnv finish_env;
+    const char *finish_at = hle_env(&finish_env, "DHD_RACE_FINISH_AT");
+    if (finish_at && race_in(1) && race_clock > atof(finish_at) * 60 &&
+        !*(volatile uint8_t *)0x0843EF18 && !*(volatile uint8_t *)0x0843EF22) {
+        *(volatile uint8_t *)0x0843EF22 = 1;
+        fprintf(stderr, "compare: finish now field=%llu clock=%d\n", field, race_clock);
+    }
 }
 
 /* From the countdown the pad is neutral, then DHD_RACE_PAD (player 0; DHD_RACE_PAD<n> for

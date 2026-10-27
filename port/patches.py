@@ -416,6 +416,13 @@ PATCHES['unsorted/00235F38.c'] = [('text', 'if (fabsf(step) < minStep) {', 'if (
 # in 32-bit address arithmetic (EE, i686). wasm32 folds the index into the store's unsigned offset,
 # which never wraps: the 64-bit build wrote 4 GiB past p and crashed late in races; write p[-1].
 PATCHES['unsorted/00224CC8.c'] = [('text', '((float *)p)[0x3fffffff]=', '((float *)p)[-1]=')]
+# The career finish text (func_0017A678) sprintfs "%d MORE CREDITS REQUIRED TO ADVANCE" into a 32-byte
+# stack buffer when the race did not advance the career (issue #8, finding 094): with two digits that
+# is 36 bytes. On the EE the overrun hits dead bytes of the frame above. In the wasm core buf is in the
+# topmost shadow frame of the main EE fiber's 256 KB slot (fiber_x64.c), so the overrun wrote into the
+# next slot's guard page at 0x06040000 and the 64-bit game crashed on every non-advancing finish.
+PATCHES['unsorted/0017A678.cpp'] = PATCHES.get('unsorted/0017A678.cpp', []) + [
+    ('text', '    char buf[0x20];', '    char buf[0x40];')]
 # Tracks at 3-4 players (public issue #1): the PS2 offered only a fixed five (mask 0x020001C2:
 # MOAB, ALPINEMX, MOABMX, JUNGLEMX, BCTDX), whatever the save had unlocked, most likely for its
 # frame rate with four views; every track loads the same "2" level files at 2-4 players (CITYMX
