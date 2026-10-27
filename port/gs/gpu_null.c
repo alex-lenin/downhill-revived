@@ -69,6 +69,13 @@ void gs_native_vsync(Gs *g, unsigned *width, unsigned *height, int resize)
     (void)resize;
 }
 
+void gs_native_vsync_handed(Gs *g, unsigned *width, unsigned *height, int resize, double due, double began,
+                            int flat_limit)
+{
+    (void)due, (void)began, (void)flat_limit;
+    gs_native_vsync(g, width, height, resize);
+}
+
 void gs_native_bench(Gs *g, int end)
 {
     (void)g;

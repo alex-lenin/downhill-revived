@@ -236,15 +236,35 @@ static void readback(void)
    transfer state must be identical. */
 extern int image_reference;
 static Gs upload_fast, upload_slow;
+/* The pages each Gs asked its backend to sync, in order (write_pixel's sync_range). */
+static unsigned sync_log[2][1 << 16], sync_count[2];
+static void sync_fast(Gs *g, unsigned address, unsigned bytes)
+{
+    (void)g; (void)bytes;
+    if (sync_count[0] < 1 << 16) sync_log[0][sync_count[0]] = address;
+    sync_count[0]++;
+}
+static void sync_slow(Gs *g, unsigned address, unsigned bytes)
+{
+    (void)g; (void)bytes;
+    if (sync_count[1] < 1 << 16) sync_log[1][sync_count[1]] = address;
+    sync_count[1]++;
+}
 static void upload_fuzz(void)
 {
     static const unsigned formats[] = {0, 1, 2, 10, 19, 20, 27, 36, 44, 48, 49, 50, 58};
     unsigned random = 0x2468ACEu, differing = 0;
     static uint32_t words[4 * 1200];
     gs_reset(&upload_fast); gs_reset(&upload_slow);
-    for (unsigned trial = 0; trial < 3000; trial++) {
+    upload_fast.sync_range = sync_fast; upload_slow.sync_range = sync_slow;
+    for (unsigned trial = 0; trial < 6000; trial++) {
 #define RND (random = random * 1664525u + 1013904223u, random >> 8)
         unsigned psm = formats[RND % 13], bp = RND & 16383, bw = RND % 12, x = RND & 2047, y = RND & 2047;
+        /* Half of them page-aligned PSMCT32, the game's uploads (memory.c's write_ct32). */
+        if (trial & 1) psm = 0, bp &= ~31u;
+        /* Some pages stay dirty, so a transfer meets both kinds. */
+        if (RND % 3 == 0) memset(upload_fast.host_dirty, 0, 64), memset(upload_slow.host_dirty, 0, 64);
+        sync_count[0] = sync_count[1] = 0;
         unsigned w = 1 + RND % 300, h = 1 + RND % 40, qwords = 1 + RND % 1100, hwreg = RND % 4 == 0;
         for (unsigned i = 0; i < qwords * 4; i++) { unsigned low = RND; words[i] = low ^ RND << 16; }
         for (int pass = 0; pass < 2; pass++) {
@@ -275,15 +295,19 @@ static void upload_fuzz(void)
             upload_fast.transfer_bits != upload_slow.transfer_bits ||
             upload_fast.pixels_written != upload_slow.pixels_written ||
             memcmp(upload_fast.page_writes, upload_slow.page_writes, sizeof upload_fast.page_writes) ||
-            memcmp(upload_fast.host_dirty, upload_slow.host_dirty, sizeof upload_fast.host_dirty))
+            memcmp(upload_fast.host_dirty, upload_slow.host_dirty, sizeof upload_fast.host_dirty) ||
+            memcmp(upload_fast.path, upload_slow.path, sizeof upload_fast.path) ||
+            sync_count[0] != sync_count[1] ||
+            memcmp(sync_log[0], sync_log[1], (sync_count[0] < 1 << 16 ? sync_count[0] : 1 << 16) * sizeof **sync_log))
             differing++;
 #undef RND
     }
     CHECK(differing == 0);
     CHECK(!memcmp(upload_fast.vram, upload_slow.vram, sizeof upload_fast.vram));
     CHECK(upload_fast.pixels_written > 1000000);
-    printf("upload fuzz: 3000 transfers, %llu pixels, %u differing\n", (unsigned long long)upload_fast.pixels_written,
+    printf("upload fuzz: 6000 transfers, %llu pixels, %u differing\n", (unsigned long long)upload_fast.pixels_written,
            differing);
+    upload_fast.sync_range = upload_slow.sync_range = NULL;
 }
 
 int main(void)

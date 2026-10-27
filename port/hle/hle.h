@@ -20,8 +20,9 @@
 /* Logs to stderr; DHD_LOG set in the environment turns on the verbose messages. */
 void hle_log(const char *fmt, ...);
 extern int hle_verbose;
-/* DHD_GRAPHICS_ORDERED (the browser's threaded build sets it, port/web/www/worker.js): the graphics
-   workers run every queued call in the order it was made (port/web/web_queue.h), so the waits that
+/* DHD_GRAPHICS_ORDERED (the browser's threaded build sets it, port/web/www/worker.js; the native
+   hosts' deferred vsync implies it, kernel.c): the graphics workers run every queued call in the
+   order it was made (port/web/web_queue.h, port/gs/present.c's picture), so the waits that
    only put earlier graphics work before a later queued call are skipped (kernel.c's vsync after the
    VBLANK handlers, sceGsSyncPath). Every read of graphics state still waits: the GS calls that
    return a value, and ps2_graphics_sync before the EE touches mapped VU1/VIF1/GIF/GS state. */
@@ -161,6 +162,11 @@ void graphics_settle(void);
 void graphics_shutdown(void);
 /* VIF1/GIF run on the graphics worker unless DHD_MTVU=0 (graphics_queue.c). */
 int graphics_threaded(void);
+/* The host's side of the deferred vsync (graphics_queue.c; the game's side: kernel.c). */
+int graphics_deferred(void);
+void graphics_vblank(void);
+void graphics_present(const void *payload, unsigned bytes);
+extern void (*graphics_present_marked)(const void *payload);
 
 /* ---- sif.c: RPC servers (one per IOP module server id) ---- */
 typedef void (*RpcServer)(int fno, void *send, int ssize, void *recv, int rsize);

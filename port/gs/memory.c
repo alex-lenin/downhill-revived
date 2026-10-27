@@ -134,12 +134,45 @@ void gs_write_pixel(Gs *g, unsigned psm, unsigned bp, unsigned bw, unsigned x, u
         write_pixel(g, PSM, bp, bw, x & 2047, y & 2047, v);                                            \
         if (++x == x_end) x = x0, y++;                                                                 \
     }
+/* PSMCT32 from a page-aligned base pointer (the game's texture uploads): the pixels of a row
+   inside one 64-pixel page column all land in one physical page, so a run of them is synced,
+   marked and counted once, then stored at pixel_address's word offsets (block and column bits
+   of x and y, separately). The same words, counters and sync_range calls, in the same order, as
+   write_pixel per pixel. */
+static void write_ct32(Gs *g, unsigned bp, unsigned bw, unsigned x0, unsigned y0, unsigned width, unsigned first,
+                       unsigned count, const uint8_t *data)
+{
+    unsigned x = x0 + first % width, y = y0 + first / width, x_end = x0 + width;
+    while (count) {
+        unsigned px = x & 2047, py = y & 2047, n = 64 - px % 64;
+        if (n > x_end - x) n = x_end - x;
+        if (n > count) n = count;
+        unsigned page = (bp / 32 + (py / 32) * bw + px / 64) & 511, bit = 1u << (page & 31);
+        if (!(g->host_dirty[page / 32] & bit) && g->sync_range)
+            g->sync_range(g, page * 8192, 8192);
+        g->host_dirty[page / 32] |= bit;
+        g->page_writes[page] += n;
+        g->pixels_written += n;
+        unsigned r = py % 32;
+        uint32_t *row = &g->vram[page * 2048 + ((r & 8) << 4 | (r & 16) << 5 | (r & 1) << 1 | (r & 6) << 3)];
+        for (unsigned i = 0; i < n; i++, data += 4) {
+            unsigned c = (px + i) % 64;
+            uint32_t v = (uint32_t)data[0] | (uint32_t)data[1] << 8 | (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
+            row[(c & 8) << 3 | (c & 16) << 4 | (c & 32) << 5 | (c & 1) | (c & 6) << 1] = v;
+        }
+        count -= n;
+        if ((x += n) == x_end) x = x0, y++;
+    }
+}
+
 void gs_write_pixels(Gs *g, unsigned psm, unsigned bp, unsigned bw, unsigned x0, unsigned y0, unsigned width,
                      unsigned first, unsigned count, const uint8_t *data)
 {
     unsigned x = x0 + first % width, y = y0 + first / width, x_end = x0 + width;
     switch (psm) {
-    case GS_PSMCT32: WRITE_PIXELS(GS_PSMCT32, 32) break;
+    case GS_PSMCT32:
+        if (!(bp % 32)) { write_ct32(g, bp, bw, x0, y0, width, first, count, data); break; }
+        WRITE_PIXELS(GS_PSMCT32, 32) break;
     case GS_PSMCT24: WRITE_PIXELS(GS_PSMCT24, 24) break;
     case GS_PSMCT16: WRITE_PIXELS(GS_PSMCT16, 16) break;
     case GS_PSMCT16S: WRITE_PIXELS(GS_PSMCT16S, 16) break;

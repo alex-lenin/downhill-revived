@@ -693,6 +693,7 @@ static void bench_vsync(void)
     if (field < first) return;
     double now = host_wall_seconds();
     if (field == first) {
+        if (graphics_deferred()) graphics_wait();  /* gs_native_bench reads the GS worker's renderer */
         start = previous = now; gs_native_bench(&gs, 0); snd_host_bench(0); bench_threads(0, 0, 0);
         graphics_timeline(0, (unsigned)field, 0);
         return;
@@ -702,6 +703,7 @@ static void bench_vsync(void)
     graphics_timeline(field < last ? 1 : 2, (unsigned)field, now - previous);
     previous = now;
     if (field < last) return;
+    if (graphics_deferred()) graphics_wait();
     gs_native_bench(&gs, 1);
     snd_host_bench(1);
     unsigned n = (unsigned)(last - first), worst = n / 100 ? n / 100 : 1;
@@ -720,6 +722,7 @@ static void bench_vsync(void)
 }
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height);  /* port/hle/movie.c */
+int host_widescreen_flat_limit(void);  /* port/hle/host.c */
 
 /* The graphics didn't start. The game would go on with no window (heard, never seen) behind a
    start window stuck on its graphics step: instead the start window closes, a message says why
@@ -736,13 +739,46 @@ static void graphics_failed(void)
     exit(1);
 }
 
+/* Plain MMIO pages are the authoritative privileged register storage: the GS takes them at each
+   picture. Then counts changed display buffers, excluding repeated interlaced fields (the game's
+   menu counter does not cover every track-intro render path). */
+static void present_registers(const uint64_t *mmio)
+{
+    static unsigned previous_bp = ~0u;
+    for (unsigned addr = 0; addr <= 0xE0; addr += 16)
+        gs_priv_write(&gs, addr, mmio[addr / 16]);
+    uint64_t pmode = gs_priv_read(&gs, GS_PMODE);
+    unsigned bp = (unsigned)gs_priv_read(&gs, pmode & 1 ? GS_DISPFB1 : GS_DISPFB2) & 511;
+    if ((pmode & 3) && bp != previous_bp) { gs_presented_frames++; previous_bp = bp; }
+}
+
+/* A native picture handed on in order with the drawing (deferred vsync, graphics_queue.c): the
+   register page as the VBLANK handlers left it, and what the game thread knew at its vsync. */
+typedef struct {
+    uint64_t mmio[15];
+    double due, began;  /* pacing_handed */
+    int32_t resize, flat_limit;
+} PresentMark;
+
+/* The GS owner, once the drawing queued before the picture has run. */
+static void present_marked(const void *payload)
+{
+    PresentMark m;
+    unsigned width, height;
+    memcpy(&m, payload, sizeof m);
+    present_registers(m.mmio);
+    gs_native_movie(&gs, NULL, 0, 0);
+    gs_native_vsync_handed(&gs, &width, &height, m.resize, m.due, m.began, m.flat_limit);
+}
+
 void gs_vsync(void)
 {
     static int profile;
     static int cpu_scanout;
     static double profile_start;
-    static unsigned fields, previous_frames, previous_presented, previous_bp = ~0u;
+    static unsigned fields, previous_frames, previous_presented;
     if (!initialized) {
+        if (graphics_deferred()) graphics_wait();  /* the renderer starts with the GS worker idle */
         initialized = 1;
         disabled = getenv("DHD_HEADLESS") != NULL;
         if (!disabled && !init()) graphics_failed();
@@ -759,19 +795,30 @@ void gs_vsync(void)
 #ifdef __ANDROID__
     { void android_perf_field(void); android_perf_field(); }  /* port/host/android_perf.c: CPU clocks */
 #endif
-    /* Plain MMIO pages are the authoritative privileged register storage. */
-    for (unsigned addr = 0; addr <= 0xE0; addr += 16)
-        gs_priv_write(&gs, addr, *(volatile uint64_t *)GUEST(0x12000000 + addr));
-    /* Count changed display buffers, excluding repeated interlaced fields.
-       The game's menu counter does not cover every track-intro render path. */
-    uint64_t pmode = gs_priv_read(&gs, GS_PMODE);
-    unsigned bp = (unsigned)gs_priv_read(&gs, pmode & 1 ? GS_DISPFB1 : GS_DISPFB2) & 511;
-    if ((pmode & 3) && bp != previous_bp) { gs_presented_frames++; previous_bp = bp; }
-    unsigned width = 640, height = 448;
-    int gpu_frame = 1;
+    uint64_t mmio[15];
+    for (unsigned addr = 0; addr <= 0xE0; addr += 16) mmio[addr / 16] = *(volatile uint64_t *)GUEST(0x12000000 + addr);
     /* While a movie plays (port/hle/movie.c, finding 055) its picture is shown instead. */
     unsigned movie_width, movie_height;
     const uint32_t *movie = movie_picture(&movie_width, &movie_height);
+    /* Deferred vsync: the GS worker hands the native picture on after the drawing queued before it;
+       the game thread goes on. A movie or the exact renderer waits for the drawing here instead.
+       (Capture and DHD_PROFILE turn deferral off: they read the GS below.) */
+    if (graphics_deferred()) {
+        if (!movie && gs_gpu_native(&gs)) {
+            PresentMark m;
+            memcpy(m.mmio, mmio, sizeof m.mmio);
+            pacing_handed(&m.due, &m.began);
+            m.resize = resize_pending, m.flat_limit = host_widescreen_flat_limit();
+            resize_pending = 0;
+            graphics_present_marked = present_marked;
+            graphics_present(&m, sizeof m);
+            return;
+        }
+        graphics_wait();
+    }
+    present_registers(mmio);
+    unsigned width = 640, height = 448;
+    int gpu_frame = 1;
     if (gs_gpu_native(&gs)) {
         /* The native renderer's thread draws and presents; capture waits for its picture. */
         gs_native_movie(&gs, movie, movie_width, movie_height);

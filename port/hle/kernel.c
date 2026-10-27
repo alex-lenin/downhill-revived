@@ -809,6 +809,22 @@ static int jit_on(void)
 
 int graphics_ordered;  /* hle.h */
 
+/* Deferred vsync (finding 090 HO1, after finding 048): when the host offers it
+   (host_service_graphics_threaded() == 2), the EE does not wait for the drawing at vsync. The host
+   queues the VBLANK (gs_vblank: CSR VSINT and FIELD, the readback field) behind the drawing, hands
+   the picture on after the VBLANK handlers' packets (present.c), and the game goes on with the next
+   field while VU1 and the GS finish this one; at most two fields are in flight (graphics_queue.c).
+   The CSR the game reads is its MMIO page, which only the EE writes. The bits the GS sets while
+   drawing (SIGNAL, FINISH) are known only once it has drawn; the rest only the EE changes. So the
+   host writes a provisional CSR there, exact but for those two bits (the last value with the
+   VBLANK applied), and its next wait (host_service_graphics_wait: every fence, every wait here)
+   puts the exact value the VBLANK left in its place, the value a full wait at vsync reads.
+   Unfenced, only CSR.FIELD is read (func_0020BED0; sceGsSyncV's load, port/tools/recomp.py), which
+   the provisional CSR has exact. The vsync waits as before with SetVSyncFlag (the CSR is copied to
+   RAM) and until the first exact CSR. No function of the core changes its address: the state trace
+   compares function-table indices the game keeps in RAM. */
+static int vsync_deferred, csr_exact;
+
 static void vsync(void)
 {
     /* The original online clock accounts for this time. Do not charge it
@@ -822,11 +838,16 @@ static void vsync(void)
     host_pacing_config(port_frame_period(),kernel_vsync_count);
     host_frame_context(kernel_vsync_count,host_seconds());
     port_fps_observe();  /* DHD_FPS_TRACE */
-    /* Presentation and the VBLANK handler consume completed graphics state. */
-    host_service_graphics_wait();
-    /* CSR acknowledgements and VBLANK must share the read-only FIELD state. */
-    host_service_gs_vblank();
-    GS_CSR = host_service_gs_priv_read(0x1000);
+    if (vsync_deferred && csr_exact && !vsync_flag_addr)
+        host_service_graphics_vblank();  /* the CSR page turns provisional */
+    else {
+        /* Presentation and the VBLANK handler consume completed graphics state. */
+        host_service_graphics_wait();
+        /* CSR acknowledgements and VBLANK must share the read-only FIELD state. */
+        host_service_gs_vblank();
+        GS_CSR = host_service_gs_priv_read(0x1000);
+        csr_exact = 1;
+    }
     if (vsync_flag_addr) {
         *(uint32_t *)(uintptr_t)vsync_flag_addr = 1;
         *(uint64_t *)(uintptr_t)vsync_csr_addr = GS_CSR;
@@ -1056,9 +1077,14 @@ void kernel_init(void)
     ps2_intc_read = intc_read;
     intc_stat = 0;
     *(volatile uint32_t *)(uintptr_t)PS2_INTC_STAT = 0;
-    ps2_graphics_sync = host_service_graphics_threaded() ? host_service_graphics_wait : NULL;
+    int threaded = host_service_graphics_threaded();
+    ps2_graphics_sync = threaded ? host_service_graphics_wait : NULL;
+    /* the host offers deferred vsyncs only where it queues the picture in order (never with
+       DHD_SCREENSHOT): the waits that only order graphics work go too */
+    vsync_deferred = threaded == 2;
     /* screenshot runs (DHD_SCREENSHOT) keep every wait */
-    graphics_ordered = ps2_graphics_sync && host_getenv("DHD_GRAPHICS_ORDERED") && !host_getenv("DHD_SCREENSHOT");
+    graphics_ordered = ps2_graphics_sync && (vsync_deferred || host_getenv("DHD_GRAPHICS_ORDERED")) &&
+                       !host_getenv("DHD_SCREENSHOT");
     ps2_vu1_regs_sync = ps2_graphics_sync;
     host_seconds();
     kernel_vsync_count = 0;

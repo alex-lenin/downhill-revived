@@ -2081,6 +2081,14 @@ int gs_gpu_native(const Gs *g)
 
 void gs_native_vsync(Gs *g, unsigned *width, unsigned *height, int resize)
 {
+    double due, began;
+    pacing_handed(&due, &began);
+    gs_native_vsync_handed(g, width, height, resize, due, began, host_widescreen_flat_limit());
+}
+
+void gs_native_vsync_handed(Gs *g, unsigned *width, unsigned *height, int resize, double due, double began,
+                            int flat_limit)
+{
     FILE *trace = native_field_trace("registers");
     if (trace) {
         extern uint64_t kernel_vsync_count;
@@ -2125,11 +2133,11 @@ void gs_native_vsync(Gs *g, unsigned *width, unsigned *height, int resize)
         *width = d[5]; *height = d[6];
     } else n->stats.display_missing++;
     memcpy(f->display, packed, sizeof packed);
-    f->flat_limit = host_widescreen_flat_limit();
+    f->flat_limit = (unsigned)flat_limit;
     f->field = ++n->field;
     if (n->texpack) texpack_field(n->field);
     f->time = host_wall_seconds();
-    pacing_handed(&f->due, &f->began);
+    f->due = due, f->began = began;
     n->stats.frames++;
     if (n->field <= n->full_until) n->stats.full_fields++;
     if (n->trace_fields) {
@@ -2408,6 +2416,7 @@ static void native_install(Gs *g, NativeExact *exact, Native *n, const char *api
     exact->native = n;
     exact->clip[0] = exact->clip[1] = 1; exact->clip[2] = exact->clip[3] = 0;  /* nothing until a probe */
     exact->clip_on = 1;
+    exact->e.upload_lazily = 1;  /* the probe's draws need only the uploaded pages they touch */
     g->draw = native_draw;
     g->local_copy = native_local_copy;
     g->flush_draw = native_flush_draw;

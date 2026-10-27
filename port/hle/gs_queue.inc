@@ -94,7 +94,9 @@ static DWORD WINAPI gs_consume(void *unused)
             continue;
         }
         const GsPacket *p = (const GsPacket *)(gs_ring + (at & (GS_RING_BYTES - 1)));
-        if (p->path != UINT32_MAX) {
+        if (p->path == GS_PATH_MARK)
+            run_mark((const uint32_t *)(p + 1));
+        else if (p->path != UINT32_MAX) {
             double start = gs_profile_begin();
             gs_execute(p->path, (const uint32_t *)(p + 1), p->words, &p->provenance);
             if (start)

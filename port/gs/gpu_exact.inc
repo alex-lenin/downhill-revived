@@ -74,6 +74,9 @@ typedef struct Exact {
     uint64_t state_version;
     unsigned state_context;
     uint64_t uploaded;
+    /* The native renderer's Z probe device: CPU-written pages go up only when a draw reads or
+       writes them (draw's upload_pages want); the others wait in g->host_dirty. */
+    int upload_lazily;
     int dirty;                  /* the GPU has written pages the CPU has not read back */
     int recorded;               /* commands are waiting for a submit */
     int display_valid;          /* the scanout picture is in the display texture */
@@ -477,27 +480,38 @@ static void fetch_pages(Gs *g, const uint32_t staged[16], uint32_t *image)
     if (gpu->profile) gpu->sync_ticks += op_clock() - start;
 }
 
-static void upload_pages(Gs *g)
+/* CPU-written pages (g->host_dirty) to the GPU's VRAM: all of them, or with upload_lazily only
+   those in want (NULL: all). A page the GPU reads or writes is always uploaded first, so a page
+   still waiting is never GPU-written (cpu_dirty) and the readbacks never need it. */
+static void upload_pages(Gs *g, const uint32_t *want)
 {
     Exact *gpu = g->backend;
     if (gpu->uploaded == g->pixels_written) return;
     unsigned any = 0;
+    uint32_t pages[16];
     for (unsigned i = 0; i < 16; i++) any |= g->host_dirty[i];
     /* Initial contents and explicit whole-image writes have no page range. */
-    if (gpu->uploaded == UINT64_MAX || !any) memset(g->host_dirty, 255, sizeof g->host_dirty);
+    if (gpu->uploaded == UINT64_MAX || !any) memset(g->host_dirty, 255, sizeof g->host_dirty), want = NULL;
+    if (!gpu->upload_lazily) want = NULL;
+    any = 0;
+    for (unsigned i = 0; i < 16; i++) any |= pages[i] = want ? g->host_dirty[i] & want[i] : g->host_dirty[i];
+    if (!any) return;
     /* The queue writes land before the submit: a page of the upload buffer serves one copy each. */
-    for (unsigned i = 0; i < 16; i++) if (g->host_dirty[i] & gpu->upload_used[i]) { submit_all(gpu); break; }
+    for (unsigned i = 0; i < 16; i++) if (pages[i] & gpu->upload_used[i]) { submit_all(gpu); break; }
     exact_commands(gpu);
     for (unsigned page = 0; page < 512;) {
-        if (!(g->host_dirty[page / 32] & (1u << (page & 31)))) { page++; continue; }
+        if (!(pages[page / 32] & (1u << (page & 31)))) { page++; continue; }
         unsigned first = page++;
-        while (page < 512 && (g->host_dirty[page / 32] & (1u << (page & 31)))) page++;
+        while (page < 512 && (pages[page / 32] & (1u << (page & 31)))) page++;
         dev_write(gpu, B_UPLOAD, first * 8192, (uint8_t *)g->vram + first * 8192, (page - first) * 8192);
         dev_copy(gpu, B_UPLOAD, first * 8192, B_VRAM, first * 8192, (page - first) * 8192);
     }
-    for (unsigned i = 0; i < 16; i++) { gpu->texture_dirty[i] |= g->host_dirty[i]; gpu->upload_used[i] |= g->host_dirty[i]; }
-    memset(g->host_dirty, 0, sizeof g->host_dirty);
-    gpu->uploaded = g->pixels_written;
+    any = 0;
+    for (unsigned i = 0; i < 16; i++) {
+        gpu->texture_dirty[i] |= pages[i]; gpu->upload_used[i] |= pages[i];
+        any |= g->host_dirty[i] &= ~pages[i];
+    }
+    if (!any) gpu->uploaded = g->pixels_written;
     gpu->uploads++;
 }
 
@@ -507,7 +521,7 @@ static int readback_all(Gs *g, uint32_t *image)
     Exact *gpu = g ? g->backend : NULL;
     uint32_t all[16];
     if (!gpu || !image) return 0;
-    upload_pages(g);
+    upload_pages(g, NULL);
     memset(all, 255, sizeof all);
     copy_pages(gpu, B_READBACK, all);
     submit_all(gpu);
@@ -709,9 +723,17 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
     c.info[0] = type; c.info[1] = prim; c.info[2] = count;
     unsigned memberships = ((unsigned)maxx / 8 - (unsigned)minx / 8 + 1) *
                            ((unsigned)maxy / 8 - (unsigned)miny / 8 + 1);
-    upload_pages(g);
+    /* The pages it writes, and those it reads: the frame and Z inside its box, and its texture's. */
+    uint32_t written[16] = {0}, want[16] = {0};
+    uint64_t frame = g->reg[GS_FRAME_1 + ctxt], zbuf = g->reg[GS_ZBUF_1 + ctxt];
+    unsigned bw = (unsigned)(frame >> 16) & 63;
+    gs_mark_pages(written, (unsigned)(frame >> 24) & 63, ((unsigned)frame & 511) * 32, bw, minx,miny,maxx,maxy);
+    gs_mark_pages(want, 48 | ((unsigned)(zbuf >> 24) & 15), ((unsigned)zbuf & 511) * 32, bw, minx,miny,maxx,maxy);
+    if (!(zbuf >> 32 & 1)) for (unsigned i = 0; i < 16; i++) written[i] |= want[i];
+    if (prim & 16) texture_pages(gpu, g, ctxt);
+    for (unsigned i = 0; i < 16; i++) want[i] |= written[i] | (prim & 16 ? gpu->texture_pages[i] : 0);
+    upload_pages(g, want);
     if (prim & 16) {
-        texture_pages(gpu, g, ctxt);
         for (unsigned i = 0; i < 16; i++) if (gpu->texture_pages[i] & gpu->texture_dirty[i]) {
             exact_commands(gpu);
             dev_copy(gpu, B_VRAM, 0, B_SNAPSHOT, 0, GS_VRAM_SIZE);
@@ -749,12 +771,6 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
     gpu->primitive_data[gpu->primitive_count++] = c;
     gpu->memberships += memberships;
     gpu->dirty = 1;
-    uint32_t written[16] = {0};
-    uint64_t frame = g->reg[GS_FRAME_1 + ctxt], zbuf = g->reg[GS_ZBUF_1 + ctxt];
-    unsigned bw = (unsigned)(frame >> 16) & 63;
-    gs_mark_pages(written, (unsigned)(frame >> 24) & 63, ((unsigned)frame & 511) * 32, bw, minx,miny,maxx,maxy);
-    if (!(zbuf >> 32 & 1))
-        gs_mark_pages(written, 48 | ((unsigned)(zbuf >> 24) & 15), ((unsigned)zbuf & 511) * 32, bw, minx,miny,maxx,maxy);
     for (unsigned i = 0; i < 16; i++) { gpu->cpu_dirty[i] |= written[i]; gpu->texture_dirty[i] |= written[i]; }
     gpu->draws++;
     if (!gpu->batch_safe) close_batch(gpu);
@@ -780,7 +796,7 @@ static int local_copy(Gs *g)
     for (unsigned i = 0; i < 16; i++) if (from[i] & to[i]) return 0;
     /* Its constants' queue write lands before the next submit: earlier work goes first, and
        until that submit no other write reaches them (each local copy starts with one). */
-    upload_pages(g);
+    upload_pages(g, NULL);
     submit_all(gpu);
     dev_write(gpu, B_COPY, 0, c, sizeof c);
     record(gpu, P_COPY, (width + 7) / 8, (height + 7) / 8);
@@ -806,7 +822,7 @@ static int exact_display(Gs *g, unsigned *width, unsigned *height)
     c[6] = ((unsigned)(display >> 44) & 2047) + 1; c[6] /= ((unsigned)(display >> 27) & 3) + 1;
     c[7] = (gs_priv_read(g, GS_SMODE2) & 3) == 3;
     if (!gpu || !(pmode & 3) || !c[2] || !c[5] || !c[6] || c[5] > 1024 || c[6] > 1024) return 0;
-    upload_pages(g);
+    upload_pages(g, NULL);
     submit_all(gpu);
     dev_write(gpu, B_DISPLAY, 0, c, 48);
     if (!record(gpu, P_SCANOUT, (c[5] + 7) / 8 | c[5] << 16, (c[6] + 7) / 8 | c[6] << 16)) return 0;

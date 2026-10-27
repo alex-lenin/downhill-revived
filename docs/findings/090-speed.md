@@ -2536,3 +2536,379 @@ of the base build.
 - The `0x0062....` scratch shows up because the snapshot is taken at the tick top; a variant that
   scans only words the game thread writes during the update (watchpoint-driven) would remove that
   noise, at the cost of a much slower run.
+
+## ZC1: port-only C for hot translated functions (tried, dropped)
+
+2026-10-27. A port-only switch compiled the `#ifdef NONMATCHING` C of func_00213C08 and
+func_00213658 (collision) and new C for func_002628A0 (NGA animation curve) instead of their
+recomp.py translations. Dropped, branch deleted:
+- Slower: one ABBA session (hidden desktop, scale 2, uncapped, race fields 7400-14600, shared
+  PC): game thread busy 2.40 / 2.48 ms a field on main against 2.65 / 2.60 with the C, 233.7 /
+  229.7 against 224.3 / 225.9 fields/s. The SP13-SP15 work had already made these translations
+  cheap, and the game thread is no longer the limit (VU 3.3 ms, GS 3.0 ms busy).
+- Not checkable with the state trace: the translations keep their stack frames and scratch
+  registers in guest memory, C keeps them in locals, so `ram`/`cpu` differ in dead stack on every
+  field. The collision pair also changed real state: func_00213658 reads a hit normal's w lane it
+  never writes (stack leftovers: -25.0 on main, 0.0 with the C, fields 3332-3398).
+- The C stayed non-matching (none of it is byte-exact), so it was not kept as decompilation.
+- Its C for 00213658 declared func_00213250 with the two floats in the middle; on the EE ABI
+  floats travel in $f12/$f13 whatever their position, so any port-side C of these functions must
+  declare them in the callers' order.
+
+## GP1: GS thread profile and upload counters
+
+2026-10-27, branch `rr/GP1`, based on main `766435a80`. Measurement only: no code change is
+committed and no speedup is claimed. The point is to size three options for the GS path: (a) moving
+the whole GS onto the GPU, (b) a GPU-side upload cache, (c) moving uploads ahead of draw batches.
+
+### Method
+
+The core wasm was rebuilt from main (`build_wasm.py -j 2`, 294 s, objcache 10,737 hits / 0 misses);
+`build_host64.py --debug` (PDB for the sampler, codegen unchanged) produced
+`build/host64-exe/dhd64.exe`. Every run reached GO at field 7139.
+
+One clean profile (`prof1`, 24 s) and one counter run (`cnt2`, 12 s) are reported. The counter build
+is the same code plus the env-gated scratch patch `gp1_counters.patch` (`DHD_GP1_COUNTERS`,
+`DHD_GP1_UPLOADS`; off by default), which only reads counters and writes CSV. A rebuild of the
+counter binary reproduced `cnt2` exactly on all 10,887 common field rows and 78,648 common upload
+rows (`cnt3`), and `cnt1`/`cnt2` agree on every shared counter, so the counters are deterministic.
+The profile is one sample on a shared PC: treat the ms/field values as ±5-10%, not a confidence
+interval (the two runs' GS CPU is 4.729 vs 4.510 ms/field).
+
+Sample-to-ms conversion: `ms/field = self samples / all thread samples × thread CPU ms/field`
+(12,821 samples, 4.729 ms/field); `% work` uses the 9,249 non-wait samples. Wait samples are
+reported separately. The counter window is fields 8200-8700 (501 fields): after GO, in the steady
+race, where both upload sets are present.
+
+### GS thread
+
+`prof1` (fields 7900-10900): 164.323 fields/s, p50 5.739 ms, p99 11.525 ms; GS thread CPU 4.729
+ms/field, GS busy 4.406 ms/field (timeline: wall − gs_idle). 12,821 samples, 3,572 of them in waits
+(27.9%, 1.318 ms/field), 9,249 work samples = 3.411 ms/field.
+
+| Bucket | Samples | % work | ms/field | Contents |
+| --- | ---: | ---: | ---: | --- |
+| gif | 2,761 | 29.9% | 1.018 | `gs_write`, `packed`, `gif_qword`, `gs_feed`: GIF packet parse and register decode |
+| prim | 2,764 | 29.9% | 1.019 | `native_record`, `vertex_kick`, `native_draw`, `native_index_of`: primitive recording, vertex conversion, batching |
+| localmem | 1,853 | 20.0% | 0.683 | `native_exact`, `pixel_address`, `write_pixel`, `gs_write_pixels`, `gs_read_pixel`, `image_data`: VRAM access (uploads, CLUT and texture reads, local copies) |
+| texkey | 755 | 8.2% | 0.278 | `load_clut`, `gs_palette`, `native_mix`, `native_page_hash`, `gs_mark_pages`: texture key and CLUT |
+| gpudrv | 470 | 5.1% | 0.173 | `nvwgf2umx.dll`, `D3D12Core.dll`: driver calls made on the GS thread |
+| libc | 234 | 2.5% | 0.086 | `memmove`, `memset`, `memcpy` |
+| state | 102 | 1.1% | 0.038 | `native_texture`, `native_state`, `native_command` |
+| decode | 99 | 1.1% | 0.037 | `gs_color`, `native_decode` |
+| rust | 93 | 1.0% | 0.034 | wgpu/allocator |
+| other | 82 | 0.9% | 0.030 | — |
+| upload | 36 | 0.4% | 0.013 | `native_import_page` |
+| waits | 3,572 | — | 1.318 | handoff to the render thread (not work) |
+
+Top functions by self samples:
+
+| Function | Samples | ms/field | Bucket |
+| --- | ---: | ---: | --- |
+| `gs_write` | 1,048 | 0.387 | gif |
+| `native_record` | 1,040 | 0.384 | prim |
+| `vertex_kick` | 1,024 | 0.378 | prim |
+| `packed` | 748 | 0.276 | gif |
+| `gif_qword` | 567 | 0.209 | gif |
+| `native_exact` | 530 | 0.195 | localmem |
+| `pixel_address` | 492 | 0.181 | localmem |
+| `nvwgf2umx.dll` | 370 | 0.136 | gpudrv |
+| `load_clut` | 355 | 0.131 | texkey |
+| `gs_feed` | 338 | 0.125 | gif |
+| `native_index_of` | 210 | 0.077 | prim |
+| `memmove` | 193 | 0.071 | libc |
+| `native_draw` | 185 | 0.068 | prim |
+| `write_pixel` | 182 | 0.067 | localmem |
+| `gs_write_pixels` | 157 | 0.058 | localmem |
+| `gs_palette` | 153 | 0.056 | texkey |
+
+The front end splits roughly in thirds: GIF decode 1.0 ms, primitive recording/batching 1.0 ms,
+local memory 0.7 ms; texture keys and the CLUT add 0.28 ms.
+
+### Upload counters
+
+`cnt2`, fields 8200-8700 (501 fields; 179.271 fields/s, GS 4.510 ms/field, native 1.395 ms/field, EE
+4.432, VU 4.114; timeline GS busy 4.127).
+
+| Metric | Per field |
+| --- | ---: |
+| host→local uploads (`GS_TRXDIR=0`, `image_data`) | 30.76 |
+| upload bytes | 964,935 B |
+| — 128x128 psm 0 (65,536 B each) | 12.43, 814,818 B |
+| — 64x32 psm 0 (8,192 B each) | 18.32, 150,089 B |
+| content already uploaded in the previous field (size + FNV-1a hash) | 30.75 (100.0%), 964,759 B (100.0%) |
+| same destination *and* same content as the previous field | 4.92 (16.0%), 40,322 B (4.2%) |
+| distinct contents in the window | 28 (13 × 128x128, 11 × 64x32, 4 one-off tiny) |
+| distinct destinations in the window | 31 |
+| destination/content rotation period | 39 fields |
+| uploads before the field's first draw | 0 |
+| batch breaks caused by an upload | 28.81 |
+
+The uploads are the same 24 recurring images every field (28 distinct contents in the window,
+including four one-offs), written to a rotating set of 31 VRAM addresses with a 39-field period.
+That is why a content-only hash matches 100% while an (address, content) cache over the previous
+field matches only 16% of uploads / 4.2% of bytes.
+
+Batches and breaks:
+
+| Metric | Per field |
+| --- | ---: |
+| batches | 468.70 |
+| break: first draw of the field | 2.04 |
+| break: upload (batch closed by an upload) | 28.81 |
+| break: draw state change (non-CLUT) | 410.68 |
+| break: CLUT only | 0.00 |
+| break: texture context | 0.00 |
+| break: primitive type | 27.18 |
+| commands (1 + passes per batch) | 483.39 |
+| primitives recorded | 38,611.8 |
+| primitives per batch | 82.4 |
+| passes per batch | 1.03 |
+
+The CLUT split uses the strict test "every `state_version` bump since the batch opened is a CLUT
+entry change". None of the 410.7 state breaks passes it: every batch that spans a CLUT change also
+spans a non-CLUT state change. CLUT loads are therefore a consequence of texture state changes, not
+an independent batch-break source. For the record: 616.2 CLUT loads per field (272.1 16-entry, 344.1
+256-entry) and 108,420 changed entries per field (176 per load).
+
+GPU bytes per field:
+
+| Stream | Bytes | Share |
+| --- | ---: | ---: |
+| vertices (`NativeVertex`, 32 B × 58,476) | 1,871,233 | 72.4% |
+| indices (4 B × 121,787) | 487,150 | 18.9% |
+| other (draw constants 123,748 B + imports/alpha ~98,305 B) | 222,053 | 8.6% |
+| decoded textures | 2,665 | 0.1% |
+| total | 2,583,100 | 100% |
+
+2.58 MB/field at 179.3 fields/s is 463 MB/s. Textures are essentially all cache hits in the race
+(0.07 decodes/field); the uploaded pages are almost never re-decoded as textures in this window (2.7
+KB/field) — the remaining GPU-side traffic they cause is page imports, about 1.5 × 64 KiB per field.
+Upload traffic is 965 KB per field, 37% on top of the 2.58 MB of GPU buffer traffic, but it is
+CPU→VRAM, not a GPU upload.
+
+### Implications
+
+**(a) Whole GS on the GPU.** Measured GS work is 3.411 ms/field (4.406 ms busy including waits), 79%
+of the 5.58 ms frame at 179.3 fields/s. The buckets a GPU GS could absorb are prim 1.019, localmem
+0.683, texkey 0.278, gpudrv 0.173 and the small state/decode/upload buckets, about 2.2-2.4 ms/field;
+the GIF front end (1.018 ms) still has to parse the game's packets unless the GPU consumes GIF
+directly, and the render thread would grow by whatever the GPU rasterizer costs (not measured here).
+Rough saving: 2.2-3.4 ms/field, 40-60% of the frame, with the full 4.4-4.7 ms GS CPU as the ceiling
+if the handoff waits go too. This is the only option with a multi-millisecond prize, but it is a
+rewrite of rasterization, blending, CLUT and VRAM behaviour.
+
+**(b) GPU-side upload cache.** 100% of the 965 KB/field repeats the previous field's content, but
+only 4.2% repeats at the same address; destinations rotate with a 39-field period. A cache keyed by
+(address, content) over one field is worth almost nothing (40 KB/field). To capture the bytes it
+must be content-addressed (24 recurring images, about 1 MB) or keep 39 fields of destination history
+(about 37 MB). The measurable CPU saving is the upload write path: `image_data` 0.043 +
+`gs_write_pixels` 0.058 + `write_pixel` 0.067 + the upload share of `pixel_address` (241k of ~375k
+calls) 0.116 ≈ 0.29 ms/field (6% of GS CPU), plus 28.8 fewer batch breaks ≈ 0.09 ms/field of
+render-thread CPU (native thread 1.395 ms/field over 468.7 batches = 2.98 µs/batch), so about
+0.35-0.4 ms/field (6-7% of the frame). Correctness is the hard part: the uploaded pages are read as
+render-target initial content (imports) and could be read back, so a cache that skips the VRAM write
+must serve those readers too, not only texture decode.
+
+**(c) Uploads ahead of draw batches.** All uploads happen after at least 7 batches (of 468.7), i.e.
+they are interleaved with draws; each closes the open batch. Moving them to the top of the field
+removes the 28.8 upload breaks (6.1% of batches) but not the 965 KB/field of writes: about 0.086
+ms/field on the render thread + 0.003 ms/field on the GS thread, roughly 0.09 ms/field (1.6% of the
+frame). It is cheap, but it needs a hazard check: an upload that overwrites a render target after it
+was drawn would change what the draws see if moved earlier. The counters show the uploads are not at
+the field start, so that check is required per upload, not optional.
+
+Verdict: (b) is the best return for a contained change, but only in its content-addressed form; (c)
+is a small add-on worth about 0.09 ms/field if the hazards check out; (a) is the only
+multi-millisecond option and should be its own project. These are counter-derived estimates, not
+measured speedups.
+
+## GS2: emulate only the GS local memory that is read
+
+2026-10-27, branch `rr/GS2` (code `45ddb5ed4`, merged with main `067fb5061` as `353c261cd`). GP1 put
+about 20% of the GS thread in emulated local memory. This lane first listed who can read it in
+native mode, then cut what no reader needs and made the rest cheaper. All bytes, counters and calls
+the readers see stay the same.
+
+### Who reads the emulated local memory (native mode)
+
+| Reader | What it reads |
+| --- | --- |
+| `native_page_hash` (texture keys, `native_texture`) | every page of every texture a draw uses: whole 8 KB pages, swizzled, each time `page_writes` changed. The streamed uploads (GP1: 30 a field, 965 KB) are all read here every field. |
+| `native_decode`, `native_convert_texture` | texels of textures missing from the cache (GP1: 0.07 decodes a field) |
+| `native_import_page` | a colour page as a surface's starting content (about 1.5 a field) |
+| `load_clut` | 64 B or 1 KB at CBP per CLUT load (GP1: 616 a field) |
+| `gs_read_image` / `gs_defer_read_image` | readbacks: the lens-flare Z probe (GPU-written pages from the exact device, the rest from the CPU image), colour reads |
+| `local_copy` fallbacks (`native_local_copy`) | the source rectangle |
+| exact Z device (`gpu_exact.inc` `upload_pages`) | before each exact draw, every CPU-written page not yet uploaded, whether the draw touches it or not |
+| state trace (`host_service_gs_snapshot`) | all 4 MB (`gs_vram` column), plus `pixels_written`, `state_version` and the GIF path words (`gs_regs`) |
+| capture, `gs_display`, texture packs (`texpack.c`) | captures, the CPU scanout, the pack hash |
+
+Because the texture keys and the state trace hash the uploaded pages, the CPU copy has to stay
+complete in every field. Skipping or deferring the CPU writes themselves would make every key lookup
+wait on them, so no upload is dropped. Only one reader needs less: the exact Z device, which draws
+only the probe's Z-writing primitives (watch rectangle, band, exact targets).
+
+### Changes
+
+- **Exact device uploads only the pages it touches** (`gpu_exact.inc`, `upload_lazily`; set by
+  `native_install`, so exact mode is unchanged). Before, the first exact draw of a field
+  uploaded every CPU-written page (about 120 pages, 965 KB, through the queue) and marked them all
+  texture-dirty. Now `draw` uploads only the pending pages it writes or reads (frame and Z inside
+  its clipped box, including Z under ZMSK, and its texture's pages, mip levels included). The
+  others wait in `g->host_dirty`. Invariant: the GPU never draws into a page that has CPU content
+  waiting, so `cpu_dirty` and `host_dirty` never overlap. The readbacks (`sync_range`,
+  `stage_pages`, `sync_vram`) read only `cpu_dirty` pages and so never need a waiting one.
+  `uploaded` follows `pixels_written` only once nothing is left waiting. `readback_all`,
+  `local_copy` and `exact_display` still upload everything.
+- **PSMCT32 uploads written a row run at a time** (`memory.c` `write_ct32`, page-aligned base
+  pointers, which covers the game's uploads). Within a 64-pixel page column a row lands in one
+  physical page, so the sync check, dirty bit and `page_writes`/`pixels_written` counts happen
+  once per run. The pixels go to `pixel_address`'s word offsets, split into row and column bits.
+  The words, counters and the order of `sync_range` calls match `write_pixel`.
+- **IMAGE data in runs** (`gs.c` `gs_feed`): a run of whole IMAGE qwords goes to `image_data` in
+  one call instead of one call (with its `flush_draw`) per 16 bytes. The path keeps the last
+  qword in `words`, as before. Off when `record_transfer` is set (captures see every qword) or
+  under `image_reference`.
+- **CLUT loads without a branch per entry** (`gs.c` `load_clut`, CSM1): the entries are
+  gathered, then compared and stored with a branch-free count of changed entries. The CLUT and
+  `state_version` (hashed by the state trace) end up the same. CSM2 keeps the old loop (its
+  32-bit entries can overlap).
+
+Not done: caching the palette part of the texture key (SP3's next idea; it needs a CLUT version in
+`Gs` and changes the key function). Lazy swizzling (keeping raw upload bytes until a reader needs
+the page) would not pay off, because the texture key reads every uploaded page in the same field.
+
+### Checks
+
+- `test_gs` (clang-cl -m32 as `test_runtime.py`): 0 failures. The upload fuzz now runs 6000
+  transfers (half page-aligned PSMCT32, some pages pre-dirtied), fast against `image_reference`.
+  It compares VRAM, counters, `host_dirty`, the GIF path state and the `sync_range` call
+  sequence. Two deliberately wrong versions (one column bit, sync on every run) fail it.
+- State trace, x64, 60 Hz, seed 81257: race 5000 fields and boot 600, base main against rr/GS2,
+  `trace_columns.py`: **PASS, all 13 columns identical**, before the merge (base `348567dcc`
+  against `45ddb5ed4`) and after it (`067fb5061` against `353c261cd`). The race includes the
+  lens-flare probe every field, whose answers feed `ram`. The mask was not touched.
+- Builds: `build_wasm.py`, `package_release.py` (x64) and `port/web/build.py --renderer rust` +
+  `check_web_layout.py --require-renderer`: OK (web layout: core, graphics, renderer, vu).
+
+### Timing
+
+Same core wasm for both. Base main `067fb5061`, new rr/GS2 `353c261cd`.
+
+| Run | Fields/s | p50 / p99 ms | busy ms/field game / vu / gs | CPU ms/field gs | CPU native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| base-1 | 176.7 | 5.56 / 10.74 | 3.53 / 4.09 / 3.98 | 4.20 | 1.67 |
+| new-1 | 171.9 | 5.85 / 10.39 | 3.73 / 4.50 / 3.57 | 3.92 | 1.73 |
+| new-2 | 175.6 | 5.64 / 10.51 | 3.74 / 4.34 / 3.47 | 3.86 | 1.82 |
+| base-2 | 166.4 | 5.90 / 11.92 | 3.82 / 4.30 / 4.20 | 4.33 | 1.90 |
+| mean base → new | 171.5 → 173.7 | | 3.68 / 4.20 / 4.09 → 3.74 / 4.42 / 3.52 | 4.26 → 3.89 | 1.78 → 1.78 |
+
+The GS thread is 0.57 ms a field less busy (-14%) and uses 0.37 ms less CPU (-9%). Both new runs are
+below both base runs. The busy time drops more than the CPU time, consistent with the GS no longer
+blocking in the queue writes of 965 KB a field to the exact device. Fields/s did not move beyond
+noise (+1.3%). The PC was busier than in the 2026-10-27 reference (about 230 fields/s, VU 3.27 ms;
+here VU 4.1-4.5 ms busy, base fields/s 166-177), and the VU thread was the limit in every run. One
+session on a shared PC, not a confidence interval.
+
+### Left
+
+- The GS front end (GIF decode, primitive recording) is still most of the GS thread. The
+  palette-key cache above is worth about 0.05-0.08 ms (GP1's `gs_palette` + part of `native_mix`).
+- The texture-key page hash still reads every uploaded page each field. A key built from the
+  upload's content hash (GP1's content-addressed option) could drop that read, but it changes
+  the key function and needs a rule for partly written pages.
+
+## HO1: deferred vsync, the EE no longer waits for the drawing at each field
+
+Goal: on main a race field takes about 4.4 ms though no thread is busy more than about 3.3 ms; cut
+the waits between the game (EE), VU and GS threads without changing anything the game can observe.
+
+### Where the waits were (main, DHD_TIMELINE, x64, hidden desktop, fields 7400-14600)
+
+The timeline now prints each EE wait site as `exe+0x...` so it can be looked up in `dhd64.map`
+(`port/hle/graphics_timeline.h`). Main: 216.8 fields/s; busy EE 2.72, VU 3.43, GS 3.22 ms/field; the
+EE waited 1.89 ms/field (1.43 for VU, 0.46 for GS; 1.09 spinning, 0.78 parked), VU was idle 1.18 and
+GS 1.39. By site: the full waits at vsync (two per field) and at `sceGsSyncPath` (four per field,
+1.74 ms) made the EE wait for the whole of its own field's drawing every field, so the three threads
+ran one after the other rather than overlapped. The rest is the Z probe (`sceGsExecStoreImage` and
+its guarded-page fault, about 0.74 per field, 0.5 ms), a readback the game uses the next frame,
+which must stay a full wait.
+
+### What changed
+
+- **Deferred vsync** (native hosts with the graphics workers, `host_service_graphics_threaded()`
+  returns 2). The design is finding 048's (f80b4d61, reverted then because VU was the bottleneck),
+  close to PCSX2's MTGS, which queues the vsync as a ring packet and lets the EE run a bounded number
+  of frames ahead. At vsync the EE queues the VBLANK as a marker behind the drawing
+  (`graphics_queue.c`, run in order on the GS thread: `gs_vblank`, CSR VSINT/FIELD, the readback
+  field). `gs_vsync` queues the picture the same way (`present.c`: the display registers are copied
+  and handed to the render thread when the GS reaches them). The EE goes on with the next field. At
+  most two fields are in flight: vsync N waits until the picture of field N-2 has been handed on
+  (`DHD_FIELDS_IN_FLIGHT=1`: N-1). `sceGsSyncPath` and the second vsync wait only ordered graphics
+  work and are skipped, as in the browser's `DHD_GRAPHICS_ORDERED`.
+- **The CSR page stays exact.** The game reads CSR from its MMIO page, which only the EE writes. At a
+  deferred vsync the host writes a provisional CSR there, the last value with the VBLANK applied:
+  exact except for SIGNAL/FINISH, which only the GS knows once it has drawn. The next
+  `host_service_graphics_wait` (every fence, every kernel or HLE wait) writes the exact CSR the
+  VBLANK left, which is the value a full wait at vsync would read. Unfenced, the game reads only
+  CSR.FIELD (func_0020BED0, and sceGsSyncV's load at 0x00243D2C, emitted unfenced by
+  `port/tools/recomp.py`), and the provisional value has FIELD exact. With SetVSyncFlag, and up to
+  the first exact CSR, vsync waits as before.
+- Off (old full waits) with `DHD_SYNC_STRICT=1`, `DHD_SCREENSHOT`, `DHD_GS_CAPTURE`,
+  `DHD_RACE_GSDUMP`, `DHD_PROFILE`, `DHD_VU_SUSPECT`, with a movie or a non-native renderer
+  picture, and in bench pictures. The browser build is unchanged (its host reports 1). Android uses
+  the same code as x64, so it gets the deferral too.
+- `DHD_STATE_NOWAIT=1` (state trace): no wait for the workers at each row, so the fields overlap as
+  in play; only the EE's sections are hashed (the others are written as 0).
+- Nothing spins more: the new waits use the queue's `idle_wait` (short spin, then park).
+
+### The race-trace failure and its fix
+
+The first version failed the race trace: only `ram` differed, from field 1453 (race start), and it
+differed even with `DHD_SYNC_STRICT=1`. The dump showed 10 words, all 0x12904 against 0x12905, in an
+array with a 0x7BD0 stride: a function-table index the game keeps in RAM, shifted by one. That
+version had made two new core functions address-taken (`graphics_sync`, `csr_settle` as
+`ps2_graphics_sync`/`ps2_gs_csr_sync`), which added a wasm table entry. The game's behaviour was the
+same, but the state trace compares those indices. The fix moved the CSR settle into the host
+(`host_service_graphics_wait`, `host_service_graphics_vblank`), so the core takes no new function
+addresses and `ps2_graphics_sync` is `host_service_graphics_wait` as on main. The `ps2asm` fence
+plumbing went back to main's.
+
+### Exactness (x64, against a fresh build of main 656e65677)
+
+| trace | result |
+|---|---|
+| race, 5000 fields, seed 81257 | PASS, all 13 columns identical |
+| boot | PASS, all 13 columns identical |
+| race with `DHD_STATE_NOWAIT=1` (fields overlapping) | menu, phase, clock, ram, scratch, cpu, sound, code identical for all 5000 fields; GS/VU/hw columns not hashed in that mode |
+
+`port/tools/state_trace_mask.txt` is unchanged. Browser: `port/web/build.py --renderer rust` and
+`check_web_layout.py --require-renderer` pass (138 imports).
+
+### Timing (one ABBA session, x64, hidden desktop, race fields 7400-14600, DHD_TIMELINE on)
+
+| run | fields/s | p50 / p99 ms | busy EE / VU / GS ms | EE wait VU / GS ms | VU idle / GS idle ms | EE / GS spin ms | busy cores |
+|---|---|---|---|---|---|---|---|
+| A1 main | 225.6 | 4.33 / 8.68 | 2.68 / 3.31 / 3.12 | 1.32 / 0.43 | 1.12 / 1.31 | 1.03 / 0.37 | 2.69 |
+| B1 HO1 | 242.0 | 3.92 / 9.04 | 2.61 / 3.33 / 3.20 | 0.47 / 1.04 | 0.63 / 0.94 | 0.78 / 0.27 | 2.80 |
+| B2 HO1 | 245.5 | 3.85 / 8.69 | 2.59 / 3.28 / 3.14 | 0.47 / 1.01 | 0.64 / 0.94 | 0.76 / 0.27 | 2.80 |
+| A2 main | 242.5 | 3.99 / 8.15 | 2.29 / 3.13 / 2.90 | 1.44 / 0.39 | 1.00 / 1.22 | 1.10 / 0.39 | 2.63 |
+| extra: HO1, `DHD_FIELDS_IN_FLIGHT=1` | 259.2 | 3.65 / 8.37 | 2.18 / 3.07 / 3.16 | 0.49 / 1.19 | 0.79 / 0.70 | 0.92 / 0.19 | 2.72 |
+
+ABBA: main 234.1 fields/s on average, HO1 243.8, **+4.1%**. p50 is 0.3-0.4 ms lower, p99 about the
+same. Busy cores rise from 2.63-2.69 to 2.80 (more overlap; spinning is lower, not higher). The
+extra one-field run came last, when the PC was quietest; with no pair of its own it does not show
+whether one or two fields in flight is faster. Two stays the default.
+
+### What is left
+
+- VU and GS now idle 0.6-0.9 ms/field, and the EE waits about 1 ms/field at the vsync bound plus
+  0.5 ms at the Z probe. The probe (about 0.74 full waits per field) drains the whole pipeline,
+  whatever the depth. That readback, which the game uses the next frame, is what keeps the field
+  above the busiest thread's 3.3 ms. Lifting it would mean making the probe read itself cheaper or
+  earlier, not dropping the wait.
+- The GS thread now also does the picture handoff that used to run on the EE (about +0.1-0.3
+  ms/field of GS work); the GS is the busiest thread with VU.
+- The timeline's site attribution points inside the `host_service_*` wrappers, so it splits the
+  waits only into "full wait" and "vsync bound".

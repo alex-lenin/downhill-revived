@@ -30,6 +30,9 @@
      DHD_STATE_STOP=<field>    end the process after that field's row (the run's length)
      DHD_STOP_FIELD=<field>    without DHD_STATE_TRACE: end after that field, nothing traced (timing)
      DHD_STATE_EXE=<sha256>    the executable's hash, copied into the header (the runner sets it)
+     DHD_STATE_NOWAIT=1        no wait for the graphics workers at each row, so a deferred vsync
+                               overlaps the fields as in play (finding 090 HO1): only the EE's own
+                               sections (ram, scratch, cpu, sound, code) are hashed, the others are 0
 
    Sections: ram (32 MB of EE RAM), scratch (16 KB), hw (the EE register pages 0x10000000 and
    0x12000000), cpu (ps2_cpu: gpr[0..31] and the registers), vu0 (VU0 and VU1 micro and data
@@ -166,6 +169,7 @@ static void norm_bytes(uint8_t *p, size_t size)
 
 static struct {
     int on;
+    int nowait;                 /* DHD_STATE_NOWAIT */
     FILE *tsv;
     uint32_t *mask;             /* sorted EE word offsets (address & 0x1FFFFFC), zeroed in ram */
     size_t mask_count;
@@ -334,7 +338,7 @@ static const char *header_env[] = {
     "DHD_RACE_SEED", "DHD_NAV", "DHD_AUTOPAD", "DHD_AUTOPAD_FRAMES", "DHD_RACE_SYNC", "DHD_RACE_PAD",
     "DHD_RACE_PAD1", "DHD_RACE_PAD2", "DHD_RACE_PAD3", "DHD_PADS", "DHD_FPS", "DHD_PACE", "DHD_LATENCY",
     "DHD_INTERP", "DHD_KEYS", "DHD_GS_CAPTURE", "DHD_HASH_LOG", "DHD_PROFILE", "DHD_STATE_STOP",
-    "DHD_STATE_MASK", "DHD_STATE_CODEPTRS", "DHD_STATE_NORM", NULL};
+    "DHD_STATE_MASK", "DHD_STATE_CODEPTRS", "DHD_STATE_NORM", "DHD_STATE_NOWAIT", "DHD_SYNC_STRICT", NULL};
 
 const char *state_trace_watch_spec(void)
 {
@@ -374,7 +378,8 @@ void state_trace_init(void)
     XXH64_reset(&st.pcm, 0);
     XXH64_reset(&st.packets, 0);
     st.on = 1;
-    host_service_gs_trace_begin();
+    st.nowait = getenv("DHD_STATE_NOWAIT") && *getenv("DHD_STATE_NOWAIT");
+    if (!st.nowait) host_service_gs_trace_begin();
 
     fprintf(st.tsv, "# state-trace 1 exe=%s prefix=%s env=", getenv("DHD_STATE_EXE") ? getenv("DHD_STATE_EXE") : "-",
             prefix);
@@ -518,18 +523,20 @@ void state_trace_field(uint64_t field, uint64_t next_vsync)
     }
     if (!st.on && stop_field && field >= (uint64_t)stop_field) host_exit(0);
     if (!st.on) return;
-    host_service_graphics_wait();  /* every packet fed this field has reached the GS state */
-    /* Queue retirement above publishes every copied packet and the GS state.
-       Replay the original hash operation on the module's current wasm stack. */
     static Gs snapshot;
-    host_service_gs_snapshot(GADDR(&snapshot), (uint32_t)offsetof(Gs,sync));
-    uint32_t packet_bytes;
-    while ((packet_bytes=host_service_gs_trace_size())!=0) {
-        uint32_t *packet=malloc(packet_bytes);
-        if (!packet) abort();
-        host_service_gs_trace_pop(GADDR(packet));
-        state_trace_gs_packet(NULL,packet[0],packet+2,packet[1]);
-        free(packet);
+    if (!st.nowait) {
+        host_service_graphics_wait();  /* every packet fed this field has reached the GS state */
+        /* Queue retirement above publishes every copied packet and the GS state.
+           Replay the original hash operation on the module's current wasm stack. */
+        host_service_gs_snapshot(GADDR(&snapshot), (uint32_t)offsetof(Gs,sync));
+        uint32_t packet_bytes;
+        while ((packet_bytes=host_service_gs_trace_size())!=0) {
+            uint32_t *packet=malloc(packet_bytes);
+            if (!packet) abort();
+            host_service_gs_trace_pop(GADDR(packet));
+            state_trace_gs_packet(NULL,packet[0],packet+2,packet[1]);
+            free(packet);
+        }
     }
     int32_t menu = *(volatile int32_t *)(uintptr_t)MENU_ADDR;
     int32_t phase = *(volatile int32_t *)(uintptr_t)PHASE_ADDR;
@@ -627,6 +634,8 @@ void state_trace_field(uint64_t field, uint64_t next_vsync)
     norm_off = 0;
     uint64_t h_gs_regs = hash_buf(&st.gs);
     uint64_t h_gs_vram = XXH64(snapshot.vram, sizeof snapshot.vram, 0);
+    /* DHD_STATE_NOWAIT: the graphics workers may still own these (the CSR page may be provisional) */
+    if (st.nowait) h_hw = h_vu0 = h_stream = h_gs_regs = h_gs_vram = 0;
 
     /* sound: the PCM of this field, and the rendered sample count (not normalised: no host values) */
     uint64_t pcm_digest = XXH64_digest(&st.pcm);

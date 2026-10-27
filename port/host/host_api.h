@@ -184,7 +184,10 @@ void host_service_host_pad_vibrate(int a0, int a1, int a2);
 int host_service_host_relaunch_reserving(uint32_t a0, uint32_t a1);
 void host_service_graphics_feed(int a0, uint32_t a1, uint32_t a2);
 void host_service_graphics_wait(void);
-int host_service_graphics_threaded(void);
+int host_service_graphics_threaded(void);  /* 2: threaded, with deferred vsyncs */
+/* Deferred vsync (kernel.c): queues this VBLANK once the last field's picture is handed on and
+   makes the CSR page provisional; the next host_service_graphics_wait puts the exact CSR there. */
+void host_service_graphics_vblank(void);
 void host_service_graphics_shutdown(void);
 int host_service_movie_playing(void);
 void host_service_movie_audio(uint32_t a0, int a1);

@@ -996,6 +996,16 @@ def translate(name, recompiled, sigs):
             L.append('}')
             i+=1
             continue
+        # sceGsSyncV keeps only CSR.FIELD (bit 13) of this load, which the EE's CSR page always
+        # holds exactly, even while a deferred vsync's CSR is provisional (port/hle/kernel.c,
+        # finding 090 HO1). The page changes only on the EE, so a wait for the drawing cannot change
+        # what it reads: read it without the graphics fence, which would wait for the whole field.
+        if name == 'func_00243CE8' and addr == 0x00243D2C:
+            if (op, a) != ('ld', ['$v0', '0x0($v1)']):
+                raise Fail('%s %08X: expected the CSR load, found %s %s' % (name, addr, op, a))
+            L.append('GPR(2) = *(volatile uint64_t *)(uintptr_t)UW(3);')
+            i += 1
+            continue
         control = op in BRANCH or op in LIKELY or op in ('j', 'jal', 'jr', 'jalr')
         if not control:
             fn.insn(op, a, text(op, a))

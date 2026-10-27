@@ -141,6 +141,26 @@ static void idle_wait(volatile LONG *p, uint32_t at, volatile LONG *flag, HANDLE
 static void wait_retired(uint32_t at) { idle_wait(&consumed, at, &waiting, retired, 1, NULL); }
 
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+/* Markers (finding 090 HO1): a VBLANK or a picture queued in order with the packets, run by the
+   thread that owns the GS once everything sent before it has run there. Unit 3 in this ring, then
+   GS_PATH_MARK in the GS ring. Words: sequence number, kind, payload. */
+enum { UNIT_MARK = 3, MARK_VBLANK = 0, MARK_PRESENT = 1, MARK_WORDS = 64 };
+static uint32_t marks_sent, vblank_mark, present_mark;  /* EE */
+QUEUE_COUNTER(marks_done);                              /* the GS owner: the last marker run */
+static volatile uint64_t vblank_csr;  /* CSR after the last VBLANK marker; read after its mark */
+void (*graphics_present_marked)(const void *payload);  /* present.c */
+
+static void run_mark(const uint32_t *words)
+{
+    if (words[1] == MARK_VBLANK) {
+        gs_vblank(&gs);
+        vblank_csr = gs_priv_read(&gs, GS_CSR);
+    } else if (graphics_present_marked) graphics_present_marked(words + 2);
+    InterlockedExchange(&marks_done, (LONG)words[0]);
+}
+#endif
+
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
 #include "gs_queue.inc"
 #endif
 
@@ -150,6 +170,12 @@ static void execute(unsigned unit, const uint32_t *words, unsigned count)
        exceptional values must not inherit the game's diagnostic SSE mask. */
     unsigned control = fp_control();
     fp_set_control(FP_IEEE(control));  /* IEEE: nearest, no FTZ/DAZ */
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    if (unit == UNIT_MARK) {
+        if (gs_worker) graphics_gif_feed(GS_PATH_MARK, words, count);
+        else run_mark(words);
+    } else
+#endif
     if (unit == 2) {
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
         double start = worker_profile_start && worker_profile ? host_wall_seconds() : 0;
@@ -266,10 +292,17 @@ static void initialize(void)
     }
 }
 
+static void feed_words(int unit, const uint32_t *words, uint32_t count);
+
 void graphics_feed(int unit, uint32_t guest_words, uint32_t count)
 {
     const uint32_t *words = GUEST(guest_words);
     if (unit == 0) { vif_feed(unit, words, count); return; }
+    feed_words(unit, words, count);
+}
+
+static void feed_words(int unit, const uint32_t *words, uint32_t count)
+{
     if (!initialized) initialize();
     if (!worker) { execute((unsigned)unit, words, count); return; }
     while (count) {
@@ -299,10 +332,106 @@ void graphics_feed(int unit, uint32_t guest_words, uint32_t count)
     }
 }
 
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+/* Deferred vsync (finding 090 HO1, after finding 048's f80b4d61): with the workers, the EE does not
+   wait for the drawing at vsync. The VBLANK and the picture go into the queues as markers and the
+   EE goes on with the next field while VU1 and the GS finish this one; at most two fields are in
+   flight (graphics_vblank). The game's CSR page stays exact where it can be read (kernel.c,
+   host_service_graphics_wait). Off with DHD_SYNC_STRICT=1 and wherever the EE reads the GS at
+   vsync: screenshots, GS captures, DHD_PROFILE. */
+int graphics_deferred(void)
+{
+    static int deferred = -1;
+    if (deferred < 0) {
+        const char *strict = getenv("DHD_SYNC_STRICT");
+        deferred = graphics_threaded() && !(strict && strcmp(strict, "0")) && !getenv("DHD_SCREENSHOT") &&
+                   !getenv("DHD_GS_CAPTURE") && !getenv("DHD_RACE_GSDUMP") && !getenv("DHD_PROFILE") &&
+                   !getenv("DHD_VU_SUSPECT");
+    }
+    return deferred;
+}
+
+/* Queues a marker behind everything sent so far (payload: whole words, copied). */
+static uint32_t graphics_mark(unsigned kind, const void *payload, unsigned bytes)
+{
+    uint32_t words[2 + MARK_WORDS];
+    if (bytes > MARK_WORDS * 4) abort();
+    words[0] = ++marks_sent;
+    words[1] = kind;
+    if (bytes) memcpy(words + 2, payload, bytes);
+    feed_words(UNIT_MARK, words, 2 + (bytes + 3) / 4);
+    return marks_sent;
+}
+
+static void wait_mark(uint32_t sequence)
+{
+    uint32_t done;
+    while ((int32_t)((done = position(&marks_done)) - sequence) < 0) {
+        if (gs_worker) idle_wait(&marks_done, done, &gs_waiting, gs_retired, 1, NULL);
+        else idle_wait(&marks_done, done, &waiting, retired, 1, NULL);
+    }
+}
+
+/* The EE's side of a deferred VBLANK (kernel.c): wait until the picture of the field before last
+   has been handed on (two fields in flight: the GS works on one while VU1 starts the next), or with
+   DHD_FIELDS_IN_FLIGHT=1 the last one, then queue this VBLANK. */
+void graphics_vblank(void)
+{
+    static int in_flight;
+    static uint32_t before_last;
+    if (!in_flight) {
+        const char *option = getenv("DHD_FIELDS_IN_FLIGHT");
+        in_flight = option && atoi(option) == 1 ? 1 : 2;
+    }
+    /* the last picture, or with none since the last VBLANK (no window: DHD_HEADLESS) that VBLANK */
+    uint32_t last = (int32_t)(present_mark - vblank_mark) < 0 ? vblank_mark : present_mark;
+    uint32_t target = in_flight == 1 ? last : before_last;
+    before_last = last;
+    LONG64 start = tl_begin();
+    int pending = (int32_t)(position(&marks_done) - target) < 0;
+    wait_mark(target);
+    tl_add(TL_EE_GS, start);
+    if (start) tl_site(__builtin_return_address(0), pending, tl_now() - start);
+    vblank_mark = graphics_mark(MARK_VBLANK, NULL, 0);
+}
+
+/* present.c's gs_vsync: the picture, run by graphics_present_marked in order with the drawing. */
+void graphics_present(const void *payload, unsigned bytes)
+{
+    present_mark = graphics_mark(MARK_PRESENT, payload, bytes);
+}
+#endif
+
 /* Guest-address-only module boundary; native device code stays above. */
 #include "../host/host_api.h"
 #include "../include/guest.h"
 void host_service_graphics_feed(int a0, uint32_t a1, uint32_t a2) { graphics_feed(a0, a1, a2); }
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+/* The game's CSR page (0x12001000) after a deferred VBLANK: exact but for SIGNAL and FINISH until
+   the game's next wait, which puts the CSR the VBLANK left there (kernel.c). */
+static int csr_provisional;
+
+void host_service_graphics_wait(void)
+{
+    graphics_wait();
+    if (!csr_provisional) return;
+    csr_provisional = 0;
+    wait_mark(vblank_mark);
+    *(volatile uint64_t *)GUEST(0x12001000) = vblank_csr;
+}
+
+/* 2: threaded with deferred vsyncs (graphics_deferred) */
+int host_service_graphics_threaded(void) { return graphics_threaded() ? 1 + graphics_deferred() : 0; }
+
+void host_service_graphics_vblank(void)
+{
+    graphics_vblank();
+    volatile uint64_t *csr = (volatile uint64_t *)GUEST(0x12001000);
+    *csr = (*csr | 8) ^ 0x2000;  /* gs_vblank's change; SIGNAL and FINISH settle later */
+    csr_provisional = 1;
+}
+#else
 void host_service_graphics_wait(void) { graphics_wait(); }
 int host_service_graphics_threaded(void) { return graphics_threaded(); }
+#endif
 void host_service_graphics_shutdown(void) { graphics_shutdown(); }

@@ -67,6 +67,37 @@ static void load_clut(Gs *g, uint64_t tex)
                           field(cl, 6, 63) * 16 + i, field(cl, 12, 1023)) / 8, 4);
     }
     start = (csa & ((cpsm & 2) ? 31 : 15)) * 16;
+    if (!csm) {
+        /* CSM1: the entries are distinct, so only the number of changed ones matters for
+           state_version; counted without a branch per entry. */
+        uint16_t low[256], high[256];
+        unsigned first = 0, changed = 0;
+        if (cpsm & 2) {
+            for (i = 0; i < count; i++) {
+                unsigned a = cbp * 256 + ((i & ~31u) + t16[i & 31]) * 2;
+                low[i] = (uint16_t)(g->vram[(a & (GS_VRAM_SIZE - 1)) / 4] >> ((a & 2) * 8));
+            }
+            for (i = 0; i < count; i++) {
+                uint16_t *entry = &g->clut[(start + i) & 511];
+                changed += *entry != low[i];
+                *entry = low[i];
+            }
+        } else {
+            if (count == 256) first = start, start = 0;
+            for (i = first; i < count; i++) {
+                unsigned src = count == 256 ? (i & 0x80) | (i & 0x10) << 2 | (i & 0x60) >> 1 | t32[i & 15] : t32[i];
+                uint32_t value = g->vram[(cbp * 64 + src) & (GS_VRAM_SIZE / 4 - 1)];
+                low[i] = (uint16_t)value; high[i] = (uint16_t)(value >> 16);
+            }
+            for (i = first; i < count; i++) {
+                uint16_t *lo = &g->clut[start + i], *hi = &g->clut[start + i + 256];
+                changed += (*lo != low[i]) + (*hi != high[i]);
+                *lo = low[i]; *hi = high[i];
+            }
+        }
+        g->state_version += changed;
+        return;
+    }
     for (i = 0; i < count; i++) {
         unsigned dst = start + i, value;
         if (csm) {
@@ -479,7 +510,15 @@ void gs_feed(Gs *g, unsigned path, const uint32_t *words, size_t count)
     int bulk = input < state ? count <= (state - input) / sizeof *words
                              : input - state >= sizeof *p;
     for (size_t i = 0; i < count;) {
-        if (bulk && !p->have && count - i >= 4) {
+        if (bulk && !p->have && count - i >= 4 && p->left && p->mode >= 2 && !g->record_transfer && !image_reference) {
+            /* IMAGE data: the whole run of qwords at once, the same pixels as one image_data per
+               qword. The path keeps the last qword, as it would. */
+            size_t run = (count - i) / 4 < p->left ? (count - i) / 4 : p->left;
+            image_data(g, (const uint8_t *)(words + i), (unsigned)run * 16);
+            memcpy(p->words, words + i + (run - 1) * 4, sizeof p->words);
+            p->left -= (uint32_t)run;
+            i += run * 4;
+        } else if (bulk && !p->have && count - i >= 4) {
             memcpy(p->words, words + i, sizeof p->words);
             p->have = 4;  /* the transfer callback observes a completed qword */
             i += 4;

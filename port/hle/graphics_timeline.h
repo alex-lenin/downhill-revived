@@ -142,9 +142,16 @@ void graphics_timeline(int phase, unsigned field, double wall_seconds)
     fprintf(stderr, "bench timeline: busy_ms_per_field game=%.3f vu=%.3f gs=%.3f\n",
             field_ms - mean[1 + TL_EE_VU] - mean[1 + TL_EE_GS] - mean[1 + TL_EE_FULL],
             field_ms - mean[1 + TL_VU_IDLE] - mean[1 + TL_VU_FULL], field_ms - mean[1 + TL_GS_IDLE]);
+    /* exe+offset: the site's place in the link map (dhd64.map), whatever the load address */
+#ifdef _WIN32
+    uintptr_t image = (uintptr_t)GetModuleHandleA(NULL);
+#else
+    uintptr_t image = 0;
+#endif
     for (unsigned i = 0; i < TL_SITES && tl_sites[i].site; i++)
-        fprintf(stderr, "bench timeline: ee_wait site=%p calls=%.2f pending=%.2f wait_ms=%.3f (per field)\n",
-                tl_sites[i].site, (double)tl_sites[i].calls / count, (double)tl_sites[i].pending / count,
+        fprintf(stderr, "bench timeline: ee_wait site=%p exe+0x%llx calls=%.2f pending=%.2f wait_ms=%.3f (per field)\n",
+                tl_sites[i].site, (unsigned long long)((uintptr_t)tl_sites[i].site - image),
+                (double)tl_sites[i].calls / count, (double)tl_sites[i].pending / count,
                 (double)tl_sites[i].ticks * 1e3 / frequency / count);
     const char *path = getenv("DHD_TIMELINE");
     if (path && strcmp(path, "1")) {
