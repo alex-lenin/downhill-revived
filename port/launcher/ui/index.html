@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Downhill Revived</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-notes" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></symbol>
+  <symbol id="i-min" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-retry" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-disc" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+</svg>
+
+<header class="titlebar" data-tauri-drag-region>
+  <div class="win-ctl">
+    <button id="win-min" aria-label="Minimize"><svg class="i"><use href="#i-min"/></svg></button>
+    <button id="win-close" class="close" aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button>
+  </div>
+</header>
+
+<div class="body">
+  <aside class="rail">
+    <div class="word" aria-label="Downhill Revived">Downhill<b>Revived</b></div>
+    <nav class="nav">
+      <button data-page="play" class="on"><svg class="i"><use href="#i-play"/></svg>Play</button>
+      <button data-page="settings"><svg class="i"><use href="#i-sliders"/></svg>Settings</button>
+      <button data-page="notes"><svg class="i"><use href="#i-notes"/></svg>Patch notes</button>
+    </nav>
+    <div class="rider" id="rider">
+      <div class="plate" id="rider-initial">?</div>
+      <div class="who">
+        <span id="rider-name">RIDER</span>
+        <input id="rider-input" maxlength="12" spellcheck="false" autocomplete="off" aria-label="Rider name" hidden>
+        <small id="rider-hint">Rider name</small>
+      </div>
+      <button class="icon-btn" id="rider-edit" aria-label="Change rider name"><svg class="i"><use href="#i-pencil"/></svg></button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="page" id="page-play">
+      <div class="home">
+        <div id="home-ready">
+          <h1 id="home-title">Ready to ride</h1>
+          <p class="meta" id="home-meta"></p>
+          <ul class="news" id="news" hidden></ul>
+        </div>
+        <div id="home-first" hidden>
+          <h1 id="first-title">One step to the start gate</h1>
+          <p class="lead">Downhill Revived plays from <b>your own copy</b> of Downhill Domination (USA, SCUS-97177) as an .iso file. It is checked here and remembered; nothing leaves your PC.</p>
+          <ol class="steps">
+            <li class="now"><i>1</i><div>Choose your disc image<small id="first-step">Any folder; the file stays where it is</small></div></li>
+            <li><i>2</i><div>Ride<small>PLAY appears below once the disc checks out</small></div></li>
+          </ol>
+        </div>
+        <div class="facts">
+          <button class="fact" id="fact-disc" hidden><svg class="i"><use href="#i-disc"/></svg><span id="fact-disc-name"></span></button>
+          <span class="fact" id="fact-server" hidden></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-settings" hidden>
+      <div class="set">
+        <div class="head"><h1>Settings</h1><button class="link quiet" id="reset-tab"><svg class="i"><use href="#i-undo"/></svg>Reset tab</button></div>
+        <p class="sub">The same settings as PC SETTINGS in the game, saved to dhd.ini. Changes apply the next time the game starts.</p>
+        <div class="tabs" role="tablist" id="tabs"></div>
+        <div class="rows" id="rows"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-notes" hidden>
+      <div class="set notes">
+        <h1 id="notes-title">Patch notes</h1>
+        <div class="md" id="notes-body"><p class="muted">Patch notes appear here once the launcher reaches GitHub.</p></div>
+        <button class="link" id="notes-page"><svg class="i"><use href="#i-external"/></svg>All releases on GitHub</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="st" id="status" role="status" aria-live="polite"></div>
+  <div class="pads" aria-hidden="true">
+    <span><i class="pa" id="pad-a">A</i>Select</span><span><i class="pb" id="pad-b">B</i>Back</span>
+    <span class="tabs-hint"><i id="pad-lb">LB</i><i id="pad-rb">RB</i>Tabs</span>
+  </div>
+  <button class="btn text" id="secondary" hidden></button>
+  <button class="btn danger" id="danger" hidden></button>
+  <button class="icon-btn" id="dismiss" aria-label="Dismiss" hidden><svg class="i"><use href="#i-x"/></svg></button>
+  <button class="btn" id="discord"><svg class="i discord"><use href="#i-chat"/></svg>Discord</button>
+  <button class="btn primary" id="primary"><svg class="i"><use href="#i-play"/></svg><span>Play</span></button>
+</footer>
+
+<script src="app.js"></script>
+<script src="pad.js"></script>
+</body>
+</html>

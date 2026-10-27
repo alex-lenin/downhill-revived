@@ -924,6 +924,7 @@ static void apply_setting(const char *key, const char *value)
         {"sound_latency_ms", "DHD_SND_LATENCY_MS"},
         {"server", "DHD_NET_SERVER"}, {"name", "DHD_NET_NAME"}, {"rider", "DHD_NET_RIDER"},  /* online (port/net) */
         {"update_url", "DHD_UPDATE_URL"}, {"auto_update", "DHD_AUTO_UPDATE"},  /* the updater (update.c) */
+        {"launcher", "DHD_LAUNCHER_MODE"},  /* off: dhd.exe doesn't open the launcher (update.c) */
         {"texture_pack", "DHD_TEXTURE_PACK"}, {"textures", "DHD_TEXTURES"},  /* texture packs (port/gs/texpack.c) */
         {"texture_cache_mb", "DHD_TEXTURE_CACHE_MB"},
         {"font", "DHD_FONT"},  /* the sharp font (port/gs/font_sharp.c) */
@@ -1100,6 +1101,9 @@ static const char settings_template[] =
     "; the official releases. An update replaces dhd.exe and the text files, never dhd.ini or saves.\n"
     "update_url =\n"
     "auto_update = ask\n"
+    "; launcher: on (dhd.exe opens DownhillRevived.exe, the launcher, when it is beside it) or off\n"
+    "; (dhd.exe starts the game straight away).\n"
+    "launcher = on\n"
     "\n"
     "; A texture pack (upscale mod) made for PCSX2 works unchanged: texture_pack is its folder of\n"
     "; PNGs, the full path of PCSX2's textures\\SCUS-97177\\replacements folder for example (in\n"

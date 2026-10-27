@@ -5,6 +5,7 @@ in build/release/DownhillRevived-<version>/), built from the 64-bit game on the 
     python port/tools/package_release.py                 # dhd.exe from it, checked, zipped
     python port/tools/package_release.py --wasm PATH     # from another dhd_core.wasm
     python port/tools/package_release.py --exe PATH      # a ready build_host64.py dhd64.exe (link.rsp beside it)
+    python port/tools/package_release.py --launcher PATH # a ready build_launcher.py DownhillRevived.exe
 
 dhd.exe is build_host64.py's dhd64.exe (wasm2c, clang-cl, lld-link; the Rust renderer,
 port/render, linked in as dhd_render.lib) under build/release-work/, with an x64 SDL3 static
@@ -19,12 +20,16 @@ asset of tag v<version>, or --base-url + the zip's name), "sha256" (the zip's), 
 Publish both as assets of the GitHub release tagged v<version>.
 
 The zip holds one folder, DownhillRevived-<version>, with:
+  DownhillRevived.exe      the launcher (port/launcher, finding 093; built by build_launcher.py): settings,
+                           rider name, updates, Discord; it starts dhd.exe, and dhd.exe started straight
+                           opens it (port/hle/update.c). It imports only Windows' own DLLs (checked)
   dhd.exe                  the 64-bit game; it imports only Windows' own DLLs (checked)
   README.txt               how to play (port/release/README.txt)
   LICENSE.txt              the GPL-3.0 text (LICENSE)
   THIRD-PARTY-NOTICES.txt  port/release/THIRD-PARTY-NOTICES.txt, then the licences of the Rust
-                           crates linked into dhd.exe, generated from port/render/Cargo.lock and
-                           the crates' own licence files (rust_notices)
+                           crates linked into dhd.exe and DownhillRevived.exe, generated from
+                           port/render/Cargo.lock, port/launcher/src-tauri/Cargo.lock and the
+                           crates' own licence files (rust_notices)
   dxcompiler.dll           Microsoft's DirectX Shader Compiler, x64, unchanged (port/tools/dxc.py):
                            the renderer compiles its Direct3D 12 shaders with it (finding 084 §14)
 
@@ -40,7 +45,8 @@ The package is refused if:
   - dhd.exe holds a server address other than the official one (dhd.skuza.app, the built-in
     default): another workers.dev host, DHD_NET_SERVER when set, or the server line of a dhd.ini
     named by --settings;
-  - dhd.exe imports a DLL that is not Windows' own;
+  - dhd.exe or DownhillRevived.exe imports a DLL that is not Windows' own, or the launcher holds a
+    folder of this machine or another version (build_launcher.problems);
   - a packaged file name looks like game data, or any packaged file holds a run of 64 bytes or more
     of the retail ELF (port/tools/scan_retail.py) other than the string literals and tables the
     decompiled source itself holds (scan_retail.SOURCE) and the Rust library's own bytes. The
@@ -66,12 +72,14 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import build_launcher  # noqa: E402
 import dxc  # noqa: E402
 import scan_retail  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE = ROOT / 'port' / 'release'
 RENDER = ROOT / 'port' / 'render'
+LAUNCHER_CRATE = ROOT / 'port' / 'launcher' / 'src-tauri'
 VERSION_H = ROOT / 'port' / 'include' / 'version.h'
 WORK = ROOT / 'build' / 'release-work'
 # Where players get releases: latest.json names the zip as an asset of the release v<version>.
@@ -107,6 +115,8 @@ SYSTEM_DLL = re.compile(r'^(kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut3
                         r'bcrypt|imm32|version|setupapi|cfgmgr32|combase|uxtheme|dwmapi|hid|hidapi|'
                         r'shcore|msvcrt|mfplat|xinput1_4|xinput9_1_0|dinput8|wintrust|crypt32|'
                         r'ntdll|bcryptprimitives)\.dll$', re.I)  # the last two: Rust std's
+# The launcher's webview shell also uses these (Windows' own as well).
+LAUNCHER_DLL = re.compile(r'^(comctl32|secur32|shlwapi)\.dll$', re.I)
 RUST_TRIPLE = 'x86_64-pc-windows-msvc'   # the Rust renderer's native target
 RUST_LIB = 'dhd_render.lib'              # build_host64.py links it (rustgs.py builds it)
 
@@ -254,7 +264,8 @@ def imported_dlls(exe):
 # The licences a linked crate may be used under, in the order one is chosen from an "A OR B";
 # the value names the crate's licence file (its name holds the word), when it has several.
 LICENCES = {'MIT': 'mit', 'Zlib': 'zlib', 'ISC': 'isc', 'BSD-2-Clause': 'bsd', 'BSD-3-Clause': 'bsd',
-            'Apache-2.0': 'apache', 'Unicode-3.0': 'unicode', 'CC0-1.0': 'cc0'}
+            'Apache-2.0': 'apache', 'Unicode-3.0': 'unicode', 'CC0-1.0': 'cc0',
+            'MPL-2.0': 'mpl'}  # MPL-2.0: the launcher's HTML parser crates (Tauri's), unmodified
 LICENCE_FILE = re.compile(r'^(licen[cs]e|copying|copyright|notice|unlicense)', re.I)
 MIT_TEMPLATE = """Copyright (c) %s
 
@@ -274,20 +285,21 @@ OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."""
 
 
-def linked_crates():
-    """The crates linked into dhd_render.lib: cargo metadata (offline, --locked: Cargo.lock's
-    versions) with the native feature for the x64 Windows target, walked from dhd_render through
+def linked_crates(folder=RENDER, root_name='dhd_render', features=('native',)):
+    """The crates linked into a crate of ours (dhd_render.lib; the launcher): cargo metadata (offline,
+    --locked: Cargo.lock's versions) with its features for the x64 Windows target, walked from it through
     normal dependencies. Proc-macro crates run only inside the compiler: neither they nor what only
-    they use reach the library."""
-    r = subprocess.run(['cargo', 'metadata', '--offline', '--locked', '--format-version', '1', '--features', 'native',
-                        '--filter-platform', RUST_TRIPLE], cwd=str(RENDER), capture_output=True, text=True,
-                       encoding='utf-8', errors='replace')
+    they use reach the binary."""
+    cmd = ['cargo', 'metadata', '--offline', '--locked', '--format-version', '1', '--filter-platform', RUST_TRIPLE]
+    if features:
+        cmd += ['--features', ','.join(features)]
+    r = subprocess.run(cmd, cwd=str(folder), capture_output=True, text=True, encoding='utf-8', errors='replace')
     if r.returncode:
-        sys.exit('cargo metadata failed in %s:\n%s' % (RENDER, r.stderr[-2000:]))
+        sys.exit('cargo metadata failed in %s:\n%s' % (folder, r.stderr[-2000:]))
     meta = json.loads(r.stdout)
     packages = {p['id']: p for p in meta['packages']}
     nodes = {n['id']: n for n in meta['resolve']['nodes']}
-    root = next(i for i, p in packages.items() if p['name'] == 'dhd_render')
+    root = next(i for i, p in packages.items() if p['name'] == root_name)
     seen, todo = set(), [root]
     while todo:
         i = todo.pop()
@@ -302,7 +314,8 @@ def linked_crates():
 def crate_licence(package):
     """[(licence, text or None)] a crate is used under: one licence of each "AND" part (the first in
     LICENCES of its "OR" choices), with the crate's licence file for it. None: no file of its own
-    (Apache-2.0: the text at the end; CC0-1.0: none needed; MIT: the MIT text with the authors)."""
+    (Apache-2.0: the text at the end; CC0-1.0: none needed; MIT: the MIT text with the authors;
+    MPL-2.0: the same text another crate ships, rust_notices)."""
     expression = (package.get('license') or '').replace('/', ' OR ')
     if not expression:
         sys.exit('Rust crate %s %s names no licence; not packaged' % (package['name'], package['version']))
@@ -323,7 +336,7 @@ def crate_licence(package):
         if text is None and chosen == 'MIT':
             text = MIT_TEMPLATE % ', '.join(re.sub(r'\s*<[^>]*>', '', a) for a in package.get('authors') or
                                             ['the %s developers' % package['name']])
-        if text is None and chosen not in ('Apache-2.0', 'CC0-1.0'):
+        if text is None and chosen not in ('Apache-2.0', 'CC0-1.0', 'MPL-2.0'):
             sys.exit('Rust crate %s %s: no %s licence file in %s; not packaged'
                      % (package['name'], package['version'], chosen, folder))
         if chosen == 'Apache-2.0':  # its NOTICE file travels with it (Apache-2.0 section 4d)
@@ -338,11 +351,12 @@ def indent(text):
 
 
 def rust_notices():
-    """The notices of the Rust crates linked into dhd.exe (linked_crates), as text: a list, then each
-    licence text once with the crates it covers, then the Apache License 2.0 text (also the WABT
-    runtime's, THIRD-PARTY-NOTICES.txt)."""
-    crates = linked_crates()
-    rows, texts, apache = [], {}, None
+    """The notices of the Rust crates linked into dhd.exe and DownhillRevived.exe (linked_crates), as
+    text: a list, then each licence text once with the crates it covers, then the Apache License 2.0
+    text (also the WABT runtime's, THIRD-PARTY-NOTICES.txt)."""
+    both = {(p['name'], p['version']): p for p in linked_crates() + linked_crates(LAUNCHER_CRATE, 'dhd_launcher', ())}
+    crates = [both[k] for k in sorted(both)]
+    rows, texts, apache, mpl_without = [], {}, None, []
     for p in crates:
         used = crate_licence(p)
         rows.append('  %s %s  %s%s  %s' % (p['name'], p['version'], p.get('license'),
@@ -353,6 +367,8 @@ def rust_notices():
             if text:
                 key = ' '.join(text.split())
                 texts.setdefault(key, (licence, text, []))[2].append('%s %s' % (p['name'], p['version']))
+            elif licence == 'MPL-2.0':
+                mpl_without.append('%s %s' % (p['name'], p['version']))
         folder = Path(p['manifest_path']).parent
         if apache is None:
             apache = next((f.read_text(encoding='utf-8', errors='replace').strip() for f in sorted(folder.iterdir())
@@ -360,13 +376,20 @@ def rust_notices():
                            and 'Apache License' in f.read_text(encoding='utf-8', errors='replace')[:400]), None)
     if apache is None:
         sys.exit('no Apache License 2.0 text among the Rust crates\' licence files; not packaged')
-    out = ['Rust crates linked into dhd.exe',
-           '===============================',
+    if mpl_without:  # the MPL-2.0 text is the same for every crate: listed under one that ships it
+        mpl = next((t for t in texts.values() if t[0] == 'MPL-2.0' and 'Mozilla Public License' in t[1]), None)
+        if mpl is None:
+            sys.exit('no MPL-2.0 text for %s; not packaged' % ', '.join(mpl_without))
+        mpl[2].extend(mpl_without)
+    out = ['Rust crates linked into dhd.exe and DownhillRevived.exe',
+           '=======================================================',
            '',
-           'The graphics renderer (port/render, part of this project, GPL-3.0-or-later) is written in Rust and',
-           'linked into dhd.exe with these crates (versions from port/render/Cargo.lock). A crate offered under',
-           'several licences is used under the first of MIT, Zlib, ISC, BSD, Apache-2.0. Their licence texts',
-           'follow the list; the Apache License 2.0 text is at the end.',
+           'The graphics renderer (port/render) and the launcher (port/launcher), parts of this project',
+           '(GPL-3.0-or-later), are written in Rust and linked with these crates (versions from',
+           'port/render/Cargo.lock and port/launcher/src-tauri/Cargo.lock). A crate offered under several',
+           'licences is used under the first of MIT, Zlib, ISC, BSD, Apache-2.0. The crates under MPL-2.0 are',
+           'used unmodified; their source is on crates.io under the name and version listed. Their licence',
+           'texts follow the list; the Apache License 2.0 text is at the end.',
            ''] + rows
     for licence, text, names in texts.values():
         out += ['', '%s: %s' % (licence, ', '.join(names)), '', indent(text)]
@@ -410,6 +433,7 @@ def main():
     source.add_argument('--wasm', type=Path, default=ROOT / 'build' / 'wasm' / 'dhd_core.wasm',
                         help='the dhd_core.wasm to build dhd.exe from (default build/wasm/dhd_core.wasm)')
     source.add_argument('--exe', type=Path, help="a ready build_host64.py dhd64.exe (its link.rsp beside it)")
+    ap.add_argument('--launcher', type=Path, help='a ready build_launcher.py DownhillRevived.exe (default: build it)')
     ap.add_argument('--sdl-lib', type=Path, help='x64 SDL3 static library (default: sdl3.py\'s x64 build)')
     ap.add_argument('--sdl-include', type=Path, help='its include directory (with --sdl-lib)')
     ap.add_argument('--jobs', type=int, default=2)
@@ -470,8 +494,17 @@ def main():
     foreign = [d for d in dlls if not SYSTEM_DLL.match(d)]
     if foreign:
         sys.exit('dhd.exe imports DLLs that are not Windows\' own: %s' % ', '.join(foreign))
+    launcher = a.launcher.resolve() if a.launcher else build_launcher.build()
+    if not launcher.exists():
+        sys.exit('%s: no such file' % launcher)
+    found = build_launcher.problems(launcher)
+    foreign = [d for d in imported_dlls(launcher) if not SYSTEM_DLL.match(d) and not LAUNCHER_DLL.match(d)]
+    if found or foreign:
+        sys.exit('%s is not fit to publish:\n  %s' % (launcher, '\n  '.join(
+            found + ['imports %s, not Windows\' own' % d for d in foreign])))
 
     files = {
+        'DownhillRevived.exe': launcher.read_bytes(),
         'dhd.exe': data,
         'README.txt': crlf(RELEASE / 'README.txt'),
         'LICENSE.txt': crlf(ROOT / 'LICENSE'),
@@ -493,8 +526,11 @@ def main():
         if runs:
             sys.exit('%s holds game data (runs of the retail ELF):\n  %s' % (file_name, '\n  '.join(
                 '+0x%X: %d bytes = %s' % (at, n, scan_retail.elf_place(elf, e)) for at, e, n in runs[:20])))
-        # the text files may show the official server and example.org addresses, nothing else
-        hosts = set(h.lower().rstrip(b'.') for h in re.findall(rb'wss?://([A-Za-z0-9.:-]+)', content)) - {
+        # the text files may show the official server and example.org addresses, nothing else. In the
+        # launcher the Rust string constants sit back to back ("wss://dhd.skuza.appwss://ws://"); no host
+        # holds a scheme, so each scheme starts a new address.
+        split = re.sub(rb'(?=(?:wss?|https?)://)', b'\0', content)
+        hosts = set(h.lower().rstrip(b'.') for h in re.findall(rb'wss?://([A-Za-z0-9.:-]+)', split)) - {
             b'races.example.org', OFFICIAL_HOST}
         if file_name != 'dhd.exe' and (hosts or other_hosts(content) or any(
                 s.lower() in content.lower() for s in FORBIDDEN + sorted(server_strings(a.settings)))):

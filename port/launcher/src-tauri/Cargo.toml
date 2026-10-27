@@ -1,0 +1,37 @@
+# The player launcher (finding 093): settings, rider name, updates and Discord before dhd.exe starts.
+# One Rust core and one HTML/CSS front end (../ui) for Windows, macOS and Linux (Tauri 2).
+[package]
+name = "dhd_launcher"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+description = "Downhill Revived launcher"
+publish = false
+
+[[bin]]
+name = "DownhillRevived"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# no "compression": the UI is small, and brotli's crates lack the licence files a release needs
+tauri = { version = "2", default-features = false, features = ["wry", "common-controls-v6", "dynamic-acl"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTTPS through the system's own TLS and certificates (Windows: SChannel), no bundled root list
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
+native-tls = "0.2"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

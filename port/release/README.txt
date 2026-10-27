@@ -14,10 +14,14 @@ What you need
 
 How to play
 1. Unzip this folder anywhere you can write to (not Program Files).
-2. Run dhd.exe.
+2. Run DownhillRevived.exe, the launcher (dhd.exe opens it too). It keeps the game up to date
+   and holds the settings, your rider name for online races, the patch notes and a link to the
+   Discord server. Press PLAY.
 3. The first time, the game asks for your disc image: choose your .iso. It is checked and
    remembered in dhd.ini (the game writes this file then); you are only asked again if the file
-   moves or changes.
+   moves or changes. The launcher's Settings > Game can change it later.
+To start the game without the launcher, turn off Settings > Game > Open the launcher first (or
+put "launcher = off" in dhd.ini); dhd.exe then starts the game straight away.
 
 Controls
 A controller works out of the box: Xbox pads, DualSense, DualShock 4, Switch Pro, 8BitDo and most

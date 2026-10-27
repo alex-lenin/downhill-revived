@@ -49,6 +49,7 @@
 #define OFFICIAL_UPDATE_URL "https://api.github.com/repos/skuza-oss/downhill-revived/releases/latest"
 #define RELEASES_PAGE "https://github.com/skuza-oss/downhill-revived/releases/latest"
 #define TITLE "Downhill Revived"
+#define LAUNCHER_EXE "DownhillRevived.exe" /* port/launcher, beside dhd.exe in a release */
 #define WIDE2(s) L##s
 #define WIDE(s) WIDE2(s)
 enum { CHECK_SECONDS = 6, UPDATE_EXIT_CODE = 0x55504454 /* "UPDT": the game asks for an update */ };
@@ -839,10 +840,46 @@ static void clean_up(void)
 #endif
 }
 
-/* The first process, after dhd.ini: clean up, then look for a newer release and offer it. */
+/* dhd.exe started straight (a shortcut, or after an older release's own update) with the launcher
+   beside it: the launcher opens instead and starts the game itself, with DHD_LAUNCHER=1 (finding
+   093). Not when dhd.ini says launcher = off, nor for tools driving the game. Nonzero: started. */
+static int start_launcher(void)
+{
+#ifdef _WIN32
+    const char *setting = getenv("DHD_LAUNCHER_MODE");
+    char dir[MAX_PATH], exe[MAX_PATH + 32];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    if (getenv("DHD_LAUNCHER") || getenv("DHD_UPDATE_NOW") || automated() || (setting && !_stricmp(setting, "off")))
+        return 0;
+    exe_dir(dir, sizeof dir);
+    snprintf(exe, sizeof exe, "%s%s", dir, LAUNCHER_EXE);
+    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) return 0;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    if (!CreateProcessA(exe, NULL, NULL, NULL, FALSE, 0, start_environment, dir, &si, &pi)) {
+        fprintf(stderr, "update: can't start %s (error %lu); starting the game\n", exe, GetLastError());
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    fprintf(stderr, "update: %s opened instead\n", exe);
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* The first process, after dhd.ini: the launcher if there is one, else clean up, then look for a
+   newer release and offer it. */
 void update_at_start(void)
 {
     if (getenv("DHD_RELAUNCHED")) return;
+    if (start_launcher()) {
+        splash_close();
+        fflush(stdout), fflush(stderr);
+        exit(0);
+    }
     clean_up();
     const char *now_env = getenv("DHD_UPDATE_NOW");
     int now = now_env && atoi(now_env), m = now ? 2 : mode();
@@ -899,13 +936,13 @@ int update_after_game(int code)
     return start_again(exe) ? 0 : 1;
 }
 
-/* The online menu's Update Now: the game ends and the first dhd.exe updates (update_after_game).
-   Without that first process (the game wasn't relaunched) this one does it. */
+/* The online menu's Update Now: the game ends and the first dhd.exe updates (update_after_game),
+   or the launcher does when it started the game. Without either this one does it. */
 void update_request(void)
 {
     fprintf(stderr, "update: asked for from the online menu\n");
     fflush(stdout), fflush(stderr);
-    if (getenv("DHD_RELAUNCHED")) ExitProcess(UPDATE_EXIT_CODE);
+    if (getenv("DHD_RELAUNCHED") || getenv("DHD_LAUNCHER")) ExitProcess(UPDATE_EXIT_CODE);
     exit(update_after_game(UPDATE_EXIT_CODE));
 }
 
