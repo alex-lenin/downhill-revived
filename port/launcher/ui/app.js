@@ -12,7 +12,7 @@ const $ = (id) => document.getElementById(id);
 const DEFAULTS = {
   scale: '2', window: 'borderless', size: 'monitor', widescreen: '1', DHD_ASPECT: 'wide', skip_movies: '1', vsync: '1',
   fps: '60', textures: 'on', font: 'sharp', vibration: '1', DHD_PRESENT_FILTER: 'linear',
-  auto_update: 'ask', launcher: 'on', name: '', server: '', iso: '',
+  auto_update: 'ask', launcher: 'on', name: '', server: '', iso: '', unlock_all: '0',
 };
 const NAME_LETTERS = /[^A-Z0-9 -]/g;
 
@@ -44,6 +44,7 @@ const TABS = [
     { key: 'iso', label: 'Disc image', type: 'disc' },
     { key: 'skip_movies', label: 'Skip intro movies', type: 'switch', on: '1', off: '0' },
     { key: 'vibration', label: 'Vibration', type: 'switch', on: '1', off: '0' },
+    { key: 'unlock_all', label: 'Unlock All', hint: 'Every track, rider, bike and shop item; your save is not changed', type: 'switch', on: '1', off: '0' },
     { key: 'auto_update', label: 'Updates', hint: 'Online races need the newest version', type: 'seg',
       options: [['ask', 'Ask'], ['on', 'Automatic'], ['off', 'Off']] },
     { key: 'launcher', label: 'Open the launcher first', hint: 'Off: dhd.exe starts the game straight away', type: 'switch', on: 'on', off: 'off' },

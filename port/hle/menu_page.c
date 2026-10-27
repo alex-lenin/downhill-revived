@@ -74,10 +74,20 @@ static void footer(MenuPage *p)
     else set_text(&MENU(p, X_FOOTER, Item), TEXT_PREV_NEXT, NULL);
 }
 
+/* The rows start at 0x54 under the title (0x40), 10 apart, and the footer sits at 0xCC. A long
+   page (PC SETTINGS: 13 rows) would run its last rows into the footer, so the title and the rows
+   move up together until the last row ends a gap above it. */
+enum { ROW_Y = 0x54, ROW_STEP = 10, TITLE_ABOVE = 0x14, FOOTER_Y = 0xCC, FOOTER_GAP = 16, TITLE_MIN = 0x10 };
+
 static void rows(MenuPage *p)
 {
     MENU(p, X_COUNT, int) = 0;
     p->build(p);
+    int n = menu_page_rows(p), y = ROW_Y;
+    if (n > 0 && y + (n - 1) * ROW_STEP > FOOTER_Y - FOOTER_GAP) y = FOOTER_Y - FOOTER_GAP - (n - 1) * ROW_STEP;
+    if (y < TITLE_MIN + TITLE_ABOVE) y = TITLE_MIN + TITLE_ABOVE;
+    MENU(p, X_ROW_Y, int) = y;
+    MENU(p, X_TITLE, Item).y = (short)(y - TITLE_ABOVE);
 }
 
 /* ---- the vtable's slots ---- */
@@ -89,11 +99,10 @@ static void slot_build(void *menu)  /* slot 1, as func_0015F0C8, centred as func
     func_0023D650(*(int *)(D_003F52D0 + M_VIEW), &width, &height);
     int half = width >> 1;
     Item *title = &MENU(p, X_TITLE, Item), *foot = &MENU(p, X_FOOTER, Item);
-    MENU(p, X_ROW_Y, int) = 0x54;
-    MENU(p, X_ROW_STEP, int) = 10;
+    MENU(p, X_ROW_STEP, int) = ROW_STEP;
     MENU(p, X_ROW_X, int) = half;
-    title->x = (short)half; title->y = 0x40; title->placed = 1;
-    foot->x = (short)half; foot->y = 0xCC; foot->placed = 1;
+    title->x = (short)half; title->placed = 1;  /* its y and the rows' (X_ROW_Y): rows() */
+    foot->x = (short)half; foot->y = FOOTER_Y; foot->placed = 1;
     MENU(p, X_LEFT_ALIGNED, char) = 0;  /* centred rows, highlight and panel */
     MENU(p, X_46C, int) = 1;
     MENU(p, X_4C4, int) = 0;
