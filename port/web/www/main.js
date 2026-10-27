@@ -72,14 +72,14 @@ function cursor() {
   if (canvas.style.cursor !== 'none' && (performance.now() - lastMove > 3000 || Atomics.load(mouse, 12))) canvas.style.cursor = 'none';
 }
 
-// Fullscreen: a double click on the picture or the header's button (PC SETTINGS has no Display
+// Fullscreen: a double click on the picture or the Fullscreen button (PC SETTINGS has no Display
 // row in the browser).
 const fullscreen = () => { if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   else canvas.requestFullscreen?.().catch(e => addLog(`fullscreen: ${e.message}`)); };
 canvas.ondblclick = fullscreen;
 $('fullscreen').onclick = () => { fullscreen(); canvas.focus(); };
 
-// The header's Controls and the footer's Log open their panels; a click elsewhere closes them.
+// The Controls and Log buttons under the picture open their panels; a click elsewhere closes them.
 const panels = { controlsButton: $('controls'), logButton: $('logPanel') };
 for (const [id, panel] of Object.entries(panels))
   $(id).onclick = e => { e.stopPropagation(); const open = panel.hidden;
