@@ -5,7 +5,7 @@
      Triangle (BACK) puts the values the page opened with back and closes, as AUDIO / OTHER does.
    Every change is saved to dhd.ini at once (host_setting_save keeps the other lines). Display,
    window size, picture shape, scaling, skip movies (the startup movies) and vibration apply at
-   once; resolution, widescreen, the texture pack and the font at
+   once; resolution, widescreen, the texture pack, the font, the frame rate and V-Sync at
    the next start ("*" and the footer say so). A setting the environment
    sets (DHD_*) is shown but can't be changed here. Nothing here writes game state: the page
    lives in host memory and the settings in dhd.ini, never in the memory card's save.
@@ -28,7 +28,7 @@ void gs_window_apply(void);           /* port/gs/present.c */
 void gs_present_options_apply(void);
 int texpack_available(void);          /* port/gs/texpack.c */
 
-enum { ROWS = 11 };
+enum { ROWS = 12 };
 
 typedef struct { const char *text, *value; } Choice;
 typedef struct {
@@ -60,7 +60,7 @@ static const Choice rates[] = {{"60", "60"}, {"120", "120"}, {"144", "144"}, {"1
 static Choice rate_list[sizeof rates / sizeof *rates + 1];
 
 #define CHOICES(c) c, (int)(sizeof c / sizeof *c)
-enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT, RATE };
+enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT, RATE, VSYNC };
 static Row rows[ROWS] = {
     {"Resolution:", "scale", "DHD_SCALE", "2", CHOICES(scales), 0},
     {"Display:", "window", "DHD_WINDOW", "windowed", CHOICES(displays), 1},
@@ -73,6 +73,7 @@ static Row rows[ROWS] = {
     {"Texture Pack:", "textures", "DHD_TEXTURES", "on", CHOICES(toggles), 0},  /* port/gs/texpack.c */
     {"Font:", "font", "DHD_FONT", "sharp", CHOICES(fonts), 0},  /* port/gs/font_sharp.c */
     {"Frame Rate:", "fps", "DHD_FPS", "60", CHOICES(rates), 0},
+    {"V-Sync:", "vsync", "DHD_VSYNC", "0", CHOICES(switches), 0},  /* no tearing (port/gs/gpu_rust.c) */
 };
 
 static int loaded;
@@ -141,7 +142,7 @@ static void current(const Row *r, char *out, size_t size)
     }
     const char *v = host_getenv(r->env);
     snprintf(out, size, "%s", v && *v ? v : r->fallback);
-    if (r == &rows[WIDESCREEN] || r == &rows[MOVIES] || r == &rows[VIBRATION])
+    if (r == &rows[WIDESCREEN] || r == &rows[MOVIES] || r == &rows[VIBRATION] || r == &rows[VSYNC])
         snprintf(out, size, "%d", atoi(out) != 0);
     if (r == &rows[TEXTURES])
         snprintf(out, size, "%s", v && (!dhd_stricmp(v, "off") || !strcmp(v, "0") || !dhd_stricmp(v, "false") || !dhd_stricmp(v, "no"))

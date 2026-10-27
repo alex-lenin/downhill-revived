@@ -928,6 +928,7 @@ static void apply_setting(const char *key, const char *value)
         {"texture_cache_mb", "DHD_TEXTURE_CACHE_MB"},
         {"font", "DHD_FONT"},  /* the sharp font (port/gs/font_sharp.c) */
         {"fps", "DHD_FPS"},
+        {"vsync", "DHD_VSYNC"},  /* 1: no tearing (port/gs/gpu_rust.c) */
     };
     if (!_strnicmp(key, "DHD_", 4)) { setting(key, value); return; }
     if (!_stricmp(key, "renderer")) { setting("DHD_RENDER", _stricmp(value, "native") ? "exact" : "native"); return; }
@@ -1005,7 +1006,8 @@ static int settings_has(const char *key);
 
 /* A player's settings where dhd.ini doesn't say (round 40, finding 056): the native renderer at
    2x, borderless on the monitor at its own resolution, widescreen in the monitor's shape with
-   the HUD kept in shape, the startup movies skipped (skip_movies 1, finding 086 S1; 0 before).
+   the HUD kept in shape, the startup movies skipped (skip_movies 1, finding 086 S1; 0 before),
+   V-Sync on (no tearing; issue #2).
    The window size, for the windowed display, is the monitor's desktop resolution ("monitor":
    present.c reads it through SDL when it makes the window and puts the numbers in its place;
    only when dhd.ini has neither a width nor a height line). Only with a dhd.ini (the game
@@ -1014,6 +1016,7 @@ static int settings_has(const char *key);
 static const char *const player_defaults[][3] = {
     {"renderer", "native", "DHD_RENDER"}, {"scale", "2", "DHD_SCALE"}, {"window", "borderless", "DHD_WINDOW"},
     {"widescreen", "1", "DHD_WIDESCREEN"}, {"DHD_ASPECT", "wide", "DHD_ASPECT"}, {"skip_movies", "1", "DHD_SKIP_MOVIES"},
+    {"vsync", "1", "DHD_VSYNC"},
 };
 
 void host_settings_load(void)

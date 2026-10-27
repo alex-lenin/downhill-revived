@@ -368,8 +368,11 @@ int gs_gpu_surface(Gs *g, void *window)
     w.kind = DHDR_WINDOW_ANDROID;
     w.a = (uint64_t)(uintptr_t)window;
 #endif
-    const char *tearing = getenv("DHD_TEARING");
-    uint32_t flags = tearing && !atoi(tearing) ? DHDR_PRESENT_NO_TEARING : 0;
+    /* V-Sync (dhd.ini "vsync", PC SETTINGS): no tearing, without waiting where the display allows
+       it (Mailbox, else Fifo; present/surface.rs). Off: pictures go out at once and may tear.
+       DHD_TEARING=0 is the older name for it. */
+    const char *tearing = getenv("DHD_TEARING"), *vsync = getenv("DHD_VSYNC");
+    uint32_t flags = (vsync && atoi(vsync)) || (tearing && !atoi(tearing)) ? DHDR_PRESENT_NO_TEARING : 0;
     if (p->native && native_waits_for_vsync(p->native)) flags |= DHDR_PRESENT_VSYNC;
     p->surface = dhdr_surface_create(&w, flags);
     if (p->surface && getenv("DHD_PROFILE"))
