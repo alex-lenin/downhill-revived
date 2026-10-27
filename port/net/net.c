@@ -233,6 +233,6 @@ void host_service_net_set_room(uint32_t address) {
     out.track=(int)in[0]; out.laps=(int)in[1];
     out.is_public=(int)in[2]; out.max_players=(int)in[3];
     memcpy(&out.seed,in+4,8);
-    out.room_name=GUEST(in[6]);
+    out.room_name=in[6] ? GUEST(in[6]) : NULL;  /* 0: the name stays (a track or bots change) */
     net_set_room(&out);
 }
