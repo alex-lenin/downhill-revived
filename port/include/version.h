@@ -2,7 +2,7 @@
 
    - The online hello sends it as clientVersion; the server refuses releases older than its
      MIN_VERSION (online/server/wrangler.jsonc).
-   - The updater (port/hle/update.c) compares it with the newest release's latest.json.
+   - The launcher (port/launcher, build.rs reads it) compares it with the newest release's latest.json.
    - port/tools/package_release.py names the zip after it and writes latest.json for it.
 
    Bump it here, and only here, for each release: "MAJOR.MINOR.PATCH". */

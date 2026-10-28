@@ -8,7 +8,6 @@
    func_0025F1B0), which the native kernel (kernel.c) doesn't need. */
 #include "hle.h"
 #include "ps2asm.h"
-#include "splash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,20 +49,12 @@ static void root(void)
 int main(int argc, char **argv)
 {
     (void)argc, (void)argv;
+    if (host_service_launcher_open())  /* started straight with the launcher beside: it starts the game */
+        return 0;
     host_service_host_console_init();  /* no console window: where the log goes */
-    host_service_update_save_environment();  /* as started, for starting an updated dhd.exe (update.c) */
-    host_service_host_settings_load();  /* before the relaunch, so the child inherits the variables */
-    host_service_splash_show();  /* the start window, until the game's window shows (splash.c) */
-    if (!host_getenv("DHD_RELAUNCHED")) host_service_splash_step(4, GADDR("Checking for updates..."));
-    host_service_update_at_start();  /* first process: a newer release offered (dhd.ini auto_update) */
-    if (!host_getenv("DHD_RELAUNCHED")) host_service_splash_step(25, GADDR("Checking your disc image..."));
-    if (host_service_host_disc_ready())  /* the disc image: asked once, here in the first process */
+    host_service_host_settings_load();
+    if (host_service_host_disc_ready())  /* the disc image, checked or asked for */
         return 0;  /* the player cancelled */
-    if (!ps2_low_view_reserved()) {  /* first run: again, with the RAM's own addresses kept free */
-        host_service_splash_step(40, GADDR("Starting the game..."));
-        return host_service_update_after_game(host_service_host_relaunch_reserving(PS2_LOW_VIEW, PS2_RAM_SIZE - PS2_LOW_VIEW));
-    }
-    host_service_splash_step(50, GADDR("Reading the game's data from your disc..."));
     if (!ps2_memory_init() || !game_data_load())  /* the data image, from the player's disc */
         return 1;
     host_widescreen_init();  /* data patches, once the data image is in place */

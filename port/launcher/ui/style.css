@@ -94,10 +94,18 @@ button.fact:hover { color: var(--snow); }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--dim); }
 .dot.ok { background: var(--ok); }
 .dot.warn { background: var(--gold); }
+.dot.busy { background: var(--gold); animation: pulse 1.2s ease-in-out infinite; }
+/* the disc image's online check (app.js onlineNote): on the Play page and the Online tab */
+.note { display: flex; align-items: flex-start; gap: 10px; max-width: 560px; font-size: 13.5px; line-height: 1.45; color: var(--lilac); }
+.note > svg.i { color: var(--gold); margin-top: 1px; }
+.note > .dot { margin-top: 6px; }
+#online-note { margin-top: 18px; }
+.rows .note { max-width: none; padding: 14px 0; border-bottom: 1px solid var(--line); }
 .link { display: inline-flex; align-items: center; gap: 7px; margin-top: 10px; color: var(--gold); font-weight: 700; text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
 .link:hover { color: #ffd889; }
 .link.quiet { color: var(--lilac); font-weight: 600; font-size: 13px; text-decoration: none; margin: 0; }
 .link.quiet:hover { color: var(--snow); }
+.link.inline { margin: 0; }
 .link svg.i { width: 15px; height: 15px; }
 
 /* settings and notes */
@@ -149,7 +157,6 @@ button.fact:hover { color: var(--snow); }
 .foot { height: 72px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 18px 0 24px; background: var(--rail); border-top: 1px solid var(--line); }
 .st { flex: 1; min-width: 0; font-size: 13.5px; color: var(--lilac); display: flex; align-items: center; gap: 10px; }
 .st b { color: var(--snow); font-weight: 700; }
-.st .dot.busy { background: var(--gold); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .35; } }
 .st .bad { color: var(--bad); }
 .st .good { color: var(--ok); }

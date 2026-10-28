@@ -23,11 +23,19 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# HTTPS through the system's own TLS and certificates (Windows: SChannel), no bundled root list
-ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
-native-tls = "0.2"
+# HTTPS through ureq's rustls (ring) with Mozilla's roots bundled (webpki-roots), on every platform:
+# the game's rule too (port/render/net), so no OS certificate store is read and no OpenSSL is needed.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# dhd.ini's keys, defaults, choices and line-keeping saves: the game's own crate (port/render/settings)
+dhd_settings = { path = "../../render/settings" }
+# the disc image's online check (its game files) and iso-check.txt: the game's own crate (port/render/disc)
+dhd_disc = { path = "../../render/disc" }
+
+# SIGTERM and SIGINT end the launcher cleanly (main.rs's quit_signals): the C library's sigaction
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = "s"
