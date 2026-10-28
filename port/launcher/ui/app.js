@@ -162,6 +162,15 @@ function renderHome() {
   $('fact-disc-name').textContent = baseName(iso);
   renderOnline();
   renderServer();
+  renderPlayed();
+}
+
+// Time played in all (saves/playtime.txt, counted by the launcher while the game runs).
+function renderPlayed() {
+  const s = state.played || 0;
+  $('fact-played').hidden = s < 60;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  $('fact-played-time').textContent = h ? `${h} h ${m} min played` : `${m} min played`;
 }
 
 // A disc problem's "More: https://..." (the other releases, finding 100) as a link.
@@ -612,11 +621,13 @@ async function start() {
   state.running = snap.running;
   state.discProblem = snap.disc_problem;
   state.texturePack = snap.texture_pack;
+  state.played = snap.played;
 
   document.querySelectorAll('[data-page]').forEach((b) => b.addEventListener('click', () => show(b.dataset.page)));
   $('win-min').onclick = () => appWindow.minimize();
   $('win-close').onclick = () => appWindow.close();
   $('discord').onclick = () => invoke('open_link', { url: 'discord' });
+  $('kofi').onclick = () => invoke('open_link', { url: 'kofi' });
   $('dismiss').onclick = () => { state.error = null; renderFooter(); };
   $('reset-tab').onclick = resetTab;
   $('fact-disc').onclick = () => { state.tab = GAME_TAB; renderTabs(); renderRows(); show('settings'); };
@@ -657,6 +668,8 @@ async function start() {
   await listen('game-exited', (e) => {
     state.running = false;
     state.confirmClose = false;
+    state.played = e.payload.played;
+    renderPlayed();
     renderFooter();
     checkServer();
     if (e.payload.wants_update) checkUpdate().then(() => { if (state.check === 'available') installUpdate(); });

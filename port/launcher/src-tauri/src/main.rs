@@ -13,13 +13,14 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 const VERSION: &str = env!("DHD_VERSION");
 const DISCORD: &str = "https://discord.gg/XrSeTyzfr2";
+const KOFI: &str = "https://ko-fi.com/skuza";
 
 struct App {
     place: game::Place,
@@ -42,6 +43,8 @@ struct Snapshot {
     disc_problem: Option<String>,
     /// A texture pack is there: texture_pack's folder, or textures/SCUS-97177/replacements.
     texture_pack: bool,
+    /// Seconds played in all (saves/playtime.txt).
+    played: u64,
 }
 
 /// A setting as the settings tabs offer it (dhd_settings' table): its default and its choices as
@@ -105,6 +108,28 @@ struct DiscProgress {
 struct Exited {
     code: Option<u32>,
     wants_update: bool,
+    played: u64,
+}
+
+/// Time played (an idea of asio's): seconds in saves/playtime.txt, counted while a game the
+/// launcher started runs and saved each minute, so a crash or a killed launcher loses at most one.
+fn playtime(place: &game::Place) -> PathBuf {
+    place.data.join("saves").join("playtime.txt")
+}
+
+fn played(place: &game::Place) -> u64 {
+    std::fs::read_to_string(playtime(place)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+fn add_played(place: &game::Place, since: &mut Instant) {
+    let seconds = since.elapsed().as_secs();
+    if seconds == 0 {
+        return;
+    }
+    *since += Duration::from_secs(seconds);
+    let path = playtime(place);
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let _ = std::fs::write(&path, (played(place) + seconds).to_string());
 }
 
 #[tauri::command]
@@ -122,6 +147,7 @@ fn snapshot(app: State<App>) -> Snapshot {
         texture_pack: std::fs::read_dir(pack).is_ok_and(|mut d| d.next().is_some()),
         game_found: app.place.exe().is_file(),
         running: app.game.lock().unwrap().is_some(),
+        played: played(&app.place),
         settings,
     }
 }
@@ -213,9 +239,13 @@ fn play(handle: AppHandle, app: State<App>) -> Result<(), String> {
     *slot = Some(child);
     app.starting.store(true, Ordering::Relaxed);
     let h = handle.clone();
+    let mut since = Instant::now();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(400));
         let app = h.state::<App>();
+        if since.elapsed() >= Duration::from_secs(60) {
+            add_played(&app.place, &mut since);
+        }
         let mut slot = app.game.lock().unwrap();
         let status = match slot.as_mut().map(|c| c.try_wait()) {
             Some(Ok(Some(s))) => Some(s),
@@ -225,8 +255,10 @@ fn play(handle: AppHandle, app: State<App>) -> Result<(), String> {
         *slot = None;
         drop(slot);
         app.starting.store(false, Ordering::Relaxed);
+        add_played(&app.place, &mut since);
         let code = status.and_then(game::exit_code);
-        let _ = h.emit("game-exited", Exited { code, wants_update: code == Some(game::UPDATE_EXIT_CODE) });
+        let played = played(&app.place);
+        let _ = h.emit("game-exited", Exited { code, wants_update: code == Some(game::UPDATE_EXIT_CODE), played });
         if let Some(w) = h.get_webview_window("main") {
             // show() first: on Wayland a minimized window can't be restored by unminimize()
             // alone (from n0buholic, PR #13).
@@ -323,8 +355,8 @@ async fn check_disc(handle: AppHandle) -> Result<OnlineCheck, String> {
 /// Only the project's own pages open from the launcher.
 #[tauri::command]
 fn open_link(handle: AppHandle, url: String) -> Result<(), String> {
-    let url = if url == "discord" { DISCORD.to_string() } else { url };
-    let allowed = ["https://discord.gg/", "https://github.com/skuza-oss/", "https://downhill-revived.pages.dev/"];
+    let url = match url.as_str() { "discord" => DISCORD.to_string(), "kofi" => KOFI.to_string(), _ => url };
+    let allowed = ["https://discord.gg/", "https://ko-fi.com/skuza", "https://github.com/skuza-oss/", "https://downhill-revived.pages.dev/"];
     if !allowed.iter().any(|a| url.starts_with(a)) {
         return Err(format!("not opening {url}"));
     }
