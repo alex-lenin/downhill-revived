@@ -24,12 +24,28 @@
 /* ---- environment, errors and the program ---- */
 const char *host_getenv(const char *name) { return getenv(name); }
 
-/* The log carries it too; tool runs (DHD_HEADLESS) never wait on a box. */
+typedef struct { const char *title, *message; } ErrorBox;
+
+static void show_error_box(void *box)
+{
+    const ErrorBox *b = box;
+    if (!SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, b->title, b->message, NULL))
+        fprintf(stderr, "(no error box: %s)\n", SDL_GetError());
+}
+
+/* The log carries it too; tool runs (DHD_HEADLESS) never wait on a box. The box is shown on the
+   main thread (sdl_host_run), the one that runs SDL's events, on every platform: macOS shows a box
+   only there, and asked from the game's thread SDL waited for a main thread that never ran it (a
+   game with no disc image stayed up with no box until killed). Before that thread's loop is up the
+   box is shown where it is asked for. With no display SDL shows nothing and returns at once, and the
+   caller goes on to end the game. */
 void host_error_box(const char *title, const char *message)
 {
     fprintf(stderr, "%s: %s\n", title, message);
     fflush(stderr);
-    if (!getenv("DHD_HEADLESS")) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, NULL);
+    if (getenv("DHD_HEADLESS")) return;
+    ErrorBox box = {title, message};
+    if (!sdl_host_run(show_error_box, &box)) show_error_box(&box);
 }
 
 void host_console_write(uint32_t address, uint32_t bytes)
