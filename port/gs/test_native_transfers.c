@@ -19,6 +19,7 @@ volatile int gs_native_view;
 double host_seconds(void) { return GetTickCount64()/1000.0; }
 double host_wall_seconds(void) { return host_seconds(); }
 void host_thread_name(const char *n) {(void)n;}
+void host_putenv_s(const char *name, const char *value) {_putenv_s(name, value);}
 void pacing_handed(double *d,double *b) {*d=*b=0;}
 void pacing_present(double d,double b) {(void)d;(void)b;}
 int host_widescreen_flat_limit(void) {return 1000;}
@@ -45,6 +46,14 @@ static unsigned failures, pictures;
 static int presented_on;
 static unsigned presented_checks;
 static HWND presented_window_handle;
+
+/* The presented window's client size (the renderer's GsWindow.size). */
+static void presented_window_size(unsigned *width, unsigned *height)
+{
+    RECT client = {0, 0, 0, 0};
+    GetClientRect(presented_window_handle, &client);
+    *width = (unsigned)client.right; *height = (unsigned)client.bottom;
+}
 
 /* test_gpu_stubs.c's test_gpu_init (this program has its own stubs): gs_gpu_init under the EE mode
    when DHD_TEST_EE_MXCSR=1 (round toward zero, FTZ, DAZ, exceptions masked; host_win32.c). */
@@ -280,7 +289,9 @@ int main(void)
         RegisterClassA(&wc);
         presented_window_handle = CreateWindowExA(0, wc.lpszClassName, "test_native_transfers", WS_POPUP, 0, 0,
                                                   PRESENTED_W, PRESENTED_H, NULL, NULL, wc.hInstance, NULL);
-        if (!presented_window_handle || !gs_gpu_surface(&gs, presented_window_handle)) {
+        GsWindow target = {GS_WINDOW_WIN32, (uintptr_t)presented_window_handle, (uintptr_t)GetModuleHandleA(NULL),
+                           presented_window_size};
+        if (!presented_window_handle || !gs_gpu_surface(&gs, &target)) {
             printf("FAIL DHD_NATIVE_TEST_PRESENTED: no WebGPU surface\n");
             return 1;
         }

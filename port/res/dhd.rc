@@ -1,2 +1,4 @@
-// dhd.exe's resources: the Downhill Revived icon (port/res/icon.png, sizes 16-256).
+// dhd.exe's resources: the Downhill Revived icon (port/res/icon.png, sizes 16-256) and the manifest
+// (dhd.manifest: the UTF-8 code page).
 1 ICON "dhd.ico"
+1 24 "dhd.manifest"

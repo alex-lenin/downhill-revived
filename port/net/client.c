@@ -10,22 +10,11 @@
 #include "json.h"
 #include "../include/version.h"
 #include "../host/host_api.h"
+#include <SDL3/SDL_timer.h>
 
 enum { PING_LOBBY_MS = 1000, PING_RACE_MS = 500, SILENT_MS = 10000 };
 
-double net_now_ms(void)
-{
-#ifdef _WIN32
-    static LARGE_INTEGER freq;
-    LARGE_INTEGER now;
-    if (!freq.QuadPart)
-        QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&now);
-    return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
-#else
-    return host_wall_seconds() * 1000.0;
-#endif
-}
+double net_now_ms(void) { return (double)SDL_GetTicksNS() / 1e6; }
 
 static void copy(char *dst, size_t cap, const char *src)
 {
@@ -39,7 +28,7 @@ static void copy(char *dst, size_t cap, const char *src)
 static void changed(NetClient *c)
 {
     c->lobby.seq++;
-    WakeAllConditionVariable(&c->changed);
+    SDL_BroadcastCondition(c->changed);
 }
 
 /* Sends with the lock held: the transports only queue. */
@@ -63,8 +52,8 @@ static void send_binary(NetClient *c, const uint8_t *data, size_t n)
 void client_init(NetClient *c, const char *name, const char *version, const char *iso)
 {
     memset(c, 0, sizeof *c);
-    InitializeCriticalSection(&c->lock);
-    InitializeConditionVariable(&c->changed);
+    c->lock = SDL_CreateMutex();
+    c->changed = SDL_CreateCondition();
     copy(c->name, sizeof c->name, name);
     {   /* the server takes 1-24 UTF-16 units */
         int units = 0;
@@ -82,13 +71,14 @@ void client_init(NetClient *c, const char *name, const char *version, const char
 
 void client_free(NetClient *c)
 {
-    DeleteCriticalSection(&c->lock);
+    SDL_DestroyCondition(c->changed);
+    SDL_DestroyMutex(c->lock);
 }
 
 void client_connected(NetClient *c, const NetTransport *tr)
 {
     char name[200];
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     c->tr = *tr;
     c->connected = 1;
     c->last_rx = c->next_ping = net_now_ms();
@@ -99,7 +89,7 @@ void client_connected(NetClient *c, const NetTransport *tr)
     if (c->lobby.state != NET_RECONNECTING)
         c->lobby.state = NET_CONNECTING;
     changed(c);
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 static void read_room(NetClient *c, const char *t)
@@ -217,7 +207,7 @@ void client_on_text(NetClient *c, const char *text, size_t n)
     long long v;
     double t, server_time;
     (void)n;
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     c->last_rx = net_now_ms();
     if (!json_string(text, "type", type, sizeof type))
         ;
@@ -266,12 +256,12 @@ void client_on_text(NetClient *c, const char *text, size_t n)
         json_string(text, "message", c->lobby.error, sizeof c->lobby.error);
         changed(c);
     }
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_on_binary(NetClient *c, const uint8_t *data, size_t n)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     c->last_rx = net_now_ms();
     if (n >= 2 + sizeof(double) && data[0] == NET_FRAME_PONG) {
         double sent;
@@ -286,13 +276,13 @@ void client_on_binary(NetClient *c, const uint8_t *data, size_t n)
         memcpy(c->relayed[at], data, n);
         c->relayed_size[at] = (uint16_t)n;
     }
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 int client_on_closed(NetClient *c, int code, const char *reason)
 {
     int rejoin = 0;
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     c->connected = 0;
     if (c->racing) {
         /* No reconnect during a race (protocol 1): the others hand our rider to the host's AI,
@@ -312,7 +302,7 @@ int client_on_closed(NetClient *c, int code, const char *reason)
         snprintf(c->lobby.error, sizeof c->lobby.error, "connection closed (%d%s%s)", code,
                  reason && *reason ? ": " : "", reason ? reason : "");
     changed(c);
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
     return rejoin;
 }
 
@@ -320,7 +310,7 @@ int client_tick(NetClient *c)
 {
     double now = net_now_ms();
     int dead = 0;
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     if (c->connected) {
         if (now >= c->next_ping) {
             if (c->racing) {
@@ -336,7 +326,7 @@ int client_tick(NetClient *c)
         }
         dead = now - c->last_rx > SILENT_MS;
     }
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
     return dead;
 }
 
@@ -359,65 +349,65 @@ void client_set_room(NetClient *c, const NetRoomSettings *s)
         n += snprintf(text + n, sizeof text - n, ",\"roomName\":\"%s\"", name);
     }
     snprintf(text + n, sizeof text - n, "}");
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     say(c, "%s", text);
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_pick(NetClient *c, int member, int rider, int bike)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     if (member < 0 || member == c->lobby.member_id) {
         c->picked = 1, c->rider = rider, c->bike = bike;
         say(c, "{\"type\":\"pick\",\"rider\":%d,\"bike\":%d}", rider, bike);
     } else
         say(c, "{\"type\":\"pick\",\"member\":%d,\"rider\":%d,\"bike\":%d}", member, rider, bike);
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_ready(NetClient *c, int ready)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     c->ready = ready != 0;
     say(c, "{\"type\":\"ready\",\"ready\":%s}", ready ? "true" : "false");
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_kick(NetClient *c, int member)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     say(c, "{\"type\":\"kick\",\"member\":%d}", member);
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_start(NetClient *c)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     say(c, "{\"type\":\"start\"}");
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_end(NetClient *c)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     say(c, "{\"type\":\"end\"}");
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_leave(NetClient *c)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     c->leaving = 1;
     if (c->racing)
         say(c, "{\"type\":\"leave\"}");
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 void client_lobby(NetClient *c, NetLobby *out)
 {
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     *out = c->lobby;
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
 }
 
 int client_send_frame(NetClient *c, int type, const void *payload, size_t n)
@@ -428,19 +418,19 @@ int client_send_frame(NetClient *c, int type, const void *payload, size_t n)
     frame[0] = (uint8_t)type;
     frame[1] = 0;
     memcpy(frame + 2, payload, n);
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     if (c->racing && c->connected) {
         send_binary(c, frame, n + 2);
         sent = 1;
     }
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
     return sent;
 }
 
 int client_receive_frame(NetClient *c, uint8_t *out, size_t max)
 {
     int n = 0;
-    EnterCriticalSection(&c->lock);
+    SDL_LockMutex(c->lock);
     if (c->relayed_count) {
         unsigned at = c->relayed_head;
         n = c->relayed_size[at] <= max ? c->relayed_size[at] : 0;
@@ -448,6 +438,6 @@ int client_receive_frame(NetClient *c, uint8_t *out, size_t max)
         c->relayed_head = (at + 1) % NET_RELAY_QUEUE;
         c->relayed_count--;
     }
-    LeaveCriticalSection(&c->lock);
+    SDL_UnlockMutex(c->lock);
     return n;
 }

@@ -42,6 +42,7 @@ use crate::abi::{DhdrCommand, DhdrNativeConstants, DhdrPictureResult, DHDR_CMD_A
 use crate::device::Gpu;
 use crate::native::arenas::Arenas;
 use crate::native::init::Objects;
+use crate::native::pipelines::gputimes;
 use crate::native::shared::NativeShared;
 use crate::native::Native;
 
@@ -291,6 +292,7 @@ fn rect_pass(kit: &mut Kit, view: &wgpu::TextureView, size: [u32; 2], pipe: &wgp
         crate::host::log("gs native: a surface pass before the arenas were reserved (skipped)");
         return;
     };
+    let times = gputimes::slot(kit.gpu, gputimes::SURFACE);
     let mut pass = kit.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: None,
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -300,7 +302,7 @@ fn rect_pass(kit: &mut Kit, view: &wgpu::TextureView, size: [u32; 2], pipe: &wgp
             ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes: times.as_ref().map(gputimes::Slot::render),
         occlusion_query_set: None,
         multiview_mask: None,
     });
@@ -343,6 +345,7 @@ fn grow_depth(kit: &mut Kit, from: &wgpu::TextureView, size: [u32; 2], to: &wgpu
     let (gpu, layout, pipe) = (kit.gpu, kit.grow_layout, kit.grow_pipe);
     let bind = group(gpu, layout, &[view_entry(0, from)]);
     let uniforms = kit.arenas.uniform_group().ok_or("gs native: a Z surface grown before the arenas were reserved")?;
+    let times = gputimes::slot(gpu, gputimes::SURFACE);
     let mut pass = kit.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: None,
         color_attachments: &[],
@@ -351,7 +354,7 @@ fn grow_depth(kit: &mut Kit, from: &wgpu::TextureView, size: [u32; 2], to: &wgpu
             depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
             stencil_ops: None,
         }),
-        timestamp_writes: None,
+        timestamp_writes: times.as_ref().map(gputimes::Slot::render),
         occlusion_query_set: None,
         multiview_mask: None,
     });

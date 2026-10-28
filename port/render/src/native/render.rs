@@ -39,7 +39,7 @@ use crate::device::Gpu;
 use crate::native::arenas::Arenas;
 use crate::native::convert::{ConvertObjects, ConvertSource};
 use crate::native::scanout::ScanoutObjects;
-use crate::native::pipelines::{VARIANT_ALPHA_ONLY, VARIANT_DUAL, VARIANT_PLAIN, VARIANT_RGB_A128};
+use crate::native::pipelines::{gputimes, VARIANT_ALPHA_ONLY, VARIANT_DUAL, VARIANT_PLAIN, VARIANT_RGB_A128};
 use crate::native::shared::NativeShared;
 use crate::native::surfaces::Kit;
 use crate::native::{Native, Picture};
@@ -210,6 +210,7 @@ impl Pass {
     fn begin(&mut self, gpu: &Gpu, target: i32, depth: i32, color: &wgpu::TextureView, z: Option<&wgpu::TextureView>,
              vertices: &wgpu::Buffer, vertex_bytes: u64, indices: Option<&(wgpu::Buffer, u64)>) {
         let keep = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
+        let times = gputimes::slot(gpu, gputimes::DRAW);
         let encoder = self.encoder(gpu);
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -225,7 +226,7 @@ impl Pass {
                     depth_ops: Some(keep),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: times.as_ref().map(gputimes::Slot::render),
                 occlusion_query_set: None,
                 multiview_mask: None,
             })

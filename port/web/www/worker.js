@@ -105,7 +105,7 @@ async function start(m) {
   const env = { DHD_ISO: '/disc.iso', DHD_HEADLESS: '1', DHD_FRAME_CLOCK: '1', DHD_FPS_WALL: '1', DHD_SKIP_MOVIES: '1',
     DHD_RENDER: 'native', DHD_SETTINGS: 'dhd.ini', ...(threaded ? { DHD_GRAPHICS_ORDERED: '1' } : {}),
     ...BROWSER_PC_SETTINGS, ...(m.env || {}) };
-  const settings = await createSettings(env, m.env, say);
+  const settings = await createSettings(env, say);
   let core, graphics, queue, memory, bytes, dv, arena = 0x07000000, current = 65, csr = 0x1f80, field = 0;
   const strings = new Map(), files = new Map(), fibers = new Map(); let nextFile = 1, nextDir = 1; const dirs = new Map();
   const refresh = () => { bytes = new Uint8Array(memory.buffer); dv = new DataView(memory.buffer); };
@@ -224,7 +224,6 @@ async function start(m) {
     host_ram_view: (at, offset, n) => +((offset === 0 && n === 0x02000000 && [0x08000000, 0x28000000, 0x38000000].includes(at >>> 0)) ||
       (offset === 0x00400000 && n === 0x01c00000 && [0x00400000, 0x20400000, 0x30400000].includes(at >>> 0))),
     host_mem_commit: (a, n) => +((a >>> 0) + n <= bytes.length), host_mem_reserved: (a, n) => +((a >>> 0) + n <= bytes.length),
-    host_service_host_relaunch_reserving: () => -1,
     host_mem_protect: (_a, _n, protection) => +(protection === 2), host_callback_fault_guard: () => 0, host_fault_guard_here: () => 0,
     // The disc (read only) and the memory card's files (vfs.js); other paths don't exist.
     host_file_open: (a, mode) => { const name = str(a);
@@ -245,8 +244,6 @@ async function start(m) {
       const id = nextDir++; dirs.set(id, { list, at: 0 }); entry(list[0], out); return id; },
     host_dir_next: (id, out) => { const d = dirs.get(id); if (!d || ++d.at >= d.list.length) return 0; entry(d.list[d.at], out); return 1; },
     host_dir_close: id => { dirs.delete(id); },
-    host_path_info: (a, size, time) => { const n = vfs.info(str(a)); if (!n) return 0;
-      dv.setBigUint64(size, BigInt(n.data?.length || 0), true); dv.setBigUint64(time, BigInt(n.time || 0), true); return 1; },
     host_service_host_disc_ready: () => 0, host_service_host_skip_movies: () => 1,
     host_service_host_pad_device: (port, a) => pad(port, a),
     // host_api.h's HostMouse, 36 bytes, from the page (main.js)
@@ -305,13 +302,12 @@ async function start(m) {
 host_pacing_wait host_pacing_handoff host_pacing_input host_callback_heartbeat
 host_sound_open host_sound_reset host_sound_tick host_sound_log_stack snd_host_bench
 host_service_host_init host_service_host_console_init host_service_host_settings_load host_service_host_pad_vibrate
-host_service_splash_show host_service_splash_step host_service_update_save_environment host_service_update_at_start
 host_service_movie_prepare host_service_movie_start host_service_movie_audio host_service_graphics_wait host_service_graphics_shutdown
 host_service_gs_pump_messages host_service_gs_window_title host_service_gs_native_view
 host_service_gs_window_apply host_service_gs_present_options_apply host_service_gs_window_close
-host_service_text_input_begin host_service_text_input_end host_service_host_backtrace`.split(/\s+/);
+host_service_text_input_begin host_service_text_input_end host_service_host_backtrace host_service_presence`.split(/\s+/);
   for (const n of noops) impl[n] ??= () => {};
-  for (const n of ['host_service_net_racing', 'host_service_net_seconds', 'host_service_net_server_ms', 'host_heartbeat_eip', 'host_service_update_after_game']) impl[n] = () => 0;
+  for (const n of ['host_service_net_racing', 'host_service_net_seconds', 'host_service_net_server_ms', 'host_heartbeat_eip', 'host_service_launcher_open']) impl[n] = () => 0;
 
   const graphicsExports = new Set(WebAssembly.Module.exports(graphicsModule).map(e => e.name));
   const linkedExports = threaded ? new Set(WebAssembly.Module.exports(queueModule).map(e => e.name)) : graphicsExports;

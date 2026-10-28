@@ -270,17 +270,18 @@ static void region_callback(uintptr_t lo, uintptr_t hi, int host) {
         strings = {
             'host_service_host_setting_save': (0,1),
             'host_service_host_setting_locked': (0,),
-            'host_service_splash_step': (1,), 'host_service_gs_window_title': (0,),
+            'host_service_gs_window_title': (0,),
             'host_service_movie_start': (0,), 'host_service_text_input_edit': (2,),
             'host_service_net_init': (0,1,2,3), 'host_service_net_join_room': (0,),
             'host_service_gs_capture_request': (0,),
-            'host_service_file_sha256_start': (0,),
+            'host_service_disc_check_start': (0,1),
         }
         for i in strings.get(name, ()):
             code.append(f'    (void)host64_bridge_string(a{i});')
         spans = {
             'host_service_host_pad_device': [(1,'sizeof(HostPad)')],
             'host_service_mouse_state': [(0,'sizeof(HostMouse)')],
+            'host_service_presence': [(0,'sizeof(HostPresence)')],
             'host_service_movie_audio': [(0,'host64_bridge_array_bytes((int32_t)a1,8)')],
             'host_service_vif_feed': [(1,'host64_bridge_array_bytes((int32_t)a2,4)')],
             'host_service_graphics_feed': [(1,'host64_bridge_array_bytes((int32_t)a2,4)')],
@@ -289,7 +290,7 @@ static void region_callback(uintptr_t lo, uintptr_t hi, int host) {
             'host_service_net_send_frame': [(1,'a2')],
             'host_service_net_receive_frame': [(0,'a1')],
             'host_service_net_list_lobbies': [(0,'host64_bridge_array_bytes((int32_t)a1,sizeof(NetLobbyInfo))')],
-            'host_service_file_sha256_poll': [(0,'32')],
+            'host_service_disc_check_poll': [(0,'32'),(1,'a2')],
             'host_service_net_list_lobbies_poll': [(0,'host64_bridge_array_bytes((int32_t)a1,sizeof(NetLobbyInfo))')],
             'host_service_net_hash_ranges': [(0,'host64_bridge_array_bytes((int32_t)a1,8)')],
             'host_service_gs_read_image': [(0,'a1')],
@@ -363,8 +364,6 @@ static void region_callback(uintptr_t lo, uintptr_t hi, int host) {
                         ('host_sound_write', 0): 'host64_bridge_pcm_bytes((int32_t)a1)',
                         ('host_dir_open', 1): 'sizeof(HostDirEntry)',
                         ('host_dir_next', 1): 'sizeof(HostDirEntry)',
-                        ('host_path_info', 1): 'sizeof(uint64_t)',
-                        ('host_path_info', 2): 'sizeof(uint64_t)',
                     }.get((name, i))
                     if length is None:
                         raise ValueError(f'pointer argument needs an explicit span policy: {name} argument {i}')

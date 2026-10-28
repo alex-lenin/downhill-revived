@@ -1,11 +1,12 @@
 /* POSIX mapping for guest_memory.c: one PROT_NONE reservation, a memfd RAM
-   section aliased with MAP_FIXED|MAP_SHARED, commit-on-demand with mprotect
+   section (macOS: an unlinked shared memory object) aliased with MAP_FIXED|MAP_SHARED, commit-on-demand with mprotect
    (which preserves contents, like MEM_COMMIT), and a SIGSEGV/SIGBUS handler
    on an alternate stack that reports the guest address and re-raises the
    signal. Policy (which regions are mirrors, what is committed) stays shared.
    Written for this task; no third-party code. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include "../host/backtrace_posix.h"  /* <execinfo.h>, or Android's own (API < 33) */
 #include <signal.h>
 #include <stdint.h>
@@ -29,7 +30,13 @@ void os_fail(const char *what) {
     fprintf(stderr,"host64 memory: %s (%d: %s)\n",what,errno,strerror(errno)); abort();
 }
 uintptr_t os_reserve(void) {
+#ifdef __APPLE__  /* no memfd: a POSIX shared memory object, unlinked at once */
+    char name[32]; snprintf(name,sizeof name,"/dhd-guest-ram-%d",(int)getpid());
+    ram_fd=shm_open(name,O_RDWR|O_CREAT|O_EXCL,0600);
+    if (ram_fd>=0) shm_unlink(name);
+#else
     ram_fd=memfd_create("dhd-guest-ram",MFD_CLOEXEC);
+#endif
     if (ram_fd<0) return 0;
     if (ftruncate(ram_fd,RAM_SIZE)<0) { close(ram_fd); ram_fd=-1; return 0; }
     /* MAP_NORESERVE: the 8 GiB reservation must not charge swap; committed
@@ -96,8 +103,11 @@ static void fault(int sig,siginfo_t *info,void *ctx) {
     backtrace_symbols_fd(frames,n,STDERR_FILENO);
     /* Report and exit with the signal, as an unhandled fault would. Android: the handler that
        was there (the system's crash dump, debuggerd) gets the fault when it happens again. */
+    {   /* the report reaches dhd.log (and logcat) first: host.c's log, absent in the self-test */
+        void host_log_drain(void) __attribute__((weak));
+        if (host_log_drain) host_log_drain();
+    }
 #ifdef __ANDROID__
-    { void android_log_drain(void); android_log_drain(); }  /* the report reaches logcat first */
     sigaction(sig,sig==SIGBUS ? &old_bus : &old_segv,NULL);
     return;
 #else

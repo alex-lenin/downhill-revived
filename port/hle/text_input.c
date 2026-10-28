@@ -1,29 +1,23 @@
 #include "text_input.h"
 #include "hle.h"
-#ifdef _WIN32
-#include <windows.h>  /* SRWLOCK */
-#else
-#include "../host/win32_compat.h"
-#endif
-#if defined(_WIN32) || defined(DHD_HAVE_SDL)
-#include <SDL3/SDL.h>  /* the clipboard */
-#endif
+#include <SDL3/SDL_atomic.h>     /* SDL_SpinLock */
+#include <SDL3/SDL_clipboard.h>
 #include <string.h>
 
 /* The arrow keys, by their Windows virtual-key codes (keyboard.c's codes). */
 enum { TEXT_LEFT = 0x25, TEXT_UP = 0x26, TEXT_RIGHT = 0x27, TEXT_DOWN = 0x28 };
 
-static SRWLOCK lock = SRWLOCK_INIT;
+static SDL_SpinLock lock;  /* a few words at a time: the SDL thread types, the game reads */
 static int active, count;
 static unsigned characters[256];
 static unsigned char blocked[256]; /* held typing keys must be released before pad use */
 
 void text_input_begin(void)
 {
-    AcquireSRWLockExclusive(&lock);
+    SDL_LockSpinlock(&lock);
     active = 1;
     count = 0;
-    ReleaseSRWLockExclusive(&lock);
+    SDL_UnlockSpinlock(&lock);
 }
 void text_input_end(void)
 {
@@ -31,28 +25,28 @@ void text_input_end(void)
         for (unsigned vk = 0; vk < 256; vk++)
             if (vk != TEXT_LEFT && vk != TEXT_RIGHT && vk != TEXT_UP && vk != TEXT_DOWN &&
                 keyboard_is_down(vk)) blocked[vk] = 1;
-    AcquireSRWLockExclusive(&lock);
+    SDL_LockSpinlock(&lock);
     active = count = 0;
-    ReleaseSRWLockExclusive(&lock);
+    SDL_UnlockSpinlock(&lock);
 }
 int text_input_active(void)
 {
-    AcquireSRWLockShared(&lock);
+    SDL_LockSpinlock(&lock);
     int result = active;
-    ReleaseSRWLockShared(&lock);
+    SDL_UnlockSpinlock(&lock);
     return result;
 }
 void text_input_clear(void)
 {
-    AcquireSRWLockExclusive(&lock);
+    SDL_LockSpinlock(&lock);
     count = 0;
-    ReleaseSRWLockExclusive(&lock);
+    SDL_UnlockSpinlock(&lock);
 }
 void text_input_character(unsigned c)
 {
-    AcquireSRWLockExclusive(&lock);
+    SDL_LockSpinlock(&lock);
     if (active && count < 256) characters[count++] = c;
-    ReleaseSRWLockExclusive(&lock);
+    SDL_UnlockSpinlock(&lock);
 }
 int text_input_key_allowed(unsigned vk)
 {
@@ -73,11 +67,11 @@ static void append(char *buffer, int capacity, const char *allowed, unsigned c)
 int text_input_edit(char *buffer, int capacity, const char *allowed)
 {
     unsigned input[256];
-    AcquireSRWLockExclusive(&lock);
+    SDL_LockSpinlock(&lock);
     int n = count;
     memcpy(input, characters, n * sizeof *input);
     count = 0;
-    ReleaseSRWLockExclusive(&lock);
+    SDL_UnlockSpinlock(&lock);
     for (int i = 0; i < n; i++) {
         unsigned c = input[i];
         if (c == 13 || c == 10) return 1;
@@ -86,16 +80,12 @@ int text_input_edit(char *buffer, int capacity, const char *allowed)
             size_t length = strlen(buffer);
             if (length) buffer[length - 1] = 0;
         } else if (c == 22) { /* Ctrl+V: the clipboard's text, the field's allowed characters only */
-#if defined(_WIN32) || defined(DHD_HAVE_SDL)
             char *text = SDL_GetClipboardText();  /* UTF-8: bytes of 128 and more are not allowed */
             if (text) {
                 for (size_t k = 0; text[k] && k < 4096; k++)
                     append(buffer, capacity, allowed, (unsigned char)text[k]);
                 SDL_free(text);
             }
-#else
-            /* No clipboard on this host; the paste is dropped. */
-#endif
         } else append(buffer, capacity, allowed, c);
     }
     return 0;

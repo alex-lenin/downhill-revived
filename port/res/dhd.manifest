@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- dhd.exe's manifest: the process's code page is UTF-8 (Windows 10 1903 and later), so the
+     environment (DHD_ISO, DHD_DATA_DIR, DHD_SETTINGS from the launcher), argv and the C library's
+     narrow calls carry the same UTF-8 paths as on every other platform (port/host/host_os.h). -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

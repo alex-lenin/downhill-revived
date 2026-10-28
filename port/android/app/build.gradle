@@ -1,5 +1,5 @@
 // Downhill Revived's APK (finding 091). The native libraries are prebuilt by
-// port/tools/build_host64_android.py and copied into src/main/jniLibs by port/android/build_apk.py,
+// port/tools/build_host64.py --target android-arm64 and copied into src/main/jniLibs by port/android/build_apk.py,
 // which also adds SDL's Java sources (org.libsdl.app) and the icons; Gradle only packages and signs.
 plugins {
     id 'com.android.application'
@@ -34,7 +34,7 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = false   // stored uncompressed and page-aligned: loaded from the APK
-            keepDebugSymbols += ['**/*.so']  // already stripped (build_host64_android.py keeps libmain.debug.so)
+            keepDebugSymbols += ['**/*.so']  // already stripped (build_host64.py keeps libmain.debug.so)
         }
     }
     lint {

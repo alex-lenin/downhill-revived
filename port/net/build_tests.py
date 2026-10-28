@@ -1,19 +1,31 @@
-"""Build and run the network module's tests as 32-bit Windows programs (clang-cl and Visual
-Studio's x86 libraries, as port/tools/test_runtime.py does). Separate from the port's build.
+"""Build and run the network module's tests as x64 Windows programs (clang-cl and Visual Studio's
+x64 libraries). Separate from the port's build. nettool links the WebSocket client (ws.h), the Rust
+library rustgs.py builds (dhd_render.lib, which carries dhd_net).
 usage: python port/net/build_tests.py [--no-run] [PROGRAM...]"""
 import os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(ROOT, 'port', 'tools'))
 OUT = os.path.join(ROOT, 'build', 'port', 'net')
-FLAGS = '-m32 /nologo /O2 /W4 -Wno-deprecated-declarations /D_CRT_SECURE_NO_WARNINGS'
-CLIENT = ['hash.c', 'json.c', 'client.c']
-PROGRAMS = {  # name: (sources, libraries, run in the tests)
-    'test_hash': (['hash.c', 'test_hash.c'], '', True),
-    'test_json': (['json.c', 'test_json.c'], '', True),
-    'test_loopback': (CLIENT + ['test_loopback.c'], 'winmm.lib', True),
-    'nettool': (CLIENT + ['ws_winhttp.c', 'net.c', 'nettool.c'], 'winhttp.lib winmm.lib', False),
+FLAGS = '/nologo /O2 /W4 -Wno-deprecated-declarations /D_CRT_SECURE_NO_WARNINGS /MT'
+CLIENT = ['hash.c', 'json.c', 'client.c', 'test_guest.c']  # client.c locks with SDL3 (sdl3.py's x64 build)
+RUST = '<rust>'  # the Rust library and the system libraries rustc lists for it
+PROGRAMS = {  # name: (sources, libraries, run in the tests, SDL3)
+    'test_hash': (['hash.c', 'test_hash.c', 'test_guest.c'], '', True, False),
+    'test_json': (['json.c', 'test_json.c'], '', True, False),
+    'test_loopback': (CLIENT + ['test_loopback.c'], 'winmm.lib', True, True),
+    'nettool': (CLIENT + ['net.c', 'nettool.c'], 'winmm.lib user32.lib ' + RUST, False, True),
 }
+
+
+def rust_libs():
+    import rustgs
+    try:
+        report = rustgs.build(rustgs.X64)
+    except rustgs.Refused as why:
+        sys.exit('rustgs: refused: %s' % why)
+    return ' '.join(['"%s"' % report['lib']] + report['native_static_libs'])
 
 
 def main():
@@ -25,14 +37,22 @@ def main():
     cmd = os.path.join(OUT, 'build.cmd')
     with open(cmd, 'w') as f:
         f.write('@set "PATH=%%PATH%%;%s"\n' % os.path.dirname(vswhere))
-        f.write('@call "%s\\VC\\Auxiliary\\Build\\vcvarsall.bat" x86 >nul\n' % vs)
+        f.write('@call "%s\\VC\\Auxiliary\\Build\\vcvarsall.bat" x64 >nul\n' % vs)
         f.write('@set "PATH=%s;%%PATH%%"\n' % llvm)
         wanted = [a for a in sys.argv[1:] if not a.startswith('-')] or list(PROGRAMS)
         for name in wanted:
-            sources, libs, run = PROGRAMS[name]
+            sources, libs, run, sdl = PROGRAMS[name]
+            if RUST in libs:
+                libs = libs.replace(RUST, rust_libs())
             exe = os.path.join(OUT, name + '.exe')
             files = ' '.join('"%s"' % os.path.join(HERE, s) for s in sources)
-            f.write('clang-cl %s /Fo"%s\\\\" %s /Fe:"%s" /link %s\n' % (FLAGS, OUT, files, exe, libs))
+            flags = FLAGS
+            if sdl:
+                import sdl3
+                sdl_lib, sdl_include = sdl3.build()
+                flags += ' /I"%s"' % sdl_include
+                libs += ' "%s" %s' % (sdl_lib, ' '.join(sdl3.SYSTEM_LIBS))
+            f.write('clang-cl %s /Fo"%s\\\\" %s /Fe:"%s" /link %s\n' % (flags, OUT, files, exe, libs))
             f.write('@if errorlevel 1 exit /b 1\n')
             if run and '--no-run' not in sys.argv:
                 f.write('"%s"\n@if errorlevel 1 exit /b 1\n' % exe)

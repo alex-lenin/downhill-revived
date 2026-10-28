@@ -18,6 +18,7 @@ void hle_log(const char *fmt, ...)
     (void)fmt;
 }
 void host_thread_name(const char *name) { (void)name; }
+double host_current_thread_cpu(void) { return 0; }
 double host_wall_seconds(void)
 {
     return 0;

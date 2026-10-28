@@ -15,6 +15,8 @@
    bench_vsync calls graphics_timeline at every field of the window; at its end the medians and
    means go to stderr ("bench timeline:" lines) and, with a path, one CSV row per field. */
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+#include <SDL3/SDL_time.h>   /* the wall clock's date */
+#include <SDL3/SDL_timer.h>  /* the performance counter */
 enum { TL_EE_VU, TL_EE_GS, TL_EE_FULL, TL_VU_IDLE, TL_VU_FULL, TL_GS_IDLE,
        TL_EE_CYCLES, TL_VU_CYCLES, TL_GS_CYCLES, TL_NATIVE_CYCLES,
        TL_EE_CPU, TL_VU_CPU, TL_GS_CPU,
@@ -25,9 +27,9 @@ static const char *const tl_names[TL_COUNT] = {"ee_wait_vu", "ee_wait_gs", "ee_r
 static int tl_on = -1;
 /* One role per host thread: EE=0, VU=1, GS=2. */
 static _Thread_local unsigned tl_role;
-static volatile LONG64 tl_ticks[TL_COUNT];
+static _Atomic int64_t tl_ticks[TL_COUNT];
 enum { TL_SITES = 32 };
-static struct { void *site; unsigned calls, pending; LONG64 ticks; } tl_sites[TL_SITES];
+static struct { void *site; unsigned calls, pending; int64_t ticks; } tl_sites[TL_SITES];
 
 static int timeline_enabled(void)
 {
@@ -35,23 +37,18 @@ static int timeline_enabled(void)
     return tl_on;
 }
 
-static LONG64 tl_now(void)
+static int64_t tl_now(void) { return (int64_t)SDL_GetPerformanceCounter(); }
+
+/* Each counter has one writing thread; the atomic add keeps the 64-bit value whole for the EE's
+   reads on a 32-bit host. */
+static void tl_add(unsigned which, int64_t start)
 {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return t.QuadPart;
+    if (start) atomic_fetch_add_explicit(&tl_ticks[which], tl_now() - start, memory_order_relaxed);
 }
 
-/* Each counter has one writing thread; the interlocked add keeps the 64-bit value whole for the
-   EE's reads on this 32-bit host. */
-static void tl_add(unsigned which, LONG64 start)
-{
-    if (start) InterlockedExchangeAdd64(&tl_ticks[which], tl_now() - start);
-}
+static int64_t tl_begin(void) { return timeline_enabled() ? tl_now() : 0; }
 
-static LONG64 tl_begin(void) { return timeline_enabled() ? tl_now() : 0; }
-
-static void tl_site(void *site, int pending, LONG64 ticks)
+static void tl_site(void *site, int pending, int64_t ticks)
 {
     unsigned i = 0;
     while (i < TL_SITES - 1 && tl_sites[i].site && tl_sites[i].site != site) i++;
@@ -70,19 +67,15 @@ static int tl_compare(const void *a, const void *b)
 /* phase 0: the window's first field; 1: every later field; 2: the last one (report). */
 void graphics_timeline(int phase, unsigned field, double wall_seconds)
 {
-    static LONG64 last[TL_COUNT];
+    static int64_t last[TL_COUNT];
     static double *rows;  /* per field: wall then TL_COUNT waits, in ms */
     static unsigned count, capacity, first;
     static double frequency;
     if (!timeline_enabled()) return;
-    if (!frequency) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        frequency = (double)f.QuadPart;
-    }
+    if (!frequency) frequency = (double)SDL_GetPerformanceFrequency();
     extern unsigned host_thread_cycles(const char **names, uint64_t *cycles, unsigned max);
-    LONG64 now[TL_COUNT] = {0};
-    for (unsigned i = 0; i < TL_COUNT; i++) now[i] = InterlockedCompareExchange64(&tl_ticks[i], 0, 0);
+    int64_t now[TL_COUNT] = {0};
+    for (unsigned i = 0; i < TL_COUNT; i++) now[i] = atomic_load_explicit(&tl_ticks[i], memory_order_relaxed);
     const char *names[16]; uint64_t cycles[16];
 #ifdef GRAPHICS_QUEUE_TEST
     unsigned threads = 0;
@@ -99,17 +92,15 @@ void graphics_timeline(int phase, unsigned field, double wall_seconds)
     threads = host_thread_cpu(names, seconds, 16);
     for (unsigned i = 0; i < threads; i++)
         for (unsigned j = 0; j < 3; j++)
-            if (!strcmp(names[i], wanted[j])) now[TL_EE_CPU + j] = (LONG64)(seconds[i] * 1e7);
+            if (!strcmp(names[i], wanted[j])) now[TL_EE_CPU + j] = (int64_t)(seconds[i] * 1e7);
 #endif
     if (phase == 0) {
         fprintf(stderr, "bench timeline: clock field=%u host_s=%.9f\n", field, host_wall_seconds());
         memcpy(last, now, sizeof last);
         memset(tl_sites, 0, sizeof tl_sites);
-#ifdef _WIN32
-        FILETIME utc; GetSystemTimePreciseAsFileTime(&utc);
-        double unix_s = ((double)(((uint64_t)utc.dwHighDateTime << 32) | utc.dwLowDateTime) - 116444736000000000.0) * 1e-7;
-        fprintf(stderr, "bench timeline: clock unix_s=%.9f host_s=%.9f\n", unix_s, host_wall_seconds());
-#endif
+        SDL_Time utc;
+        if (SDL_GetCurrentTime(&utc))
+            fprintf(stderr, "bench timeline: clock unix_s=%.9f host_s=%.9f\n", utc * 1e-9, host_wall_seconds());
         first = field, count = 0;
         return;
     }
@@ -144,7 +135,8 @@ void graphics_timeline(int phase, unsigned field, double wall_seconds)
             field_ms - mean[1 + TL_VU_IDLE] - mean[1 + TL_VU_FULL], field_ms - mean[1 + TL_GS_IDLE]);
     /* exe+offset: the site's place in the link map (dhd64.map), whatever the load address */
 #ifdef _WIN32
-    uintptr_t image = (uintptr_t)GetModuleHandleA(NULL);
+    extern char __ImageBase[];  /* the linker's: the executable's load address */
+    uintptr_t image = (uintptr_t)__ImageBase;
 #else
     uintptr_t image = 0;
 #endif
@@ -171,9 +163,9 @@ void graphics_timeline(int phase, unsigned field, double wall_seconds)
     fflush(stderr);
 }
 #else
-static LONG64 tl_now(void) { return 0; }
-static LONG64 tl_begin(void) { return 0; }
-static void tl_add(unsigned which, LONG64 start) { (void)which, (void)start; }
-static void tl_site(void *site, int pending, LONG64 ticks) { (void)site, (void)pending, (void)ticks; }
+static int64_t tl_now(void) { return 0; }
+static int64_t tl_begin(void) { return 0; }
+static void tl_add(unsigned which, int64_t start) { (void)which, (void)start; }
+static void tl_site(void *site, int pending, int64_t ticks) { (void)site, (void)pending, (void)ticks; }
 enum { TL_EE_VU, TL_EE_GS, TL_EE_FULL, TL_VU_IDLE, TL_VU_FULL, TL_GS_IDLE };
 #endif

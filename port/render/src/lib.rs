@@ -27,6 +27,7 @@
 //! | `native::present` | N7 | the native present pass and filter |
 //! | `web` | B1 | the browser: allocator, async init, the pending read |
 //! | `test_hooks` | HK | `dhdr_test_*` (feature `test-hooks`) |
+//! | `png_decode` | TP1 | the texture packs' PNG files (`dhdr_png_*`), native only |
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::missing_safety_doc, clippy::new_without_default)]
 
@@ -37,6 +38,30 @@ pub mod guard;
 pub mod host;
 pub mod log;
 pub mod shaders;
+
+/// The texture packs' PNG decoder (port/gs/texpack.c), on every native platform.
+#[cfg(feature = "native")]
+pub mod png_decode;
+
+/// The port's WebSocket and HTTPS client (port/net/ws.h), native only: linked here so its
+/// `#[no_mangle]` exports reach the one static library.
+#[cfg(feature = "native")]
+pub use dhd_net;
+
+/// dhd.ini's settings (port/render/include/dhd_settings.h), native only: linked here for the
+/// game's host (port/hle/host.c).
+#[cfg(feature = "native")]
+pub use dhd_settings;
+
+/// Discord Rich Presence (port/render/include/dhd_presence.h), native only: linked here for the
+/// game's host (port/hle/host.c).
+#[cfg(feature = "native")]
+pub use dhd_presence;
+
+/// The disc image's online check (port/render/include/dhd_disc.h), native only: linked here for
+/// the game's host (port/host/host_sdl.c).
+#[cfg(feature = "native")]
+pub use dhd_disc;
 
 /// The renderer's version line (`dhdr_version`), NUL-terminated.
 pub const VERSION: &str = "dhd_render 1.0 wgpu 29.0.3 core 29.0.3 naga 29.0.3\0";

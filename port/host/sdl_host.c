@@ -1,8 +1,12 @@
-/* The SDL thread (W11): the process's one SDL thread. It owns the video subsystem and the window
-   (SDL's window messages go to the thread that created the window, and SDL's documentation puts
-   the video calls and the event queue on one thread), it pumps the events and sends them where
-   they belong (the window, the keyboard, the text field, the controllers), and it runs the
-   controllers' pass (gamepad.c) every 4 ms, as the controllers' own thread did before.
+/* The SDL thread (W11) is the process's main thread, on every platform: macOS's Cocoa wants its
+   windows and its event loop there, and one structure serves Windows, Linux and Android the same
+   way (Android's main thread is SDL_main's, port/host/android_main.c). sdl_host_main runs the game
+   on a thread of its own (64 MiB of stack, normal priority, as main had) and this loop here: it
+   owns the video subsystem and the window (SDL's window messages go to the thread that created
+   the window, and SDL's documentation puts the video calls and the event queue on one thread),
+   it pumps the events and sends them where they belong (the window, the keyboard, the text field,
+   the controllers), and it runs the controllers' pass (gamepad.c) every 4 ms. The game ends the
+   process itself (exit, host_exit) or returns from its thread; main then returns its code.
 
    The game thread never waits on SDL's queue. It reads copies: the keyboard's keys
    (keyboard.c), the controllers' states (gamepad.c), and the window's size and close (present.c).
@@ -13,8 +17,8 @@
    Escape, Ctrl+letter) are sent from the key events here, repeats included, so the text field
    behaves as before. Text: SDL's UTF-8 text input, decoded to code points.
 
-   Used through hle.h: sdl_host_start (the thread, once), sdl_host_run (a function run on the
-   thread, waiting for it: the window's creation). */
+   Used through hle.h: sdl_host_main (launcher.c's main), sdl_host_start (the controllers' start,
+   once), sdl_host_run (a function run on this thread, waiting for it: the window's calls). */
 #include "host_api.h"
 #include "../hle/hle.h"
 #include "../hle/text_input.h"
@@ -24,9 +28,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static SDL_AtomicInt started;      /* 1 once the thread was started */
-static SDL_AtomicInt up_ok;        /* 1 once SDL's events are up on the thread */
-static SDL_Semaphore *up;          /* signalled once the thread's start is done */
+static SDL_AtomicInt up_ok;        /* 1 once SDL's events are up on the main thread */
+static SDL_AtomicInt game_running; /* the game's thread has not returned */
+static SDL_InitState pads;         /* sdl_host_start's one start */
+static Uint32 wake_event;          /* pushed by sdl_host_run: the loop runs the request at once */
+static SDL_ThreadID main_thread;   /* sdl_host_main's */
 static SDL_Mutex *slot_lock;       /* one request at a time */
 static void (*request_fn)(void *); /* the pending request (under slot_lock) */
 static void *request_arg;
@@ -169,23 +175,53 @@ static void run_request(void)
     }
 }
 
-static int sdl_thread(void *unused)
+/* On this thread, at the game's first sdl_host_start: the controllers (their own messages, logs
+   and failures; gamepad.c reads dhd.ini's settings, which the game has loaded by then). */
+static void start_input(void *unused)
 {
     (void)unused;
-    host_thread_name("sdl");
-    if (!SDL_Init(SDL_INIT_EVENTS)) {
-        fprintf(stderr, "sdl: no event queue (%s)\n", SDL_GetError());
-        SDL_SignalSemaphore(up);
-        return 0;
-    }
-    SDL_SetAtomicInt(&up_ok, 1);
     /* DHD_TEST_INPUT=1 (test runs on a desktop that is never shown, whose window never gets the
        focus): the keys sent to the window count, as if it had the keyboard. */
     if (getenv("DHD_TEST_INPUT")) keyboard_focus(1);
-    gamepad_thread_start();  /* the controllers: their own messages, logs and failures */
-    SDL_SignalSemaphore(up);
-    for (;;) {
+    gamepad_thread_start();
+}
+
+typedef struct { int (*fn)(void *); void *arg; } GameStart;
+
+static int SDLCALL game_thread(void *start)
+{
+    GameStart *g = start;
+    int code = g->fn(g->arg);
+    SDL_SetAtomicInt(&game_running, 0);
+    return code;
+}
+
+int sdl_host_main(int (*game)(void *), void *arg)
+{
+    enum { GAME_STACK = 64 << 20 };  /* the EE's fibers and wasm2c's frames run on it */
+    host_thread_name("sdl");
+    main_thread = SDL_GetCurrentThreadID();
+    slot_lock = SDL_CreateMutex();
+    int events = SDL_Init(SDL_INIT_EVENTS);
+    if (events) wake_event = SDL_RegisterEvents(1);
+    else fprintf(stderr, "sdl: no event queue (%s)\n", SDL_GetError());
+    SDL_SetAtomicInt(&up_ok, events);
+    GameStart start = {game, arg};
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER, (void *)game_thread);
+    SDL_SetStringProperty(props, SDL_PROP_THREAD_CREATE_NAME_STRING, "game");
+    SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, &start);
+    SDL_SetNumberProperty(props, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER, GAME_STACK);
+    SDL_SetAtomicInt(&game_running, 1);
+    SDL_Thread *thread = SDL_CreateThreadWithProperties(props);
+    SDL_DestroyProperties(props);
+    if (!thread) {
+        fprintf(stderr, "sdl: no game thread (%s)\n", SDL_GetError());
+        return 1;
+    }
+    while (SDL_GetAtomicInt(&game_running)) {
         run_request();
+        if (!events) { SDL_Delay(4); continue; }
         SDL_Event e;
 #ifdef __ANDROID__
         /* SDL's Android wait wakes itself with each event it queues (a core spinning, measured on
@@ -193,40 +229,34 @@ static int sdl_thread(void *unused)
         while (SDL_PollEvent(&e)) dispatch(&e);
         SDL_Delay(4);
 #else
-        /* wakes on any event; 4 ms at most, so the controllers' states and vibration are never late */
+        /* wakes on any event (sdl_host_run's too); 4 ms at most, so the controllers' states and
+           vibration are never late */
         for (int got = SDL_WaitEventTimeout(&e, 4); got; got = SDL_PollEvent(&e)) dispatch(&e);
 #endif
         gamepad_thread_update();
-        gs_cursor_tick();
+        gs_window_tick();
     }
-    return 0;
+    int code = 0;
+    SDL_WaitThread(thread, &code);
+    return code;
 }
 
-/* Starts the thread once; returns 1 when SDL's events are up there (waits up to 3 s the first time). */
+/* The controllers' start on the main thread, once (the game thread's first call waits for it);
+   returns 1 when SDL's events are up. */
 int sdl_host_start(void)
 {
-    static int waited;
-    if (SDL_CompareAndSwapAtomicInt(&started, 0, 1)) {
-        up = SDL_CreateSemaphore(0);
-        slot_lock = SDL_CreateMutex();
-        SDL_Thread *t = SDL_CreateThread(sdl_thread, "sdl", NULL);
-        if (t) SDL_DetachThread(t);
-        else {
-            fprintf(stderr, "sdl: no thread (%s)\n", SDL_GetError());
-            SDL_SignalSemaphore(up);
-        }
-    }
-    if (!waited) {  /* the game thread makes these calls; only the first one waits */
-        waited = 1;
-        SDL_WaitSemaphoreTimeout(up, 3000);
+    if (SDL_ShouldInit(&pads)) {
+        sdl_host_run(start_input, NULL);
+        SDL_SetInitialized(&pads, true);
     }
     return SDL_GetAtomicInt(&up_ok);
 }
 
-/* Runs fn(arg) on the SDL thread and returns when it has. 0 if the thread isn't up. */
+/* Runs fn(arg) on the main thread and returns when it has. 0 if SDL's events aren't up there. */
 int sdl_host_run(void (*fn)(void *), void *arg)
 {
-    if (!sdl_host_start()) return 0;
+    if (!SDL_GetAtomicInt(&up_ok)) return 0;
+    if (SDL_GetCurrentThreadID() == main_thread) { fn(arg); return 1; }  /* asked from the loop itself */
     SDL_Semaphore *done = SDL_CreateSemaphore(0);
     for (;;) {  /* one request at a time */
         SDL_LockMutex(slot_lock);
@@ -238,6 +268,10 @@ int sdl_host_run(void (*fn)(void *), void *arg)
     request_arg = arg;
     request_done = done;
     SDL_UnlockMutex(slot_lock);
+    SDL_Event wake;
+    SDL_zero(wake);
+    wake.type = wake_event;
+    SDL_PushEvent(&wake);  /* the loop's wait returns now */
     SDL_WaitSemaphore(done);
     SDL_DestroySemaphore(done);
     return 1;

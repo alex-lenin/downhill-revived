@@ -1,0 +1,4 @@
+# rustc --print native-static-libs for the x86_64-unknown-linux-gnu static library (rustc 1.97.1, wgpu 29.0.3
+# with dx12+vulkan+wgsl (Vulkan loaded at run time), dhd_net; cross-built by rustgs.py for build_host64.py --target linux-x64).
+# The allow-list for rustgs.py / check_rust_lib.py.
+-ldl -lgcc_s -lutil -lrt -lpthread -lm -lc

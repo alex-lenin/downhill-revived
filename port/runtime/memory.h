@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#define PS2_RAM_BASE 0x08000000u   /* host address of PS2 address 0 (port/tools/pctarget.py) */
+#define PS2_RAM_BASE 0x08000000u   /* host address of PS2 address 0 (port/tools/data.py) */
 #define PS2_RAM_SIZE 0x02000000u
 #define PS2_IMAGE_START 0x263BC0u  /* .vutext, the first byte of the data image */
 #define PS2_IMAGE_END 0x29DCF0u    /* the end of .sdata: .sbss and .bss after it are zero */
@@ -25,8 +25,5 @@ int ps2_memory_init(void);
    to host addresses and recompiled functions, port/tools/data.py) set. Then the VU kernels take
    their microcode from it. */
 void ps2_image_load(const uint8_t *retail);
-/* Nonzero if host PS2_LOW_VIEW..PS2_RAM_SIZE is reserved for the low view (host_mem_reserved;
-   the wasm core's linear memory always is), as ps2_memory_init needs. */
-int ps2_low_view_reserved(void);
 
 #endif

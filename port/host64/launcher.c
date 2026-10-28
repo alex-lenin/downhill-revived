@@ -42,10 +42,11 @@ void host64_trap(wasm_rt_trap_t code) {
     for (;;) {}
 }
 #endif
-int main(int argc,char **argv) {
-#ifdef _WIN32
-    SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
-#endif
+typedef struct { int argc; char **argv; } Args;
+/* The game: the module instantiated and run. On a thread of its own (sdl_host.c: the process's
+   main thread runs SDL's window and events); the fixture build (--fake) runs it on main. */
+static int game(void *start) {
+    Args *args=start; int argc=args->argc; char **argv=args->argv;
     struct w2c_env env;
     wasm_rt_init(); host64_exports_bind(&env,&core);
     wasm2c_core_instantiate(&core,&env);
@@ -80,4 +81,16 @@ int main(int argc,char **argv) {
     wasm2c_core_free(&core); wasm_rt_free();
     printf("host64 module exit: %d\n",code);
     return code;
+}
+int sdl_host_main(int (*game)(void *),void *arg);  /* port/host/sdl_host.c */
+int main(int argc,char **argv) {
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
+#endif
+    Args args={argc,argv};
+#ifdef HOST64_FAKE_MODULE
+    return game(&args);  /* the boundary fixture: no window, no SDL */
+#else
+    return sdl_host_main(game,&args);
+#endif
 }

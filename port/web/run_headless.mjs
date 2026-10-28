@@ -107,7 +107,6 @@ const impl={
   host_ram_view:(at,offset,n)=>+((offset===0&&n===0x02000000&&[0x08000000,0x28000000,0x38000000].includes(at>>>0))||
     (offset===0x00400000&&n===0x01c00000&&[0x00400000,0x20400000,0x30400000].includes(at>>>0))),
   host_mem_commit:(a,n)=>+((a>>>0)+n<=bytes.length),host_mem_reserved:(a,n)=>+((a>>>0)+n<=bytes.length),
-  host_service_host_relaunch_reserving:()=>-1,
   // JS cannot protect individual linear-memory pages. Refuse fault guards so
   // graphics.c uses its existing immediate readback fallback.
   host_mem_protect:(_a,_n,protection)=>+(protection===2),host_callback_fault_guard:()=>0,host_fault_guard_here:()=>0,
@@ -123,7 +122,7 @@ const impl={
   host_console_write:(a,n)=>{process.stderr.write(Buffer.from(span(a,n)));},
   host_path_exists:a=>+fs.existsSync(str(a)),host_path_is_dir:a=>{try{return +fs.statSync(str(a)).isDirectory();}catch{return 0;}},
   host_dir_create:a=>{try{fs.mkdirSync(str(a));return 1;}catch{return 0;}},
-  host_dir_open:()=>0,host_dir_next:()=>0,host_dir_close:()=>{},host_path_info:()=>0,
+  host_dir_open:()=>0,host_dir_next:()=>0,host_dir_close:()=>{},
   host_service_host_disc_ready:()=>0,host_service_host_skip_movies:()=>1,
   host_service_host_pad_device:(_,a)=>{span(a,18).fill(0);span(a+2,4).fill(128);},
   host_service_mouse_state:a=>{span(a,36).fill(0);},
@@ -137,13 +136,12 @@ const noops=`host_sleep_ms host_wait_wall host_dpi_aware host_callbacks_drain ho
 host_pacing_config host_pacing_wait host_pacing_handoff host_pacing_input host_callback_heartbeat
 host_sound_open host_sound_write host_sound_reset host_sound_tick host_sound_log_stack snd_host_bench
 host_service_host_init host_service_host_console_init host_service_host_settings_load host_service_host_pad_vibrate
-host_service_splash_show host_service_splash_step host_service_update_save_environment host_service_update_at_start
 host_service_movie_prepare host_service_movie_start host_service_movie_audio host_service_graphics_wait host_service_graphics_shutdown
 host_service_gs_vsync host_service_gs_pump_messages host_service_gs_window_title host_service_gs_native_view
 host_service_gs_window_apply host_service_gs_present_options_apply host_service_gs_window_close
-host_service_text_input_begin host_service_text_input_end host_service_host_backtrace`.split(/\s+/);
+host_service_text_input_begin host_service_text_input_end host_service_host_backtrace host_service_presence`.split(/\s+/);
 for(const n of noops)impl[n]=()=>{};
-for(const n of ['host_service_net_racing','host_service_net_seconds','host_service_net_server_ms','host_heartbeat_eip','host_service_update_after_game'])impl[n]=()=>0;
+for(const n of ['host_service_net_racing','host_service_net_seconds','host_service_net_server_ms','host_heartbeat_eip','host_service_launcher_open'])impl[n]=()=>0;
 const metadata=JSON.parse(fs.readFileSync(option('--imports',path.join(root,'build/web/imports.json'))));
 const coreBytes=fs.readFileSync(modulePath),threaded=definesSharedMemory(coreBytes);
 // As www/worker.js: the threaded core skips the waits that only order queued graphics work

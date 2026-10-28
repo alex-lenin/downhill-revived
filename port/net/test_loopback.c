@@ -7,6 +7,7 @@
 #include "client.h"
 #include "json.h"
 
+#include <windows.h>
 #include <mmsystem.h>
 #include <stdio.h>
 #include <stdlib.h>

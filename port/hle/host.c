@@ -7,50 +7,66 @@
 #include "hle.h"
 #include "timer.h"
 #include "state_trace.h"
+#include "../include/version.h"
+#include "../runtime/sha256.h"
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_timer.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>        /* _get_osfhandle */
 #include <fcntl.h>     /* _O_WRONLY, _O_TEXT (the log's pipe) */
 #include <signal.h>
-#include <commdlg.h>  /* the file-open dialog's struct; comdlg32 itself is loaded when needed */
 #else
-#include "../host/win32_compat.h"
 #include "../host/backtrace_posix.h"  /* <execinfo.h>, or Android's own (API < 33) */
-#include <dirent.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+#ifdef __APPLE__
+#include <mach/mach.h>  /* thread_info: the bench's thread times */
+#endif
+#include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
-#include <sys/prctl.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <ucontext.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 #endif
 
 #include "ps2asm.h"
 #include "../include/guest.h"
+#include "../host/host_os.h"
+#include "../render/include/dhd_settings.h"  /* dhd.ini (port/render/settings) */
+#include "../render/include/dhd_presence.h"  /* Discord Rich Presence (port/render/presence) */
 
-/* The instruction pointer, stack pointer and frame register of a CONTEXT (the 32-bit and the 64-bit
-   records name them differently). */
+#include <SDL3/SDL.h>
+
+/* The instruction pointer and stack pointer of a CONTEXT. */
 #ifdef _WIN32
-#ifdef _WIN64
 #define CTX_IP(c) ((uintptr_t)(c)->Rip)
 #define CTX_SP(c) ((uintptr_t)(c)->Rsp)
 #else
-#define CTX_IP(c) ((uintptr_t)(c)->Eip)
-#define CTX_SP(c) ((uintptr_t)(c)->Esp)
-#endif
-#else
-/* Linux crash/dump signals hand a ucontext_t: x86_64, or aarch64 (Android, finding 091). */
-#if defined(__aarch64__)
+/* POSIX crash/dump signals hand a ucontext_t: x86_64, or aarch64 (Android, finding 091; macOS,
+   whose registers sit behind a pointer, with fp and lr right after x0-x28). CTX_X: x0 up. */
+#if defined(__APPLE__)
+#define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__pc)
+#define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__sp)
+#define CTX_X(c) ((const unsigned long long *)(c)->uc_mcontext->__ss.__x)
+#elif defined(__aarch64__)
 #define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext.pc)
 #define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext.sp)
+#define CTX_X(c) ((const unsigned long long *)(c)->uc_mcontext.regs)
 #else
 #define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext.gregs[REG_RIP])
 #define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext.gregs[REG_RSP])
@@ -71,7 +87,19 @@ typedef struct {
 
 /* No CRT calls while the game thread is suspended: it may own a CRT lock. */
 static uint32_t published_registers[5];
-#ifndef _WIN32
+#ifdef _WIN32
+/* Whether [p, p + n) can be read (peek, snapshot): a kernel read, which never faults. */
+static int host_readable(const void *p, size_t n)
+{
+    char sink[64];
+    SIZE_T got;
+    for (size_t at = 0; at < n; at += sizeof sink) {
+        size_t part = n - at < sizeof sink ? n - at : sizeof sink;
+        if (!ReadProcessMemory(GetCurrentProcess(), (const char *)p + at, sink, part, &got) || got != part) return 0;
+    }
+    return 1;
+}
+#else
 /* Whether [p, p + n) can be read (peek, safe_vprint, snapshot): a fault guard
    around a volatile probe. The previous SIGSEGV/SIGBUS handlers stay in the
    chain for faults outside the probe (or on other threads). */
@@ -129,19 +157,6 @@ static void snapshot(Snapshot *out, const CONTEXT *c)
 {
     out->context = *c;
     out->count = 0;
-#ifdef _WIN32
-    extern char __ImageBase[];
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(__ImageBase + ((IMAGE_DOS_HEADER *)__ImageBase)->e_lfanew);
-    uintptr_t lo = (uintptr_t)__ImageBase + nt->OptionalHeader.BaseOfCode;
-    uintptr_t hi = lo + nt->OptionalHeader.SizeOfCode;
-    const uintptr_t *sp = (const uintptr_t *)CTX_SP(c);
-    for (unsigned i = 0; i < 2048 && out->count < 32; i++) {
-        uintptr_t value;
-        SIZE_T read;
-        if (!ReadProcessMemory(GetCurrentProcess(), sp + i, &value, sizeof value, &read) || read != sizeof value) break;
-        if (value >= lo && value < hi) out->returns[out->count++] = value;
-    }
-#else
     uintptr_t lo = 0, hi = 0;
     const uintptr_t *sp = (const uintptr_t *)CTX_SP(c);
     host_code_range(&lo, &hi);
@@ -151,33 +166,21 @@ static void snapshot(Snapshot *out, const CONTEXT *c)
         value = *(volatile const uintptr_t *)(sp + i);
         if (value >= lo && value < hi) out->returns[out->count++] = value;
     }
-#endif
-#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
     memcpy(out->registers,published_registers,sizeof out->registers);
-#else
-    out->registers[0] = ps2.gpr[29].w[0]; out->registers[1] = ps2.gpr[31].w[0];
-    out->registers[2] = ps2.gpr[4].w[0]; out->registers[3] = ps2.gpr[5].w[0];
-    out->registers[4] = ps2.gpr[2].w[0];
-#endif
 }
 
 static void print_snapshot(const Snapshot *s)
 {
     const CONTEXT *c = &s->context;
 #ifdef _WIN32
-#ifdef _WIN64
     fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
             (unsigned long long)c->Rip, (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
             (unsigned long long)c->Rcx, (unsigned long long)c->Rdx, (unsigned long long)c->Rsi,
             (unsigned long long)c->Rdi, (unsigned long long)c->Rsp);
-#else
-    fprintf(stderr, "  eip %08lX eax %08lX ebx %08lX ecx %08lX edx %08lX esi %08lX edi %08lX esp %08lX\n",
-            c->Eip, c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Esp);
-#endif
 #elif defined(__aarch64__)
-    const unsigned long long *x = (const unsigned long long *)c->uc_mcontext.regs;
+    const unsigned long long *x = CTX_X(c);
     fprintf(stderr, "  pc %016llX sp %016llX lr %016llX x0 %016llX x1 %016llX x2 %016llX x19 %016llX x29 %016llX\n",
-            (unsigned long long)c->uc_mcontext.pc, (unsigned long long)c->uc_mcontext.sp, x[30], x[0], x[1], x[2],
+            (unsigned long long)CTX_IP(c), (unsigned long long)CTX_SP(c), x[30], x[0], x[1], x[2],
             x[19], x[29]);
 #else
     const greg_t *r = c->uc_mcontext.gregs;
@@ -208,11 +211,7 @@ static void peek(void)
     unsigned addr, len;
     if (peek && sscanf(peek, "%x,%x", &addr, &len) == 2)
         for (unsigned i = 0; i < len; i += 4) {
-#ifdef _WIN32
-            if (IsBadReadPtr(GUEST(addr + i), 4)) break;
-#else
             if (!host_readable(GUEST(addr + i), 4)) break;
-#endif
             fprintf(stderr, "%s%08X", i % 32 ? " " : i ? "\n  " : "  ", *(uint32_t *)GUEST(addr + i));
         }
     fprintf(stderr, "\n");
@@ -361,7 +360,7 @@ static void crashed(int sig, siginfo_t *info, void *ctx)
 {
     const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL" : "SIGFPE";
     char thread[17] = "?";
-    prctl(PR_GET_NAME, thread);  /* which of the port's threads (host_thread_name) */
+    pthread_getname_np(pthread_self(), thread, sizeof thread);  /* which of the port's threads (host_thread_name) */
     fprintf(stderr, "crash: %s at %016llX in thread %s\n", name,
             (unsigned long long)(uintptr_t)(info ? info->si_addr : NULL), thread);
     fflush(stderr);
@@ -381,13 +380,8 @@ void host_backtrace(void)
 {
 #ifdef _WIN32
     CONTEXT c = {0};
-#ifdef _WIN64
     c.Rip = (DWORD64)(uintptr_t)__builtin_return_address(0);
     c.Rsp = (DWORD64)(uintptr_t)__builtin_frame_address(0);
-#else
-    c.Eip = (DWORD)(uintptr_t)__builtin_return_address(0);
-    c.Esp = (DWORD)(uintptr_t)__builtin_frame_address(0);
-#endif
     report(&c);
 #else
     void *frames[32];
@@ -409,7 +403,7 @@ static int game_thread_set;
    watchpoint) prints the word, the code address after the access and the code addresses on the
    stack, for port/tools/host64_rva.py (as RVAs). A diagnostic (finding 041: host addresses in EE memory). */
 static uint32_t watch_address[4];
-static LONG watch_hits[4];
+static atomic_int watch_hits[4];
 
 #ifdef _WIN32
 static LONG WINAPI watch_hit(EXCEPTION_POINTERS *e)
@@ -417,7 +411,7 @@ static LONG WINAPI watch_hit(EXCEPTION_POINTERS *e)
     CONTEXT *c = e->ContextRecord;
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(c->Dr6 & 15)) return EXCEPTION_CONTINUE_SEARCH;
     for (int i = 0; i < 4; i++)
-        if (c->Dr6 & 1u << i && InterlockedIncrement(&watch_hits[i]) <= 40) {
+        if (c->Dr6 & 1u << i && atomic_fetch_add(&watch_hits[i], 1) < 40) {
             extern uint64_t kernel_vsync_count;
             uint32_t value = 0;
             SIZE_T got;  /* a kernel read: a plain load would hit a load watchpoint again */
@@ -433,7 +427,7 @@ static LONG WINAPI watch_hit(EXCEPTION_POINTERS *e)
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-static DWORD WINAPI watch_arm(void *unused)
+static int SDLCALL watch_arm(void *unused)
 {
     CONTEXT c = {.ContextFlags = CONTEXT_DEBUG_REGISTERS};
     const char *spec = getenv("DHD_WATCH");
@@ -458,7 +452,7 @@ static DWORD WINAPI watch_arm(void *unused)
 #else
 /* Hardware data watchpoints need another thread's debug registers; the
    state-trace watch (DHD_STATE_WATCH, state_trace.c) is the portable one. */
-static DWORD watch_arm(void *unused)
+static int SDLCALL watch_arm(void *unused)
 {
     const char *spec = getenv("DHD_WATCH");
     if (!spec) spec = state_trace_watch_spec();
@@ -468,13 +462,13 @@ static DWORD watch_arm(void *unused)
     return 0;
 }
 #endif
-static volatile LONG dump_pending;
+static atomic_int dump_pending;
 
 /* Kernel details are printed by the game thread at its next safe boundary. */
 #ifdef _WIN32
-static DWORD WINAPI watchdog(void *seconds)
+static int SDLCALL watchdog(void *seconds)
 {
-    Sleep((DWORD)(uintptr_t)seconds * 1000);
+    SDL_Delay((Uint32)(uintptr_t)seconds * 1000);
     Snapshot s;
     CONTEXT c = {.ContextFlags = CONTEXT_FULL};
     if (SuspendThread(game_thread) == (DWORD)-1) return 0;
@@ -485,7 +479,7 @@ static DWORD WINAPI watchdog(void *seconds)
     fprintf(stderr, "dump after %u s:\n", (unsigned)(uintptr_t)seconds);
     print_snapshot(&s);
     peek();
-    InterlockedExchange(&dump_pending, 1);
+    atomic_store(&dump_pending, 1);
     return 0;
 }
 #else
@@ -500,11 +494,11 @@ static void dump_signal(int sig, siginfo_t *info, void *ctx)
     fprintf(stderr, "dump:\n");
     print_snapshot(&s);
     peek();
-    InterlockedExchange(&dump_pending, 1);
+    atomic_store(&dump_pending, 1);
 }
-static DWORD WINAPI watchdog(void *seconds)
+static int SDLCALL watchdog(void *seconds)
 {
-    Sleep((DWORD)(uintptr_t)seconds * 1000);
+    SDL_Delay((Uint32)(uintptr_t)seconds * 1000);
     if (game_thread_set) pthread_kill(game_thread, SIGUSR1);
     return 0;
 }
@@ -518,20 +512,24 @@ static struct { const char *name; HANDLE handle; } named[NAMED_THREADS];
 #else
 static struct { const char *name; pthread_t handle; } named[NAMED_THREADS];
 #endif
-static volatile LONG named_count;
+static atomic_int named_count;
 
 void host_thread_name(const char *name)
 {
 #ifdef _WIN32  /* the OS's name too, for debuggers and profilers */
     WCHAR wide[64];
     if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64)) SetThreadDescription(GetCurrentThread(), wide);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);  /* the calling thread's own */
 #else
-    pthread_setname_np(pthread_self(), name);
+    /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
+       system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */
+    if (gettid() != getpid()) pthread_setname_np(pthread_self(), name);
 #endif
 #ifdef __ANDROID__
     { void android_perf_thread(const char *name); android_perf_thread(name); }  /* port/host/android_perf.c */
 #endif
-    LONG at = InterlockedIncrement(&named_count) - 1;
+    int at = atomic_fetch_add(&named_count, 1);
     if (at >= NAMED_THREADS) return;
 #ifdef _WIN32
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &named[at].handle, 0, FALSE,
@@ -545,13 +543,22 @@ void host_thread_name(const char *name)
 unsigned host_thread_cpu(const char **names, double *seconds, unsigned max)
 {
     unsigned n = 0;
-    for (LONG i = 0; i < named_count && i < NAMED_THREADS && n < max; i++) {
+    for (int i = 0; i < named_count && i < NAMED_THREADS && n < max; i++) {
 #ifdef _WIN32
         FILETIME created, exited, kernel, user;
         if (!named[i].name || !GetThreadTimes(named[i].handle, &created, &exited, &kernel, &user)) continue;
         names[n] = named[i].name;
         seconds[n++] = (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
                         ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__APPLE__)  /* no per-thread CPU clocks: Mach's thread times */
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        if (!named[i].name || thread_info(pthread_mach_thread_np(named[i].handle), THREAD_BASIC_INFO,
+                                          (thread_info_t)&info, &count) != KERN_SUCCESS)
+            continue;
+        names[n] = named[i].name;
+        seconds[n++] = info.user_time.seconds + info.system_time.seconds +
+                       (info.user_time.microseconds + info.system_time.microseconds) / 1e6;
 #else
         clockid_t id;
         struct timespec t;
@@ -570,7 +577,7 @@ unsigned host_thread_cycles(const char **names, uint64_t *cycles, unsigned max)
 {
     unsigned n = 0;
 #ifdef _WIN32
-    for (LONG i = 0; i < named_count && i < NAMED_THREADS && n < max; i++) {
+    for (int i = 0; i < named_count && i < NAMED_THREADS && n < max; i++) {
         ULONG64 value;
         if (!named[i].name || !QueryThreadCycleTime(named[i].handle, &value)) continue;
         names[n] = named[i].name;
@@ -582,6 +589,36 @@ unsigned host_thread_cycles(const char **names, uint64_t *cycles, unsigned max)
     return n;
 }
 
+/* The calling thread's CPU time, and the whole process's, in seconds (the worker profiles and the
+   bench). */
+double host_current_thread_cpu(void)
+{
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
+    return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
+            ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#else
+    struct timespec t;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t)) return 0;
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+#endif
+}
+
+double host_process_cpu(void)
+{
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
+            ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#else
+    struct timespec t;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t)) return 0;
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+#endif
+}
+
 void host_init(void)
 {
 #ifdef _WIN32
@@ -590,19 +627,13 @@ void host_init(void)
     const char *dump = getenv("DHD_DUMP");
     host_thread_name("game");
     if (getenv("DHD_WATCH") || state_trace_watch_spec()) {
-        HANDLE armer;
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &game_thread, 0, FALSE,
                         DUPLICATE_SAME_ACCESS);
         AddVectoredExceptionHandler(1, watch_hit);
-        armer = CreateThread(NULL, 0, watch_arm, NULL, 0, NULL);
-        WaitForSingleObject(armer, INFINITE);
-        CloseHandle(armer);
     }
-    if (dump) {
+    if (dump)
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &game_thread, 0, FALSE,
                         DUPLICATE_SAME_ACCESS);
-        CreateThread(NULL, 0, watchdog, (void *)(uintptr_t)atoi(dump), 0, NULL);
-    }
 #else
     struct sigaction sa, dump_sa;
     const char *dump = getenv("DHD_DUMP");
@@ -622,31 +653,121 @@ void host_init(void)
         uintptr_t lo, hi;
         host_code_range(&lo, &hi);
     }
-    if (getenv("DHD_WATCH") || state_trace_watch_spec()) {
-        HANDLE armer = CreateThread(NULL, 0, watch_arm, NULL, 0, NULL);
-        if (armer) {
-            WaitForSingleObject(armer, INFINITE);
-            CloseHandle(armer);
-        }
-    }
     if (dump) {
         memset(&dump_sa, 0, sizeof dump_sa);
         dump_sa.sa_sigaction = dump_signal;
         sigemptyset(&dump_sa.sa_mask);
         dump_sa.sa_flags = SA_SIGINFO;
         sigaction(SIGUSR1, &dump_sa, NULL);
-        CreateThread(NULL, 0, watchdog, (void *)(uintptr_t)atoi(dump), 0, NULL);
     }
 #endif
+    if (getenv("DHD_WATCH") || state_trace_watch_spec())
+        SDL_WaitThread(SDL_CreateThread(watch_arm, "watch", NULL), NULL);
+    if (dump) SDL_DetachThread(SDL_CreateThread(watchdog, "watchdog", (void *)(uintptr_t)atoi(dump)));
 }
 
-/* dhd.exe is a Windows program (/subsystem:windows), so a double-click opens no console window.
-   Its log (stderr, stdout) goes where the starter put it: the tools' files and pipes as before;
-   started from a console window, that console; else (the launcher, Explorer) a new dhd.log beside
-   dhd.exe. Before anything prints. */
-void host_console_init(void)
+#ifndef _WIN32
+/* The log on Linux, macOS and Android: stdout and stderr write into a pipe and a thread copies its
+   lines to dhd.log (and on Android to logcat, tag DownhillRevived), so a slow write to the disk
+   holds up only that thread, as on Windows. host_log_drain: the lines still in the pipe reach the
+   file before the process ends (exit, host_exit), at most half a second. */
+static int log_pipe[2] = {-1, -1};
+static FILE *log_file;
+static atomic_int log_busy;  /* the thread is between a read and its last line written */
+
+static void log_line(char *line)
 {
+#ifdef __ANDROID__
+    __android_log_write(ANDROID_LOG_INFO, "DownhillRevived", line);
+#endif
+    fputs(line, log_file);
+    fputc('\n', log_file);
+    fflush(log_file);
+}
+
+/* Only async-signal-safe calls besides fflush: host_exit also runs it after a fault. */
+void host_log_drain(void)
+{
+    if (log_pipe[0] < 0) return;
+    fflush(stdout);
+    for (int i = 0; i < 250; i++) {
+        int pending = 0;
+        if (ioctl(log_pipe[0], FIONREAD, &pending) != 0) return;
+        if (!pending && !atomic_load(&log_busy)) return;
+        usleep(2000);
+    }
+}
+
+static void *log_copy(void *unused)
+{
+    (void)unused;
+    char buf[2048];
+    size_t have = 0;
+    for (;;) {
+        /* busy goes up before the read empties the pipe, so host_log_drain never sees neither */
+        struct pollfd p = {log_pipe[0], POLLIN, 0};
+        atomic_store(&log_busy, 0);
+        if (poll(&p, 1, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        atomic_store(&log_busy, 1);
+        ssize_t n = read(log_pipe[0], buf + have, sizeof buf - 1 - have);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        have += (size_t)n;
+        char *start = buf, *nl;
+        while ((nl = memchr(start, '\n', (size_t)(buf + have - start)))) {
+            *nl = 0;
+            log_line(start);
+            start = nl + 1;
+        }
+        have -= (size_t)(start - buf);
+        memmove(buf, start, have);
+        if (have == sizeof buf - 1) { buf[have] = 0; log_line(buf); have = 0; }  /* a very long line */
+    }
+    return NULL;
+}
+
+static void log_start(const char *path)
+{
+    if (!(log_file = host_os_fopen(path, "w"))) return;
+    if (pipe(log_pipe) != 0) { log_pipe[0] = -1; return; }
+    fflush(stdout), fflush(stderr);
+    dup2(log_pipe[1], STDOUT_FILENO);
+    dup2(log_pipe[1], STDERR_FILENO);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, log_copy, NULL) == 0) pthread_detach(thread);
+    atexit(host_log_drain);
+}
+#endif
+
+/* The log's first line: the release and the build, "Downhill Revived 0.6.4 (dhd-port 0.6.4
+   1a2b3c4d5e6f7a8b)", the same build name the online lobby shows (online.c build_version: the
+   start of the program file's SHA-256), so a player's log says which game wrote it. */
+static void log_version(void)
+{
+    char path[HOST_PATH_MAX], build[17] = "unknown";
+    static uint8_t buf[1 << 16];
+    uint8_t digest[32];
+    Sha256 hash;
+    int64_t n;
+    host_exe_path(path, sizeof path);
+    HostFile f = host_file_open(path, HOST_FILE_READ);
+    if (f != HOST_FILE_NONE) {
+        sha256_init(&hash);
+        while ((n = host_file_read(f, buf, sizeof buf)) > 0) sha256_update(&hash, buf, (size_t)n);
+        host_file_close(f);
+        sha256_final(&hash, digest);
+        for (int i = 0; i < 8; i++) snprintf(build + 2 * i, 3, "%02x", digest[i]);
+    }
+    fprintf(stderr, "Downhill Revived %s (dhd-port %s %s)\n", DHD_VERSION, DHD_VERSION, build);
+}
+
 #ifdef _WIN32
+static void console_open(const char *path)
+{
     HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
     DWORD type = err && err != INVALID_HANDLE_VALUE ? GetFileType(err) : FILE_TYPE_UNKNOWN;
     if (type != FILE_TYPE_UNKNOWN) return;
@@ -655,242 +776,54 @@ void host_console_init(void)
         freopen("CONOUT$", "w", stderr);
         freopen("CONOUT$", "w", stdout);
     } else {
-        char path[MAX_PATH];
-        DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
-        while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
-        snprintf(path + n, sizeof path - n, "dhd.log");
-        if (!freopen(path, "w", stderr)) return;
-        freopen(path, "a", stdout);
+        WCHAR wide[HOST_PATH_MAX];  /* the UTF-8 path as Windows' own */
+        if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, HOST_PATH_MAX)) return;
+        if (!_wfreopen(wide, L"w", stderr)) return;
+        _wfreopen(wide, L"a", stdout);
         opened = 1;
     }
     setvbuf(stderr, NULL, _IONBF, 0);
     SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
     SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout)));
     if (opened) log_start();
+}
 #else
-    /* A console (or the tools' pipes) owns the log already; keep it unbuffered. */
-    setvbuf(stderr, NULL, _IONBF, 0);
-#endif
-}
-
-/* ---- controllers ---- */
-#ifdef _WIN32
-#pragma comment(lib, "user32")
-
-typedef struct {  /* XINPUT_STATE */
-    DWORD packet;
-    WORD buttons;
-    BYTE left_trigger, right_trigger;
-    SHORT lx, ly, rx, ry;
-} XState;
-typedef DWORD(WINAPI *XInputGetStateFn)(DWORD, XState *);
-typedef struct { WORD left, right; } XVibration;  /* XINPUT_VIBRATION: low- and high-frequency motor */
-typedef DWORD(WINAPI *XInputSetStateFn)(DWORD, XVibration *);
-static XInputSetStateFn xinput_set;
-
-static XInputGetStateFn xinput(void)
+/* A terminal, or the tools' pipe or file, keeps the log; else dhd.log at path. */
+static void console_open(const char *path)
 {
-    static int tried;
-    static XInputGetStateFn fn;
-    if (!tried++) {
-        HMODULE dll = LoadLibraryA("xinput1_4.dll");
-        if (!dll)
-            dll = LoadLibraryA("xinput9_1_0.dll");
-        if (dll) {
-            fn = (XInputGetStateFn)(void *)GetProcAddress(dll, "XInputGetState");
-            xinput_set = (XInputSetStateFn)(void *)GetProcAddress(dll, "XInputSetState");
-        }
-    }
-    return fn;
+    setvbuf(stderr, NULL, _IONBF, 0);
+    struct stat st;
+    if (isatty(STDERR_FILENO) || (fstat(STDERR_FILENO, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode))))
+        return;
+    log_start(path);
 }
+#endif
+
+/* The log (stderr, stdout) goes where the starter put it: the tools' files and pipes as before;
+   started from a console window or a terminal, there; else (the launcher, Explorer, Finder, a
+   desktop's menu, Android) a new dhd.log in DHD_DATA_DIR (the launcher's folder for the player's
+   files, port/launcher game.rs), else beside the game (on Android the app's files folder, which
+   stands for it). dhd.exe is a Windows program (/subsystem:windows), so a double-click opens no
+   console window. Before anything prints; once (android_main.c calls it before the game does). */
+void host_console_init(void)
+{
+    static int done;
+    if (done++) return;
+    char path[HOST_PATH_MAX];
+    const char *data = getenv("DHD_DATA_DIR");
+    unsigned n = data ? 0 : host_exe_path(path, sizeof path);
+    while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
+    snprintf(path + n, sizeof path - n, data ? "%s/dhd.log" : "%sdhd.log", data ? data : "");
+    console_open(path);
+    log_version();
+}
+
+/* ---- controllers: SDL's (gamepad.c) and the keyboard ---- */
 
 /* The DualShock 2's motors (pad.c, scePadSetActDirect): the small one on or off, the large one
-   0-255. A pad gets them as its high- and low-frequency motors (SDL: every pad with motors,
-   gamepad.c; without SDL, XInput pads only), unless DHD_VIBRATION=0 (dhd.ini "vibration", the
-   PC settings page). Output only: nothing comes back into the game. */
-void host_pad_vibrate(int port, int light, int heavy)
-{
-    static int last[4] = {-1, -1, -1, -1};
-    const char *setting = getenv("DHD_VIBRATION");
-    if (setting && !atoi(setting)) light = heavy = 0;
-    int key = (light ? 256 : 0) | (heavy & 255);
-    if (port < 0 || port > 3 || key == last[port]) return;
-    last[port] = key;
-    if (gamepad_start()) {
-        gamepad_vibrate(port, light, heavy);
-        return;
-    }
-    xinput();
-    if (!xinput_set) return;
-    XVibration v = {(WORD)((heavy & 255) * 257), (WORD)(light ? 0xFFFF : 0)};
-    xinput_set((DWORD)port, &v);
-}
-
-
-
-/* Sony controllers (DualSense, DualSense Edge, DualShock 4) through raw HID: Windows doesn't
-   offer them as XInput pads. A reader thread opens the first one it finds, over USB or
-   Bluetooth, and keeps its latest input report; it looks again every second while none is
-   connected. Report layouts as Linux's hid-playstation and hid-sony drivers read them. */
-typedef struct { ULONG size; USHORT vendor, product, version; } HidAttributes;
-typedef struct { DWORD size; GUID class_guid; DWORD flags; ULONG_PTR reserved; } DevInterfaceData;
-typedef struct { DWORD size; char path[1]; } DevInterfaceDetail;
-typedef void(WINAPI *HidGetGuidFn)(GUID *);
-typedef BOOLEAN(WINAPI *HidGetAttributesFn)(HANDLE, HidAttributes *);
-typedef BOOLEAN(WINAPI *HidGetFeatureFn)(HANDLE, void *, ULONG);
-typedef void *(WINAPI *GetClassDevsFn)(const GUID *, const char *, HWND, DWORD);
-typedef BOOL(WINAPI *EnumInterfacesFn)(void *, void *, const GUID *, DWORD, DevInterfaceData *);
-typedef BOOL(WINAPI *GetInterfaceDetailFn)(void *, DevInterfaceData *, DevInterfaceDetail *, DWORD, DWORD *, void *);
-typedef BOOL(WINAPI *DestroyListFn)(void *);
-
-enum { SONY_NONE, SONY_DUALSENSE, SONY_DS4 };
-typedef struct {  /* sticks, then the buttons and triggers as the DualShock 4's simple report has them */
-    uint8_t lx, ly, rx, ry, face, shoulder, l2, r2;
-} SonyState;
-
-static CRITICAL_SECTION sony_lock;
-static SonyState sony_state;
-static volatile LONG sony_connected;
-
-static HANDLE sony_open(int *kind)
-{
-    HMODULE hid = LoadLibraryA("hid.dll"), setup = LoadLibraryA("setupapi.dll");
-    HidGetGuidFn get_guid;
-    HidGetAttributesFn get_attributes;
-    HidGetFeatureFn get_feature;
-    GetClassDevsFn get_class_devs;
-    EnumInterfacesFn enum_interfaces;
-    GetInterfaceDetailFn get_detail;
-    DestroyListFn destroy;
-    GUID guid;
-    void *list;
-    HANDLE found = INVALID_HANDLE_VALUE;
-    DWORD i;
-    if (!hid || !setup)
-        return found;
-    get_guid = (HidGetGuidFn)(void *)GetProcAddress(hid, "HidD_GetHidGuid");
-    get_attributes = (HidGetAttributesFn)(void *)GetProcAddress(hid, "HidD_GetAttributes");
-    get_feature = (HidGetFeatureFn)(void *)GetProcAddress(hid, "HidD_GetFeature");
-    get_class_devs = (GetClassDevsFn)(void *)GetProcAddress(setup, "SetupDiGetClassDevsA");
-    enum_interfaces = (EnumInterfacesFn)(void *)GetProcAddress(setup, "SetupDiEnumDeviceInterfaces");
-    get_detail = (GetInterfaceDetailFn)(void *)GetProcAddress(setup, "SetupDiGetDeviceInterfaceDetailA");
-    destroy = (DestroyListFn)(void *)GetProcAddress(setup, "SetupDiDestroyDeviceInfoList");
-    if (!get_guid || !get_attributes || !get_class_devs || !enum_interfaces || !get_detail || !destroy)
-        return found;
-    get_guid(&guid);
-    list = get_class_devs(&guid, NULL, NULL, 0x12 /* DIGCF_PRESENT | DIGCF_DEVICEINTERFACE */);
-    if (list == INVALID_HANDLE_VALUE)
-        return found;
-    for (i = 0; found == INVALID_HANDLE_VALUE; i++) {
-        union { DevInterfaceDetail d; char bytes[1024]; } detail;
-        HidAttributes attributes = {sizeof attributes};
-        DevInterfaceData data = {sizeof data};
-        HANDLE h;
-        if (!enum_interfaces(list, NULL, &guid, i, &data))
-            break;
-        detail.d.size = sizeof(DWORD) + sizeof(char);  /* the fixed part's size, as SetupAPI checks it */
-        if (!get_detail(list, &data, &detail.d, sizeof detail, NULL, NULL))
-            continue;
-        h = CreateFileA(detail.d.path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                        OPEN_EXISTING, 0, NULL);
-        if (h == INVALID_HANDLE_VALUE)
-            continue;
-        if (get_attributes(h, &attributes) && attributes.vendor == 0x054C) {
-            USHORT p = attributes.product;
-            *kind = p == 0x0CE6 || p == 0x0DF2 ? SONY_DUALSENSE
-                  : p == 0x05C4 || p == 0x09CC || p == 0x0BA0 ? SONY_DS4 : SONY_NONE;
-            if (*kind != SONY_NONE) {
-                /* Over Bluetooth, reading the calibration feature report switches the pad to its
-                   full report (0x31 DualSense, 0x11 DualShock 4); over USB it changes nothing. */
-                uint8_t feature[64] = {*kind == SONY_DUALSENSE ? 0x05 : 0x02};
-                if (get_feature)
-                    get_feature(h, feature, *kind == SONY_DUALSENSE ? 41 : 37);
-                found = h;
-                continue;
-            }
-        }
-        CloseHandle(h);
-    }
-    destroy(list);
-    return found;
-}
-
-/* One input report to the common state; 0 if it isn't one we read. */
-static int sony_parse(int kind, const uint8_t *r, DWORD n, SonyState *s)
-{
-    const uint8_t *b;
-    if (kind == SONY_DUALSENSE && (r[0] == 0x01 || r[0] == 0x31) && n >= 64) {
-        /* USB (0x01) or full Bluetooth (0x31, one more header byte): sticks, L2, R2, a counter,
-           then the buttons */
-        b = r + (r[0] == 0x31 ? 2 : 1);
-        s->lx = b[0], s->ly = b[1], s->rx = b[2], s->ry = b[3], s->l2 = b[4], s->r2 = b[5];
-        s->face = b[7], s->shoulder = b[8];
-        return 1;
-    }
-    if (kind == SONY_DS4 && r[0] == 0x11 && n >= 12)  /* DualShock 4, full Bluetooth */
-        b = r + 3;
-    else if (r[0] == 0x01 && n >= 10)  /* DualShock 4 over USB; either pad's simple Bluetooth report */
-        b = r + 1;
-    else
-        return 0;
-    s->lx = b[0], s->ly = b[1], s->rx = b[2], s->ry = b[3];
-    s->face = b[4], s->shoulder = b[5], s->l2 = b[7], s->r2 = b[8];
-    return 1;
-}
-
-static DWORD WINAPI sony_reader(void *unused)
-{
-    (void)unused;
-    for (;;) {
-        int kind = SONY_NONE;
-        HANDLE h = sony_open(&kind);
-        if (h == INVALID_HANDLE_VALUE) {
-            Sleep(1000);
-            continue;
-        }
-        fprintf(stderr, "controller: %s connected\n", kind == SONY_DUALSENSE ? "DualSense" : "DualShock 4");
-        for (;;) {
-            uint8_t report[128];
-            DWORD n = 0;
-            SonyState s;
-            if (!ReadFile(h, report, sizeof report, &n, NULL))
-                break;
-            if (!sony_parse(kind, report, n, &s))
-                continue;
-            EnterCriticalSection(&sony_lock);
-            sony_state = s;
-            LeaveCriticalSection(&sony_lock);
-            InterlockedExchange(&sony_connected, 1);
-        }
-        InterlockedExchange(&sony_connected, 0);
-        CloseHandle(h);
-        fprintf(stderr, "controller: disconnected\n");
-    }
-    return 0;
-}
-
-static int sony_read(SonyState *out)
-{
-    static volatile LONG started;
-    if (!InterlockedExchange(&started, 1)) {
-        InitializeCriticalSection(&sony_lock);
-        CloseHandle(CreateThread(NULL, 0, sony_reader, NULL, 0, NULL));
-    }
-    if (!sony_connected)
-        return 0;
-    EnterCriticalSection(&sony_lock);
-    *out = sony_state;
-    LeaveCriticalSection(&sony_lock);
-    return 1;
-}
-#else
-/* No XInput or HID pads on this host: SDL (gamepad.c) or nobody. */
-typedef struct { uint16_t left, right; } XVibration;
-static void (*xinput_set)(unsigned, void *);
-static void *xinput(void) { return NULL; }
-
-/* The motors without XInput: gamepad.c's pads (a no-op where it has no backend), off when
-   DHD_VIBRATION=0, same dedupe as above. */
+   0-255. A pad gets them as its high- and low-frequency motors (every pad with motors, gamepad.c),
+   unless DHD_VIBRATION=0 (dhd.ini "vibration", the PC settings page). Output only: nothing comes
+   back into the game. */
 void host_pad_vibrate(int port, int light, int heavy)
 {
     static int last[4] = {-1, -1, -1, -1};
@@ -901,21 +834,6 @@ void host_pad_vibrate(int port, int light, int heavy)
     last[port] = key;
     if (gamepad_start()) gamepad_vibrate(port, light, heavy);
 }
-#endif
-
-#ifdef _WIN32
-/* The pressure byte of each pressure-sensitive button, in the DualShock 2's order. */
-static const uint16_t pressure_order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
-                                            PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
-
-static uint8_t stick(SHORT v, int flip)
-{
-    int x = (v >> 8) + 128;
-    if (flip)
-        x = 255 - x;
-    return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
-}
-#endif
 
 /* The game's controls are in riding mode (D_0029E290, func_00220550): keyboard.c moves the left
    stick with the arrows then, and the d-pad in menus. */
@@ -941,81 +859,12 @@ static void keyboard_merge(HostPad *out)
     keyboard_pad(down, riding_controls(), host_seconds(), out);
 }
 
-/* Without SDL (DHD_SDL=0, or it didn't start): XInput pad `port`, else (port 0) a DualSense or
-   DualShock 4 over raw HID. */
-#ifdef _WIN32
-static int direct_pad(int port, HostPad *out)
-{
-    XInputGetStateFn get = xinput();
-    XState x;
-    size_t i;
-    if (get && get((DWORD)port, &x) == ERROR_SUCCESS) {
-        static const struct { WORD x; uint16_t button; } map[] = {
-            {0x0001, PAD_UP}, {0x0002, PAD_DOWN}, {0x0004, PAD_LEFT}, {0x0008, PAD_RIGHT}, {0x0010, PAD_START},
-            {0x0020, PAD_SELECT}, {0x0040, PAD_L3}, {0x0080, PAD_R3}, {0x0100, PAD_L1}, {0x0200, PAD_R1},
-            {0x1000, PAD_CROSS}, {0x2000, PAD_CIRCLE}, {0x4000, PAD_SQUARE}, {0x8000, PAD_TRIANGLE},
-        };
-        for (i = 0; i < sizeof map / sizeof *map; i++)
-            if (x.buttons & map[i].x)
-                out->buttons |= map[i].button;
-        if (x.left_trigger > 30)
-            out->buttons |= PAD_L2;
-        if (x.right_trigger > 30)
-            out->buttons |= PAD_R2;
-        out->left_x = stick(x.lx, 0), out->left_y = stick(x.ly, 1);
-        out->right_x = stick(x.rx, 0), out->right_y = stick(x.ry, 1);
-        for (i = 0; i < 12; i++)
-            out->pressure[i] = pressure_order[i] == PAD_L2 ? x.left_trigger
-                             : pressure_order[i] == PAD_R2 ? x.right_trigger
-                             : out->buttons & pressure_order[i] ? 255 : 0;
-        return 1;
-    }
-    SonyState sony;
-    if (port == 0 && sony_read(&sony)) {
-        /* d-pad: a hat, 0 up then clockwise, 8 none */
-        static const uint16_t hat[9] = {PAD_UP, PAD_UP | PAD_RIGHT, PAD_RIGHT, PAD_DOWN | PAD_RIGHT, PAD_DOWN,
-                                        PAD_DOWN | PAD_LEFT, PAD_LEFT, PAD_UP | PAD_LEFT, 0};
-        static const struct { uint8_t bit; uint16_t button; } face[] = {
-            {0x10, PAD_SQUARE}, {0x20, PAD_CROSS}, {0x40, PAD_CIRCLE}, {0x80, PAD_TRIANGLE}};
-        /* Create/Share is SELECT, Options START */
-        static const struct { uint8_t bit; uint16_t button; } shoulder[] = {
-            {0x01, PAD_L1}, {0x02, PAD_R1}, {0x10, PAD_SELECT}, {0x20, PAD_START}, {0x40, PAD_L3}, {0x80, PAD_R3}};
-        out->buttons = hat[(sony.face & 0x0F) > 8 ? 8 : sony.face & 0x0F];
-        for (i = 0; i < sizeof face / sizeof *face; i++)
-            if (sony.face & face[i].bit)
-                out->buttons |= face[i].button;
-        for (i = 0; i < sizeof shoulder / sizeof *shoulder; i++)
-            if (sony.shoulder & shoulder[i].bit)
-                out->buttons |= shoulder[i].button;
-        if (sony.l2 > 30)
-            out->buttons |= PAD_L2;
-        if (sony.r2 > 30)
-            out->buttons |= PAD_R2;
-        out->left_x = sony.lx, out->left_y = sony.ly, out->right_x = sony.rx, out->right_y = sony.ry;
-        for (i = 0; i < 12; i++)
-            out->pressure[i] = pressure_order[i] == PAD_L2 ? sony.l2
-                             : pressure_order[i] == PAD_R2 ? sony.r2
-                             : out->buttons & pressure_order[i] ? 255 : 0;
-        return 1;
-    }
-    return 0;
-}
-#else
-static int direct_pad(int port, HostPad *out)
-{
-    (void)port;
-    (void)out;
-    return 0;
-}
-#endif
-
-/* Player `port`'s controller (SDL, gamepad.c, else XInput and the Sony pads directly: one of the
-   two, never both, so a pad isn't read twice), and for player 1 the keyboard as well, merged. */
+/* Player `port`'s controller (SDL, gamepad.c), and for player 1 the keyboard as well, merged. */
 void host_pad_device(int port, HostPad *out)
 {
     memset(out, 0, sizeof *out);
     out->right_x = out->right_y = out->left_x = out->left_y = 128;
-    int connected = gamepad_start() ? gamepad_read(port, out) : direct_pad(port, out);
+    int connected = gamepad_start() && gamepad_read(port, out);
     if (port == 0) keyboard_merge(out);
     out->connected = (uint8_t)(connected || port == 0);  /* player 1 always has the keyboard */
 }
@@ -1033,91 +882,26 @@ int host_service_host_skip_movies(void)
     return 1;
 }
 
-/* PC settings: dhd.ini next to dhd.exe (or the file DHD_SETTINGS names), one "key = value" a
-   line, [sections] and ;/# comments ignored. Each setting becomes the environment variable it
-   stands for, unless that variable is already set: the environment overrides the file. A line
-   may also name a DHD_* variable directly. Options are host-side only; none reaches game state. */
-static void setting(const char *name, const char *value)
-{
-    if (!getenv(name)) _putenv_s(name, value);
-}
-
-static void apply_setting(const char *key, const char *value)
-{
-    if (!_stricmp(key, "game_options")) return; /* read after the game's own boot/load */
-    if (!_stricmp(key, "auto_update") || !_stricmp(key, "update_url")) return; /* the launcher's (port/launcher) */
-    static const struct { const char *key, *name; } plain[] = {
-        {"iso", "DHD_ISO"}, {"skip_movies", "DHD_SKIP_MOVIES"}, {"window", "DHD_WINDOW"},
-        {"width", "DHD_WINDOW_WIDTH"}, {"height", "DHD_WINDOW_HEIGHT"}, {"monitor", "DHD_MONITOR"},
-        {"scale", "DHD_SCALE"}, {"widescreen", "DHD_WIDESCREEN"}, {"vibration", "DHD_VIBRATION"},
-        {"memory_card", "DHD_MEMCARD"},
-        {"sound_latency_ms", "DHD_SND_LATENCY_MS"},
-        {"server", "DHD_NET_SERVER"}, {"name", "DHD_NET_NAME"}, {"rider", "DHD_NET_RIDER"},  /* online (port/net) */
-        {"texture_pack", "DHD_TEXTURE_PACK"}, {"textures", "DHD_TEXTURES"},  /* texture packs (port/gs/texpack.c) */
-        {"texture_cache_mb", "DHD_TEXTURE_CACHE_MB"},
-        {"font", "DHD_FONT"},  /* the sharp font (port/gs/font_sharp.c) */
-        {"fps", "DHD_FPS"},
-        {"vsync", "DHD_VSYNC"},  /* 1: no tearing (port/gs/gpu_rust.c) */
-        {"unlock_all", "DHD_UNLOCK_ALL"},  /* 1: every track, rider, bike (port_unlock_all, pc_settings.c) */
-    };
-    if (!_strnicmp(key, "DHD_", 4)) { setting(key, value); return; }
-    if (!_stricmp(key, "renderer")) { setting("DHD_RENDER", _stricmp(value, "native") ? "exact" : "native"); return; }
-    /* fps selects real offline simulation steps (finding 067). */
-    for (unsigned i = 0; i < sizeof plain / sizeof *plain; i++)
-        if (!_stricmp(key, plain[i].key)) { setting(plain[i].name, value); return; }
-    hle_log("settings: unknown key %s\n", key);
-}
-
-static char *trim(char *s)
-{
-    while (*s == ' ' || *s == '\t') s++;
-    char *end = s + strlen(s);
-    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) *--end = 0;
-    return s;
-}
+/* PC settings: dhd.ini (the file DHD_SETTINGS names, else beside dhd.exe), read and written by the
+   Rust crate dhd_settings (port/render/settings, finding 101), which holds every key, the DHD_*
+   variable it stands for, the player's defaults and the choices. At the start each setting becomes
+   its variable, unless the environment has that already: the environment overrides the file.
+   Options are host-side only; none reaches game state. */
 
 /* dhd.ini's path: DHD_SETTINGS, else beside dhd.exe. */
 static void settings_path(char *path, size_t size)
 {
     const char *named = getenv("DHD_SETTINGS");
     if (named) { snprintf(path, size, "%s", named); return; }
-#ifdef _WIN32
-    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
-#else
     unsigned n = host_exe_path(path, (unsigned)size);
-#endif
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
     snprintf(path + n, size - n, "dhd.ini");
-}
-
-/* A value in double quotes is taken as it is (a path may hold ; or #), else up to a comment. */
-static char *setting_value(char *value)
-{
-    if (*value == '"') {
-        char *end = strchr(value + 1, '"');
-        if (end) { *end = 0; return value + 1; }
-    }
-    char *comment = strpbrk(value, ";#");
-    if (comment && (comment == value || comment[-1] == ' ' || comment[-1] == '\t')) { *comment = 0; value = trim(value); }
-    return value;
 }
 
 static int iso_from_environment;  /* DHD_ISO was set before dhd.ini was read: it overrides the file */
 
 /* The PC settings the environment sets (so dhd.ini can't), for the settings page to show them
-   locked: looked at before reading dhd.ini, kept in DHD_ENV_OVERRIDES. */
-static void note_overrides(void)
-{
-    static const char *const names[] = {"DHD_SCALE", "DHD_WINDOW", "DHD_WINDOW_WIDTH", "DHD_WINDOW_HEIGHT",
-                                        "DHD_ASPECT", "DHD_PRESENT_FILTER", "DHD_WIDESCREEN", "DHD_SKIP_MOVIES",
-                                        "DHD_VIBRATION", "DHD_RENDER", "DHD_TEXTURES", "DHD_FONT"};
-    char list[256] = ",";
-    for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
-        if (getenv(names[i]) && strlen(list) + strlen(names[i]) + 2 < sizeof list)
-            strcat(strcat(list, names[i]), ",");
-    _putenv_s("DHD_ENV_OVERRIDES", list);
-}
-
+   locked: DHD_ENV_OVERRIDES, which the load writes. */
 int host_setting_locked(const char *name)
 {
     char key[64];
@@ -1126,184 +910,73 @@ int host_setting_locked(const char *name)
     return list && strstr(list, key) != NULL;
 }
 
-/* The official public race server (online/server, deployed by the project). DHD_NET_SERVER or
-   a "server =" line with an address replaces it, for anyone running their own. */
-#define OFFICIAL_SERVER "wss://dhd.skuza.app"
-
-static int settings_has(const char *key);
-
-/* A player's settings where dhd.ini doesn't say (round 40, finding 056): the native renderer at
-   2x, borderless on the monitor at its own resolution, widescreen in the monitor's shape with
-   the HUD kept in shape, the startup movies skipped (skip_movies 1, finding 086 S1; 0 before),
-   V-Sync on (no tearing; issue #2).
-   The window size, for the windowed display, is the monitor's desktop resolution ("monitor":
-   present.c reads it through SDL when it makes the window and puts the numbers in its place;
-   only when dhd.ini has neither a width nor a height line). Only with a dhd.ini (the game
-   writes one on the first start; the release ships none): the tools run without one and keep
-   the old defaults, and a line in dhd.ini or a DHD_* variable wins. */
-static const char *const player_defaults[][3] = {
-    {"renderer", "native", "DHD_RENDER"}, {"scale", "2", "DHD_SCALE"}, {"window", "borderless", "DHD_WINDOW"},
-    {"widescreen", "1", "DHD_WIDESCREEN"}, {"DHD_ASPECT", "wide", "DHD_ASPECT"}, {"skip_movies", "1", "DHD_SKIP_MOVIES"},
-    {"vsync", "1", "DHD_VSYNC"},
-};
+static const char *settings_get(const char *name) { return getenv(name); }
+static void settings_unknown(const char *key) { hle_log("settings: unknown key %s\n", key); }
 
 void host_settings_load(void)
 {
-    char path[MAX_PATH];
+    char path[HOST_PATH_MAX];
     iso_from_environment = getenv("DHD_ISO") != NULL;
-    note_overrides();
     settings_path(path, sizeof path);
-    FILE *f = fopen(path, "r");
-    char line[1024];
-    while (f && fgets(line, sizeof line, f)) {
-        char *s = trim(line), *eq = strchr(s, '=');
-        if (!*s || *s == ';' || *s == '#' || *s == '[' || !eq) continue;
-        *eq = 0;
-        char *key = trim(s), *value = setting_value(trim(eq + 1));
-        if (*key && *value) apply_setting(key, value);
-    }
-    if (f) {
-        fclose(f);
-        for (unsigned i = 0; i < sizeof player_defaults / sizeof *player_defaults; i++)
-            if (!settings_has(player_defaults[i][0])) setting(player_defaults[i][2], player_defaults[i][1]);
-        if (!settings_has("width") && !settings_has("height") && !getenv("DHD_WINDOW_WIDTH") && !getenv("DHD_WINDOW_HEIGHT")) {
-            setting("DHD_WINDOW_WIDTH", "monitor");
-            setting("DHD_WINDOW_HEIGHT", "monitor");
-        }
-    }
-    setting("DHD_NET_SERVER", OFFICIAL_SERVER);  /* no server set (an empty "server =" sets none) */
+    dhd_settings_load(path, settings_get, host_putenv_s, settings_unknown);
 }
 
-/* Whether dhd.ini has a line for key. */
-static int settings_has(const char *key)
+/* One dhd.ini line (the others kept). Nonzero when saved. */
+int host_setting_save(const char *key, const char *value)
 {
-    char path[MAX_PATH], line[1024];
-    int found = 0;
+    char path[HOST_PATH_MAX];
     settings_path(path, sizeof path);
-    FILE *f = fopen(path, "r");
-    while (f && !found && fgets(line, sizeof line, f)) {
-        char *s = trim(line), *eq = strchr(s, '=');
-        if (!*s || *s == ';' || *s == '#' || *s == '[' || !eq) continue;
-        *eq = 0;
-        found = !_stricmp(trim(s), key);
-    }
-    if (f) fclose(f);
-    return found;
+    return dhd_settings_save(path, key, value);
 }
-
-/* What a new dhd.ini starts with. The release ships none (port/tools/package_release.py), so
-   unzipping a new version over an old folder never replaces the player's: the game writes this
-   the first time it saves a setting (the disc image, on the first start). */
-static const char settings_template[] =
-    "; Downhill Revived settings: one \"key = value\" per line. The game adds your disc image (iso)\n"
-    "; on the first start, and OPTIONS > PC SETTINGS writes the display settings here. DHD_*\n"
-    "; environment variables override them.\n"
-    "\n"
-    "; scale: the 3D picture's resolution, 1-8 times the PlayStation 2's,\n"
-    ";   or window.\n"
-    "; window: windowed (width x height; the monitor's resolution when not set), borderless\n"
-    ";   or fullscreen (borderless over the whole monitor).\n"
-    "; widescreen: 1 the monitor's shape (a wider view, the HUD and menus kept in shape), 0 off,\n"
-    ";   or a shape such as 21:9. DHD_ASPECT, the picture's shape: wide (widescreen's), 4:3, 16:9,\n"
-    ";   stretch or pixels.\n"
-    "renderer = native\n"
-    "scale = 2\n"
-    "window = borderless\n"
-    "widescreen = 1\n"
-    "DHD_ASPECT = wide\n"
-    "skip_movies = 1\n"
-    "; Offline real simulation rate: 60 (original), 120, 144, 165, 240 or monitor (max 240).\n"
-    "; Online always uses 60. Frame rate changes apply at the next start.\n"
-    "fps = 60\n"
-    "\n"
-    "; Online races use the official server, wss://dhd.skuza.app, when\n"
-    "; server is empty. To use a server of your own, put its address here, for example\n"
-    ";   server = wss://races.example.org\n"
-    "server =\n"
-    "\n"
-    "; The launcher (DownhillRevived) looks for a newer release and offers it; online races need\n"
-    "; the newest. auto_update = ask (asks first), on (updates without asking) or off (never looks).\n"
-    "; update_url: where to look, a latest.json or a GitHub releases API address; empty means\n"
-    "; the official releases. An update replaces the game's files, never dhd.ini or saves.\n"
-    "update_url =\n"
-    "auto_update = ask\n"
-    "\n"
-    "; A texture pack (upscale mod) made for PCSX2 works unchanged: texture_pack is its folder of\n"
-    "; PNGs, the full path of PCSX2's textures\\SCUS-97177\\replacements folder for example (in\n"
-    "; Documents\\PCSX2). When empty, a textures\\SCUS-97177\\replacements folder beside dhd.exe is\n"
-    "; used if there is one. textures = off draws the game's own textures (PC SETTINGS > Texture\n"
-    "; Pack).\n"
-    "texture_pack =\n"
-    "textures = on\n"
-    "\n"
-    "; font: sharp draws the game's font with clean edges at any resolution (made in memory from\n"
-    "; the font on your disc each time the game starts); original draws it as the PS2 does.\n"
-    "font = sharp\n";
-
-/* Writes key = value into dhd.ini: replaces the key's first line, else adds one at the end; every
-   other line (comments, sections, unknown keys) stays as it was. A missing dhd.ini starts as
-   settings_template. Nonzero when saved. */
-static int settings_save(const char *key, const char *value)
-{
-    char path[MAX_PATH], temp[MAX_PATH + 8], line[1024];
-    settings_path(path, sizeof path);
-    snprintf(temp, sizeof temp, "%s.new", path);
-    FILE *in = fopen(path, "r"), *out = fopen(temp, "w");
-    if (!out) { if (in) fclose(in); return 0; }
-    const char *quote = strpbrk(value, ";#\"") || value[0] == ' ' ? "\"" : "";
-    int written = 0;
-    if (!in) fputs(settings_template, out);
-    while (in && fgets(line, sizeof line, in)) {
-        char copy[1024], *s, *eq;
-        snprintf(copy, sizeof copy, "%s", line);
-        s = trim(copy);
-        if (!written && (eq = strchr(s, '=')) && *s != ';' && *s != '#' && *s != '[') {
-            *eq = 0;
-            if (!_stricmp(trim(s), key)) { fprintf(out, "%s = %s%s%s\n", key, quote, value, quote); written = 1; continue; }
-        }
-        fputs(line, out);
-        if (!strchr(line, '\n')) fputc('\n', out);
-    }
-    if (!written) fprintf(out, "%s = %s%s%s\n", key, quote, value, quote);
-    if (in) fclose(in);
-    int ok = !ferror(out);
-    ok &= fclose(out) == 0;
-#ifdef _WIN32
-    if (ok) ok = MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING) != 0;
-    if (!ok) DeleteFileA(temp);
-#else
-    if (ok) ok = rename(temp, path) == 0;
-    if (!ok) unlink(temp);
-#endif
-    return ok;
-}
-
-int host_setting_save(const char *key, const char *value) { return settings_save(key, value); }
 
 /* Read afresh after each game-data load; these values never become DHD_* overrides. */
 int host_game_options_read(char *value, size_t size)
 {
-    char path[MAX_PATH], line[1024];
+    char path[HOST_PATH_MAX];
     settings_path(path, sizeof path);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    int found = 0;
-    while (fgets(line, sizeof line, f)) {
-        char *s = trim(line), *eq = strchr(s, '=');
-        if (!eq || *s == ';' || *s == '#' || *s == '[') continue;
-        *eq = 0;
-        if (!_stricmp(trim(s), "game_options")) {
-            snprintf(value, size, "%s", setting_value(trim(eq + 1)));
-            found = 1; break;
-        }
-    }
-    fclose(f);
-    return found;
+    return dhd_settings_read(path, "game_options", value, size);
 }
 
 /* ---- the disc image (first start) ---- */
 
 static uint32_t le32_at(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+/* The game's other releases (finding 100), from the table the launcher reads too. */
+#define OTHER_RELEASE(boot, what) {boot, what},
+#define OTHER_RELEASES_MORE(url)
+static const struct { const char *boot, *what; } other_releases[] = {
+#include "other_releases.inc"
+};
+#undef OTHER_RELEASE
+#undef OTHER_RELEASES_MORE
+#define OTHER_RELEASE(boot, what)
+#define OTHER_RELEASES_MORE(url) url
+static const char other_releases_more[] =
+#include "other_releases.inc"
+    ;
+#undef OTHER_RELEASE
+#undef OTHER_RELEASES_MORE
+
+/* A boot file's letters and digits, upper case: SCPS_150.62 and SCPS-15062 alike. */
+static void serial_key(const char *s, char *out, size_t size)
+{
+    size_t n = 0;
+    for (; *s && n + 1 < size; s++)
+        if (SDL_isalnum((unsigned char)*s)) out[n++] = (char)SDL_toupper((unsigned char)*s);
+    out[n] = 0;
+}
+
+/* What the release booting boot is, when it is one of the game's other releases; else NULL. */
+static const char *other_release(const char *boot)
+{
+    char key[32], known[32];
+    serial_key(boot, key, sizeof key);
+    for (unsigned i = 0; *key && i < sizeof other_releases / sizeof *other_releases; i++) {
+        serial_key(other_releases[i].boot, known, sizeof known);
+        if (!strcmp(key, known)) return other_releases[i].what;
+    }
+    return NULL;
+}
 
 /* Whether path is Downhill Domination (USA): the ISO 9660 root holds a SYSTEM.CNF whose boot
    line names SCUS_971.77, and SCUS_971.77 is the retail one (game_data_read: the game's data
@@ -1315,11 +988,11 @@ static const char *disc_problem(const char *path, char *why, size_t size)
     enum { SECTOR = 2048 };
     static uint8_t sector[SECTOR];
     static char text[SECTOR + 1];
-    FILE *f = fopen(path, "rb");
-    if (!f) return "The file can't be opened.";
+    HostFile f = host_file_open(path, HOST_FILE_READ);
+    if (f == HOST_FILE_NONE) return "The file can't be opened.";
     const char *problem = NULL;
     uint32_t cnf = 0, cnf_size = 0;
-#define READ(lsn) (_fseeki64(f, (long long)(lsn) * SECTOR, SEEK_SET) == 0 && fread(sector, SECTOR, 1, f) == 1)
+#define READ(lsn) (host_file_seek(f, (uint64_t)(lsn) * SECTOR) == 0 && host_file_read(f, sector, SECTOR) == SECTOR)
     if (!READ(16) || sector[0] != 1 || memcmp(sector + 1, "CD001", 5)) {
         problem = "It isn't a disc image (no ISO 9660 volume in it).";
         goto done;
@@ -1330,7 +1003,7 @@ static const char *disc_problem(const char *path, char *why, size_t size)
         if (!READ(dir + off / SECTOR)) break;
         for (unsigned i = 0; i + 33 < SECTOR && sector[i]; i += sector[i]) {
             const uint8_t *r = sector + i;
-            if (r[32] >= 10 && i + 33 + r[32] <= SECTOR && !_strnicmp((const char *)r + 33, "SYSTEM.CNF", 10) &&
+            if (r[32] >= 10 && i + 33 + r[32] <= SECTOR && !SDL_strncasecmp((const char *)r + 33, "SYSTEM.CNF", 10) &&
                 (r[32] == 10 || r[33 + 10] == ';')) {
                 cnf = le32_at(r + 2);
                 cnf_size = le32_at(r + 10);
@@ -1356,111 +1029,52 @@ static const char *disc_problem(const char *path, char *why, size_t size)
         size_t n = strcspn(boot, ";\r\n");
         snprintf(id, sizeof id, "%.*s", (int)(n < 31 ? n : 31), boot);
     }
-    snprintf(why, size, "It is another PlayStation 2 disc%s%s%s, not Downhill Domination (USA), SCUS-97177.",
-             *id ? " (" : "", id, *id ? ")" : "");
+    const char *release = other_release(id);
+    if (release)
+        snprintf(why, size, "This is %s. Downhill Revived needs the USA disc (SCUS-97177) for now. More: %s", release,
+                 other_releases_more);
+    else
+        snprintf(why, size, "It is another PlayStation 2 disc%s%s%s, not Downhill Domination (USA), SCUS-97177.",
+                 *id ? " (" : "", id, *id ? ")" : "");
     problem = why;
 done:
 #undef READ
-    fclose(f);
+    host_file_close(f);
     return problem;
 }
 
-#ifdef _WIN32
-typedef BOOL(WINAPI *GetOpenFileNameFn)(OPENFILENAMEA *);
-
-/* The file-open dialog for a disc image (comdlg32 loaded here: no new import); 0 if cancelled. */
-static int choose_disc(char *path, size_t size)
-{
-    static GetOpenFileNameFn open_file;
-    if (!open_file) {
-        HMODULE dll = LoadLibraryA("comdlg32.dll");
-        if (dll) open_file = (GetOpenFileNameFn)(void *)GetProcAddress(dll, "GetOpenFileNameA");
-        if (!open_file) return 0;
-    }
-    OPENFILENAMEA o = {sizeof o};
-    char folder[MAX_PATH];  /* dhd.exe's: players often keep the disc image beside the game */
-    DWORD n = GetModuleFileNameA(NULL, folder, sizeof folder);
-    while (n && folder[n - 1] != '\\' && folder[n - 1] != '/') n--;
-    folder[n] = 0;
-    o.lpstrInitialDir = folder;
-    path[0] = 0;
-    o.lpstrFilter = "Disc images (*.iso)\0*.iso\0All files (*.*)\0*.*\0";
-    o.nFilterIndex = 1;
-    o.lpstrFile = path; o.nMaxFile = (DWORD)size;
-    o.lpstrTitle = "Choose your Downhill Domination (USA) disc image";
-    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
-    return open_file(&o) && path[0];
-}
-#endif
-
-/* Before the relaunch (only the first of the two dhd.exe asks): the disc image dhd.ini names
-   (iso), if it is there and is Downhill Domination (USA); else a message, a file-open dialog,
-   the choice checked and saved to dhd.ini. DHD_ISO in the environment overrides the file and is
-   never questioned (the tools set it). Returns 0 to go on, 1 if the player cancelled. */
+/* At start: the disc image dhd.ini names (iso), if it is there and is Downhill Domination (USA).
+   The launcher (port/launcher, disc.rs) chooses it and checks it the same way on every desktop;
+   Android's start picks it (port/host/android_main.c). DHD_ISO in the environment overrides the
+   file and is never questioned (the tools set it). Without a usable one: a message (in the log;
+   DHD_HEADLESS shows no box), then the end. Returns 0 to go on, 1 to end. */
 int host_disc_ready(void)
 {
     static const char title[] = "Downhill Revived";
-    static char why[256], chosen[MAX_PATH], message[1024];
-    if (iso_from_environment || getenv("DHD_HEADLESS")) return 0;
+    static char why[512], message[1536];
+    if (iso_from_environment) return 0;
     const char *iso = getenv("DHD_ISO");
     const char *problem = iso ? disc_problem(iso, why, sizeof why) : NULL;
     if (iso && !problem) return 0;
-#ifdef _WIN32
-    if (!iso)
-        snprintf(message, sizeof message, "Choose your Downhill Domination (USA) disc image.\n\n"
-                 "The game plays from your own copy of the disc, as an .iso file (SCUS-97177). "
-                 "You choose it once; the game remembers it.");
-    else if (GetFileAttributesA(iso) == INVALID_FILE_ATTRIBUTES)
-        snprintf(message, sizeof message, "The disc image chosen before is gone:\n%s\n\n"
-                 "Choose your Downhill Domination (USA) disc image.", iso);
-    else
-        snprintf(message, sizeof message, "The disc image chosen before can't be used:\n%s\n%s\n\n"
-                 "Choose your Downhill Domination (USA) disc image.", iso, problem);
-    if (MessageBoxA(NULL, message, title, MB_OKCANCEL | MB_ICONINFORMATION | MB_SETFOREGROUND) != IDOK) return 1;
-    for (;;) {
-        if (!choose_disc(chosen, sizeof chosen)) return 1;
-        if (!(problem = disc_problem(chosen, why, sizeof why))) break;
-        snprintf(message, sizeof message, "%s\n\n%s\n\nChoose your Downhill Domination (USA) disc image (SCUS-97177).",
-                 chosen, problem);
-        if (MessageBoxA(NULL, message, title, MB_RETRYCANCEL | MB_ICONWARNING | MB_SETFOREGROUND) != IDRETRY) return 1;
-    }
-    _putenv_s("DHD_ISO", chosen);
-    hle_log("settings: disc image %s\n", chosen);
-    /* The player defaults where dhd.ini doesn't say (a new dhd.ini has them from its template;
-       without dhd.ini the tools' defaults stay, the exact renderer among them). This start uses
-       them too. */
-    int saved = settings_save("iso", chosen);
-    for (unsigned i = 0; i < sizeof player_defaults / sizeof *player_defaults; i++)
-        if (!settings_has(player_defaults[i][0])) {
-            setting(player_defaults[i][2], player_defaults[i][1]);
-            if (saved) settings_save(player_defaults[i][0], player_defaults[i][1]);
-        }
-    if (!saved) {
-        char path[MAX_PATH];
-        settings_path(path, sizeof path);
-        snprintf(message, sizeof message, "The disc image can't be saved in\n%s\n\n"
-                 "The game starts with it now, but will ask again next time.", path);
-        MessageBoxA(NULL, message, title, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-    }
-    return 0;
-#else
-    /* No dialogs on this host: without DHD_ISO the game cannot start. */
 #ifdef __ANDROID__
     /* The copy android_main.c made passed its first look but not the game's data: say so and drop
        the copy, so the next start asks for the disc again. */
-    if (iso && problem) {
-        snprintf(message, sizeof message, "The disc image can't be used:\n%s\n\nStart the game again to choose "
-                 "your Downhill Domination (USA) disc image (SCUS-97177).", problem);
-        host_error_box(title, message);
-        remove(iso);
-    }
+    static const char choose[] = "Start the game again to choose your Downhill Domination (USA) disc image (SCUS-97177).";
+    if (iso) remove(iso);
+#else
+    static const char choose[] = "Start the game from its launcher (DownhillRevived) and choose your Downhill "
+                                 "Domination (USA) disc image (SCUS-97177) there.";
 #endif
     if (!iso)
-        fprintf(stderr, "settings: set DHD_ISO to your Downhill Domination (USA) disc image\n");
+        snprintf(message, sizeof message, "No disc image is chosen.\n\nThe game plays from your own copy of the "
+                 "disc, as an .iso file (SCUS-97177). %s", choose);
+    else if (!host_path_exists(iso))
+        snprintf(message, sizeof message, "The disc image chosen before is gone:\n%s\n\n%s", iso, choose);
     else
-        fprintf(stderr, "settings: disc image problem: %s\n", problem ? problem : iso);
+        snprintf(message, sizeof message, "The disc image chosen before can't be used:\n%s\n%s\n\n%s", iso, problem,
+                 choose);
+    host_error_box(title, message);
     return 1;
-#endif
 }
 
 /* Widescreen: port/hle/widescreen.c. */
@@ -1476,32 +1090,40 @@ int host_service_host_disc_ready(void) { return host_disc_ready(); }
    NULL when it is Downhill Domination (USA), else why not. */
 const char *host_disc_check(const char *path)
 {
-    static char why[256];
+    static char why[512];
     disc_shallow = 1;
     const char *problem = disc_problem(path, why, sizeof why);
     disc_shallow = 0;
     return problem;
 }
 #endif
-int host_service_host_poll_dump(void) { return InterlockedExchange(&dump_pending,0)!=0; }
+int host_service_host_poll_dump(void) { return atomic_exchange(&dump_pending, 0) != 0; }
 void host_service_host_settings_load(void) { host_settings_load(); }
 int host_service_host_setting_save(uint32_t a0, uint32_t a1) { return host_setting_save((const char *)GUEST(a0), (const char *)GUEST(a1)); }
 int host_service_host_setting_locked(uint32_t a0) { return host_setting_locked((const char *)GUEST(a0)); }
 void host_service_host_pad_device(int a0, uint32_t a1) { host_pad_device(a0, (HostPad *)GUEST(a1)); }
 void host_service_host_pad_vibrate(int a0, int a1, int a2) { host_pad_vibrate(a0, a1, a2); }
-int host_service_host_relaunch_reserving(uint32_t a0, uint32_t a1) {
-    (void)a0; (void)a1; return -1; /* linear memory is already reserved by the allocator */
+
+/* Discord Rich Presence (finding 106): the core's state (port/hle/presence.c) to dhd_presence
+   (port/render/presence), which runs only when the discord setting is on, and is cleared at exit. */
+static void presence_log(const char *line) { hle_log("%s\n", line); }
+static void presence_stop(void) { dhd_presence_stop(); }
+void host_service_presence(uint32_t a0)
+{
+    static int running = -1;
+    if (running < 0 && (running = dhd_presence_start(getenv("DHD_DISCORD"), presence_log))) atexit(presence_stop);
+    if (!running) return;
+    const HostPresence *p = GUEST(a0);
+    char track[sizeof p->track + 1], room[sizeof p->room + 1];
+    snprintf(track, sizeof track, "%.*s", (int)sizeof p->track, p->track);
+    snprintf(room, sizeof room, "%.*s", (int)sizeof p->room, p->room);
+    dhd_presence_set(p->kind, track, p->place, p->riders, room, p->members, p->max_members);
 }
 
 
 /* Wall-clock pacing is shared by the EE producer and native presenter. */
 #define WORK_SAMPLES 300
-#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 #define FIELD_SECONDS pacing_period
-#else
-#include "../include/fps.h"
-#define FIELD_SECONDS port_frame_period()
-#endif
 static double pacing_period=1001.0/60000.0;
 static uint64_t pacing_field;
 static double jit_due, frame_began;           /* the next picture's due; when this frame's pad was read */
@@ -1531,8 +1153,7 @@ static FILE *pacing_log[2];  /* DHD_PACING_LOG=prefix: prefix-ee.csv, prefix-pre
    and the one after it, wait the whole period, so late pictures never come faster than the refresh
    and the first on-time one never falls back over the vblank after them (two in one refresh).
    Late pictures still move the grid as before and never wait for a vblank. 60 a second (and
-   online, always 60) keeps its 59.94 grid; DHD_PACE_LOCK=0 turns this off. x64 only: i686 keeps
-   port_frame_period (FIELD_SECONDS). */
+   online, always 60) keeps its 59.94 grid; DHD_PACE_LOCK=0 turns this off. Windows only (DWM). */
 static struct {
     double next_query;         /* EE thread: when to ask again */
     double nominal;            /* the display mode's refresh period (s); 0 unknown */
@@ -1676,12 +1297,12 @@ static FILE *pacing_file(int which)
         }
         if (pacing_log[0]) fprintf(pacing_log[0], "field,now,shown,due,start,work_ms,began\n");
         if (pacing_log[1]) fprintf(pacing_log[1], "due,began,ready,presented,refresh_phase\n");
-#ifdef _WIN32
-        LARGE_INTEGER freq, qpc;  /* the logs' clock, to set them against other QPC timestamps (DWM's vblanks) */
-        if (prefix && QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&qpc))
-            fprintf(stderr, "pacing: log seconds = QueryPerformanceCounter / %lld - %.7f\n", (long long)freq.QuadPart,
-                    (double)qpc.QuadPart / (double)freq.QuadPart - host_wall_seconds());
-#endif
+        /* the logs' clock, to set them against other timestamps of the performance counter (Windows'
+           QueryPerformanceCounter: DWM's vblanks) */
+        Uint64 freq = SDL_GetPerformanceFrequency(), counter = SDL_GetPerformanceCounter();
+        if (prefix)
+            fprintf(stderr, "pacing: log seconds = performance counter / %lld - %.7f\n", (long long)freq,
+                    (double)counter / (double)freq - host_wall_seconds());
     }
     return pacing_log[which];
 }
@@ -1709,16 +1330,12 @@ void host_pacing_wait(void)
        are on time (this one isn't known yet: on time is the least it can wait). */
     double last_due, last_at, spacing;
     int last_late;
-#ifdef __aarch64__  /* arm64 reorders loads: the writer's order (below) is kept with fences */
-    do {
+    do {  /* the writer's order (below), kept with fences (arm64 reorders loads; x86 only the compiler) */
         last_due = shown_due;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         last_at = shown_at, last_late = shown_late;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
     } while (last_due != shown_due);
-#else
-    do last_due = shown_due, last_at = shown_at, last_late = shown_late; while (last_due != shown_due);
-#endif
     spacing = period - (last_late ? 0 : pacing_slack);
     int previous = display.frames ? fabs(shown - last_due - period) < 0.03 * period  /* dues steered a little */
                                   : last_due + period - shown < 1e-6 && shown - last_due - period < 1e-6;
@@ -1768,15 +1385,11 @@ void pacing_present(double due, double began)
             host_wait_wall(target);
         last_at = host_wall_seconds();
         last_late = late;
-        shown_due = 0;  /* x86 keeps stores in order: a reader sees due 0 or all three values */
-#ifdef __aarch64__  /* arm64 does not: fences keep it */
+        shown_due = 0;  /* a reader sees due 0 or all three values: the fences keep the order */
         __atomic_thread_fence(__ATOMIC_RELEASE);
-#endif
         shown_at = last_at;
         shown_late = late;
-#ifdef __aarch64__
         __atomic_thread_fence(__ATOMIC_RELEASE);
-#endif
         shown_due = due;
     }
     FILE *log = pacing_file(1);
@@ -1810,19 +1423,11 @@ void host_pacing_handoff(int fresh) { handed_due=fresh ? jit_due : 0; handed_beg
 void host_pacing_input(void) { frame_began=host_wall_seconds(); }
 
 /* Native diagnostics consume published scalar state, never call the module
-   from graphics, presenter or device OS threads. i686 keeps its direct clock. */
-#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
+   from graphics, presenter or device OS threads. */
 uint64_t kernel_vsync_count;
 static double module_seconds;
 double host_seconds(void) { return module_seconds; }
-#endif
-void host_frame_context(uint64_t field, double seconds) {
-#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
-    kernel_vsync_count=field; module_seconds=seconds;
-#else
-    (void)field; (void)seconds;
-#endif
-}
+void host_frame_context(uint64_t field, double seconds) { kernel_vsync_count=field; module_seconds=seconds; }
 
 void host_frame_registers(uint32_t address) {
     memcpy(published_registers,GUEST(address),sizeof published_registers);
@@ -1830,19 +1435,11 @@ void host_frame_registers(uint32_t address) {
 
 double host_pacing_period(void) { return pacing_period; }
 
-#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 static double published_aspect;
 static int published_flat_limit;
 double host_widescreen_aspect(void) { return published_aspect; }
 int host_widescreen_flat_limit(void) { return published_flat_limit; }
-#endif
-void host_frame_video(double aspect, int flat_limit) {
-#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
-    published_aspect=aspect; published_flat_limit=flat_limit;
-#else
-    (void)aspect; (void)flat_limit;
-#endif
-}
+void host_frame_video(double aspect, int flat_limit) { published_aspect=aspect; published_flat_limit=flat_limit; }
 
 /* Guest-address-only module services. */
 #include "../host/host_api.h"

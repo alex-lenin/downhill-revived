@@ -1,5 +1,5 @@
 // Downhill Revived on Android (finding 091): SDL's activity, which loads libSDL3.so and libmain.so
-// (the game, port/tools/build_host64_android.py) and runs SDL_main (port/host/android_main.c) on its
+// (the game, port/tools/build_host64.py --target android-arm64) and runs SDL_main (port/host/android_main.c) on its
 // own thread. Here only what the game asks of the activity before that: the screen's shape.
 package app.downhillrevived;
 

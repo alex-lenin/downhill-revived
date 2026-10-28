@@ -8,7 +8,7 @@ The reactor's GS device ops are the Rust renderer's, through port/web/gpu_rust_w
 dhd_render imports (port/render/include/dhd_render.h, the Rust module's raw exports, wasm-to-wasm)
 plus env.web_gpu_await, the reactor's own JSPI Suspending import that a split readback waits on;
 with its native renderer (gpu_rust_web_native.inc over port/gs/native_core.inc) and the sharp font
-(port/gs/font_sharp.c, built here with its Win32 lock as a no-op). The import section is checked
+(port/gs/font_sharp.c, built here with its SDL3 spinlock as a no-op). The import section is checked
 after the link (check_imports).
 
 Float ops: the reactor only makes pictures (VIF1/VU1, the GS front end); none of its float results
@@ -209,12 +209,12 @@ shim=OUT/'shim'; shim.mkdir(exist_ok=True)
 for name,target in [('xmmintrin.h','sse.h'),('emmintrin.h','sse2.h')]:
     (shim/name).write_text('#define SIMDE_ENABLE_NATIVE_ALIASES\n#include <simde/x86/'+target+'>\n')
 cmd += [str(ROOT/p) for p in ('port/web/host_graphics.c','port/web/gpu_rust_web.c','port/gs/gs.c','port/gs/memory.c')]
-# The native renderer's sharp font: font_sharp.c with its two Win32 needs (a lock around its
-# cache, _stricmp) for the one-threaded reactor, and its includes made absolute.
+# The native renderer's sharp font: font_sharp.c with its two SDL needs (a lock around its cache,
+# SDL_strcasecmp) as no-ops for the one-threaded reactor, and its includes made absolute.
 font=(ROOT/'port/gs/font_sharp.c').read_text()
-win32=('#include <strings.h>\n#define _stricmp strcasecmp\ntypedef int SRWLOCK;\n#define SRWLOCK_INIT 0\n'
-       '#define AcquireSRWLockExclusive(l) ((void)(l))\n#define ReleaseSRWLockExclusive(l) ((void)(l))')
-for a,b in (('#include <windows.h>',win32),('#include "font_sharp.h"','#include "'+(ROOT/'port/gs/font_sharp.h').as_posix()+'"'),
+sdl=('#include <strings.h>\n#define SDL_strcasecmp strcasecmp\ntypedef int SDL_SpinLock;\n'
+     '#define SDL_LockSpinlock(l) ((void)(l))\n#define SDL_UnlockSpinlock(l) ((void)(l))')
+for a,b in (('#include <SDL3/SDL_atomic.h>',sdl),('#include "font_sharp.h"','#include "'+(ROOT/'port/gs/font_sharp.h').as_posix()+'"'),
             ('#include "memory.h"','#include "'+(ROOT/'port/runtime/memory.h').as_posix()+'"'),
             ('#include "../','#include "'+(ROOT/'port').as_posix()+'/')):
     if a not in font:sys.exit('build_graphics: port/gs/font_sharp.c has no %r any more'%a)

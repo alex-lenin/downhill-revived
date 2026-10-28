@@ -1,5 +1,5 @@
-/* The GS renderer's interface: the Rust renderer (port/render, dhd_render.lib) behind port/gs/gpu_rust.c,
-   or gpu_null.c on a host with no graphics device (headless Linux). */
+/* The GS renderer's interface: the Rust renderer (port/render, the dhd_render library) behind
+   port/gs/gpu_rust.c, on every platform. */
 #ifndef PORT_GS_GPU_H
 #define PORT_GS_GPU_H
 #include "gs.h"
@@ -11,13 +11,23 @@ int gs_gpu_display(Gs *g, unsigned *width, unsigned *height);
 int gs_gpu_capture(Gs *g, uint32_t *pixels);
 /* "wgpu" once gs_gpu_init succeeded; "none" before. */
 const char *gs_gpu_backend_name(const Gs *g);
-/* The renderer's surface on the window (an HWND): 1 when it presents there. gs_gpu_present then
+/* A window for the renderer's surface: its kind (dhd_render.h's DHDR_WINDOW_* values) and native
+   handles (WIN32: a = HWND, b = HINSTANCE; XLIB: a = Display *, b = Window; WAYLAND: a = wl_display *,
+   b = wl_surface *; ANDROID: a = ANativeWindow *; METAL_LAYER: a = CAMetalLayer *), and the
+   function that tells its drawable size in pixels (0 x 0 while minimised; any thread). */
+enum { GS_WINDOW_WIN32 = 1, GS_WINDOW_XLIB = 3, GS_WINDOW_WAYLAND = 4, GS_WINDOW_ANDROID = 5, GS_WINDOW_METAL_LAYER = 6 };
+typedef struct GsWindow {
+    unsigned kind;
+    uint64_t a, b;
+    void (*size)(unsigned *width, unsigned *height);
+} GsWindow;
+/* The renderer's surface on the window (copied): 1 when it presents there. gs_gpu_present then
    shows the display picture, or pixels (width x height) when given, stretched over the window's
    width x height client area. */
-int gs_gpu_surface(Gs *g, void *window);
+int gs_gpu_surface(Gs *g, const GsWindow *window);
 /* The surface again on a new window, or none (NULL): the OS took the old one (Android, finding 091). */
-int gs_gpu_surface_reset(Gs *g, void *window);
-/* The SDL window's size in pixels (present.c; not on Windows, where the HWND says). */
+int gs_gpu_surface_reset(Gs *g, const GsWindow *window);
+/* present.c's SDL window: its drawable size in pixels (the GsWindow size it gives the renderer). */
 void gs_window_pixels(unsigned *width, unsigned *height);
 int gs_gpu_present(Gs *g, const uint32_t *pixels, unsigned width, unsigned height,
                    unsigned window_width, unsigned window_height);

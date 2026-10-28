@@ -39,7 +39,7 @@ static int commit_range(uint64_t lo, uint64_t hi) {
    1 on success; 0 beyond the memory's current size. */
 int host64_memory_commit(uint64_t at,uint64_t size) {
     if (!owner || at+size>owner->size || at+size<at) return 0;
-    uint64_t lo=at&~0xfffull, hi=(at+size+0xfff)&~0xfffull;
+    uint64_t lo=at&~(uint64_t)(HOST64_PAGE-1), hi=(at+size+HOST64_PAGE-1)&~(uint64_t)(HOST64_PAGE-1);
     return commit_range(lo,hi);
 }
 int host64_memory_commit_stack(uint32_t sp) {

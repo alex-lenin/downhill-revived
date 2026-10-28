@@ -1,14 +1,11 @@
 /* Copied VIF1/GIF packets run in FIFO order on one optional graphics worker.
-   Interlocked publication owns the ring bytes until the consumer retires them.
+   Atomic publication owns the ring bytes until the consumer retires them.
    Design reference: PCSX2 MTVU's copied command ring; no source copied. */
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#include "../host/win32_compat.h"
-#endif
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <SDL3/SDL_mutex.h>   /* SDL_Semaphore */
+#include <SDL3/SDL_thread.h>
 #if defined(__aarch64__)
 /* The Android build (finding 091): FPCR for MXCSR; isb for pause: yield is a no-op on the Cortex
    cores, so the 4096-step spins before a sleep lasted ~2 us instead of x86's ~100 us and the
@@ -38,10 +35,11 @@ enum { RING_BYTES = 8 * 1024 * 1024 };
 
 typedef struct { uint32_t bytes, unit, words, padding; } Packet;
 static uint8_t *ring;
-static HANDLE worker, available, retired;
+static SDL_Thread *worker;
+static SDL_Semaphore *available, *retired;
 /* Producer/consumer writes must not invalidate each other's publication line.
    Keep announcements separate too: both threads poll them for every packet. */
-#define QUEUE_COUNTER(name) static volatile LONG name __attribute__((aligned(64)))
+#define QUEUE_COUNTER(name) static _Atomic uint32_t name __attribute__((aligned(64)))
 QUEUE_COUNTER(written);
 QUEUE_COUNTER(consumed);
 QUEUE_COUNTER(stopping);
@@ -56,18 +54,27 @@ static double spin_seconds = -1;  /* DHD_SPIN_US, read at the first long wait (i
 
 /* Reads only acquire ownership published by the other side. A locked RMW here
    unnecessarily takes exclusive ownership of its cache line on every poll.
-   Keep the interlocked publications and sleep announcements below: their full
+   Keep the exchanging publications and sleep announcements below: their full
    barriers also order each publication before the subsequent waiter check. */
-static uint32_t position(volatile LONG *p) { return (uint32_t)__atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static uint32_t position(_Atomic uint32_t *p) { return atomic_load_explicit(p, memory_order_acquire); }
+
+/* An auto-reset event: wakes the sleeper, or makes its next wait return at once. Set only while
+   it is clear, so a burst of packets leaves one wakeup, not one per packet. */
+static void wake(SDL_Semaphore *event)
+{
+    if (!SDL_GetSemaphoreValue(event)) SDL_SignalSemaphore(event);
+}
 
 #include "graphics_timeline.h"
 
 /* Spin briefly before sleeping until *p moves away from at. *flag announces the sleep;
-   the interlocked store and reread pair with the other side's publish-then-read. */
-static void idle_wait(volatile LONG *p, uint32_t at, volatile LONG *flag, HANDLE event, DWORD timeout, unsigned *budget)
+   the atomic increment and reread pair with the other side's publish-then-read. timeout: ms,
+   -1 for none. */
+static void idle_wait(_Atomic uint32_t *p, uint32_t at, _Atomic uint32_t *flag, SDL_Semaphore *event, Sint32 timeout,
+                      unsigned *budget)
 {
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
-    LONG64 spin_start = tl_begin();
+    int64_t spin_start = tl_begin();
 #endif
     unsigned limit = budget ? (adaptive_waits ? *budget : 4096) : 512;
     for (unsigned spin = 0; spin < limit; spin++) {
@@ -114,25 +121,25 @@ static void idle_wait(volatile LONG *p, uint32_t at, volatile LONG *flag, HANDLE
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
     tl_add(TL_EE_SPIN + 2 * tl_role, spin_start);
 #endif
-    InterlockedIncrement(flag);
+    atomic_fetch_add(flag, 1);
     if (position(p) == at) {
 #ifndef GRAPHICS_QUEUE_TEST
         double start = spike_waits ? host_wall_seconds() : 0;
 #endif
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
-        LONG64 park_start = tl_begin();
+        int64_t park_start = tl_begin();
 #endif
-        DWORD result = WaitForSingleObject(event, timeout);
+        bool woken = SDL_WaitSemaphoreTimeout(event, timeout);
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
         tl_add(TL_EE_PARK + 2 * tl_role, park_start);
 #endif
 #ifndef GRAPHICS_QUEUE_TEST
-        if (spike_waits && result == WAIT_TIMEOUT)
+        if (spike_waits && !woken)
             fprintf(stderr, "spike_queue: start=%.9f ms=%.6f moved=%u\n", start,
                     (host_wall_seconds()-start)*1e3, position(p) != at);
 #endif
     }
-    InterlockedDecrement(flag);
+    atomic_fetch_sub(flag, 1);
 }
 
 /* Retired-side waits share one auto-reset event; the short timeout covers two waiters. */
@@ -156,7 +163,7 @@ static void run_mark(const uint32_t *words)
         gs_vblank(&gs);
         vblank_csr = gs_priv_read(&gs, GS_CSR);
     } else if (graphics_present_marked) graphics_present_marked(words + 2);
-    InterlockedExchange(&marks_done, (LONG)words[0]);
+    atomic_exchange(&marks_done, words[0]);
 }
 #endif
 
@@ -189,7 +196,7 @@ static void execute(unsigned unit, const uint32_t *words, unsigned count)
     fp_set_control(control);
 }
 
-static DWORD WINAPI consume(void *unused)
+static int SDLCALL consume(void *unused)
 {
     (void)unused;
     host_thread_name("vu");
@@ -201,8 +208,8 @@ static DWORD WINAPI consume(void *unused)
         uint32_t at = position(&consumed);
         if (at == position(&written)) {
             if (position(&stopping)) return 0;
-            LONG64 idle = tl_begin();
-            idle_wait(&written, at, &sleeping, available, INFINITE, &idle_budget);
+            int64_t idle = tl_begin();
+            idle_wait(&written, at, &sleeping, available, -1, &idle_budget);
             tl_add(TL_VU_IDLE, idle);
             continue;
         }
@@ -212,8 +219,8 @@ static DWORD WINAPI consume(void *unused)
             execute(packet->unit, (const uint32_t *)(packet + 1), packet->words);
             worker_end(start);
         }
-        InterlockedExchange(&consumed, (LONG)(at + packet->bytes));
-        if (position(&waiting)) SetEvent(retired);
+        atomic_exchange(&consumed, at + packet->bytes);
+        if (position(&waiting)) wake(retired);
     }
 }
 
@@ -221,14 +228,14 @@ void graphics_wait(void)
 {
     if (!worker) return;
     uint32_t target = position(&written);
-    LONG64 start = tl_begin();
+    int64_t start = tl_begin();
     int pending = (int32_t)(position(&consumed) - target) < 0;
     uint32_t observed;
     while ((int32_t)((observed = position(&consumed)) - target) < 0)
         wait_retired(observed);
     tl_add(TL_EE_VU, start);
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
-    LONG64 gs_start = tl_begin();
+    int64_t gs_start = tl_begin();
     pending |= gs_position(&gs_consumed) != gs_position(&gs_written);
     graphics_gs_wait();
     tl_add(TL_EE_GS, gs_start);
@@ -240,15 +247,15 @@ void graphics_shutdown(void)
 {
     if (!worker) return;
     graphics_wait();
-    InterlockedExchange(&stopping, 1);
-    SetEvent(available);
-    WaitForSingleObject(worker, INFINITE);
+    atomic_exchange(&stopping, 1);
+    SDL_SignalSemaphore(available);
+    SDL_WaitThread(worker, NULL);
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
     gs_queue_shutdown();
 #endif
-    CloseHandle(worker); CloseHandle(available); CloseHandle(retired);
+    SDL_DestroySemaphore(available); SDL_DestroySemaphore(retired);
     free(ring);
-    worker = available = retired = NULL; ring = NULL;
+    worker = NULL; available = retired = NULL; ring = NULL;
 }
 
 /* The default since round 22: race frames and dumps are identical to inline execution
@@ -269,18 +276,18 @@ static void initialize(void)
     if (!graphics_threaded()) return;
 #ifdef GRAPHICS_QUEUE_TEST
     /* Cross the 32-bit publication counter rollover during the stress test. */
-    written = consumed = (LONG)0xFFFFF800u;
+    written = consumed = 0xFFFFF800u;
 #endif
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
     gs_queue_initialize();
 #endif
     ring = malloc(RING_BYTES);
-    available = CreateEventA(NULL, FALSE, FALSE, NULL);
-    retired = CreateEventA(NULL, FALSE, FALSE, NULL);
-    if (ring && available && retired) worker = CreateThread(NULL, 0, consume, NULL, 0, NULL);
+    available = SDL_CreateSemaphore(0);
+    retired = SDL_CreateSemaphore(0);
+    if (ring && available && retired) worker = SDL_CreateThread(consume, "vu", NULL);
     if (!worker) {
-        if (available) CloseHandle(available);
-        if (retired) CloseHandle(retired);
+        SDL_DestroySemaphore(available);
+        SDL_DestroySemaphore(retired);
         free(ring); ring = NULL; available = retired = NULL;
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
         gs_queue_shutdown();
@@ -312,7 +319,7 @@ static void feed_words(int unit, const uint32_t *words, uint32_t count)
         unsigned tail = RING_BYTES - (at & (RING_BYTES - 1));
         unsigned wrap = bytes > tail ? tail : 0;
         if (RING_BYTES - (at - position(&consumed)) < bytes + wrap) {
-            LONG64 full = tl_begin();
+            int64_t full = tl_begin();
             uint32_t observed;
             while (RING_BYTES - (at - (observed = position(&consumed))) < bytes + wrap)
                 wait_retired(observed);
@@ -326,8 +333,8 @@ static void feed_words(int unit, const uint32_t *words, uint32_t count)
         Packet *packet = (Packet *)(ring + (at & (RING_BYTES - 1)));
         *packet = (Packet){bytes, (unsigned)unit, take, 0};
         memcpy(packet + 1, words, take * 4);
-        InterlockedExchange(&written, (LONG)(at + bytes));
-        if (position(&sleeping)) SetEvent(available);
+        atomic_exchange(&written, at + bytes);
+        if (position(&sleeping)) wake(available);
         words += take; count -= take;
     }
 }
@@ -387,7 +394,7 @@ void graphics_vblank(void)
     uint32_t last = (int32_t)(present_mark - vblank_mark) < 0 ? vblank_mark : present_mark;
     uint32_t target = in_flight == 1 ? last : before_last;
     before_last = last;
-    LONG64 start = tl_begin();
+    int64_t start = tl_begin();
     int pending = (int32_t)(position(&marks_done) - target) < 0;
     wait_mark(target);
     tl_add(TL_EE_GS, start);

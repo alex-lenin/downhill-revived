@@ -286,7 +286,7 @@ def emit_block(prefix, i, block, unit, lazy=(), words=None):
 
 def generate(destination):
     destination = Path(destination).resolve()
-    if ROOT / 'build' not in destination.parents:
+    if (ROOT / 'build').resolve() not in destination.parents:  # build/ may be a junction off C:
         raise ValueError('game-derived AOT output must stay under build/')
     data = Path(os.environ.get('DHD_VUTEXT', ROOT / 'assets/vutext.bin')).read_bytes()
     # Each block is keyed by its pairs and the offsets of those that commit their MAC update

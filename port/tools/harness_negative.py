@@ -75,16 +75,19 @@ def build(name, sources, out=None):
     out.mkdir(parents=True, exist_ok=True)
     report = rust_build()
     system = list(report['native_static_libs']) + [x for x in LIBS if x not in report['native_static_libs']]
+    import sdl3  # the native renderer's render thread and locks (sdl3.py's x64 build)
+    sdl_lib, sdl_include = sdl3.build()
+    system += [x for x in sdl3.SYSTEM_LIBS if x not in system]
     vs = subprocess.check_output([str(VSWHERE), '-latest', '-property', 'installationPath'], text=True).strip()
     exe = out / (name + '.exe')
     cmd = out / (name + '.cmd')
     cmd.write_text('@set "PATH=%%PATH%%;%s"\r\n@call "%s" x64 >nul\r\n@if errorlevel 1 exit /b 1\r\n'
                    '@set "PATH=%s;%%PATH%%"\r\n'
                    'clang-cl -m64 /nologo /O2 /MT -Wno-deprecated-declarations /clang:-ffp-contract=off '
-                   '/DDHD_GS_TEST_BUILD=1 /I"%s" /I"%s" %s /Fe:"%s" /link "%s" %s\r\n'
+                   '/DDHD_GS_TEST_BUILD=1 /I"%s" /I"%s" /I"%s" %s /Fe:"%s" /link "%s" "%s" %s\r\n'
                    % (VSWHERE.parent, Path(vs) / 'VC/Auxiliary/Build/vcvarsall.bat', LLVM,
-                      GS, RUST_INCLUDE, ' '.join('"%s"' % (GS / s) for s in sources), exe,
-                      report['lib'], ' '.join(system)))
+                      GS, RUST_INCLUDE, sdl_include, ' '.join('"%s"' % (GS / s) for s in sources), exe,
+                      report['lib'], sdl_lib, ' '.join(system)))
     p = subprocess.run(['cmd', '/c', str(cmd)], cwd=out, capture_output=True, text=True)
     if p.returncode:
         sys.exit('harness_negative: %s did not build:\n%s%s' % (name, p.stdout, p.stderr))

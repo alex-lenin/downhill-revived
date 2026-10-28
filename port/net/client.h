@@ -1,14 +1,10 @@
 /* One online player: the lobby state machine and the race's relayed frames, driven by messages
-   from any transport (ws_winhttp.c, or test_loopback.c's fake relay). Thread-safe: the network
+   from any transport (ws.h, or test_loopback.c's fake relay). Thread-safe: the network
    threads deliver messages while the game thread sends and takes frames. */
 #ifndef NET_CLIENT_H
 #define NET_CLIENT_H
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include "../host/win32_compat.h"
-#endif
+#include <SDL3/SDL_mutex.h>
 
 #include "net.h"
 
@@ -21,8 +17,8 @@ typedef struct {
 } NetTransport;
 
 typedef struct {
-    CRITICAL_SECTION lock;
-    CONDITION_VARIABLE changed;
+    SDL_Mutex *lock;
+    SDL_Condition *changed;
     NetTransport tr;
     int connected, leaving;
     char name[100], version[64], iso[65];

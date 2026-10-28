@@ -14,10 +14,9 @@
    d-pad, axes 0/1 the left stick, 2/3 the right stick, buttons 0-3 Cross Circle Square
    Triangle, 4/5 L1/R1, 6/7 L2/R2, 8 SELECT, 9 START, 10/11 L3/R3. gamecontrollerdb.txt beside
    dhd.exe (SDL's format) adds or corrects mappings; so does SDL_GAMECONTROLLERCONFIG.
-   DHD_SDL=0 leaves the pads to host.c's direct XInput and Sony code. */
+   DHD_SDL=0: no pads (the keyboard still plays). */
 #include "hle.h"
 
-#if defined(_WIN32) || defined(DHD_HAVE_SDL)
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,7 +167,7 @@ static void stop_vibration(void);
 
 static int enabled(void)
 {
-    const char *setting = getenv("DHD_SDL");  /* DHD_SDL=0: host.c's direct XInput and Sony code */
+    const char *setting = getenv("DHD_SDL");  /* DHD_SDL=0: no pads */
     return !(setting && !atoi(setting));
 }
 
@@ -182,7 +181,7 @@ int gamepad_thread_start(void)
     }
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  /* the window may not have the focus */
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
-        fprintf(stderr, "controller: SDL didn't start (%s); using XInput and the Sony pads directly\n", SDL_GetError());
+        fprintf(stderr, "controller: SDL didn't start (%s); no controllers (the keyboard still plays)\n", SDL_GetError());
         SDL_SetAtomicInt(&running, -1);
         return 0;
     }
@@ -271,19 +270,3 @@ void gamepad_vibrate(int player, int light, int heavy)
     SDL_SetAtomicInt(&want_light[player], light ? 1 : 0);
     SDL_SetAtomicInt(&want_heavy[player], heavy & 255);
 }
-#else
-/* No controller backend on this host (SDL3 comes later): there are no pads. */
-int gamepad_start(void) { return 0; }
-int gamepad_read(int player, HostPad *out)
-{
-    (void)player;
-    (void)out;
-    return 0;
-}
-void gamepad_vibrate(int player, int light, int heavy)
-{
-    (void)player;
-    (void)light;
-    (void)heavy;
-}
-#endif

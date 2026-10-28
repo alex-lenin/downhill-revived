@@ -1,4 +1,4 @@
-/* net.h's API: one client (client.c) over one WebSocket (ws_winhttp.c). The relay's address
+/* net.h's API: one client (client.c) over one WebSocket (ws.h). The relay's address
    comes from net_init or the DHD_NET_SERVER environment variable (the official server unless
    dhd.ini or the environment names another, port/hle/host.c). */
 #include "net.h"
@@ -10,7 +10,7 @@
 
 #include "client.h"
 #include "json.h"
-#include "ws_winhttp.h"
+#include "ws.h"
 
 enum { REJOIN_ATTEMPTS = 5 };
 
@@ -18,7 +18,7 @@ static NetClient client;
 static WsConn *conn;
 static int inited;
 static char base[256], name[100], version[64], iso[65], next_url[300];
-static CRITICAL_SECTION api;  /* serialises connect, leave and the reset between rooms */
+static SDL_Mutex *api;  /* serialises connect, leave and the reset between rooms */
 
 static void send_text(void *ws, const char *text) { ws_send(ws, 0, text, strlen(text)); }
 static void send_binary(void *ws, const void *data, size_t n) { ws_send(ws, 1, data, n); }
@@ -62,7 +62,7 @@ void net_init(const char *base_url, const char *player_name, const char *build_v
     const char *url = base_url && *base_url ? base_url : getenv("DHD_NET_SERVER");
     size_t n;
     if (!inited) {
-        InitializeCriticalSection(&api);
+        api = SDL_CreateMutex();
         client_init(&client, "", "", "");
         inited = 1;
     }
@@ -82,19 +82,19 @@ static int connect_to(const char *path)
     if (!inited)
         net_init(NULL, "Rider", "", "");
     net_leave();
-    EnterCriticalSection(&api);
+    SDL_LockMutex(api);
     client_free(&client);
     client_init(&client, name, version, iso);
     if (!base[0]) {
         client.lobby.state = NET_FAILED;
         snprintf(client.lobby.error, sizeof client.lobby.error, "no server: set DHD_NET_SERVER");
-        LeaveCriticalSection(&api);
+        SDL_UnlockMutex(api);
         return -1;
     }
     client.lobby.state = NET_CONNECTING;
     snprintf(url, sizeof url, "%s%s", base, path);
     conn = ws_start(url, &h);
-    LeaveCriticalSection(&api);
+    SDL_UnlockMutex(api);
     return 0;
 }
 
@@ -122,13 +122,13 @@ void net_leave(void)
     WsConn *c;
     if (!inited)
         return;
-    EnterCriticalSection(&api);
+    SDL_LockMutex(api);
     c = conn, conn = NULL;
     if (c) {
         client_leave(&client);
         ws_stop(c);
     }
-    LeaveCriticalSection(&api);
+    SDL_UnlockMutex(api);
 }
 
 int net_list_lobbies(NetLobbyInfo *out, int max)

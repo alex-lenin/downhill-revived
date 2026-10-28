@@ -15,7 +15,7 @@
 #include "../host/host_api.h"  /* the OS services: files, time, fibers, memory */
 
 /* Defines a C function under the retail name of the SDK function it replaces. */
-#define RETAIL(name) __asm__("_" #name)
+#define RETAIL(name) __asm__(#name)
 
 /* Logs to stderr; DHD_LOG set in the environment turns on the verbose messages. */
 void hle_log(const char *fmt, ...);
@@ -53,12 +53,10 @@ unsigned host_thread_cpu(const char **names, double *seconds, unsigned max); /* 
 void host_poll_dump(void);   /* optional watchdog request at a kernel boundary */
 void host_backtrace(void);    /* the same report, here */
 void host_settings_load(void); /* dhd.ini next to the exe into DHD_* variables (host.c) */
-int host_disc_ready(void);     /* the disc image checked, else asked for; nonzero: cancelled */
-/* update.c, the auto-updater (finding 054); all but update_request in the first dhd.exe */
-void update_save_environment(void);  /* before dhd.ini: the environment to start an update with */
-void update_at_start(void);   /* after dhd.ini: dhd.exe.old away, then a newer release offered */
-int update_after_game(int code);  /* the game's exit code; updates when the game asked to */
-void update_request(void);    /* the online menu's Update Now: ends the game for the update */
+int host_disc_ready(void);     /* the disc image checked (the launcher chooses it); nonzero: none usable, end */
+/* launcher_link.c, the game's side of the launcher (finding 093) */
+int launcher_open(void);      /* first thing: started straight, the launcher opens instead; nonzero: end */
+void update_request(void);    /* the online menu's Update Now: ends the game; the launcher updates */
 
 /* ---- game_data.c: the game's data from the player's disc ---- */
 /* NULL if the disc image at path holds the retail SCUS_971.77 (checked by SHA-1), then in *elf
@@ -123,7 +121,7 @@ enum { VKEY_SHIFT = 0x10, VKEY_CONTROL = 0x11, VKEY_MENU = 0x12, VKEY_LWIN = 0x5
 
 /* gamepad.c: controllers through SDL3 (XInput, DirectInput, HID: DualSense, DualShock 4, Switch
    Pro and the generic pads in SDL's mapping database). gamepad_start: 1 if SDL is running. The
-   pads are read on the SDL thread (sdl_host.c), which calls gamepad_thread_*. */
+   pads are read on the SDL thread (sdl_host.c: the main thread), which calls gamepad_thread_*. */
 int gamepad_start(void);
 int gamepad_read(int player, HostPad *out);  /* 0: no controller for that player */
 void gamepad_vibrate(int player, int light, int heavy);
@@ -132,9 +130,12 @@ enum { PADDEV_ADDED = 1, PADDEV_REMOVED, PADDEV_REMAPPED };
 int gamepad_thread_start(void);
 void gamepad_device(int change, unsigned id);
 void gamepad_thread_update(void);
-/* sdl_host.c: starts the SDL thread once and returns when it is up (see sdl_host.c). */
+/* sdl_host.c: the SDL loop on the main thread, the game on a thread of its own (launcher.c's
+   main; returns the game's code); the controllers' start (once; 1 when SDL's events are up); a
+   function run on the main thread, waited for (the window's calls). See sdl_host.c. */
+int sdl_host_main(int (*game)(void *), void *arg);
 int sdl_host_start(void);
-int sdl_host_run(void (*fn)(void *), void *arg);  /* runs fn on the SDL thread and waits for it */
+int sdl_host_run(void (*fn)(void *), void *arg);
 
 /* ---- kernel.c ---- */
 enum { INTC_GS = 0, INTC_VBLANK_START = 2, INTC_VBLANK_END = 3, INTC_TIMER0 = 9 };
@@ -193,6 +194,7 @@ void pad_vsync(void);  /* refreshes the controllers' frames in EE memory */
 void menu_mouse_field(void);
 void menu_mouse_merge(int player, HostPad *out);
 void pad_refresh(void);  /* the newest frames' input read again (just-in-time frames, kernel.c) */
+void presence_field(void);  /* presence.c: what the player is doing, for Discord (pad_vsync) */
 
 /* ---- online.c: where the pads' input comes from ---- */
 int pads_connected(void);   /* pads the game can open: DHD_PADS (1-4), 1 online, else 4 (pads_live) */

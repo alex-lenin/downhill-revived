@@ -11,5 +11,10 @@
 /* wasm-ld --stack-first places the shadow stack at [0, __stack_pointer) even
    with --global-base. host64_memory_commit_stack commits it above a reserved
    null/overflow page; it must end below the low RAM view (0x00400000). */
-#define HOST64_NULL_GUARD 0x1000u
+#define HOST64_NULL_GUARD HOST64_PAGE
+/* The guest's page on every host: the largest OS page the port runs on (16 KiB: Apple silicon
+   and some Android devices; 4 KiB elsewhere). Guest commits round to it and guard pages (the
+   null page, each EE stack slot's lowest page) are this size, so what is committed and what
+   faults is the same on every platform. */
+#define HOST64_PAGE 0x4000u
 #endif

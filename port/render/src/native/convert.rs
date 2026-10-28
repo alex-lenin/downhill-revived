@@ -17,6 +17,7 @@ use crate::abi::{DhdrConvert, DhdrConvertConstants};
 use crate::device::Gpu;
 use crate::native::arenas::Arenas;
 use crate::native::init::INVERSE_WORDS;
+use crate::native::pipelines::gputimes;
 
 /// NATIVE_CONVERTS: conversions a picture holds at most (native_core.inc).
 pub const CONVERTS: usize = 64;
@@ -170,7 +171,9 @@ impl Converts {
         });
         let uniforms = arenas.uniform_group()?;
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            let times = gputimes::slot(gpu, gputimes::CONVERT);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None, timestamp_writes: times.as_ref().map(gputimes::Slot::compute) });
             pass.set_pipeline(o.pipeline);
             pass.set_bind_group(0, uniforms, &[offset]);
             pass.set_bind_group(1, &group, &[]);

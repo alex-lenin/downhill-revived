@@ -1,0 +1,5 @@
+# rustc --print native-static-libs for the aarch64-apple-darwin static library (rustc 1.97.1, wgpu 29.0.3
+# with metal+vulkan+wgsl (Vulkan loaded at run time), dhd_net; built on a Mac by rustgs.py for
+# build_host64.py --target macos-arm64): the system's own libraries and frameworks. The allow-list for
+# rustgs.py / check_rust_lib.py.
+-lSystem -framework QuartzCore -framework Metal -framework Foundation -framework CoreFoundation -lobjc -liconv -lc -lm

@@ -42,17 +42,8 @@
 
 #include <math.h>
 #include <limits.h>
-#include "native_thread.h"  /* locks, the render thread, atomics, timer: the only platform calls */
-#ifdef _WIN32
+#include "native_thread.h"  /* locks, the render thread, sleeps (SDL3; none in the browser) */
 #include "texpack.h"
-#else  /* texpack.h names Direct3D; these are its calls made here, over its opaque entry */
-typedef struct TexPackEntry TexPackEntry;
-TexPackEntry *texpack_find(const Gs *g, unsigned ctxt);
-void *texpack_view(TexPackEntry *e, uint64_t field);
-void texpack_field(uint64_t field);
-void texpack_report(void);
-int texpack_open(const void *device, uint64_t video_memory);  /* texpack_linux.c: no packs */
-#endif
 #include "font_sharp.h"
 #include "native_frontend.h"
 
@@ -269,7 +260,7 @@ typedef struct Native {
     NativeUsage *usage;              /* DHD_NATIVE_SURFACES */
     uint64_t replay_version;
     /* render thread */
-    NativeThread thread;
+    int thread;                      /* started */
     NativeMutex queue_lock;
     NativeCond queue_changed;
     NativeFrame *pending[2], *free_frames[NATIVE_FRAMES];
@@ -301,7 +292,6 @@ typedef struct Native {
     unsigned same_capacity;
     uint8_t *paired;
     unsigned paired_capacity;
-    NativeTimer timer;
     double last_present, first_present;
     float intervals[NATIVE_INTERVALS];   /* ms between presents, a ring */
     uint64_t interval_count;
@@ -2061,11 +2051,10 @@ static const NativeVertex *native_mixed(Native *n, const NativeFrame *a, const N
     return n->mixed;
 }
 
-static void native_sleep_until(Native *n, double when)
+static void native_sleep_until(double when)
 {
     double left = when - host_wall_seconds();
-    if (left > 0.001 && n->timer) native_timer_wait(n->timer, left - 0.0007);
-    else if (left > 0.002) native_sleep_ms((unsigned)((left - 0.0015) * 1000));
+    if (left > 0.001) native_sleep_ns((uint64_t)((left - 0.0007) * 1e9));
     while (host_wall_seconds() < when) native_cpu_relax();
 }
 
@@ -2235,7 +2224,7 @@ static void native_interp_thread(Native *n)
         if (n->interp_hz) {
             now = host_wall_seconds();
             next = next && next > now - 0.05 ? next + 1 / n->interp_hz : now + 1 / n->interp_hz;
-            native_sleep_until(n, next);
+            native_sleep_until(next);
         }
     }
 }
@@ -2314,10 +2303,11 @@ static int native_render_next(Native *n)
 }
 
 #ifndef NATIVE_INLINE
-static NATIVE_THREAD_RESULT native_thread(void *argument)
+static int SDLCALL native_thread(void *argument)
 {
     Native *n = argument;
     host_thread_name("native");
+    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
 #ifdef NATIVE_EXACT_ON_RENDER
     native_on_render = 1;
     native_mutex_lock(&n->queue_lock);
@@ -2657,7 +2647,6 @@ static Native *native_create(NativeExact *exact)
     n->interp_hz = n->interp && hz ? atof(hz) : 0;
     const char *indexed = getenv("DHD_NATIVE_INDEXED");
     n->indexed = !n->interp && !(indexed && atoi(indexed) == 0);
-    if (n->interp_hz) n->timer = native_timer_create();
     n->logs[1].state_version = UINT64_MAX;
     for (unsigned i = 0; i < 512; i++) n->owner[i] = n->top_owner[i] = -1;
     /* DHD_SCALE (dhd.ini "scale"): 1 to NATIVE_SCALE_MAX (default 2), or "window" for the smallest

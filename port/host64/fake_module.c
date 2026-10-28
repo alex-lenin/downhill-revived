@@ -35,8 +35,8 @@ EXPORT("boundary_negative") int boundary_negative(unsigned test) {
     }
     if (test==7) { host_callback_detach(HOST_CALLBACK(wrong_callback),0); return 1; }
     if (test==8) { host_service_text_input_edit(0x7fffffff,2,(uint32_t)(uintptr_t)"AB"); return 1; }
-    if (test==9) { host_service_file_sha256_start(0x80000010); return 1; }
-    if (test==10) { host_service_file_sha256_poll(0x7fffffff); return 1; }
+    if (test==9) { host_service_disc_check_start(0x80000010,0x80000010); return 1; }
+    if (test==10) { host_service_disc_check_poll(0x7fffffff,0,0); return 1; }
     if (test==11) { host_service_net_list_lobbies_poll(0x7fffffff,2); return 1; }
     return 2;
 }
@@ -99,20 +99,23 @@ EXPORT("main") int fake_main(void) {
     static const int16_t pcm[4]={123,-123,456,-456};
     host_sound_reset(); host_sound_write(pcm,2); host_sound_tick();
     /* The async services: the blocking part runs on a host thread, only the
-       digest and rows cross. The fixture has no lobby server, so the fetch is
-       expected to fail; the hash of fixture.txt must match its bytes. */
-    if (!host_service_file_sha256_start((uint32_t)(uintptr_t)"fixture.txt")) return 22;
-    if (host_service_file_sha256_start((uint32_t)(uintptr_t)"fixture.txt")) return 23;
+       answer and rows cross. The fixture has no lobby server, so the fetch is
+       expected to fail; fixture.txt has no ISO 9660 file system, so the disc
+       check answers -2 and says why. */
+    if (!host_service_disc_check_start((uint32_t)(uintptr_t)"fixture.txt",(uint32_t)(uintptr_t)"fixture-check.txt")) return 22;
+    if (host_service_disc_check_start((uint32_t)(uintptr_t)"fixture.txt",(uint32_t)(uintptr_t)"fixture-check.txt")) return 23;
     static uint8_t digest[32];
+    static char note[128];
     unsigned waited=0;
-    while (!host_service_file_sha256_poll((uint32_t)(uintptr_t)digest)) {
+    int checked;
+    while (!(checked=host_service_disc_check_poll((uint32_t)(uintptr_t)digest,(uint32_t)(uintptr_t)note,sizeof note))) {
         if (++waited>10000) return 24;
         host_sleep_ms(1);
     }
-    if (host_service_file_sha256_poll((uint32_t)(uintptr_t)digest)!=-1) return 25;
-    static const uint8_t sha_want[32]={0x9f,0x29,0x1a,0x34,0x96,0xe9,0xd2,0x06,0xf2,0x85,0x3d,0xe3,0xff,0xdf,0x99,0x0c,
-                                      0x73,0x35,0x84,0x5d,0x28,0xdb,0xe2,0xc3,0xa8,0xfa,0x93,0x73,0xd2,0x4d,0x0b,0xd7};
-    for (unsigned i=0;i<sizeof digest;i++) if (digest[i]!=sha_want[i]) return 26;
+    if (host_service_disc_check_poll((uint32_t)(uintptr_t)digest,(uint32_t)(uintptr_t)note,sizeof note)!=-1) return 25;
+    static const char why[]="it isn't a disc image (no ISO 9660 volume in it)";
+    if (checked!=-2) return 26;
+    for (unsigned i=0;i<sizeof why;i++) if (note[i]!=why[i]) return 26;
     if (host_service_net_list_lobbies_poll((uint32_t)(uintptr_t)digest,2)!=-1) return 27;
     if (!host_service_net_list_lobbies_start(8)) return 28;
     waited=0;

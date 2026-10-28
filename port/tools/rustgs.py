@@ -5,14 +5,31 @@
                                       [--profile release|fixloop] [--no-cache] [--report FILE]
     python port/tools/rustgs.py build --target wasm32-unknown-unknown [--profile ...]   # cdylib + wasm-bindgen
     python port/tools/rustgs.py build --target aarch64-linux-android [--profile ...]    # Android (finding 091)
+    python port/tools/rustgs.py build --target x86_64-unknown-linux-gnu [--profile ...] # Linux x64
+    python3 port/tools/rustgs.py build --target aarch64-apple-darwin [--profile ...]    # macOS, on a Mac
+    python port/tools/rustgs.py build --target wasm32-unknown-unknown --crate dhd_settings  # the browser's dhd.ini module
     python port/tools/rustgs.py test  --target x86_64-pc-windows-msvc [--features ...] -- --test device_smoke [filter]
     python port/tools/rustgs.py run   --target x86_64-pc-windows-msvc --bin optrace_replay -- <args>
+    python port/tools/rustgs.py check --target aarch64-apple-darwin                    # cargo check (any target)
     python port/tools/rustgs.py tree  [--target T]      # the version gate, printed
     python port/tools/rustgs.py selftest [--keep]       # port/tools/rustgs_selftest.py
 
-Scope: x64 Windows, the browser (wasm32) and Android arm64 (aarch64-linux-android, finding 091: a
-staticlib, libdhd_render.a, linked into libmain.so by build_host64_android.py; Vulkan only). The i686
-build is retired.
+Scope: x64 Windows, the browser (wasm32), Android arm64 (aarch64-linux-android, finding 091: a
+staticlib, libdhd_render.a, linked into libmain.so by build_host64.py --target android-arm64; Vulkan
+only), Linux x64 (x86_64-unknown-linux-gnu: libdhd_render.a for build_host64.py --target linux-x64,
+on Linux or cross-built here for WSL; Vulkan on X11 or Wayland) and macOS on Apple silicon
+(aarch64-apple-darwin: libdhd_render.a, Metal; built on a Mac, as ring compiles its C against the
+macOS SDK; `check` runs anywhere). The i686 build is retired. Off Windows the homes default to
+rustup's own (~/.cargo, ~/.rustup) and the target dirs live under DHD_CARGO_DIR, else
+~/.cache/dhd-cargo.
+
+`--crate dhd_settings` (wasm32 only; finding 102): dhd.ini's crate (port/render/settings) on its own,
+the browser's settings module: `cargo rustc -p dhd_settings --lib --crate-type cdylib`, no
+wasm-bindgen, its own memory (no WASM_LINK_ARGS: it shares nothing with the game's memory), into
+build/web/dhd_settings.wasm. Its gates: the crate has no dependencies at all (`cargo tree`), the
+include pre-check, the dep-info inputs and check_rust_lib on the module. Its cargo target dir is
+<target dir>/dhd_settings (its flags differ from the renderer's wasm build, which would otherwise
+rebuild after it); no seed. The natively built game links the crate through dhd_render (`native`).
 
 What every cargo call gets
 --------------------------
@@ -45,12 +62,18 @@ Gates (each prints `rustgs: refused: ...` and exits 2; a refused or failed build
 - port/tools/check_rust_lib.py on the built library (paths, markers, /defaultlib:msvcrt,
   native-static-libs outside the S1 list; Android: outside native-static-libs-aarch64-linux-android.txt).
 
-The one rewrite of rustc's output (x64): thin LTO re-emits the std crates' modules, which carry
+The two rewrites of the library (x64): thin LTO re-emits the std crates' modules, which carry
 CodeView, and LLVM writes each object's S_OBJNAME record (in .debug$S, which never reaches the exe's
-image) with the object's path under the per-worktree target dir. The flags may not name that dir, so
-normalise_objnames rewrites the target-dir prefix of exactly those records to `target` (NUL-padded,
-same length) and recomputes their section's checksum (refusing if the old one was not the JamCRC
-of the bytes). Every other byte is rustc's; check_rust_lib then refuses any remaining mention.
+image) with the object's path under the per-worktree target dir; so does MSVC's cl for ring's C
+objects (dhd_net's TLS). The flags may not name that dir, so normalise_objnames rewrites the
+target-dir prefix of exactly those records to `target` (NUL-padded, same length) and recomputes their
+section's checksum (refusing if the old one was not the JamCRC of the bytes; 0, cl's "none", stays 0).
+ring's pregenerated nasm objects name their upstream author's folder in their CodeView and .file
+symbol: normalise_foreign_roots rewrites exactly FOREIGN_ROOTS there, the same way. Every other byte
+is the toolchain's; check_rust_lib then refuses any remaining mention.
+
+C parts (ring): the cc crate's compiler and archiver are set per target (c_tools: LLVM's ar, which
+names archive members by file name; the NDK's clang for Android).
 
 Cache
 -----
@@ -64,7 +87,7 @@ DHD_OBJCACHE=0 turns the cache off (every build a miss).
 
 Outputs: native: <target_dir>/rustgs/<triple>/<profile>/<features>/dhd_render.lib (Android:
 libdhd_render.a); wasm:
-build/web/renderer/. `--report FILE` writes {lib, sha256, cache, key, rustflags, target_dir, glue,
+build/web/renderer/; dhd_settings: build/web/dhd_settings.wasm. `--report FILE` writes {lib, sha256, cache, key, rustflags, target_dir, glue,
 native_static_libs, triple, profile, features, versions}.
 """
 import argparse
@@ -83,19 +106,32 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 import check_rust_lib  # noqa: E402
-DEVCACHES = Path(os.environ.get('DHD_DEVCACHES') or Path.home() / 'DevCaches')  # downloaded tools and caches
 
 ROOT = TOOLS.parents[1]
 RENDER = ROOT / 'port' / 'render'
+NET = RENDER / 'net'   # dhd_net, the WebSocket/HTTPS client linked into the native library
+SETTINGS = RENDER / 'settings'   # dhd_settings, dhd.ini's settings, linked into it too
+PRESENCE = RENDER / 'presence'   # dhd_presence, Discord Rich Presence, linked into it too
+DISC = RENDER / 'disc'   # dhd_disc, the disc image's online check, linked into it too
+MEMBERS = (NET, SETTINGS, PRESENCE, DISC)
 GS = ROOT / 'port' / 'gs'
 WGSL = ('raster.wgsl', 'present.wgsl', 'native.wgsl', 'native_dual.wgsl')
-CARGO_TARGETS = (DEVCACHES / 'dhd-cargo')
+CARGO_TARGETS = Path(os.environ.get('DHD_CARGO_DIR') or
+                     ('DHD_DEVCACHES/dhd-cargo' if os.name == 'nt' else Path.home() / '.cache' / 'dhd-cargo'))
 SEED = CARGO_TARGETS / 'seed'
 WEB_OUT = ROOT / 'build' / 'web' / 'renderer'
+RENDER_CRATE = 'dhd_render'
+SETTINGS_CRATE = 'dhd_settings'   # --crate: the browser's dhd.ini module (wasm32 only)
+CRATES = (RENDER_CRATE, SETTINGS_CRATE)
+SETTINGS_WEB_OUT = ROOT / 'build' / 'web'   # dhd_settings.wasm
 X64 = 'x86_64-pc-windows-msvc'
 WASM = 'wasm32-unknown-unknown'
-ANDROID = 'aarch64-linux-android'  # the Android build (build_host64_android.py, finding 091)
-TARGETS = (X64, WASM, ANDROID)   # i686 is retired
+ANDROID = 'aarch64-linux-android'  # build_host64.py --target android-arm64 (finding 091)
+LINUX = 'x86_64-unknown-linux-gnu'  # build_host64.py --target linux-x64 (here, or cross-built for WSL)
+MAC = 'aarch64-apple-darwin'      # build_host64.py --target macos-arm64, on a Mac
+TARGETS = (X64, WASM, ANDROID, LINUX, MAC)   # i686 is retired
+ARCHIVE_TARGETS = (ANDROID, LINUX, MAC)   # libdhd_render.a
+CHECK_TARGETS = TARGETS
 PROFILES = ('release', 'fixloop')
 FEATURES = ('test-hooks',)       # what a caller may add; native / web are rustgs's own
 REFUSED_FEATURES = ('no-fp-guard',)
@@ -136,6 +172,8 @@ def log(msg):
 
 def home(var):
     value = os.environ.get(var)
+    if not value and os.name != 'nt':  # rustup's own default: no system drive to keep free there
+        value = os.path.join(os.path.expanduser('~'), '.cargo' if var == 'CARGO_HOME' else '.rustup')
     if not value:
         refuse('%s is not set (the Rust toolchain must live off the C: drive)' % var)
     path = os.path.normpath(value)
@@ -149,14 +187,14 @@ def spellings(path):
     return list(dict.fromkeys((p, p.replace('\\', '/'))))
 
 
-def rustflags(triple):
+def rustflags(triple, crate=RENDER_CRATE):
     flags = []
     if triple.endswith('-msvc'):
         flags.append('-Ctarget-feature=+crt-static')
     for var, name in (('CARGO_HOME', 'cargo'), ('RUSTUP_HOME', 'rustup')):
         for s in spellings(home(var)):
             flags.append('--remap-path-prefix=%s=%s' % (s, name))
-    if triple == WASM:
+    if triple == WASM and crate == RENDER_CRATE:   # dhd_settings keeps its own memory
         flags += ['-Clink-arg=' + a for a in WASM_LINK_ARGS]
     return flags
 
@@ -173,7 +211,46 @@ def cargo_env(triple):
            if k not in ENV_DROP and not k.startswith(ENV_DROP_PREFIX)}
     env['CARGO_TARGET_DIR'] = str(target_dir())
     env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(rustflags(triple))
+    if os.name != 'nt':
+        env['RUSTC_WRAPPER'] = ''  # the repository's sccache wrapper (.cargo/config.toml) is a Windows program
+    env.update(c_tools(triple))
     return env
+
+
+def c_tools(triple):
+    """The C compiler and archiver for the crates that build C or assembly (ring, in dhd_net's TLS),
+    by the cc crate's per-target variables. The archiver is LLVM's ar on every target: it names each
+    member by its file name, where lib.exe and llvm-lib keep the path they are given (ring's
+    pregenerated objects come by their registry path). x64 compiles with MSVC's cl, found by cc."""
+    var = triple.replace('-', '_')
+    if triple == X64:
+        found = shutil.which('llvm-ar') or str(Path.home() / 'scoop/apps/llvm/current/bin/llvm-ar.exe')
+        if not Path(found).is_file():
+            refuse('no llvm-ar (LLVM) for the C parts of the library')
+        return {'AR_' + var: found}
+    if triple == ANDROID:
+        import sdl3
+        try:
+            bin_dir = sdl3.android_ndk() / 'toolchains' / 'llvm' / 'prebuilt' / 'windows-x86_64' / 'bin'
+        except SystemExit as why:
+            refuse(str(why))
+        # -g0: ring's build asks clang for -g3, whose DWARF names the registry, the NDK and the
+        # target dir; cc puts these flags last, so they win
+        return {'CC_' + var: str(bin_dir / 'clang.exe'), 'AR_' + var: str(bin_dir / 'llvm-ar.exe'),
+                'CFLAGS_' + var: '-g0'}
+    if triple in (LINUX, MAC) and os.name != 'nt':
+        # the machine's own compiler (cc finds it; Apple's through xcrun, with the SDK ring needs),
+        # without debug info: ring asks for -g3, whose DWARF names the registry and the target dir
+        return {'CFLAGS_' + var: '-g0'}
+    if triple == LINUX:
+        # cross-built on Windows: LLVM's clang for the target, freestanding (no Linux headers here:
+        # ring's C has a mode for that), without debug info (ring asks for -g3)
+        llvm = Path(shutil.which('clang') or Path.home() / 'scoop/apps/llvm/current/bin/clang.exe').parent
+        if not (llvm / 'clang.exe').is_file() or not (llvm / 'llvm-ar.exe').is_file():
+            refuse('no LLVM clang and llvm-ar for the C parts of the Linux library')
+        return {'CC_' + var: str(llvm / 'clang.exe'), 'AR_' + var: str(llvm / 'llvm-ar.exe'),
+                'CFLAGS_' + var: '-g0 -ffreestanding -nostdlibinc -DRING_CORE_NOSTDLIBINC=1'}
+    return {}
 
 
 def tool_version(cmd, env=None):
@@ -246,13 +323,18 @@ def source_files():
         if p.name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') or rel.parts[0] == 'src' \
                 or rel.as_posix() == '.cargo/config.toml':
             files.append(('port/render/' + rel.as_posix(), p))
+    for member in MEMBERS:
+        for p in member.rglob('*'):
+            rel = p.relative_to(member)
+            if p.is_file() and rel.parts[0] == 'src':
+                files.append(('port/render/%s/%s' % (member.name, rel.as_posix()), p))
     for name in WGSL:
         files.append(('port/gs/' + name, GS / name))
     return sorted(files)
 
 
 def include_precheck():
-    for p in sorted((RENDER / 'src').rglob('*.rs')):
+    for p in sorted([*(RENDER / 'src').rglob('*.rs'), *(p for m in MEMBERS for p in (m / 'src').rglob('*.rs'))]):
         text = p.read_text(encoding='utf-8', errors='replace')
         for m in ABS_INCLUDE.finditer(text):
             refuse('%s includes a file by an absolute path (%s): every compiled input must be inside '
@@ -326,14 +408,13 @@ def normalise_objnames(lib, tdir):
     return count
 
 
-def _objnames_in_member(data, base, size, prefixes):
-    obj = memoryview(data)[base:base + size]
-    if size < 20:
-        return 0
+def _coff_layout(obj):
+    """(sections [(name, size, pointer)], {section index: its checksum's offset}, [(start, end) of each
+    .file symbol's aux records]) of a COFF object (regular or bigobj); None for an import object."""
     sig1, sig2 = struct.unpack_from('<HH', obj, 0)
     if sig1 == 0 and sig2 == 0xFFFF:                       # bigobj (an import object has no sections)
         if struct.unpack_from('<H', obj, 4)[0] < 2:
-            return 0
+            return None
         nsec = struct.unpack_from('<I', obj, 44)[0]
         symptr, nsym = struct.unpack_from('<II', obj, 48)
         table, entry, secfmt = 56, 20, '<i'
@@ -345,7 +426,7 @@ def _objnames_in_member(data, base, size, prefixes):
     for k in range(nsec):
         h = table + 40 * k
         sections.append((bytes(obj[h:h + 8]).rstrip(NUL),) + struct.unpack_from('<II', obj, h + 16))
-    aux = {}                                                 # section index -> its checksum's offset
+    aux, files = {}, []
     i = 0
     while i < nsym:
         e = symptr + entry * i
@@ -353,7 +434,20 @@ def _objnames_in_member(data, base, size, prefixes):
         sclass, naux = obj[e + entry - 2], obj[e + entry - 1]
         if naux and sclass == 3 and 1 <= secno <= nsec and bytes(obj[e:e + 8]).rstrip(NUL) == sections[secno - 1][0]:
             aux.setdefault(secno - 1, e + entry + 8)
+        if naux and sclass == 0x67:                          # IMAGE_SYM_CLASS_FILE: its name fills its aux records
+            files.append((e + entry, e + entry * (1 + naux)))
         i += 1 + naux
+    return sections, aux, files
+
+
+def _objnames_in_member(data, base, size, prefixes):
+    obj = memoryview(data)[base:base + size]
+    if size < 20:
+        return 0
+    layout = _coff_layout(obj)
+    if layout is None:
+        return 0
+    sections, aux, _ = layout
     changed = 0
     for k, (name, length, ptr) in enumerate(sections):
         if name != b'.debug$S' or not ptr:
@@ -377,13 +471,79 @@ def _objnames_in_member(data, base, size, prefixes):
         if k not in aux:
             refuse('S_OBJNAME rewrite: the .debug$S section has no section symbol')
         stored = struct.unpack_from('<I', obj, aux[k])[0]
-        if stored != jamcrc(text):
-            refuse('S_OBJNAME rewrite: the .debug$S checksum is not the JamCRC of its bytes')
+        if stored not in (0, jamcrc(text)):
+            refuse('S_OBJNAME rewrite: the .debug$S checksum is neither 0 (none) nor the JamCRC of its bytes')
         for at, nul, prefix in hits:
             new = OBJNAME_ROOT + text[at + len(prefix):nul]
             sec[at:nul] = new + NUL * (nul - at - len(new))
-        struct.pack_into('<I', obj, aux[k], jamcrc(bytes(sec)))
+        if stored:  # MSVC's cl (ring's C, via the cc crate) writes 0: none, kept
+            struct.pack_into('<I', obj, aux[k], jamcrc(bytes(sec)))
         changed += len(hits)
+    return changed
+
+
+# ring's pregenerated nasm objects (ring 0.17.14 on x64 Windows: dhd_net's TLS) name the folder they
+# were assembled in upstream, in their CodeView (S_OBJNAME, the file-name string table) and their
+# .file symbol: the crate author's folder, none of ours. Normalised to `ring\...` as S_OBJNAME's
+# target dir is to `target\...`; never in the exe's image (debug sections and symbols).
+FOREIGN_ROOTS = ((b'C:\\Users\\b\\p\\ring\\', b'ring\\'),)
+
+
+def normalise_foreign_roots(lib):
+    """Rewrites, in place, each name in lib's objects that starts with a FOREIGN_ROOTS folder, inside a
+    .debug$S section or a .file symbol's aux records only, to its short form, NUL-padded to the same
+    length, and fixes a rewritten section's checksum (0, none, stays 0). A foreign root anywhere else
+    is refused. Returns the number of names rewritten."""
+    data = bytearray(Path(lib).read_bytes())
+    if data[:8] != b'!<arch>\n':
+        return 0
+    count, pos = 0, 8
+    while pos + 60 <= len(data):
+        size = int(bytes(data[pos + 48:pos + 58]).strip() or b'0')
+        body = pos + 60
+        if any(root in data[body:body + size] for root, _ in FOREIGN_ROOTS):
+            count += _foreign_in_member(memoryview(data)[body:body + size])
+        pos = body + size + (size & 1)
+    if count:
+        tmp = Path(str(lib) + '.tmp')
+        tmp.write_bytes(bytes(data))
+        os.replace(tmp, lib)
+    return count
+
+
+def _foreign_in_member(obj):
+    layout = _coff_layout(obj) if len(obj) >= 20 else None
+    if layout is None:
+        refuse('foreign root rewrite: a member that is no COFF object names an upstream build folder')
+    sections, aux, files = layout
+    areas = [(ptr, ptr + length, k) for k, (name, length, ptr) in enumerate(sections)
+             if name == b'.debug$S' and ptr]
+    areas += [(start, end, None) for start, end in files]
+    before = {k: jamcrc(bytes(obj[a:b])) for a, b, k in areas if k is not None}
+    changed, touched = 0, set()
+    for root, short in FOREIGN_ROOTS:
+        at = bytes(obj).find(root)
+        while at >= 0:
+            area = next(((a, b, k) for a, b, k in areas if a <= at < b), None)
+            if area is None:
+                refuse('foreign root rewrite: %r outside .debug$S and .file symbols' % root)
+            nul = bytes(obj[at:area[1]]).find(NUL)
+            end = at + nul if nul >= 0 else area[1]          # a .file name may fill its records
+            new = short + bytes(obj[at + len(root):end])
+            obj[at:end] = new + NUL * (end - at - len(new))
+            if area[2] is not None:
+                touched.add(area[2])
+            changed += 1
+            at = bytes(obj).find(root, at + 1)
+    for k in touched:
+        _, length, ptr = sections[k]
+        if k not in aux:
+            refuse('foreign root rewrite: the .debug$S section has no section symbol')
+        stored = struct.unpack_from('<I', obj, aux[k])[0]
+        if stored not in (0, before[k]):
+            refuse('foreign root rewrite: the .debug$S checksum is neither 0 (none) nor the JamCRC of its bytes')
+        if stored:
+            struct.pack_into('<I', obj, aux[k], jamcrc(bytes(obj[ptr:ptr + length])))
     return changed
 
 
@@ -428,7 +588,7 @@ def objcache():
     return oc
 
 
-def cache_key(triple, profile, features, flags, versions, tools):
+def cache_key(triple, profile, features, flags, versions, tools, crate=RENDER_CRATE):
     h = hashlib.sha256(VERSION.encode())
 
     def part(label, data):
@@ -448,7 +608,9 @@ def cache_key(triple, profile, features, flags, versions, tools):
     part('profile', profile)
     part('features', ','.join(features))
     part('versions', json.dumps(versions, sort_keys=True))
-    if triple == WASM:
+    if crate != RENDER_CRATE:   # the renderer's keys stay as they were
+        part('crate', crate)
+    elif triple == WASM:
         part('bindgen', ' '.join(WASM_BINDGEN_ARGS))
     return h.hexdigest()
 
@@ -538,10 +700,75 @@ def run_cargo(cmd, env):
     return r
 
 
-def build(triple, features=(), profile='release', no_cache=False):
+def settings_gate(env):
+    """dhd_settings's graph for the browser: the crate alone, no dependency of any kind."""
+    cmd = ['cargo', 'tree', '--locked', '--offline', '-e', 'all', '-p', SETTINGS_CRATE, '--target', WASM,
+           '--prefix', 'none']
+    r = subprocess.run(cmd, cwd=str(RENDER), env=env, capture_output=True, text=True, errors='replace')
+    if r.returncode:
+        refuse('dependency gate: `%s` failed: %s' % (' '.join(cmd), (r.stderr or r.stdout).strip()[-800:]))
+    lines = [line for line in r.stdout.splitlines() if line.strip()]
+    m = re.match(r'^%s v(\S+)' % SETTINGS_CRATE, lines[0]) if len(lines) == 1 else None
+    if not m:
+        refuse('dependency gate: %s must have no dependencies, its graph is: %s' % (SETTINGS_CRATE, '; '.join(lines)))
+    return {SETTINGS_CRATE: [m.group(1)]}
+
+
+def build_settings(profile='release', no_cache=False):
+    """The browser's dhd.ini module (--crate dhd_settings): build/web/dhd_settings.wasm; the report."""
+    env = common(WASM, profile)
+    tdir = target_dir() / SETTINGS_CRATE
+    flags = rustflags(WASM, SETTINGS_CRATE)
+    env['CARGO_TARGET_DIR'] = str(tdir)
+    env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
+    include_precheck()
+    versions = settings_gate(env)
+    tools = [('rustc', tool_version(['rustc', '-vV'], env)), ('cargo', tool_version(['cargo', '-V'], env))]
+    key = cache_key(WASM, profile, [], flags, versions, tools, SETTINGS_CRATE)
+    name = SETTINGS_CRATE + '.wasm'
+    out = SETTINGS_WEB_OUT / name
+    rep = {'triple': WASM, 'crate': SETTINGS_CRATE, 'profile': profile, 'features': [], 'key': key, 'rustflags': flags,
+           'target_dir': str(tdir), 'versions': versions, 'glue': [], 'native_static_libs': []}
+    tdir.mkdir(parents=True, exist_ok=True)
+    hit = None if no_cache else cache_fetch(key, SETTINGS_WEB_OUT)
+    if hit is not None:
+        rep.update(cache='hit', lib=str(hit[name]), sha256=check_rust_lib.sha256(hit[name]))
+        log('cache hit %s -> %s' % (key[:16], rep['lib']))
+        return rep
+    cmd = ['cargo', 'rustc', '-p', SETTINGS_CRATE, '--lib', '--crate-type', 'cdylib', *cargo_args(WASM, profile)]
+    r = run_cargo(cmd, env)
+    sys.stdout.write(r.stdout[-8000:] if r.returncode else '')
+    if r.returncode:
+        raise SystemExit('rustgs: cargo failed (exit %d)' % r.returncode)
+    built = tdir / WASM / profile
+    inputs_gate(built / (SETTINGS_CRATE + '.d'))
+    sysroot = Path(tool_version(['rustc', '--print', 'sysroot'], env).strip()) / 'lib' / 'rustlib' / WASM / 'lib'
+    SETTINGS_WEB_OUT.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(built / name, out)
+    problems = check_rust_lib.problems(out, trees=[ROOT], extra=[tdir], sysroot=sysroot)
+    if problems:
+        out.unlink()
+        refuse('check_rust_lib: ' + '; '.join(problems[:8]))
+    if not no_cache:
+        cache_store(key, {name: out}, {'native_static_libs': []})
+    rep.update(cache='miss', lib=str(out), sha256=check_rust_lib.sha256(out))
+    log('built %s (key %s)' % (out, key[:16]))
+    return rep
+
+
+def build(triple, features=(), profile='release', no_cache=False, crate=RENDER_CRATE):
     """Builds (or fetches) the library; returns the report dict. Raises Refused or SystemExit."""
     features = list(parse_features(','.join(features)))
     check_features(features)
+    if triple == MAC and sys.platform != 'darwin':
+        refuse('--target %s builds on a Mac (ring compiles its C against the macOS SDK); `check` runs here' % MAC)
+    if crate not in CRATES:
+        refuse('--crate %s: one of %s' % (crate, ', '.join(CRATES)))
+    if crate == SETTINGS_CRATE:
+        if triple != WASM or features:
+            refuse('--crate %s: the browser\'s module only (--target %s, no features); the game links it '
+                   'through %s' % (SETTINGS_CRATE, WASM, RENDER_CRATE))
+        return build_settings(profile, no_cache)
     env = common(triple, profile)
     flags = rustflags(triple)
     include_precheck()
@@ -555,7 +782,7 @@ def build(triple, features=(), profile='release', no_cache=False):
     tdir.mkdir(parents=True, exist_ok=True)
     tag = '+'.join(features) or 'default'
     out_dir = WEB_OUT if triple == WASM else tdir / 'rustgs' / triple / profile / tag
-    lib_name = 'dhd_render_bg.wasm' if triple == WASM else 'libdhd_render.a' if triple == ANDROID else 'dhd_render.lib'
+    lib_name = 'dhd_render_bg.wasm' if triple == WASM else 'libdhd_render.a' if triple in ARCHIVE_TARGETS else 'dhd_render.lib'
     rep = {'triple': triple, 'profile': profile, 'features': features, 'key': key, 'rustflags': flags,
            'target_dir': str(tdir), 'versions': versions}
     hit = None if no_cache else cache_fetch(key, out_dir)
@@ -579,7 +806,7 @@ def build(triple, features=(), profile='release', no_cache=False):
         raise SystemExit('rustgs: cargo failed (exit %d)' % r.returncode)
     built_dir = tdir / triple / profile
     raw = built_dir / ('dhd_render.wasm' if triple == WASM else lib_name)
-    inputs_gate(built_dir / ('libdhd_render.d' if triple == ANDROID else 'dhd_render.d'))
+    inputs_gate(built_dir / ('libdhd_render.d' if triple in ARCHIVE_TARGETS else 'dhd_render.d'))
     sysroot = Path(tool_version(['rustc', '--print', 'sysroot'], env).strip()) / 'lib' / 'rustlib' / triple / 'lib'
     native_libs = []
     if triple != WASM:
@@ -613,6 +840,9 @@ def build(triple, features=(), profile='release', no_cache=False):
         renamed = normalise_objnames(lib, tdir) if triple == X64 else 0  # COFF's records only
         if renamed:
             log('%d S_OBJNAME record(s) normalised to target\\...' % renamed)
+        foreign = normalise_foreign_roots(lib) if triple == X64 else 0
+        if foreign:
+            log('%d name(s) under an upstream build folder normalised (FOREIGN_ROOTS)' % foreign)
         problems = check_rust_lib.problems(lib, trees=[ROOT], extra=[tdir], native_static_libs=native_libs,
                                            sysroot=sysroot, triple=triple)
         if problems:
@@ -631,7 +861,8 @@ def build(triple, features=(), profile='release', no_cache=False):
 
 def library(target=X64, features=(), profile='release'):
     """The built library's path (for link scripts; A1c). 'x64' / 'wasm' are accepted for the triple."""
-    triple = {'x64': X64, 'x86_64': X64, 'wasm': WASM, 'wasm32': WASM, 'android': ANDROID}.get(target, target)
+    triple = {'x64': X64, 'x86_64': X64, 'wasm': WASM, 'wasm32': WASM, 'android': ANDROID, 'linux': LINUX,
+              'mac': MAC}.get(target, target)
     return Path(build(triple, features, profile)['lib'])
 
 
@@ -673,6 +904,20 @@ def run(triple, features, profile, binary, rest):
     return subprocess.run(cmd, cwd=str(RENDER), env=env).returncode
 
 
+def check(triple, profile):
+    """cargo check of the library for triple (the version gate first); the exit code."""
+    if triple not in CHECK_TARGETS:
+        refuse('check --target %s: one of %s' % (triple, ', '.join(CHECK_TARGETS)))
+    if profile not in PROFILES:
+        refuse('--profile %s: one of %s' % (profile, ', '.join(PROFILES)))
+    env = cargo_env(triple)
+    include_precheck()
+    version_gate(triple, env)
+    cmd = ['cargo', 'check', '--lib', *cargo_args(triple, profile), *feature_args(triple, [])]
+    print('  + ' + ' '.join(cmd), flush=True)
+    return subprocess.run(cmd, cwd=str(RENDER), env=env).returncode
+
+
 def tree(targets):
     for triple in targets:
         env = common(triple, 'release')
@@ -695,10 +940,14 @@ def main(argv=None):
         p.add_argument('--features', action='append', default=[])
         p.add_argument('--profile', default='release')
         if name == 'build':
+            p.add_argument('--crate', default=RENDER_CRATE, choices=CRATES)
             p.add_argument('--no-cache', action='store_true')
             p.add_argument('--report', type=Path)
         if name == 'run':
             p.add_argument('--bin', required=True)
+    p = sub.add_parser('check')
+    p.add_argument('--target', default=X64)
+    p.add_argument('--profile', default='release')
     p = sub.add_parser('tree')
     p.add_argument('--target', action='append')
     p = sub.add_parser('selftest')
@@ -710,7 +959,7 @@ def main(argv=None):
                 refuse('build takes no arguments after --')
             if a.report and a.report.exists():
                 a.report.unlink()
-            rep = build(a.target, a.features, a.profile, a.no_cache)
+            rep = build(a.target, a.features, a.profile, a.no_cache, a.crate)
             if a.report:
                 a.report.parent.mkdir(parents=True, exist_ok=True)
                 a.report.write_text(json.dumps(rep, indent=1, sort_keys=True) + '\n', encoding='utf-8')
@@ -720,6 +969,8 @@ def main(argv=None):
             return test(a.target, a.features, a.profile, rest)
         if a.cmd == 'run':
             return run(a.target, a.features, a.profile, a.bin, rest)
+        if a.cmd == 'check':
+            return check(a.target, a.profile)
         if a.cmd == 'tree':
             return tree(a.target or list(TARGETS))
         if a.cmd == 'selftest':

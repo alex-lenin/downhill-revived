@@ -12,13 +12,14 @@ typedef struct {
     GraphicsProvenance provenance;
 } GsPacket;
 static uint8_t *gs_ring;
-static HANDLE gs_worker, gs_available, gs_retired;
+static SDL_Thread *gs_worker;
+static SDL_Semaphore *gs_available, *gs_retired;
 QUEUE_COUNTER(gs_written);
 QUEUE_COUNTER(gs_consumed);
 QUEUE_COUNTER(gs_stopping);
 QUEUE_COUNTER(gs_sleeping);
 QUEUE_COUNTER(gs_waiting);
-static uint32_t gs_position(volatile LONG *p)
+static uint32_t gs_position(_Atomic uint32_t *p)
 {
     return position(p);
 }
@@ -76,7 +77,7 @@ static double gs_profile_begin(void)
     }
     return now;
 }
-static DWORD WINAPI gs_consume(void *unused)
+static int SDLCALL gs_consume(void *unused)
 {
     (void)unused;
     host_thread_name("gs");
@@ -88,8 +89,8 @@ static DWORD WINAPI gs_consume(void *unused)
         if (at == gs_position(&gs_written)) {
             if (gs_position(&gs_stopping))
                 return 0;
-            LONG64 idle = tl_begin();
-            idle_wait(&gs_written, at, &gs_sleeping, gs_available, INFINITE, &idle_budget);
+            int64_t idle = tl_begin();
+            idle_wait(&gs_written, at, &gs_sleeping, gs_available, -1, &idle_budget);
             tl_add(TL_GS_IDLE, idle);
             continue;
         }
@@ -102,9 +103,9 @@ static DWORD WINAPI gs_consume(void *unused)
             if (start)
                 gs_profile_busy += host_wall_seconds() - start;
         }
-        InterlockedExchange(&gs_consumed, (LONG)(at + p->bytes));
+        atomic_exchange(&gs_consumed, at + p->bytes);
         if (gs_position(&gs_waiting))
-            SetEvent(gs_retired);
+            wake(gs_retired);
     }
 }
 void graphics_gs_wait(void)
@@ -121,15 +122,15 @@ static void gs_queue_shutdown(void)
     if (!gs_worker)
         return;
     graphics_gs_wait();
-    InterlockedExchange(&gs_stopping, 1);
-    SetEvent(gs_available);
-    WaitForSingleObject(gs_worker, INFINITE);
-    CloseHandle(gs_worker);
-    CloseHandle(gs_available);
-    CloseHandle(gs_retired);
+    atomic_exchange(&gs_stopping, 1);
+    SDL_SignalSemaphore(gs_available);
+    SDL_WaitThread(gs_worker, NULL);
+    SDL_DestroySemaphore(gs_available);
+    SDL_DestroySemaphore(gs_retired);
     free(gs_ring);
     gs_ring = NULL;
-    gs_worker = gs_available = gs_retired = NULL;
+    gs_worker = NULL;
+    gs_available = gs_retired = NULL;
 }
 static void gs_queue_initialize(void)
 {
@@ -140,13 +141,13 @@ static void gs_queue_initialize(void)
     if (getenv("DHD_VU_SUSPECT"))
         return;
 #ifdef GS_QUEUE_TEST
-    gs_written = gs_consumed = (LONG)0xfffff800u;
+    gs_written = gs_consumed = 0xfffff800u;
 #endif
     gs_ring = malloc(GS_RING_BYTES);
-    gs_available = CreateEventA(NULL, FALSE, FALSE, NULL);
-    gs_retired = CreateEventA(NULL, FALSE, FALSE, NULL);
+    gs_available = SDL_CreateSemaphore(0);
+    gs_retired = SDL_CreateSemaphore(0);
     if (gs_ring && gs_available && gs_retired)
-        gs_worker = CreateThread(NULL, 0, gs_consume, NULL, 0, NULL);
+        gs_worker = SDL_CreateThread(gs_consume, "gs", NULL);
     if (!gs_worker) {
         fprintf(stderr, "GS worker initialization failed\n");
         abort();
@@ -165,7 +166,7 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
         uint32_t at = gs_position(&gs_written);
         unsigned tail = GS_RING_BYTES - (at & (GS_RING_BYTES - 1)), wrap = bytes > tail ? tail : 0;
         if (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap) {
-            LONG64 full = tl_begin();
+            int64_t full = tl_begin();
             uint32_t observed;
             while (GS_RING_BYTES - (at - (observed = gs_position(&gs_consumed))) < bytes + wrap)
                 idle_wait(&gs_consumed, observed, &gs_waiting, gs_retired, 1, NULL);
@@ -184,9 +185,9 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
         p->pad = 0;
         p->provenance = graphics_provenance;
         memcpy(p + 1, words, take * 4);
-        InterlockedExchange(&gs_written, (LONG)(at + bytes));
+        atomic_exchange(&gs_written, at + bytes);
         if (gs_position(&gs_sleeping))
-            SetEvent(gs_available);
+            wake(gs_available);
         words += take;
         count -= take;
     }

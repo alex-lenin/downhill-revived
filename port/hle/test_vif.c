@@ -13,6 +13,13 @@ void hle_log(const char *fmt, ...) { va_list args; va_start(args,fmt); vfprintf(
 void kernel_poll(void) {}
 double host_seconds(void) { return 0; }
 void host_thread_name(const char *name) { (void)name; }
+double host_current_thread_cpu(void) { return 0; }
+int host_callback_fault_guard(uint32_t fn, uint32_t ctx) { (void)fn; (void)ctx; return 0; }  /* no deferred reads */
+int host_fault_guard_here(void) { return 0; }
+int host_mem_protect(uint32_t at, uint32_t size, int protection) { (void)at; (void)size; (void)protection; return 1; }
+unsigned host_fp_csr(void) { return 0; }
+void host_fp_set_csr(unsigned csr) { (void)csr; }
+uint64_t host_cycles(void) { return 0; }
 double host_wall_seconds(void) { return 0; }
 volatile uint32_t gs_presented_frames;
 uint64_t kernel_vsync_count;
@@ -23,6 +30,7 @@ int graphics_xgkick(uint32_t memory,unsigned qword) { return gs_xgkick(&gs,GUEST
 #endif
 #ifndef GRAPHICS_QUEUE_TEST
 void graphics_wait(void) {}
+void host_service_graphics_wait(void) { graphics_wait(); }  /* graphics_queue.c's, without the queue */
 #endif
 extern int sceGsExecStoreImage(uint32_t, uint32_t) RETAIL(func_00244228);
 static void code(uint32_t value) {

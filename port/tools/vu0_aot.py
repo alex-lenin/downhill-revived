@@ -536,7 +536,7 @@ def entries(pairs):
 
 def generate(destination, verbose=False):
     destination = Path(destination).resolve()
-    if ROOT / 'build' not in destination.parents:
+    if (ROOT / 'build').resolve() not in destination.parents:  # build/ may be a junction off C:
         raise ValueError('game-derived VU0 code must stay under build/')
     data = Path(os.environ.get('DHD_VUTEXT', ROOT / 'assets/vutext.bin')).read_bytes()
     pairs, where = program(data, PACKAGE)

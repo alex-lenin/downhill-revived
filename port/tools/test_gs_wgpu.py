@@ -86,7 +86,11 @@ def harness_env(env=None):
 
 
 def compile_command(sources, exe, out, flags=''):
-    """The vcvars + clang-cl command file that builds exe from port/gs sources over dhd_render.lib."""
+    """The vcvars + clang-cl command file that builds exe from port/gs sources over dhd_render.lib
+    and SDL3 (the native renderer's render thread and locks, sdl3.py's x64 build)."""
+    import sdl3
+    sdl_lib, sdl_include = sdl3.build()
+    flags += '/I"%s" ' % sdl_include
     vs = subprocess.check_output([str(VSWHERE), '-latest', '-property', 'installationPath'], text=True).strip()
     cmd = out / (exe.stem + '.cmd')
     cmd.write_text('@set "PATH=%%PATH%%;%s"\r\n@call "%s" x64 >nul\r\n@if errorlevel 1 exit /b 1\r\n'
@@ -95,7 +99,8 @@ def compile_command(sources, exe, out, flags=''):
                    '/DDHD_GS_TEST_BUILD=1 /I"%s" /I"%s" %s /Fe:"%s" /link %s %s\r\n'
                    % (VSWHERE.parent, Path(vs) / 'VC/Auxiliary/Build/vcvarsall.bat', LLVM, flags,
                       GS, RUST_INCLUDE, ' '.join('"%s"' % (GS / s) for s in sources), exe,
-                      ' '.join('"%s"' % p for p in gs_libraries()), ' '.join(gs_system_libs())))
+                      ' '.join('"%s"' % p for p in gs_libraries() + [sdl_lib]),
+                      ' '.join(gs_system_libs() + [x for x in sdl3.SYSTEM_LIBS if x not in gs_system_libs()])))
     return cmd
 
 

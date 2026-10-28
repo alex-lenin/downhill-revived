@@ -1,30 +1,35 @@
-/* The POSIX host of host_api.h (port/host): the module's OS services on Linux
-   (and other POSIX hosts where the noted calls exist). Counterpart of
-   host_win32.c; the module sees only host_api.h. Fibers, guest RAM, the FP
-   mode, the guest-safe callback contracts and the thread name live in the
-   host64 glue (fiber_posix.c, guest_memory*.c, fp_mode.c, the generated
-   imports_gen.c, host.c), which provide those symbols. */
-#define _GNU_SOURCE /* readlink, sigaction, pthread names */
+/* The POSIX host of host_api.h (port/host): what has no portable answer on Linux, Android, macOS
+   (and other POSIX hosts where the noted calls exist); host_sdl.c has the rest, on SDL3 and the C
+   library. Guest memory protection and the access-fault guard (signals), the FP control word
+   (MXCSR, or arm64's FPCR), the cycle counter, the program's path, code range and memory regions,
+   the environment's writes, the heartbeat and the process's end. Counterpart of host_win32.c; the
+   module sees only host_api.h. Fibers, guest RAM, the FP mode, the guest-safe callback contracts
+   and the thread name live in the host64 glue (fiber*.c, guest_memory*.c, fp_mode.c, the
+   generated imports_gen.c, host.c), which provide those symbols. */
+#define _GNU_SOURCE /* readlink, sigaction, dladdr */
 #include "host_api.h"
+#include "host_os.h"
 #include "../include/guest.h"
-#include "../net/net.h"
-#include "../runtime/sha256.h"
 
-#include <dirent.h>
 #include <dlfcn.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>     /* _NSGetExecutablePath */
+#include <mach-o/getsect.h>  /* getsegmentdata */
+#include <mach/mach.h>       /* the frame waits' time-constraint sleep */
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#else
 #include <elf.h>
+#endif
 #include <errno.h>
-#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__x86_64__)
@@ -36,22 +41,7 @@
 #endif
 
 /* ---- environment, errors and the program ---- */
-const char *host_getenv(const char *name) { return getenv(name); }
-
 unsigned long host_last_error(void) { return (unsigned long)errno; }
-
-void host_error_box(const char *title, const char *message)
-{
-#ifdef __ANDROID__
-    void android_error_box(const char *title, const char *message);  /* android_main.c: logcat and a message box */
-    fprintf(stderr, "%s: %s\n", title, message);
-    android_error_box(title, message);
-#else
-    /* No message boxes on a headless host: the log carries it. */
-    fprintf(stderr, "%s: %s\n", title, message);
-    fflush(stderr);
-#endif
-}
 
 unsigned host_exe_path(char *out, unsigned size)
 {
@@ -61,6 +51,16 @@ unsigned host_exe_path(char *out, unsigned size)
     const char *android_exe_path(void);
     int k = snprintf(out, size, "%s", android_exe_path());
     return k > 0 && (unsigned)k < size ? (unsigned)k : 0;
+#elif defined(__APPLE__)
+    char given[4096], real[PATH_MAX];
+    uint32_t length = sizeof given;
+    int k = _NSGetExecutablePath(given, &length) == 0 && realpath(given, real)
+            ? snprintf(out, size, "%s", real) : -1;
+    if (k <= 0 || (unsigned)k >= size) {
+        if (size) out[0] = 0;
+        return 0;
+    }
+    return (unsigned)k;
 #endif
     ssize_t n = readlink("/proc/self/exe", out, size ? size - 1 : 0);
     if (n < 0) {
@@ -76,13 +76,11 @@ void host_exit(int code)
 #ifdef __ANDROID__
     extern int __llvm_profile_write_file(void) __attribute__((weak));  /* --pgo-generate builds only */
     if (__llvm_profile_write_file) __llvm_profile_write_file();
-    void android_log_drain(void);  /* android_main.c: the last lines reach logcat and dhd.log */
-    android_log_drain();
 #endif
+    void host_log_drain(void);  /* port/hle/host.c: the last lines reach dhd.log (and logcat) */
+    host_log_drain();
     _exit(code);
 }
-
-int host_display_hz(void) { return 0; }
 
 /* The callers (vu0_interp.c, ps2asm.c) speak MXCSR: they read the word, set rounding toward zero
    with FTZ/DAZ ((c & ~0x603F) | 0xFFC0) and restore what they read. On arm64 the word is translated
@@ -136,273 +134,20 @@ void host_putenv_s(const char *name, const char *value)
     else setenv(name, value, 1);
 }
 
-void host_dpi_aware(void) {} /* pixels are real without asking */
-
-double host_monitor_aspect(void)
-{
-#ifdef __ANDROID__
-    /* the screen's shape, from the activity (DhdActivity: DHD_MONITOR_ASPECT, the long side over the short) */
-    const char *aspect = getenv("DHD_MONITOR_ASPECT");
-    if (aspect && atof(aspect) >= 1.0 && atof(aspect) < 4.0) return atof(aspect);
-#endif
-    return 16.0 / 9.0;
-}
-
-/* ---- files: the disc image and the memory card's files ----
-   A file is a C library FILE behind a small handle (1..FILE_SLOTS, 0 is none). */
-#define FILE_SLOTS 32
-static FILE *file_slot[FILE_SLOTS + 1];
-
-static FILE *file_of(HostFile h) { return h > 0 && h <= FILE_SLOTS ? file_slot[h] : NULL; }
-
-/* The game's own files (the memory card's saves\cardN folders, mc.c) are named with Windows
-   backslashes. On Android they become real folders: each path below has them turned into slashes
-   (other POSIX builds keep the names as they were). */
-#ifdef __ANDROID__
-static const char *posix_path(const char *path, char *buf, size_t size)
-{
-    if (!path || !strchr(path, '\\')) return path;
-    snprintf(buf, size, "%s", path);
-    for (char *c = buf; *c; c++)
-        if (*c == '\\') *c = '/';
-    return buf;
-}
-#define POSIX_PATH(path) char path##_buf[4096]; path = posix_path(path, path##_buf, sizeof path##_buf)
-#else
-#define POSIX_PATH(path) (void)0
-#endif
-
-HostFile host_file_open(const char *path, unsigned mode)
-{
-    POSIX_PATH(path);
-    FILE *f;
-    int slot;
-    /* The module's WASI open shim has no preopened directories, so an absolute POSIX
-       path arrives with its leading slash removed (observed: "/tmp/x" as "tmp/x");
-       Windows paths have no leading slash and never hit this. A path that fails
-       relative to the process directory is retried from the root; the retry only
-       runs after the plain open already failed, so working opens are untouched. */
-    char *alt = NULL;
-    if (path && path[0] != '/' && !(mode & HOST_FILE_DISCARD)) {
-        size_t n = strlen(path) + 2;
-        alt = malloc(n);
-        if (alt) {
-            alt[0] = '/';
-            memcpy(alt + 1, path, n - 1);
-        }
-    }
-    if (mode & HOST_FILE_WRITE) {
-        const char *kind = mode & HOST_FILE_TRUNCATE ? "w+b" : "r+b";
-        const char *target = mode & HOST_FILE_DISCARD ? "/dev/null" : path;
-        f = fopen(target, kind);
-        if (!f && alt) f = fopen(alt, kind);
-    } else {
-        f = fopen(path, "rb");
-        if (!f && alt) f = fopen(alt, "rb");
-    }
-    free(alt);
-    if (!f) return HOST_FILE_NONE;
-    for (slot = 1; slot <= FILE_SLOTS && file_slot[slot]; slot++)
-        ;
-    if (slot > FILE_SLOTS) {
-        fclose(f);
-        return HOST_FILE_NONE;
-    }
-    file_slot[slot] = f;
-    return slot;
-}
-
-void host_file_close(HostFile h)
-{
-    FILE *f = file_of(h);
-    if (f) {
-        fclose(f);
-        file_slot[h] = NULL;
-    }
-}
-
-int64_t host_file_read(HostFile h, void *dst, size_t size)
-{
-    FILE *f = file_of(h);
-    size_t n;
-    if (!f) return -1;
-    n = fread(dst, 1, size, f);
-    return n < size && ferror(f) ? -1 : (int64_t)n;
-}
-
-size_t host_file_write(HostFile h, const void *src, size_t size)
-{
-    FILE *f = file_of(h);
-    return f ? fwrite(src, 1, size, f) : 0;
-}
-
-int host_file_flush(HostFile h)
-{
-    FILE *f = file_of(h);
-    return f ? fflush(f) : -1;
-}
-
-int host_file_seek(HostFile h, uint64_t offset)
-{
-    FILE *f = file_of(h);
-    return f ? fseeko(f, (off_t)offset, SEEK_SET) : -1;
-}
-
-uint64_t host_file_size(HostFile h)
-{
-    FILE *f = file_of(h);
-    off_t here, end;
-    if (!f || (here = ftello(f)) < 0) return 0;
-    if (fseeko(f, 0, SEEK_END) != 0) return 0;
-    end = ftello(f);
-    fseeko(f, here, SEEK_SET);
-    return end < 0 ? 0 : (uint64_t)end;
-}
-
-/* ---- paths and folders: the memory card's folders ---- */
-#define DIR_SLOTS 16
-static DIR *dir_slot[DIR_SLOTS + 1];
-
-/* A stat time as local time, as the card's directory entries show it. */
-static void host_time_of(time_t t, HostTime *out)
-{
-    struct tm local;
-    memset(out, 0, sizeof *out);
-    if (!localtime_r(&t, &local)) return;
-    out->year = (uint16_t)(local.tm_year + 1900);
-    out->month = (uint16_t)(local.tm_mon + 1);
-    out->day = (uint16_t)local.tm_mday;
-    out->hour = (uint16_t)local.tm_hour;
-    out->minute = (uint16_t)local.tm_min;
-    out->second = (uint16_t)local.tm_sec;
-}
-
-static void dir_entry_of(const char *path, const struct dirent *fd, HostDirEntry *e)
-{
-    struct stat st;
-    char full[4096];
-    memset(e, 0, sizeof *e);
-    snprintf(e->name, sizeof e->name, "%s", fd->d_name);
-    snprintf(full, sizeof full, "%s/%s", path, fd->d_name);
-    e->is_dir = fd->d_type == DT_DIR || (fd->d_type == DT_UNKNOWN && stat(full, &st) == 0 && S_ISDIR(st.st_mode));
-    if (stat(full, &st) == 0) {
-        e->size = (uint32_t)st.st_size;
-        host_time_of(st.st_ctime, &e->created);
-        host_time_of(st.st_mtime, &e->modified);
-    }
-}
-
-/* The open directory remembers its path for entry stats. */
-static char dir_path[DIR_SLOTS + 1][4096];
-
-HostDir host_dir_open(const char *path, HostDirEntry *first)
-{
-    struct dirent *fd;
-    DIR *d;
-    int slot;
-    POSIX_PATH(path);
-    d = opendir(path);
-    if (!d) return HOST_DIR_NONE;
-    for (slot = 1; slot <= DIR_SLOTS && dir_slot[slot]; slot++)
-        ;
-    if (slot > DIR_SLOTS) {
-        closedir(d);
-        return HOST_DIR_NONE;
-    }
-    /* Skip nothing: "." and ".." are listed, as on Windows. */
-    fd = readdir(d);
-    if (!fd) {
-        closedir(d);
-        return HOST_DIR_NONE;
-    }
-    dir_slot[slot] = d;
-    snprintf(dir_path[slot], sizeof dir_path[slot], "%s", path);
-    dir_entry_of(path, fd, first);
-    return slot;
-}
-
-int host_dir_next(HostDir d, HostDirEntry *e)
-{
-    struct dirent *fd;
-    if (d <= 0 || d > DIR_SLOTS || !dir_slot[d]) return 0;
-    fd = readdir(dir_slot[d]);
-    if (!fd) return 0;
-    dir_entry_of(dir_path[d], fd, e);
-    return 1;
-}
-
-void host_dir_close(HostDir d)
-{
-    if (d > 0 && d <= DIR_SLOTS && dir_slot[d]) {
-        closedir(dir_slot[d]);
-        dir_slot[d] = NULL;
-    }
-}
-
-int host_path_is_dir(const char *path)
-{
-    struct stat st;
-    POSIX_PATH(path);
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-int host_path_exists(const char *path)
-{
-    struct stat st;
-    POSIX_PATH(path);
-    return stat(path, &st) == 0;
-}
-
-int host_dir_create(const char *path)
-{
-    POSIX_PATH(path);
-    return mkdir(path, 0777) == 0 || errno == EEXIST ? 1 : 0;
-}
-
-/* ---- time and waiting: the wall clock (the game's own clock is virtual, kernel.c) ---- */
-double host_wall_seconds(void)
-{
-    static struct timespec start;
-    static int have;
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    if (!have) {
-        start = t;
-        have = 1;
-    }
-    return (double)(t.tv_sec - start.tv_sec) + (double)(t.tv_nsec - start.tv_nsec) / 1e9;
-}
-
-void host_sleep_ms(unsigned ms)
-{
-    struct timespec t = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
-    nanosleep(&t, NULL);
-}
-
-/* Until a monotonic-clock time: sleep to a millisecond before it (timer slack
-   is left to the kernel), then a yield-instruction spin. */
-void host_wait_wall(double seconds)
-{
-    double left = seconds - host_wall_seconds();
-    if (left > 0.001) {
-        struct timespec t = {(time_t)left, (long)((left - (time_t)left) * 1e9) - 1000000L};
-        if (t.tv_nsec < 0) {
-            t.tv_sec--;
-            t.tv_nsec += 1000000000L;
-        }
-        if (t.tv_sec >= 0) nanosleep(&t, NULL);
-    }
-    while (host_wall_seconds() < seconds)
-        sched_yield();
-}
-
 /* ---- memory protection and access faults (graphics.c, deferred store-image reads) ---- */
+static uintptr_t os_page(void)
+{
+    static uintptr_t page;
+    if (!page) page = (uintptr_t)sysconf(_SC_PAGESIZE);
+    return page;
+}
+
 int host_mem_protect(uint32_t at, uint32_t size, int protection)
 {
-    /* Page-align the range the way the OS requires; the caller's exact range
-       keeps its protection inside it. */
-    uintptr_t base = (uintptr_t)GUEST(at);
-    uintptr_t lo = base & ~(uintptr_t)4095, hi = (base + size + 4095) & ~(uintptr_t)4095;
+    /* Page-align the range the way the OS requires (its page: 16 KiB on Apple silicon and some
+       Android devices); the caller's exact range keeps its protection inside it. */
+    uintptr_t page = os_page(), base = (uintptr_t)GUEST(at);
+    uintptr_t lo = base & ~(page - 1), hi = (base + size + page - 1) & ~(page - 1);
     if (hi < base) return 0;
     return mprotect((void *)lo, hi - lo, protection == HOST_MEM_NOACCESS ? PROT_NONE : PROT_READ | PROT_WRITE) == 0;
 }
@@ -411,7 +156,9 @@ int host_mem_protect(uint32_t at, uint32_t size, int protection)
    installed it. The module's handler commits the page and returns 1 (the
    faulting access is retried); 0 passes the fault to the previous handler
    (the guest allocator's reporter, which ends the process with the guest
-   address). Only the installing thread is guarded. */
+   address). Only the installing thread is guarded. The module guards 4 KiB
+   pages; where the OS page is larger, a fault anywhere in it is offered for
+   each 4 KiB page it holds. */
 static _Thread_local int (*guard_on_fault)(uint32_t address);
 static _Thread_local int guard_armed;
 static struct sigaction guard_old_segv, guard_old_bus;
@@ -423,7 +170,10 @@ static void guard_fault(int sig, siginfo_t *info, void *ctx)
     uintptr_t host = (uintptr_t)info->si_addr;
     (void)ctx;
     if (guard_armed && guard_on_fault && host >= guest_base && host - guest_base < 0x100000000ull) {
-        if (guard_on_fault((uint32_t)(host - guest_base))) return; /* retry the access */
+        uint32_t at = (uint32_t)(host - guest_base), page = (uint32_t)os_page();
+        if (guard_on_fault(at)) return; /* retry the access */
+        for (uint32_t sub = at & ~(page - 1); page > 4096 && sub < (at & ~(page - 1)) + page; sub += 4096)
+            if (sub != (at & ~4095u) && guard_on_fault(sub)) return;
     }
     /* Not ours, or not handled: run the previous handler. */
     struct sigaction *old = sig == SIGSEGV ? &guard_old_segv : &guard_old_bus;
@@ -467,59 +217,23 @@ int host_fault_guard(int (*on_fault)(uint32_t address))
 
 int host_fault_guard_here(void) { return guard_armed; }
 
-/* ---- threads: a fire-and-forget job (online_menu.c) ---- */
-typedef struct {
-    void (*fn)(void *);
-    void *arg;
-} DetachedStart;
-
-static void *detached_run(void *p)
-{
-    DetachedStart start = *(DetachedStart *)p;
-    free(p);
-    start.fn(start.arg);
-    return NULL;
-}
-
-int host_thread_detach(void (*fn)(void *), void *arg)
-{
-    DetachedStart *start = malloc(sizeof *start);
-    pthread_t t;
-    pthread_attr_t attr;
-    if (!start) return 0;
-    start->fn = fn;
-    start->arg = arg;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&t, &attr, detached_run, start) != 0) {
-        free(start);
-        pthread_attr_destroy(&attr);
-        return 0;
-    }
-    pthread_attr_destroy(&attr);
-    return 1;
-}
-
-/* ---- a path's size and last write time (online.c's cache key) ----
-   The size in bytes and the write time in 100 ns ticks since 1601 (Windows
-   FILETIME); 1 if it exists. */
-int host_path_info(const char *path, uint64_t *size, uint64_t *write_time)
-{
-    struct stat st;
-    POSIX_PATH(path);
-    if (stat(path, &st) != 0) return 0;
-    *size = (uint64_t)st.st_size;
-    *write_time = ((uint64_t)st.st_mtime + 11644473600ull) * 10000000ull;
-    return 1;
-}
-
 /* dhd64's .text: the section of the image that holds the code, by its ELF
-   program headers (the PE walk's counterpart in host_win32.c). */
+   program headers or its Mach-O __TEXT segment (the PE walk's counterpart in
+   host_win32.c). */
 void host_code_range(uintptr_t *lo, uintptr_t *hi)
 {
     static uintptr_t base, extent;
     static int have;
     *lo = *hi = 0;
+#ifdef __APPLE__
+    if (!have) {
+        Dl_info self;
+        unsigned long size = 0;
+        uint8_t *text = dladdr((void *)host_code_range, &self) && self.dli_fbase
+                        ? getsegmentdata((const struct mach_header_64 *)self.dli_fbase, "__TEXT", &size) : NULL;
+        base = (uintptr_t)text, extent = text ? size : 0, have = 1;
+    }
+#else
     if (!have) {
         char path[4096];
 #ifdef __ANDROID__
@@ -556,6 +270,7 @@ void host_code_range(uintptr_t *lo, uintptr_t *hi)
             }
         }
     }
+#endif
     if (extent) {
         *lo = base;
         *hi = base + extent;
@@ -619,148 +334,29 @@ void host_heartbeat_start(void (*beat)(void))
    host PC the way the i686 watchdog does; the generated boundary reports 0. */
 uintptr_t host_heartbeat_eip(void) { return 0; }
 
-void host_console_write(uint32_t address, uint32_t bytes)
+#ifdef __APPLE__
+/* The frame waits' sleep (host_os.h). macOS coalesces the timers of a process it doesn't treat as
+   interactive: a 15.7 ms sleep from a process started in the background (ssh) woke 4.6 ms late on
+   average, 8.2 at worst (300 sleeps, an M1, 2026-10-27; public PR #6 saw ~6). For the sleep alone
+   the thread is a time-constraint one, whose timers aren't coalesced: 0.02 ms late, 0.04 at worst.
+   None of the game's work runs at that priority. */
+void host_os_sleep_ns(unsigned long long ns)
 {
-    fwrite(GUEST(address), 1, bytes, stderr);
-    fflush(stderr);
+    static mach_timebase_info_data_t base;
+    if (!base.denom) mach_timebase_info(&base);
+    thread_port_t self = pthread_mach_thread_np(pthread_self());
+    uint32_t ms = (uint32_t)(1000000ull * base.denom / base.numer);  /* a millisecond in Mach time units */
+    thread_time_constraint_policy_data_t rt = {16 * ms, ms / 2, 16 * ms, 1};
+    int precise = thread_policy_set(self, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&rt,
+                                    THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS;
+    struct timespec t = {(time_t)(ns / 1000000000u), (long)(ns % 1000000000u)};
+    while (nanosleep(&t, &t) < 0 && errno == EINTR) {}
+    if (precise) {
+        thread_standard_policy_data_t standard = {0};
+        thread_policy_set(self, THREAD_STANDARD_POLICY, (thread_policy_t)&standard, THREAD_STANDARD_POLICY_COUNT);
+    }
 }
+#endif
 
-/* ---- async services: file SHA-256 and the lobby list (online_menu.c) ----
-   The blocking part runs on a host thread; only results cross, as guest-address
-   buffers the game thread copies at poll time. One job of each kind runs at a
-   time. The mutex guards the state; the worker publishes its result before
-   marking itself done, and the poller copies it before idling. */
-static pthread_mutex_t async_lock = PTHREAD_MUTEX_INITIALIZER;
-static int sha_job;  /* 0 idle, 1 working, 2 done, 3 failed */
-static char sha_path[1024];
-static uint8_t sha_digest[32];
-
-static void *sha_run(void *unused)
-{
-    static uint8_t buf[1 << 20];
-    Sha256 hash;
-    FILE *f;
-    int ok = 0;
-    (void)unused;
-    f = fopen(sha_path, "rb");
-    if (f) {
-        size_t n;
-        sha256_init(&hash);
-        while ((n = fread(buf, 1, sizeof buf, f)) > 0) sha256_update(&hash, buf, n);
-        ok = !ferror(f);
-        sha256_final(&hash, sha_digest);
-        fclose(f);
-    }
-    pthread_mutex_lock(&async_lock);
-    sha_job = ok ? 2 : 3;
-    pthread_mutex_unlock(&async_lock);
-    return NULL;
-}
-
-int host_service_file_sha256_start(uint32_t path)
-{
-    const char *at = GUEST(path);
-    pthread_t t;
-    pthread_attr_t attr;
-    pthread_mutex_lock(&async_lock);
-    if (sha_job) {
-        pthread_mutex_unlock(&async_lock);
-        return 0;
-    }
-    if (!path || strlen(at) >= sizeof sha_path) {
-        pthread_mutex_unlock(&async_lock);
-        return 0;
-    }
-    snprintf(sha_path, sizeof sha_path, "%s", at);
-    sha_job = 1;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&t, &attr, sha_run, NULL) != 0) {
-        sha_job = 0;
-        pthread_attr_destroy(&attr);
-        pthread_mutex_unlock(&async_lock);
-        return 0;
-    }
-    pthread_attr_destroy(&attr);
-    pthread_mutex_unlock(&async_lock);
-    return 1;
-}
-
-int host_service_file_sha256_poll(uint32_t digest)
-{
-    int s;
-    pthread_mutex_lock(&async_lock);
-    s = sha_job;
-    if (s == 2) {
-        memcpy(GUEST(digest), sha_digest, sizeof sha_digest);
-        sha_job = 0;
-    } else if (s == 3) {
-        sha_job = 0;
-    }
-    pthread_mutex_unlock(&async_lock);
-    return s == 1 ? 0 : s == 2 ? 1 : -1;
-}
-
-/* The lobby fetch: entries published here, copied to the guest buffer at poll time. */
-#define ASYNC_LOBBY_MAX 64
-static int lobby_job;  /* 0 idle, 1 working, 2 done, 3 failed */
-static NetLobbyInfo lobby_list[ASYNC_LOBBY_MAX];
-static int lobby_max, lobby_count;
-
-static void *lobby_run(void *unused)
-{
-    int n;
-    (void)unused;
-    n = net_list_lobbies(lobby_list, lobby_max);
-    pthread_mutex_lock(&async_lock);
-    if (n < 0) {
-        lobby_job = 3;
-    } else {
-        lobby_count = n;
-        lobby_job = 2;
-    }
-    pthread_mutex_unlock(&async_lock);
-    return NULL;
-}
-
-int host_service_net_list_lobbies_start(int max)
-{
-    pthread_t t;
-    pthread_attr_t attr;
-    if (max <= 0 || max > ASYNC_LOBBY_MAX) return 0;
-    pthread_mutex_lock(&async_lock);
-    if (lobby_job) {
-        pthread_mutex_unlock(&async_lock);
-        return 0;
-    }
-    lobby_max = max;
-    lobby_count = -1;
-    lobby_job = 1;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&t, &attr, lobby_run, NULL) != 0) {
-        lobby_job = 0;
-        pthread_attr_destroy(&attr);
-        pthread_mutex_unlock(&async_lock);
-        return 0;
-    }
-    pthread_attr_destroy(&attr);
-    pthread_mutex_unlock(&async_lock);
-    return 1;
-}
-
-int host_service_net_list_lobbies_poll(uint32_t out, int max)
-{
-    int s, n;
-    pthread_mutex_lock(&async_lock);
-    s = lobby_job;
-    n = lobby_count;
-    if (s == 2) lobby_job = 0;
-    else if (s == 3) lobby_job = 0;
-    pthread_mutex_unlock(&async_lock);
-    if (s == 1) return -2;
-    if (s != 2) return -1;
-    n = n < max ? n : max;
-    if (n > 0) memcpy(GUEST(out), lobby_list, (size_t)n * sizeof lobby_list[0]);
-    return n;
-}
+/* ---- files (host_os.h): the C library's ---- */
+FILE *host_os_fopen(const char *path, const char *mode) { return fopen(path, mode); }

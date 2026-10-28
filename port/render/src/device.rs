@@ -4,7 +4,8 @@
 //! (last at render/rust 3882d5576; the line numbers below are that file's), written out explicitly
 //! (finding 085 question 1):
 //! - InstanceFlags empty, no `with_env()`; DEBUG | VALIDATION only for `DHDR_DEV_DEBUG` /
-//!   `DHDR_DEV_VALIDATION`. Backends DX12, or VULKAN for `DHDR_DEV_VULKAN`.
+//!   `DHDR_DEV_VALIDATION`. Backends (`backends`): on Windows DX12, or VULKAN for
+//!   `DHDR_DEV_VULKAN`; METAL on Apple platforms; VULKAN elsewhere (Linux, Android).
 //! - DX12 compiler: FXC for `DHDR_DEV_FXC` or no `dxc_path`, else `DynamicDxc { dxc_path }`; every
 //!   other DX12 option default. No memory budget thresholds.
 //! - Adapter: `DHDR_DEV_FALLBACK` = the fallback (WARP) adapter; else the enumerated adapter with
@@ -94,10 +95,14 @@ pub fn shader_compiler(o: &DeviceOptions) -> wgpu::Dx12Compiler {
     }
 }
 
-/// The instance flags `o` asks for: none, or DEBUG / VALIDATION for `DHDR_DEV_DEBUG` /
-/// `DHDR_DEV_VALIDATION` (wgpu-native's `WGPUInstanceFlag_*`; never `with_env()`).
+/// The instance flags `o` asks for: DEBUG / VALIDATION for `DHDR_DEV_DEBUG` /
+/// `DHDR_DEV_VALIDATION` (wgpu-native's `WGPUInstanceFlag_*`; never `with_env()`), and always
+/// ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER: wgpu's Vulkan backend otherwise hides every driver
+/// reporting conformance 0.0.0.0, such as Mesa's dzn (Vulkan on Direct3D 12, the GPU in WSL2),
+/// and the game then finds no adapter at all. The high-performance choice still puts a discrete
+/// GPU before a CPU one (llvmpipe). Only the Vulkan backend reads it.
 pub fn instance_flags(o: &DeviceOptions) -> wgpu::InstanceFlags {
-    let mut f = wgpu::InstanceFlags::empty();
+    let mut f = wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
     if o.flags & DHDR_DEV_DEBUG != 0 {
         f |= wgpu::InstanceFlags::DEBUG;
     }
@@ -107,12 +112,15 @@ pub fn instance_flags(o: &DeviceOptions) -> wgpu::InstanceFlags {
     f
 }
 
-/// The backend `o` asks for: DX12, or Vulkan for `DHDR_DEV_VULKAN`.
+/// The platform's backend: on Windows DX12, or Vulkan for `DHDR_DEV_VULKAN`; Metal on Apple
+/// platforms; Vulkan everywhere else (Linux, Android), whatever the flags say.
 pub fn backends(o: &DeviceOptions) -> wgpu::Backends {
-    if o.flags & DHDR_DEV_VULKAN != 0 {
-        wgpu::Backends::VULKAN
-    } else {
+    if cfg!(target_vendor = "apple") {
+        wgpu::Backends::METAL
+    } else if cfg!(windows) && o.flags & DHDR_DEV_VULKAN == 0 {
         wgpu::Backends::DX12
+    } else {
+        wgpu::Backends::VULKAN
     }
 }
 
@@ -186,9 +194,14 @@ mod native {
         let info = adapter.get_info();
         let dual = adapter.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING)
             && o.flags & DHDR_DEV_NO_DUAL_SOURCE == 0;
+        let mut features = if dual { wgpu::Features::DUAL_SOURCE_BLENDING } else { wgpu::Features::empty() };
+        // DHD_GPU_TIMES (diagnostics: native/pipelines.rs's gputimes) only.
+        if crate::native::pipelines::gputimes::wanted() {
+            features |= adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features: if dual { wgpu::Features::DUAL_SOURCE_BLENDING } else { wgpu::Features::empty() },
+            required_features: features,
             // the adapter's own, so a 4 MB bin list always fits (gpu_wgpu.c:195)
             required_limits: adapter.limits(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -286,6 +299,14 @@ pub fn adapter_name() -> &'static CStr {
 /// `DHDR_FEAT_*` (0 before init).
 pub fn features() -> u32 {
     GPU.get().map_or(0, |g| g.features)
+}
+
+/// `dhdr_device_max_texture` (`dhd_render_ext.h`): the device's largest 2D texture side, 0 before
+/// init. The native renderer's scale limit in C (`gpu_rust_shared.inc`'s `native_scale_hold`).
+#[no_mangle]
+pub extern "C" fn dhdr_device_max_texture() -> u32 {
+    let _g = crate::guard::Guard::enter("dhdr_device_max_texture");
+    GPU.get().map_or(0, |g| g.device.limits().max_texture_dimension_2d)
 }
 
 /// `DHDR_FEAT_DUAL_SOURCE` of `g`.

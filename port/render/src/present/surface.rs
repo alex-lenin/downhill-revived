@@ -3,8 +3,10 @@
 //!
 //! As the retired `gpu_wgpu.c`'s wgpu_surface / surface_configure / wgpu_present (last at
 //! render/rust 3882d5576): a surface on the window
-//! (`DHDR_WINDOW_WIN32`: a = HWND, b = HINSTANCE; kinds 3-6 refused by `ffi.rs`), RGBA8Unorm
-//! required; present mode Immediate > Mailbox > Fifo (`DHDR_PRESENT_NO_TEARING`: no Immediate;
+//! (each native build takes its platform's kinds, `Surface::KINDS`: Win32's HWND, X11's or
+//! Wayland's window, Android's ANativeWindow, Apple's CAMetalLayer), in RGBA8Unorm, else BGRA8Unorm
+//! (`surface_format`: whichever the surface offers first in that order; Apple's CAMetalLayer has no
+//! RGBA8), the present pipelines drawing into that format; present mode Immediate > Mailbox > Fifo (`DHDR_PRESENT_NO_TEARING`: no Immediate;
 //! `DHDR_PRESENT_VSYNC`: Fifo); desired maximum frame latency 1; alpha Opaque; usage
 //! RENDER_ATTACHMENT, plus COPY_SRC when the surface offers it (`DHDR_SURFACE_COPY_SRC`, for the
 //! test hook). Configured to the window's size, reconfigured when it changes or the frame is
@@ -65,6 +67,8 @@ pub struct Surface {
     usage: wgpu::TextureUsages,
     present_mode: wgpu::PresentMode,
     alpha_mode: wgpu::CompositeAlphaMode,
+    /// The frames' format (`surface_format`; the present pipelines target it).
+    format: wgpu::TextureFormat,
     /// The configured size; 0 x 0 before the first configure.
     width: u32,
     height: u32,
@@ -93,73 +97,108 @@ fn write_pixels(gpu: &Gpu, texture: &wgpu::Texture, pixels: &[u32], w: u32, h: u
     );
 }
 
+/// The window kinds this build takes (`dhdr_surface_create`): its platform's.
+#[cfg(windows)]
+const PLATFORM_KINDS: &[u32] = &[DHDR_WINDOW_WIN32];
+#[cfg(target_os = "android")]
+const PLATFORM_KINDS: &[u32] = &[DHDR_WINDOW_ANDROID];
+#[cfg(target_vendor = "apple")]
+const PLATFORM_KINDS: &[u32] = &[DHDR_WINDOW_METAL_LAYER];
+#[cfg(all(unix, not(target_os = "android"), not(target_vendor = "apple")))]
+const PLATFORM_KINDS: &[u32] = &[DHDR_WINDOW_XLIB, DHDR_WINDOW_WAYLAND];
+#[cfg(target_arch = "wasm32")]
+const PLATFORM_KINDS: &[u32] = &[];
+
+/// The frames' format among the surface's: RGBA8Unorm, the format of every picture the renderer
+/// draws (and of the browser's canvas), else BGRA8Unorm (the same bytes, swizzled by the present
+/// pass's target: Apple's CAMetalLayer, some Vulkan drivers). None when it has neither.
+pub fn surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Bgra8Unorm].into_iter().find(|f| formats.contains(f))
+}
+
+/// A non-null handle of `what`.
+#[cfg(not(target_arch = "wasm32"))]
+fn handle(value: u64, what: &str) -> Result<std::ptr::NonNull<std::ffi::c_void>, String> {
+    std::ptr::NonNull::new(value as usize as *mut std::ffi::c_void).ok_or_else(|| format!("NULL {what}"))
+}
+
 impl Surface {
-    /// `dhdr_surface_create`: present.wgsl's pipeline, then a surface on the Win32 window.
+    pub const KINDS: &'static [u32] = PLATFORM_KINDS;
+
+    /// `dhdr_surface_create` takes `kind` in this build.
+    pub fn supports(kind: u32) -> bool {
+        Self::KINDS.contains(&kind)
+    }
+
+    /// `dhdr_surface_create`: a surface on the window, then present.wgsl's pipeline into its format.
     pub fn create(gpu: &'static Gpu, window: &DhdrWindow, present_flags: u32) -> Result<Surface, String> {
-        if window.kind != DHDR_WINDOW_WIN32 && window.kind != DHDR_WINDOW_ANDROID {
+        if !Self::supports(window.kind) {
             return Err(format!("window kind {} is not supported", window.kind));
         }
-        let pipe = PresentPipe::create(gpu).ok_or("no present pipeline")?;
-        let surface = if window.kind == DHDR_WINDOW_ANDROID { Self::android(gpu, window)? } else { Self::win32(gpu, window)? };
+        let surface = Self::window(gpu, window)?;
+        let formats = surface.get_capabilities(&gpu.adapter).formats;
+        let format = surface_format(&formats)
+            .ok_or_else(|| format!("the surface has neither rgba8unorm nor bgra8unorm (formats {formats:?})"))?;
+        let pipe = PresentPipe::create(gpu, format).ok_or("no present pipeline")?;
         Self::from_wgpu(gpu, surface, present_flags, pipe)
     }
 
-    /// `DHDR_WINDOW_ANDROID`: a = the ANativeWindow (SDL's SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER),
-    /// on Vulkan (finding 091). The Vulkan surface holds its own reference to the window.
-    #[cfg(target_os = "android")]
-    fn android(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
-        let native = std::ptr::NonNull::new(window.a as usize as *mut std::ffi::c_void).ok_or("NULL ANativeWindow")?;
-        let handle = raw_window_handle::AndroidNdkWindowHandle::new(native);
-        // SAFETY: C keeps the window alive until dhdr_surface_destroy (present.c drops the surface
-        // when the app goes to the background, before SDL releases the window).
-        unsafe {
-            gpu.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(raw_window_handle::RawDisplayHandle::Android(
-                    raw_window_handle::AndroidDisplayHandle::new(),
-                )),
-                raw_window_handle: raw_window_handle::RawWindowHandle::AndroidNdk(handle),
-            })
-        }
-        .map_err(|e| format!("create_surface: {e}"))
-    }
-
-    #[cfg(not(target_os = "android"))]
-    fn android(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
-        let _ = (gpu, window);
-        Err("Android windows are the Android build's only".into())
-    }
-
+    /// The wgpu surface on `window` (a kind of `KINDS`: `create` checked it). C keeps the window
+    /// alive until dhdr_surface_destroy (present.c destroys the surface before the window, and on
+    /// a phone drops it when the app goes to the background, before SDL releases the window).
     #[cfg(not(target_arch = "wasm32"))]
-    fn win32(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
-        let hwnd = std::num::NonZeroIsize::new(window.a as isize).ok_or("NULL HWND")?;
-        let mut handle = raw_window_handle::Win32WindowHandle::new(hwnd);
-        handle.hinstance = std::num::NonZeroIsize::new(window.b as isize);
-        // SAFETY: C keeps the window alive until dhdr_surface_destroy (present.c destroys the
-        // surface before the window).
-        unsafe {
-            gpu.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(raw_window_handle::RawDisplayHandle::Windows(
-                    raw_window_handle::WindowsDisplayHandle::new(),
-                )),
-                raw_window_handle: raw_window_handle::RawWindowHandle::Win32(handle),
-            })
-        }
-        .map_err(|e| format!("create_surface: {e}"))
+    fn window(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
+        use raw_window_handle::{RawDisplayHandle as D, RawWindowHandle as W};
+        let target = match window.kind {
+            // a = the CAMetalLayer of SDL's Metal view (SDL_Metal_GetLayer); wgpu has the variant where
+            // its Metal backend is built
+            #[cfg(target_vendor = "apple")]
+            DHDR_WINDOW_METAL_LAYER => wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(handle(window.a, "CAMetalLayer")?.as_ptr()),
+            kind => {
+                let (display, window) = match kind {
+                    DHDR_WINDOW_WIN32 => {
+                        let hwnd = std::num::NonZeroIsize::new(window.a as isize).ok_or("NULL HWND")?;
+                        let mut w = raw_window_handle::Win32WindowHandle::new(hwnd);
+                        w.hinstance = std::num::NonZeroIsize::new(window.b as isize);
+                        (D::Windows(raw_window_handle::WindowsDisplayHandle::new()), W::Win32(w))
+                    }
+                    // a = the ANativeWindow (SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER), on Vulkan
+                    // (finding 091); the Vulkan surface holds its own reference to it
+                    DHDR_WINDOW_ANDROID => (D::Android(raw_window_handle::AndroidDisplayHandle::new()),
+                                            W::AndroidNdk(raw_window_handle::AndroidNdkWindowHandle::new(handle(window.a, "ANativeWindow")?))),
+                    // a = the X11 Display, b = the Window (SDL_PROP_WINDOW_X11_*)
+                    DHDR_WINDOW_XLIB => {
+                        let id = std::ffi::c_ulong::try_from(window.b).ok().filter(|&id| id != 0).ok_or("no X11 window")?;
+                        (D::Xlib(raw_window_handle::XlibDisplayHandle::new(Some(handle(window.a, "X11 Display")?), 0)),
+                         W::Xlib(raw_window_handle::XlibWindowHandle::new(id)))
+                    }
+                    // a = the wl_display, b = the wl_surface (SDL_PROP_WINDOW_WAYLAND_*)
+                    DHDR_WINDOW_WAYLAND => (D::Wayland(raw_window_handle::WaylandDisplayHandle::new(handle(window.a, "wl_display")?)),
+                                            W::Wayland(raw_window_handle::WaylandWindowHandle::new(handle(window.b, "wl_surface")?))),
+                    kind => return Err(format!("window kind {kind} is not supported")),
+                };
+                wgpu::SurfaceTargetUnsafe::RawHandle { raw_display_handle: Some(display), raw_window_handle: window }
+            }
+        };
+        // SAFETY: the window outlives the surface (above).
+        unsafe { gpu.instance.create_surface_unsafe(target) }.map_err(|e| format!("create_surface: {e}"))
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn win32(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
+    fn window(gpu: &Gpu, window: &DhdrWindow) -> Result<wgpu::Surface<'static>, String> {
         let _ = (gpu, window);
         Err("no window surfaces in the browser (dhdr_web_surface)".into())
     }
 
-    /// A surface over `surface` (the window's, or B1's OffscreenCanvas): checks the capabilities and
-    /// picks the present mode, alpha mode and usage. Configured on the first acquire.
+    /// A surface over `surface` (the window's, or B1's OffscreenCanvas) in `pipe`'s format: checks
+    /// the capabilities and picks the present mode, alpha mode and usage. Configured on the first
+    /// acquire.
     pub fn from_wgpu(gpu: &'static Gpu, surface: wgpu::Surface<'static>, present_flags: u32, pipe: PresentPipe)
                      -> Result<Surface, String> {
         let caps = surface.get_capabilities(&gpu.adapter);
-        if !caps.formats.contains(&wgpu::TextureFormat::Rgba8Unorm) {
-            return Err(format!("the surface has no rgba8unorm (formats {:?})", caps.formats));
+        let format = pipe.format;
+        if !caps.formats.contains(&format) {
+            return Err(format!("the surface has no {format:?} (formats {:?})", caps.formats));
         }
         let offers = |m: wgpu::PresentMode| caps.present_modes.contains(&m);
         let present_mode = if present_flags & DHDR_PRESENT_VSYNC != 0 {
@@ -178,7 +217,7 @@ impl Surface {
         };
         // COPY_SRC lets the test hook read the presented texture back; not needed otherwise.
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | (caps.usages & wgpu::TextureUsages::COPY_SRC);
-        Ok(Surface { gpu, frame: None, surface, usage, present_mode, alpha_mode, width: 0, height: 0, pipe, own: None })
+        Ok(Surface { gpu, frame: None, surface, usage, present_mode, alpha_mode, format, width: 0, height: 0, pipe, own: None })
     }
 
     /// `DHDR_SURFACE_COPY_SRC` when the frames can be copied from.
@@ -188,6 +227,11 @@ impl Surface {
         } else {
             0
         }
+    }
+
+    /// The frames' format (the native present pass's target, `Objects::present_pipe`).
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
     }
 
     /// The configured size (the present pass's target size).
@@ -203,7 +247,7 @@ impl Surface {
         let (width, height) = (width.min(max), height.min(max));
         self.surface.configure(&self.gpu.device, &wgpu::SurfaceConfiguration {
             usage: self.usage,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: self.format,
             width,
             height,
             present_mode: self.present_mode,
@@ -302,6 +346,7 @@ impl Surface {
         let source = match exact {
             Some(e) => {
                 e.submit(); // the scanout, before the picture is replaced or shown
+                e.frame_end(); // the GPU one frame behind at most, minimised too
                 if let Some(pixels) = pixels {
                     // C returns 0 (skip, keep presenting) for a frame the display texture can't hold.
                     if let Err(err) = e.display_upload(pixels, w, h) {

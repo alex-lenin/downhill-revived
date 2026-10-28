@@ -12,13 +12,7 @@
    The renderer draws it in place of the original with mipmaps (as a texture pack's replacement;
    a pack that has the font wins). Nothing is written to disk. dhd.ini font = original keeps the
    game's texture. The renderer makes the texture (replace_texture.h). */
-#define COBJMACROS
-#define WIN32_LEAN_AND_MEAN
-#if defined(_WIN32) || defined(DHD_WEB_HOST)  /* the web build swaps windows.h for its lock stub */
-#include <windows.h>
-#else
-#include "../host/win32_compat.h"  /* SRWLOCK (the Android build) */
-#endif
+#include <SDL3/SDL_atomic.h>  /* SDL_SpinLock, SDL_strcasecmp; the web build swaps in its one-thread stub */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +36,7 @@ int font_sharp_on(void)
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("DHD_FONT");
-        on = !(v && (!_stricmp(v, "original") || !_stricmp(v, "off") || !strcmp(v, "0")));
+        on = !(v && (!SDL_strcasecmp(v, "original") || !SDL_strcasecmp(v, "off") || !strcmp(v, "0")));
     }
     return on;
 }
@@ -64,7 +58,7 @@ int font_sharp_match(uint64_t tex0)
 static struct { uint64_t key; void *view; unsigned long used; } cache[SHARP_CACHE];
 static void (*cache_release)(void *view);  /* the device the cached views came from */
 static unsigned long cache_clock;
-static SRWLOCK cache_lock = SRWLOCK_INIT;
+static SDL_SpinLock cache_lock;
 
 /* The cubic B-spline's four weights at fraction t. */
 static void bspline(float t, float w[4])
@@ -216,7 +210,7 @@ static void *make(const ReplaceDevice *device, const uint32_t *pixels, unsigned 
 void *font_sharp_view(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h, uint64_t key)
 {
     void *view = NULL;
-    AcquireSRWLockExclusive(&cache_lock);
+    SDL_LockSpinlock(&cache_lock);
     unsigned oldest = 0;
     for (unsigned i = 0; i < SHARP_CACHE; i++) {
         if (cache[i].view && cache[i].key == key) {
@@ -233,6 +227,6 @@ void *font_sharp_view(const ReplaceDevice *device, const uint32_t *pixels, unsig
         cache_release = device->release;
         device->retain(view);
     }
-    ReleaseSRWLockExclusive(&cache_lock);
+    SDL_UnlockSpinlock(&cache_lock);
     return view;
 }

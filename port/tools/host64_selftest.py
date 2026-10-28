@@ -1,11 +1,13 @@
 """Build/run the independent wasm2c x64 runtime test (no game data).
 
 Windows (default on Windows): clang-cl/lld-link with guest_memory_win32.c and
-fiber_x64.c. Linux (--linux, the default when run on Linux): clang/ELF with
-guest_memory_posix.c and fiber_posix.c. Invoke the Linux mode from inside WSL.
+the fibers' Windows x64 switch (fiber_win64.c). Linux (--linux, the default when
+run on Linux): clang/ELF with guest_memory_posix.c and the System V x64 or
+AArch64 switch. Invoke the Linux mode from inside WSL.
 """
 import argparse
 import os
+import platform
 import signal
 import sys
 from pathlib import Path
@@ -71,7 +73,8 @@ def main():
                   '-I'+str(wabt/'include'), '-I'+str(rt), '-I'+str(source), '-I'+str(out)]
         if a.optimized:
             common += ['-O3', '-march=x86-64-v2', '-mtune=znver3']
-        os_sources = ('guest_memory.c', 'guest_memory_posix.c', 'fiber_posix.c',
+        switch = 'fiber_arm64.c' if platform.machine() in ('aarch64', 'arm64') else 'fiber_sysv64.c'
+        os_sources = ('guest_memory.c', 'guest_memory_posix.c', 'fiber.c', switch,
                       'fp_mode.c', 'selftest_host.c')
     else:
         msvc = Path('C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231')
@@ -86,7 +89,7 @@ def main():
         if a.optimized:
             common += ['/clang:-O3', '/clang:-march=x86-64-v2',
                        '/clang:-mtune=znver3']
-        os_sources = ('guest_memory.c', 'guest_memory_win32.c', 'fiber_x64.c',
+        os_sources = ('guest_memory.c', 'guest_memory_win32.c', 'fiber.c', 'fiber_win64.c',
                       'fp_mode.c', 'selftest_host.c')
     objects = []
     obj_suffix = '.o' if linux else '.obj'
@@ -142,7 +145,7 @@ def main():
         if result.returncode!=1 or 'w2c_core_memory_test(&core)==0' not in result.stderr:
             raise RuntimeError(f'no-mirror-fix: expected mirror assertion missing: {result.stderr}')
         print('PASS negative control no-mirror-fix: /O2 mirror assertion caught omission', flush=True)
-        fiber_source = source/('fiber_posix.c' if linux else 'fiber_x64.c')
+        fiber_source = source/'fiber.c'
         original = fiber_source.read_text()
         for name, needle, diagnostic in (
             ('no-sp', '*module_sp=fibers[to].sp;', 'address>=top-0x40000'),
@@ -162,7 +165,7 @@ def main():
                 obj = out/(name+'.obj')
                 run(common+['/c', broken, '/Fo'+str(obj)])
                 neg = out/(name+'.exe')
-                run([str(obj) if str(x)==str(out/'fiber_x64.obj') else
+                run([str(obj) if str(x)==str(out/'fiber.obj') else
                      '/Fe'+str(neg) if str(x).startswith('/Fe') else x for x in link])
             result = subprocess.run([str(neg)], cwd=out, env=env,
                                     capture_output=True, text=True, timeout=30)

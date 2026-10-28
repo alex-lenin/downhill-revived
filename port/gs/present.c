@@ -3,17 +3,14 @@
    (gpu.h, the Rust renderer) presents it on its surface on the window. */
 #ifdef _WIN32
 #include <windows.h>
-#else
-#include "../host/win32_compat.h"
 #endif
-/* The window is SDL's (W11): created on the SDL thread (host/sdl_host.c), its events come there too.
-   The renderer's surface takes the window's HWND (SDL_PROP_WINDOW_WIN32_HWND_POINTER); on Android
-   its ANativeWindow (SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER), dropped while the app is in the
-   background and made again when it comes back (android_background, finding 091). */
-#if defined(_WIN32) || defined(DHD_HAVE_SDL)
+/* The window is SDL's (W11), on every platform. It is made and driven on the SDL thread, the
+   process's main thread (host/sdl_host.c): its events come there, and its calls go there through
+   sdl_host_run. The renderer's surface takes the window's native handle (window_target, the one
+   platform part): Win32's HWND, X11's or Wayland's window, Android's ANativeWindow, or on Apple
+   the CAMetalLayer of an SDL Metal view. On a phone the surface is dropped while the app is in
+   the background and made again when it comes back (app_background_wait, finding 091). */
 #include <SDL3/SDL.h>
-#define PRESENT_SDL 1
-#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,21 +20,135 @@
 #include "../hle/hle.h"
 #include "../include/guest.h"
 #include "../hle/text_input.h"
-#include "../hle/splash.h"
 
 static uint32_t pixels[1024 * 1024];
 static int initialized, disabled, resize_pending;
 static int surface;                 /* the renderer presents to the window (init) */
 static volatile int window_closed;  /* the close button (or EXIT GAME): the game ends at the next field */
-#ifdef PRESENT_SDL
 static SDL_Window *sdl_window;
-/* The window lives on the SDL thread (sdl_host.c): its messages and a modal drag or resize stop
-   that thread only; the game thread still draws and presents to the window, and still ends the
-   process when the window closes (gs_pump_messages). */
+static GsWindow target;             /* sdl_window's native handle, for the renderer's surface */
+static volatile int target_ready;   /* window_target found it (a phone: not while in the background) */
+/* sdl_window's drawable size in pixels, w << 16 | h (0 while minimised): measured on the thread that
+   pumps SDL's events (window_measure, window_watch) and read on any thread (gs_window_pixels), as
+   Cocoa's window calls belong to the main thread. */
+static SDL_AtomicInt drawable;
 typedef struct { int x, y, w, h, borderless; } WindowSpec;
 static void display_of(SDL_Window *w, SDL_Rect *full, SDL_Rect *usable);
 
-/* The primary display's resolution: its desktop mode, the one Windows runs it at (the largest
+/* ---- the platform part: SDL's window as the renderer's window ---- */
+#if defined(_WIN32)
+#define WINDOW_FLAGS 0
+#define FIXED_SCREEN 0
+/* Laptops with two graphics chips run a program they don't know on the integrated one; these
+   exports ask the NVIDIA and AMD drivers for the dedicated chip, as most PC games do. In the exe
+   (this file is host code). */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#elif defined(__ANDROID__)
+#define WINDOW_FLAGS 0
+#define FIXED_SCREEN 1  /* the whole screen, immersive (landscape: android_main.c's hint) */
+#elif defined(__APPLE__)
+#define WINDOW_FLAGS SDL_WINDOW_METAL  /* the renderer draws into an SDL Metal view's layer */
+#define FIXED_SCREEN 0
+static SDL_MetalView metal_view;
+#else
+#define WINDOW_FLAGS 0
+#define FIXED_SCREEN 0
+#endif
+
+/* Main thread: the native handle of sdl_window into target; target_ready 0 while it has none (a
+   phone: until the OS has made the surface, and again after the app comes back from the background). */
+static void window_target(void *unused)
+{
+    (void)unused;
+    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window);
+    memset(&target, 0, sizeof target);
+    target.size = gs_window_pixels;
+#if defined(_WIN32)
+    target.kind = GS_WINDOW_WIN32;
+    target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    target.b = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, NULL);
+#elif defined(__ANDROID__)
+    target.kind = GS_WINDOW_ANDROID;
+    target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+#elif defined(__APPLE__)
+    if (!metal_view) metal_view = SDL_Metal_CreateView(sdl_window);
+    target.kind = GS_WINDOW_METAL_LAYER;
+    target.a = (uintptr_t)(metal_view ? SDL_Metal_GetLayer(metal_view) : NULL);
+#else  /* Linux and the BSDs: X11 or Wayland, whichever SDL's video driver is */
+    if (!strcmp(SDL_GetCurrentVideoDriver(), "wayland")) {
+        target.kind = GS_WINDOW_WAYLAND;
+        target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
+        target.b = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
+    } else {
+        target.kind = GS_WINDOW_XLIB;
+        target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, NULL);
+        target.b = (uint64_t)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+    }
+#endif
+    target_ready = target.a != 0;
+}
+
+/* Main thread: the window's icon (from n0buholic, PR #13). Windows and Android show the program's
+   own: the exe's (port/res/dhd.rc, every size from 16 to 256 pixels, on SDL's window class:
+   make_window's hints; SDL_SetWindowIcon would give the title bar one 512-pixel picture scaled
+   down) and the APK's. Elsewhere nothing else gives the window one (Linux) or it is the bundle's
+   own picture (macOS): port/res/icon.png, embedded by build_host64.py. */
+#if defined(_WIN32) || defined(__ANDROID__)
+static void window_icon(void) {}
+#else
+#include "dhd_icon.inc"  /* dhd_icon_png: port/res/icon.png's bytes */
+static void window_icon(void)
+{
+    SDL_Surface *icon = SDL_LoadPNG_IO(SDL_IOFromConstMem(dhd_icon_png, sizeof dhd_icon_png), true);
+    if (!icon || !SDL_SetWindowIcon(sdl_window, icon)) hle_log("gs: no window icon (%s)\n", SDL_GetError());
+    SDL_DestroySurface(icon);
+}
+#endif
+
+/* The whole monitor (DHD_WINDOW borderless and fullscreen). Windows: a borderless window over the
+   monitor, as the port always had it (no mode change; alt-tab is a window's). Elsewhere SDL's
+   desktop fullscreen: macOS's menu bar and Wayland's compositor leave a window no other way to
+   cover the screen. Main thread. */
+static void fill_monitor(void)
+{
+#ifdef _WIN32
+    SDL_Rect monitor, usable;
+    display_of(sdl_window, &monitor, &usable);
+    SDL_SetWindowBordered(sdl_window, false);
+    SDL_SetWindowSize(sdl_window, monitor.w, monitor.h);
+    SDL_SetWindowPosition(sdl_window, monitor.x, monitor.y);
+#else
+    SDL_SetWindowFullscreen(sdl_window, true);
+#endif
+}
+
+/* Started minimised (Windows: STARTUPINFO's show state, test and recording runs on a PC in use):
+   the game's window shows minimised without taking the focus (show_window). */
+#ifdef _WIN32
+static int start_minimised(void)
+{
+    STARTUPINFOA si = {sizeof si};
+    GetStartupInfoA(&si);
+    if (!(si.dwFlags & STARTF_USESHOWWINDOW)) return 0;
+    return si.wShowWindow == SW_SHOWMINIMIZED || si.wShowWindow == SW_MINIMIZE ||
+           si.wShowWindow == SW_SHOWMINNOACTIVE || si.wShowWindow == SW_FORCEMINIMIZE;
+}
+
+static void show_minimised(void)
+{
+    SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+    SDL_ShowWindow(sdl_window);
+    ShowWindow((HWND)(uintptr_t)target.a, SW_SHOWMINNOACTIVE);
+}
+#else
+static int start_minimised(void) { return 0; }
+static void show_minimised(void) {}
+#endif
+
+/* ---- the window, the same on every platform ---- */
+
+/* The primary display's resolution: its desktop mode, the one the OS runs it at (the largest
    fullscreen mode can be bigger than the screen: NVIDIA DSR lists 2560x1440 on a 1080p monitor),
    else SDL's largest fullscreen mode. Pixels (host_dpi_aware). 0 x 0 when SDL knows none. */
 static void monitor_mode(int *w, int *h)
@@ -54,9 +165,9 @@ static void monitor_mode(int *w, int *h)
 }
 
 /* DHD_MONITOR_MODE: the monitor's resolution, for PC SETTINGS > Window Size's list. A window
-   size of "monitor" (dhd.ini's default, host.c player_defaults) becomes that size, in numbers, so
-   everything after (gs_window_apply, the settings page) reads the size it has. SDL thread, before
-   the window is made: the EE thread waits in sdl_host_run. */
+   size of "monitor" (dhd.ini's default, port/render/settings) becomes that size, in numbers, so
+   everything after (gs_window_apply, the settings page) reads the size it has. Main thread, before
+   the window is made: the game thread waits in sdl_host_run. */
 static void monitor_size(WindowSpec *s)
 {
     int w, h;
@@ -76,10 +187,34 @@ static void monitor_size(WindowSpec *s)
     hle_log("gs: window size %dx%d, the monitor's resolution\n", w, h);
 }
 
-/* On the SDL thread: the window, hidden until init has its swap chain (sdl_host_run). */
+static void window_measure(void)
+{
+    int w = 0, h = 0;
+    if (sdl_window && !(SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_MINIMIZED))
+        SDL_GetWindowSizeInPixels(sdl_window, &w, &h);
+    SDL_SetAtomicInt(&drawable, (w > 0 ? w : 0) << 16 | (h > 0 ? h : 0));
+}
+
+/* SDL's window events as SDL sends them (on Windows inside a modal drag or resize too, which the
+   queued copies wait out): the drawable size follows at once. */
+static bool SDLCALL window_watch(void *unused, SDL_Event *e)
+{
+    (void)unused;
+    if (e->type >= SDL_EVENT_WINDOW_FIRST && e->type <= SDL_EVENT_WINDOW_LAST) window_measure();
+    return true;
+}
+
+/* Main thread: the window, hidden until init has its surface (show_window), in real pixels
+   (SDL_WINDOW_HIGH_PIXEL_DENSITY: macOS's and Wayland's scaled displays), and its native handle. */
 static void make_window(void *arg)
 {
     WindowSpec *s = arg;
+    /* The app id, the launcher's (tauri.conf.json's identifier): Wayland's app_id and X11's
+       WM_CLASS, by which desktops group the window and find its icon (from n0buholic, PR #13).
+       Windows: the icon (port/res/dhd.rc) on SDL's window class, small and big (window_icon). */
+    SDL_SetHint(SDL_HINT_APP_ID, "app.skuza.downhillrevived");
+    SDL_SetHint(SDL_HINT_WINDOWS_INTRESOURCE_ICON, "1");
+    SDL_SetHint(SDL_HINT_WINDOWS_INTRESOURCE_ICON_SMALL, "1");
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         fprintf(stderr, "gs: SDL video did not start (%s)\n", SDL_GetError());
         return;
@@ -94,15 +229,18 @@ static void make_window(void *arg)
     /* A minimised start: SDL applies its window state when the window shows, so it must know
        (show_window); otherwise it restores the window then. */
     if (start_minimised()) flags |= SDL_WINDOW_MINIMIZED;
-#ifdef __ANDROID__
-    flags = SDL_WINDOW_FULLSCREEN;  /* the whole screen, immersive (landscape: android_main.c's hint) */
-#endif
+    if (FIXED_SCREEN) flags = SDL_WINDOW_FULLSCREEN;
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY | WINDOW_FLAGS;
     sdl_window = SDL_CreateWindow("Downhill Revived", s->w, s->h, flags);  /* s->w x s->h: the client area */
     if (!sdl_window) {
         fprintf(stderr, "gs: SDL window (%s)\n", SDL_GetError());
         return;
     }
     if (s->borderless) SDL_SetWindowPosition(sdl_window, s->x, s->y);
+    window_icon();
+    window_measure();
+    SDL_AddEventWatch(window_watch, NULL);
+    window_target(NULL);
     hle_log("gs: SDL window %dx%d (video %s)\n", s->w, s->h, SDL_GetCurrentVideoDriver());
 }
 
@@ -115,69 +253,37 @@ static void display_of(SDL_Window *w, SDL_Rect *full, SDL_Rect *usable)
     }
     if (!SDL_GetDisplayUsableBounds(id, usable)) *usable = *full;
 }
-#endif
-#ifdef _WIN32
-static HWND window;                 /* sdl_window's HWND, for the renderer's surface */
-/* Laptops with two graphics chips run a program they don't know on the integrated one; these
-   exports ask the NVIDIA and AMD drivers for the dedicated chip, as most PC games do. In the exe
-   (this file is host code). */
-__declspec(dllexport) DWORD NvOptimusEnablement = 1;
-__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
-/* The game's window appears, in front, or minimised and without the focus when the game was
-   started minimised (splash.c's start_minimised: test and recording runs on a PC in use). */
-static void show_window(void)
+/* Main thread: the game's window appears, in front, or minimised and without the focus when the
+   game was started minimised (start_minimised). */
+static void show_window(void *unused)
 {
+    (void)unused;
     int minimised = start_minimised();
     hle_log("gs: window shown%s\n", minimised ? " minimised (a minimised start)" : "");
-    if (minimised) {  /* created minimised (make_window); shown without taking the focus */
-        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
-        SDL_ShowWindow(sdl_window);
-        ShowWindow(window, SW_SHOWMINNOACTIVE);
-    } else { SDL_ShowWindow(sdl_window); SDL_RaiseWindow(sdl_window); }
+    if (minimised) show_minimised();
+    else { SDL_ShowWindow(sdl_window); SDL_RaiseWindow(sdl_window); }
 }
 
-/* The window (SDL's), then the renderer (gpu_rust.c: wgpu on Direct3D 12, or Vulkan; WARP when
-   there is no graphics driver) and its surface on the window, which is shown once both run. */
-static int init(void)
+/* The native handle, waited for up to tries x 10 ms (a phone makes its surface a little after the
+   window, and again after the background). 1 when target holds it. */
+static int wait_target(int tries)
 {
-    host_dpi_aware();  /* real pixels: a borderless window at the monitor's own resolution (before SDL's video) */
-    /* DHD_WINDOW: windowed (default; DHD_WINDOW_WIDTH x DHD_WINDOW_HEIGHT inside, 896x672),
-       borderless or fullscreen (both the whole monitor, borderless: gs_window_apply). */
-    const char *mode = getenv("DHD_WINDOW"), *width = getenv("DHD_WINDOW_WIDTH"), *height = getenv("DHD_WINDOW_HEIGHT");
-    int borderless = mode && !strcmp(mode, "borderless"), fullscreen = mode && !strcmp(mode, "fullscreen");
-    WindowSpec spec = {0, 0, width && atoi(width) > 0 ? atoi(width) : 896, height && atoi(height) > 0 ? atoi(height) : 672,
-                       borderless || fullscreen};
-    sdl_host_run(make_window, &spec);  /* on the SDL thread: the window's messages are its queue's */
-    if (!sdl_window) return 0;
-    window = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
-    if (!window) return 0;
-    /* the icon (port/res/dhd.rc), as the window class had it: SDL sets none */
-    HICON icon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1));
-    SendMessageA(window, WM_SETICON, ICON_BIG, (LPARAM)icon);
-    SendMessageA(window, WM_SETICON, ICON_SMALL, (LPARAM)icon);
-    splash_step(75, "Preparing the graphics...");
-    if (!gs_gpu_init(&gs)) return 0;
-    if (!gs_gpu_surface(&gs, window)) {
-        hle_log("gs: the renderer has no surface on the window\n");
-        gs_gpu_destroy(&gs);
-        return 0;
+    for (int i = 0; i < tries; i++) {
+        sdl_host_run(window_target, NULL);
+        if (target_ready) return 1;
+        SDL_Delay(10);
     }
-    surface = 1;
-    hle_log("gs: WebGPU presentation (%s)\n", gs_gpu_backend_name(&gs));
-    show_window();
-    splash_close();
-    if (fullscreen) gs_window_apply();  /* the whole monitor */
-    return 1;
+    return 0;
 }
-#elif defined(__ANDROID__) && defined(PRESENT_SDL)
-static void *window;                /* sdl_window's ANativeWindow, for the renderer's surface (NULL in the background) */
+
+/* ---- the app in the background (phones: SDL sends these events on Android and iOS only) ---- */
 static volatile int app_background; /* the app is in the background (lifecycle_watch): the game waits */
-static volatile int surface_dropped; /* lifecycle_watch dropped the surface: android_background makes it again */
+static volatile int surface_dropped; /* lifecycle_watch dropped the surface: app_background_wait makes it again */
 
 /* SDL's app events, from the thread that pumps SDL's events (sdl_host.c), synchronously: SDL blocks
    that thread right after the background events (SDL_HINT_ANDROID_BLOCK_ON_PAUSE), so the queued
-   copies arrive only after the app is back. Here the render thread stops presenting before Android
+   copies arrive only after the app is back. Here the render thread stops presenting before the OS
    takes the window (on its own thread, soon after); the game thread waits at its next field. */
 static bool SDLCALL lifecycle_watch(void *unused, SDL_Event *e)
 {
@@ -192,95 +298,72 @@ static bool SDLCALL lifecycle_watch(void *unused, SDL_Event *e)
     return true;
 }
 
-/* SDL's ANativeWindow for the window: NULL until Android has made the surface (it is made again
-   after the app comes back from the background). */
-static void *native_window(void)
+/* The app went to the background (game thread, at a field): the surface is dropped before the OS
+   takes the window, and the game waits (SDL pauses the sound) until the app is back, then the
+   surface is made on the new window. The close of the app ends the game as the close button does. */
+static void app_background_wait(void)
 {
-    return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    hle_log("gs: in the background; the game waits\n");
+    gs_gpu_surface_reset(&gs, NULL);
+    target_ready = 0;
+    while (app_background && !window_closed) SDL_Delay(20);
+    surface_dropped = 0;
+    gs_pump_messages();
+    if (!wait_target(300) || !gs_gpu_surface_reset(&gs, &target)) {
+        hle_log("gs: no surface on the window after the background\n");
+        target_ready = 0;
+        return;
+    }
+    resize_pending = 1;
+    hle_log("gs: back in the foreground\n");
 }
 
-/* The window (SDL's, fullscreen), the renderer (gpu_rust.c: wgpu on Vulkan) and its surface on the
-   window's ANativeWindow. */
+/* The window (SDL's), then the renderer (gpu_rust.c: wgpu on Direct3D 12 or Vulkan, Metal on
+   Apple; WARP when Windows has no graphics driver) and its surface on the window, which is shown
+   once both run. */
 static int init(void)
 {
-    WindowSpec spec = {0, 0, 0, 0, 1};
-    sdl_host_run(make_window, &spec);
+    host_dpi_aware();  /* real pixels: a borderless window at the monitor's own resolution (before SDL's video) */
+    /* DHD_WINDOW: windowed (default; DHD_WINDOW_WIDTH x DHD_WINDOW_HEIGHT inside, 896x672),
+       borderless or fullscreen (both the whole monitor: fill_monitor). A phone: the whole screen. */
+    const char *mode = getenv("DHD_WINDOW"), *width = getenv("DHD_WINDOW_WIDTH"), *height = getenv("DHD_WINDOW_HEIGHT");
+    int fullscreen = !FIXED_SCREEN && mode && !strcmp(mode, "fullscreen");
+    int borderless = FIXED_SCREEN || (mode && !strcmp(mode, "borderless")) || fullscreen;
+    WindowSpec spec = {0, 0, width && atoi(width) > 0 ? atoi(width) : 896, height && atoi(height) > 0 ? atoi(height) : 672,
+                       borderless};
+    sdl_host_run(make_window, &spec);  /* on the main thread: the window's messages are its queue's */
     if (!sdl_window) return 0;
-    for (int i = 0; i < 200 && !(window = native_window()); i++) SDL_Delay(10);
-    if (!window) { hle_log("gs: the window has no ANativeWindow\n"); return 0; }
+    if (!target_ready && !wait_target(200)) { hle_log("gs: the window has no native handle\n"); return 0; }
     if (!gs_gpu_init(&gs)) return 0;
-    if (!gs_gpu_surface(&gs, window)) {
+    if (!gs_gpu_surface(&gs, &target)) {
         hle_log("gs: the renderer has no surface on the window\n");
         gs_gpu_destroy(&gs);
         return 0;
     }
     surface = 1;
     SDL_AddEventWatch(lifecycle_watch, NULL);
-    hle_log("gs: WebGPU presentation (%s, Vulkan)\n", gs_gpu_backend_name(&gs));
+    hle_log("gs: WebGPU presentation (%s, window kind %u)\n", gs_gpu_backend_name(&gs), target.kind);
+    sdl_host_run(show_window, NULL);
+    if (fullscreen) gs_window_apply();  /* the whole monitor */
     return 1;
 }
 
-/* The app went to the background (EE thread, at a field): the surface is dropped before Android
-   takes the window, and the game waits (SDL pauses the sound) until the app is back, then the
-   surface is made on the new window. The close of the app ends the game as the close button does. */
-static void android_background(void)
+/* Main thread: DHD_WINDOW, DHD_WINDOW_WIDTH and DHD_WINDOW_HEIGHT as init sets them up. */
+static void window_apply(void *unused)
 {
-    hle_log("gs: in the background; the game waits\n");
-    gs_gpu_surface_reset(&gs, NULL);
-    window = NULL;
-    while (app_background && !window_closed) SDL_Delay(20);
-    surface_dropped = 0;
-    gs_pump_messages();
-    for (int i = 0; i < 300 && !(window = native_window()); i++) SDL_Delay(10);
-    if (!window || !gs_gpu_surface_reset(&gs, window)) {
-        hle_log("gs: no surface on the window after the background\n");
-        window = NULL;
-        return;
-    }
-    resize_pending = 1;
-    hle_log("gs: back in the foreground\n");
-}
-#elif defined(PRESENT_SDL)
-/* No presentation device on this host (Linux: the renderer has no surface here yet). The SDL
-   window still opens for input, and audio still plays; rendering stays headless, so init reports
-   no device and gs_vsync keeps its bench path. */
-static int init(void)
-{
-    const char *width = getenv("DHD_WINDOW_WIDTH"), *height = getenv("DHD_WINDOW_HEIGHT");
-    WindowSpec spec = {0, 0, width && atoi(width) > 0 ? atoi(width) : 896,
-                       height && atoi(height) > 0 ? atoi(height) : 672, 0};
-    if (getenv("DHD_HEADLESS")) return 0;  /* headless runs never open a window */
-    sdl_host_run(make_window, &spec);  /* on the SDL thread: the window's messages are its queue's */
-    if (!sdl_window) return 0;
-    SDL_ShowWindow(sdl_window);
-    hle_log("gs: no renderer on this host yet (headless scanout)\n");
-    return 0;  /* no renderer: gs_vsync stays disabled */
-}
-#else
-/* No presentation device: init fails, so gs_vsync stays disabled (bench only). */
-static int init(void) { return 0; }
-#endif
-
-/* The PC settings page changed DHD_WINDOW, DHD_WINDOW_WIDTH or DHD_WINDOW_HEIGHT: the window
-   mode and size now, as init sets them up (fullscreen is the whole monitor, borderless). EE thread
-   (it owns the window, so the messages these calls send are handled at once). The renderer's
-   surface follows at the next present (WM_SIZE). */
-#ifdef _WIN32
-void gs_window_apply(void)
-{
-    if (!sdl_window || !surface) return;
+    (void)unused;
     const char *mode = getenv("DHD_WINDOW"), *width = getenv("DHD_WINDOW_WIDTH"), *height = getenv("DHD_WINDOW_HEIGHT");
-    int borderless = mode && !strcmp(mode, "borderless"), fullscreen = mode && !strcmp(mode, "fullscreen");
-    SDL_Rect monitor, usable;
-    display_of(sdl_window, &monitor, &usable);
-    /* The window's own calls, from this thread as before (the SDL thread gets its messages). */
-    if (borderless || fullscreen) {
-        SDL_SetWindowBordered(sdl_window, false);
-        SDL_SetWindowSize(sdl_window, monitor.w, monitor.h);
-        SDL_SetWindowPosition(sdl_window, monitor.x, monitor.y);
-        if (!IsIconic(window)) SDL_ShowWindow(sdl_window);  /* a minimised start stays so */
-    } else {
+    int whole = mode && (!strcmp(mode, "borderless") || !strcmp(mode, "fullscreen"));
+    int minimised = (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_MINIMIZED) != 0;  /* a minimised start stays so */
+    if (whole) fill_monitor();
+    else {
         int w = width && atoi(width) > 0 ? atoi(width) : 896, h = height && atoi(height) > 0 ? atoi(height) : 672;
+        if (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN) {  /* fill_monitor's, off Windows */
+            SDL_SetWindowFullscreen(sdl_window, false);
+            SDL_SyncWindow(sdl_window);
+        }
+        SDL_Rect monitor, usable;
+        display_of(sdl_window, &monitor, &usable);
         SDL_SetWindowBordered(sdl_window, true);
         SDL_SetWindowSize(sdl_window, w, h);
         int top = 0, left = 0, bottom = 0, right = 0;
@@ -288,20 +371,24 @@ void gs_window_apply(void)
         int outer_w = w + left + right, outer_h = h + top + bottom;  /* centred on the usable area */
         int x = usable.x + (usable.w - outer_w) / 2, y = usable.y + (usable.h - outer_h) / 2;
         SDL_SetWindowPosition(sdl_window, x > usable.x ? x : usable.x, y > usable.y ? y : usable.y);
-        if (!IsIconic(window)) SDL_ShowWindow(sdl_window);
     }
+    if (!minimised) SDL_ShowWindow(sdl_window);
+}
+
+/* The PC settings page changed DHD_WINDOW, DHD_WINDOW_WIDTH or DHD_WINDOW_HEIGHT: the window
+   mode and size now, on the main thread (the game thread waits). The renderer's surface follows
+   at the next present. A phone's window is always the whole screen. */
+void gs_window_apply(void)
+{
+    if (!sdl_window || !surface || FIXED_SCREEN) return;
+    sdl_host_run(window_apply, NULL);
     resize_pending = 1;
 }
-#else
-void gs_window_apply(void) {}
-#endif
 
 /* The picture's filter and shape changed (DHD_PRESENT_FILTER, DHD_ASPECT): native renderer only. */
 void gs_present_options_apply(void)
 {
-#if defined(_WIN32) || (defined(__ANDROID__) && defined(PRESENT_SDL))
     if (sdl_window && gs_gpu_native(&gs)) gs_native_present_options(&gs);
-#endif
 }
 
 /* The picture to save: the native renderer's own (upscaled with DHD_SCALE, so its size), else
@@ -381,10 +468,6 @@ static void capture(unsigned width, unsigned height, int gpu_frame)
     }
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "gs: cannot save screenshot %s\n", path); return; }
-#ifdef _WIN32
-    BITMAPFILEHEADER file = {0};
-    BITMAPINFOHEADER info = {0};
-#else
     /* The BMP headers, packed as the format requires. */
     struct __attribute__((packed)) {
         uint16_t bfType;
@@ -402,12 +485,10 @@ static void capture(unsigned width, unsigned height, int gpu_frame)
     } info = {0};
     _Static_assert(sizeof file == 14, "BMP file header is 14 bytes");
     _Static_assert(sizeof info == 40, "BMP info header is 40 bytes");
-#define BI_RGB 0
-#endif
     file.bfType = 0x4D42; file.bfOffBits = sizeof file + sizeof info;
     file.bfSize = file.bfOffBits + width * height * 4;
-    info.biSize = sizeof info; info.biWidth = width; info.biHeight = -(LONG)height;
-    info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
+    info.biSize = sizeof info; info.biWidth = width; info.biHeight = -(int32_t)height;
+    info.biPlanes = 1; info.biBitCount = 32; info.biCompression = 0;  /* BI_RGB */
     fwrite(&file, sizeof file, 1, f); fwrite(&info, sizeof info, 1, f);
     for (unsigned i = 0; i < width * height; i++) {
         uint32_t v = image[i], bgra = (v & 0xFF00FF00) | (v & 255) << 16 | (v >> 16 & 255);
@@ -429,13 +510,16 @@ volatile uint32_t gs_presented_frames;
 volatile int gs_native_view;
 void host_service_gs_native_view(int view) { gs_native_view = view; }
 
+/* The title (online races: the lobby), set by the main thread's next pass (gs_window_tick): the
+   game thread never waits for it, not even while the window is being dragged. */
+static struct { SDL_SpinLock lock; int changed; char text[256]; } title;
+
 void gs_window_title(const char *utf8)
 {
-#ifdef PRESENT_SDL
-    if (sdl_window) SDL_SetWindowTitle(sdl_window, utf8);
-#else
-    (void)utf8;
-#endif
+    SDL_LockSpinlock(&title.lock);
+    snprintf(title.text, sizeof title.text, "%s", utf8);
+    title.changed = 1;
+    SDL_UnlockSpinlock(&title.lock);
 }
 
 /* The window's events, from the SDL thread (sdl_host.c): the size changed (WM_SIZE: the back buffer
@@ -443,22 +527,17 @@ void gs_window_title(const char *utf8)
    next gs_pump_messages). */
 void gs_window_event(unsigned type)
 {
-#ifdef PRESENT_SDL
     if (type == SDL_EVENT_WINDOW_RESIZED) resize_pending = 1;
     else if (type == SDL_EVENT_WINDOW_CLOSE_REQUESTED || type == SDL_EVENT_QUIT) {
         if (sdl_window) SDL_HideWindow(sdl_window);
         window_closed = 1;
     }
-#else
-    (void)type;
-#endif
 }
 
 /* EXIT GAME (port/hle/exit_menu.c): the window closes as when its close button is clicked, and
    the game ends at the next gs_pump_messages. */
 void gs_window_close(void)
 {
-#ifdef PRESENT_SDL
     if (sdl_window) {
         SDL_Event e;
         SDL_zero(e);
@@ -467,7 +546,6 @@ void gs_window_close(void)
         SDL_PushEvent(&e);  /* the SDL thread sees it: gs_window_event */
         return;
     }
-#endif
     exit(0);
 }
 
@@ -477,19 +555,14 @@ void gs_pump_messages(void)
     if (window_closed) exit(0);
 }
 
-#ifndef _WIN32
-/* The window's size in pixels (gpu_rust.c's window_size, any thread): SDL's copy; 0 x 0 without a
-   window. */
+/* The window's drawable size in pixels (the renderer's GsWindow.size, any thread): 0 x 0 without a
+   window or while it is minimised. */
 void gs_window_pixels(unsigned *width, unsigned *height)
 {
-    int w = 0, h = 0;
-#ifdef PRESENT_SDL
-    if (sdl_window) SDL_GetWindowSizeInPixels(sdl_window, &w, &h);
-#endif
-    *width = w > 0 ? (unsigned)w : 0;
-    *height = h > 0 ? (unsigned)h : 0;
+    unsigned size = (unsigned)SDL_GetAtomicInt(&drawable);
+    *width = size >> 16;
+    *height = size & 0xFFFF;
 }
-#endif
 
 /* ---- the mouse (finding 092) ----
    The SDL thread passes the window's mouse events (touch arrives as SDL's mouse events too); the
@@ -497,15 +570,10 @@ void gs_window_pixels(unsigned *width, unsigned *height)
    picture where the renderer last showed it (gs_picture_rect: the bars beside it are outside), so
    the window's size, the picture's shape and DHD_SCALE don't matter to the menus. The OS cursor
    shows while the mouse moves, and hides after a few idle seconds and while a race is ridden. */
-#ifdef PRESENT_SDL
 #define MOUSE_LOCK() SDL_LockSpinlock(&mouse.lock)
 #define MOUSE_UNLOCK() SDL_UnlockSpinlock(&mouse.lock)
-#else
-#define MOUSE_LOCK() ((void)0)
-#define MOUSE_UNLOCK() ((void)0)
-#endif
 static struct {
-    int lock;
+    SDL_SpinLock lock;
     int left, top, right, bottom, w, h;  /* the picture in the window, pixels (0 x 0: the whole window) */
     float px, py;                        /* the pointer, window pixels */
     float before_x, before_y;            /* test desktops: where it was before the last motion, */
@@ -529,13 +597,11 @@ static void mouse_place(void)
 {
     int left = mouse.left, top = mouse.top, right = mouse.right, bottom = mouse.bottom;
     float px = mouse.px, py = mouse.py;
-#ifdef PRESENT_SDL
     int ww = 0, wh = 0;
     if (sdl_window && SDL_GetWindowSizeInPixels(sdl_window, &ww, &wh) && ww > 0 && wh > 0) {
         if (right <= left || mouse.w <= 0) left = top = 0, right = ww, bottom = wh;
         else px *= (float)mouse.w / ww, py *= (float)mouse.h / wh;  /* a resize the picture hasn't followed yet */
     }
-#endif
     if (right <= left || bottom <= top) return;
     mouse.state.x = (int32_t)((px - left) * 65536.0f / (right - left));
     mouse.state.y = (int32_t)((py - top) * 65536.0f / (bottom - top));
@@ -549,7 +615,6 @@ static void mouse_place(void)
    moves and clicks act as a real mouse's would. */
 void gs_mouse_event(const void *event)
 {
-#ifdef PRESENT_SDL
     static int test_input = -1;
     const SDL_Event *e = event;
     if (test_input < 0) test_input = getenv("DHD_TEST_INPUT") != NULL;
@@ -604,18 +669,23 @@ void gs_mouse_event(const void *event)
     mouse.state.seen = 1;
     mouse.moved = host_wall_seconds();
     MOUSE_UNLOCK();
-#else
-    (void)event;
-#endif
 }
 
-/* SDL thread, every pass of its loop: the cursor shows for 3 s after the mouse was used, never
-   while a race is ridden (the game's controls in riding mode, D_0029E290). */
-void gs_cursor_tick(void)
+/* SDL thread, every pass of its loop: a new title (gs_window_title); the cursor shows for 3 s
+   after the mouse was used, never while a race is ridden (the game's controls in riding mode,
+   D_0029E290). */
+void gs_window_tick(void)
 {
-#ifdef PRESENT_SDL
     static int shown = -1;
     if (!sdl_window) return;
+    if (title.changed) {
+        char text[sizeof title.text];
+        SDL_LockSpinlock(&title.lock);
+        memcpy(text, title.text, sizeof text);
+        title.changed = 0;
+        SDL_UnlockSpinlock(&title.lock);
+        SDL_SetWindowTitle(sdl_window, text);
+    }
     int riding = *(volatile int32_t *)GUEST(0x0829E290) != 0;
     MOUSE_LOCK();
     int want = mouse.state.seen && !riding && host_wall_seconds() - mouse.moved < 3.0;
@@ -624,7 +694,6 @@ void gs_cursor_tick(void)
     shown = want;
     if (want) SDL_ShowCursor();
     else SDL_HideCursor();
-#endif
 }
 
 void host_service_mouse_state(uint32_t out)
@@ -655,10 +724,8 @@ static void bench_threads(int end, unsigned fields, double wall)
     static unsigned count;
     double now[MAX];
     const char *now_names[MAX];
-    FILETIME created, exited, kernel, user;
-    GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
-    double process = (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
-                      ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+    double host_process_cpu(void);  /* port/hle/host.c */
+    double process = host_process_cpu();
     unsigned n = host_thread_cpu(now_names, now, MAX);
     if (!end) {
         count = n; process_before = process;
@@ -718,23 +785,22 @@ static void bench_vsync(void)
     free(frames);
     state = 2;
     const char *quit = getenv("DHD_BENCH_EXIT");
-    if (quit && !strcmp(quit, "1")) ExitProcess(0);
+    if (quit && !strcmp(quit, "1")) host_exit(0);
 }
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height);  /* port/hle/movie.c */
 int host_widescreen_flat_limit(void);  /* port/hle/host.c */
 
-/* The graphics didn't start. The game would go on with no window (heard, never seen) behind a
-   start window stuck on its graphics step: instead the start window closes, a message says why
-   and the game ends. Tools that want no window set DHD_HEADLESS and never get here. */
+/* The graphics didn't start. The game would go on with no window (heard, never seen): instead a
+   message says why and the game ends. Tools that want no window set DHD_HEADLESS and never get here. */
 static void graphics_failed(void)
 {
     hle_log("gs: the graphics didn't start\n");
-    splash_close();
-    const char *message = "Downhill Revived couldn't start its graphics on this PC.\n\n"
-                          "Its renderer needs Direct3D 12 or Vulkan (Windows 10 or 11 with a current graphics driver). "
-                          "On a laptop with two graphics chips, open Windows Settings > System > Display > Graphics, "
-                          "add the game and choose High performance.\n\nThe details are in dhd.log, next to the game.";
+    const char *message = "Downhill Revived couldn't start its graphics on this computer.\n\n"
+                          "Its renderer needs Direct3D 12 or Vulkan (Windows 10 or 11), Metal (macOS) or Vulkan "
+                          "(Linux, Android), with a current graphics driver. On a Windows laptop with two graphics "
+                          "chips, open Windows Settings > System > Display > Graphics, add the game and choose High "
+                          "performance.\n\nThe details are in dhd.log, next to the game.";
     host_error_box("Downhill Revived", message);
     exit(1);
 }
@@ -789,9 +855,7 @@ void gs_vsync(void)
     bench_vsync();
     gs_pump_messages();  /* first: the close button ends the game even with no renderer */
     if (disabled) return;
-#if defined(__ANDROID__) && defined(PRESENT_SDL)
-    if (app_background || surface_dropped) android_background();
-#endif
+    if (app_background || surface_dropped) app_background_wait();
 #ifdef __ANDROID__
     { void android_perf_field(void); android_perf_field(); }  /* port/host/android_perf.c: CPU clocks */
 #endif
@@ -834,14 +898,8 @@ void gs_vsync(void)
             if (!gs_display(&gs, pixels, &width, &height)) memset(pixels, 0, width * height * 4);
         }
         /* the renderer shows the picture itself, stretched over the client area */
-        unsigned client_width = 0, client_height = 0;
-#ifdef _WIN32
-        RECT client = {0};
-        GetClientRect(window, &client);
-        client_width = (unsigned)client.right; client_height = (unsigned)client.bottom;
-#else
+        unsigned client_width, client_height;
         gs_window_pixels(&client_width, &client_height);
-#endif
         double due, began;
         pacing_handed(&due, &began);
         pacing_present(due, began);

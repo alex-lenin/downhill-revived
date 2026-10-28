@@ -118,10 +118,6 @@ void host_callbacks_drain(void);
 /* ---- threads: a fire-and-forget job (online_menu.c) ---- */
 int host_thread_detach(void (*fn)(void *), void *arg);  /* 1 if the thread started */
 
-/* ---- a path's size and last write time (online.c's cache key) ---- */
-/* The size in bytes and the write time in 100 ns ticks since 1601 (Windows FILETIME); 1 if it exists. */
-int host_path_info(const char *path, uint64_t *size, uint64_t *write_time);
-
 /* ---- the host process's memory regions (state_trace.c, opt-in: DHD_STATE_NORM=host) ---- */
 /* Calls visit for each region [base, end) of the address space from 0x10000 up, with host_memory set
    for memory the host itself holds (not free, and not the program's own image). */
@@ -181,7 +177,6 @@ int host_service_host_setting_save(uint32_t a0, uint32_t a1);
 int host_service_host_setting_locked(uint32_t a0);
 void host_service_host_pad_device(int a0, uint32_t a1);
 void host_service_host_pad_vibrate(int a0, int a1, int a2);
-int host_service_host_relaunch_reserving(uint32_t a0, uint32_t a1);
 void host_service_graphics_feed(int a0, uint32_t a1, uint32_t a2);
 void host_service_graphics_wait(void);
 int host_service_graphics_threaded(void);  /* 2: threaded, with deferred vsyncs */
@@ -191,11 +186,7 @@ void host_service_graphics_vblank(void);
 void host_service_graphics_shutdown(void);
 int host_service_movie_playing(void);
 void host_service_movie_audio(uint32_t a0, int a1);
-void host_service_splash_show(void);
-void host_service_splash_step(int a0, uint32_t a1);
-void host_service_update_save_environment(void);
-void host_service_update_at_start(void);
-int host_service_update_after_game(int a0);
+int host_service_launcher_open(void);
 void host_service_update_request(void);
 void host_service_vif_feed(int a0, uint32_t a1, uint32_t a2);
 void host_service_gs_vsync(void);
@@ -224,8 +215,13 @@ int host_service_net_list_lobbies(uint32_t a0, int a1);
    Only results cross to the game thread, as guest-address buffers. The module
    starts a job, then polls it from its page update until it is done. One job
    of each kind runs at a time; starting while one runs returns 0. */
-int host_service_file_sha256_start(uint32_t path);    /* 1 if the hash began: guest address */
-int host_service_file_sha256_poll(uint32_t digest);    /* 0 working, 1 done (32 bytes), -1 failed */
+/* The disc image's online check (dhd_disc.h): the image's and iso-check.txt's paths (guest
+   addresses). 1 if the check began. */
+int host_service_disc_check_start(uint32_t iso, uint32_t cache);
+/* 0 working; else dhd_disc_check's answer: 1 hashed now, 2 from iso-check.txt (the game files hash
+   in digest, 32 bytes), -1 unreadable, -2 not the USA disc's files; note (size bytes) what the log
+   says. -1 when no check ran. */
+int host_service_disc_check_poll(uint32_t digest, uint32_t note, int size);
 int host_service_net_list_lobbies_start(int max);      /* 1 if the fetch began */
 int host_service_net_list_lobbies_poll(uint32_t out, int max);  /* the lobby count, -1 failed, -2 working */
 
@@ -301,5 +297,19 @@ void host_service_movie_start(uint32_t name, uint32_t lsn, uint32_t size, int au
 int host_service_movie_update(int keep);
 
 void host_service_movie_prepare(void);
+
+/* Discord Rich Presence (port/render/presence, finding 106): what the player is doing, sent by the
+   core (port/hle/presence.c) when it changes. kind: PRESENCE_*; a race's track as the game names
+   it, the player's place (1 first, 0 not known) and the riders; an online room's join code (empty
+   for a private room: its code never leaves the core), its players and size. Strings
+   NUL-terminated. The host shows it on Discord when the discord setting is on (the browser and
+   Android: nothing). */
+enum { PRESENCE_NONE, PRESENCE_MENUS, PRESENCE_RACE, PRESENCE_CAREER, PRESENCE_ROOM, PRESENCE_ONLINE_RACE,
+       PRESENCE_MOVIE };
+typedef struct {
+    int32_t kind, place, riders, members, max_members;
+    char track[24], room[8];
+} HostPresence;  /* 52 bytes */
+void host_service_presence(uint32_t state);
 
 #endif

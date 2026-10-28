@@ -1,4 +1,4 @@
-/* The PS2 address space on the PC (port/tools/pctarget.py, finding 020).
+/* The PS2 address space on the PC (port/tools/data.py, finding 020).
 
    The 32 MB of PS2 RAM are one shared memory block, mapped three times: at PS2_RAM_BASE (cached
    addresses), and at 0x20000000 and 0x30000000 + PS2_RAM_BASE, where the game's uncached
@@ -39,11 +39,6 @@ static int map_low(uint32_t mirror)
 {
     uint32_t at = mirror | PS2_LOW_VIEW;
     return host_ram_view(at, PS2_LOW_VIEW, PS2_RAM_SIZE - PS2_LOW_VIEW, !mirror);
-}
-
-int ps2_low_view_reserved(void)
-{
-    return host_mem_reserved(PS2_LOW_VIEW, PS2_RAM_SIZE - PS2_LOW_VIEW);
 }
 
 int ps2_memory_init(void)

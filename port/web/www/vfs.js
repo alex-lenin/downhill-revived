@@ -44,7 +44,6 @@ export async function createVfs(log) {
       f.n.data.set(src, f.pos); f.pos = end; f.dirty = true; f.n.time = Date.now(); return src.length; },
     flush(f) { if (f.dirty) { f.n.data = f.n.data.slice(); store(f.k, f.n); f.dirty = false; } },
     size: f => f.n.data.length,
-    info: p => nodes.get(key(p)),
     // The folder's entries: ".", ".." then its children (mc.c counts them as the card does).
     list(p) { const k = key(p); if (!nodes.get(k)?.dir) return null;
       const self = nodes.get(k), out = [{ name: '.', dir: true, time: self.time }, { name: '..', dir: true, time: self.time }];

@@ -4,13 +4,13 @@
 The host side is what runs natively in the 64-bit build (docs/findings/075-portable-core.md,
 "Phase 2 plan"): port/host/*, the host layer in port/hle (host.c, graphics_queue.c, gs_queue.inc,
 vif.c's VIF1/VU1 part, the VU1 runtime in vu0_interp.c), port/gs/*, the device and OS files
-(gamepad, keyboard, text input, movie + libmpeg2, splash, update, fps), and port/net/*.
+(gamepad, keyboard, text input, movie + libmpeg2, launcher link, fps), and port/net/*.
 
 Every unit is compiled with:
   clang --target=x86_64-pc-windows-msvc -c -O2 -ffp-contract=off -ftrivial-auto-var-init=zero
         -fno-strict-aliasing -fwrapv -w -I <gen> -I port/runtime -I port/include
   vu0_interp.c gets -DPS2_VU_AOT (as in build_host64.py), with vu1_aot.inc generated into <gen>.
-  the units that include SDL3's headers (SDL_UNITS) get the SDL3 include directory.
+  every unit gets the SDL3 include directory (SDL3's threads, locks and timers are used everywhere).
   libmpeg2 units get only their own directory on the include path.
 
 Two passes per unit:
@@ -49,22 +49,17 @@ WARN_FLAGS = ['-Wall', '-Wpointer-to-int-cast', '-Wint-to-pointer-cast', '-Wshor
 WARN = re.compile(r"\[-W(pointer-to-int-cast|int-to-pointer-cast|shorten-64-to-32|incompatible-pointer-types|"
                   r"int-conversion|format|pointer-sign)\]")
 CONFIGS = ('plain', 'warn')
-SDL_UNITS = ('gs/present.c', 'host/sdl_host.c', 'hle/text_input.c', 'hle/gamepad.c', 'host/sound_out_sdl.c')
 
-# The sound output, exactly one backend: WASAPI, or SDL3's audio stream with DHD_SOUND=sdl at build
-# time (as build_host64_linux.py; it needs the SDL3 library, --sdl-lib).
-SOUND_UNIT = 'port/host/sound_out_sdl.c' if os.environ.get('DHD_SOUND') == 'sdl' else 'port/host/sound_out_win32.c'
 # The host units, in link order. Paths are repo-relative.
 HOST_UNITS = [
-    'port/host/host_win32.c', SOUND_UNIT, 'port/host/sdl_host.c',
+    'port/host/host_sdl.c', 'port/host/host_win32.c', 'port/host/sound_out_sdl.c', 'port/host/sdl_host.c',
     'port/runtime/sha256.c',
     'port/hle/host.c', 'port/hle/graphics_queue.c', 'port/hle/vif.c', 'port/runtime/vu0_interp.c',
     'port/gs/memory.c', 'port/gs/gs.c', 'port/gs/display.c', 'port/gs/present.c', 'port/gs/gpu_rust.c',
     'port/gs/texpack.c', 'port/gs/font_sharp.c', 'port/gs/capture.c', 'port/gs/replay.c',
     'port/hle/gamepad.c', 'port/hle/keyboard.c', 'port/hle/text_input.c', 'port/hle/movie.c',
-    'port/hle/splash.c', 'port/hle/update.c', 'port/hle/fps.c',
+    'port/hle/launcher_link.c', 'port/hle/fps.c',
     'port/net/client.c', 'port/net/hash.c', 'port/net/json.c', 'port/net/net.c',
-    'port/net/ws_winhttp.c',
 ] + ['port/third_party/libmpeg2/%s.c' % n for n in (
     'alloc', 'cpu_accel', 'cpu_state', 'decode', 'header', 'idct', 'motion_comp', 'slice')]
 # port/hle/gs_queue.inc is included by graphics_queue.c; port/gs/gpu_exact.inc, gpu_rust_native.inc
@@ -178,13 +173,11 @@ def compile_unit(job):
         incs = ['-I', str(LIBMPEG2)]
     else:
         incs = ['-I', str(GEN), '-I', str(RUNTIME), '-I', str(INCLUDE)]
-    extra = []
-    if rel.endswith(SDL_UNITS):  # the units that include SDL3's headers
-        extra = ['-I', job['sdl3']]
+    extra = ['-I', job['sdl3']]  # SDL3's headers, for every unit
     if rel.endswith('runtime/vu0_interp.c'):
-        extra = ['-DPS2_VU_AOT']
+        extra += ['-DPS2_VU_AOT']
     if rel.endswith('gs/gpu_rust.c'):
-        extra = ['-I', str(ROOT / 'port' / 'render' / 'include')]  # dhd_render.h
+        extra += ['-I', str(ROOT / 'port' / 'render' / 'include')]  # dhd_render.h
     cmd = [str(CLANG)] + flags + extra + incs + [str(src), '-o', str(obj)]
     env = dict(os.environ, TMP=str(TMP), TEMP=str(TMP), TMPDIR=str(TMP))
     t0 = time.time()

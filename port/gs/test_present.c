@@ -35,13 +35,23 @@ static unsigned check(const uint32_t *source, unsigned w, unsigned h, unsigned w
     return bad;
 }
 
+static HWND window;
+
+/* The window's client size (the renderer's GsWindow.size). */
+static void client_size(unsigned *width, unsigned *height)
+{
+    RECT client = {0, 0, 0, 0};
+    GetClientRect(window, &client);
+    *width = (unsigned)client.right; *height = (unsigned)client.bottom;
+}
+
 int main(void)
 {
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = DefWindowProcA; wc.hInstance = GetModuleHandleA(NULL); wc.lpszClassName = "dhd_test_present";
     RegisterClassA(&wc);
     /* WS_OVERLAPPEDWINDOW without WS_VISIBLE, and never ShowWindow: nothing appears */
-    HWND window = CreateWindowExA(0, wc.lpszClassName, "test_present", WS_OVERLAPPEDWINDOW, 0, 0, 200, 200,
+    window = CreateWindowExA(0, wc.lpszClassName, "test_present", WS_OVERLAPPEDWINDOW, 0, 0, 200, 200,
                                   NULL, NULL, wc.hInstance, NULL);
     CHECK(window != NULL);
     gs_reset(&gs);
@@ -54,7 +64,8 @@ int main(void)
     const char *expect_env = getenv("DHD_TEST_EXPECT_SURFACE");
     int expect_set = expect_env && *expect_env;
     int surface_expected = expect_set ? atoi(expect_env) != 0 : 1;
-    int surface = gs_gpu_surface(&gs, window) != 0;
+    GsWindow target = {GS_WINDOW_WIN32, (uintptr_t)window, (uintptr_t)wc.hInstance, client_size};
+    int surface = gs_gpu_surface(&gs, &target) != 0;
     if (expect_set && surface != surface_expected) {
         printf("FAIL WebGPU surface %s, DHD_TEST_EXPECT_SURFACE=%d\n", surface ? "exists" : "is missing",
                surface_expected);

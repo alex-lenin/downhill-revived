@@ -3,7 +3,7 @@
     python port/android/build_apk.py [--wasm build/wasm/dhd_core.wasm] [--jobs 2] [--offline]
 
 1. The native libraries: build/android/lib/arm64-v8a/libmain.so and libSDL3.so, built by
-   port/tools/build_host64_android.py from the module (--wasm, default build/wasm/dhd_core.wasm,
+   port/tools/build_host64.py --target android-arm64 from the module (--wasm, default build/wasm/dhd_core.wasm,
    when given or when the libraries are missing).
 2. The Gradle project in build/android/project: this folder's files (the Gradle scripts, the
    manifest, DhdActivity.java, the strings and theme), SDL's Java sources of the same release
@@ -104,10 +104,10 @@ def main():
     libs = [OUT / 'lib' / 'arm64-v8a' / n for n in ('libmain.so', 'libSDL3.so')]
     wasm = a.wasm or (ROOT / 'build' / 'wasm' / 'dhd_core.wasm')
     if a.wasm or not all(p.exists() for p in libs):
-        r = subprocess.run([sys.executable, str(ROOT / 'port' / 'tools' / 'build_host64_android.py'), str(wasm),
-                            '--jobs', str(a.jobs)])
+        r = subprocess.run([sys.executable, str(ROOT / 'port' / 'tools' / 'build_host64.py'), '--target', 'android-arm64',
+                            str(wasm), '--jobs', str(a.jobs)])
         if r.returncode:
-            sys.exit('build_apk: build_host64_android.py failed')
+            sys.exit('build_apk: build_host64.py --target android-arm64 failed')
     project(libs + a.extra_lib)
     name, code = version()
     gradlew = PROJECT / ('gradlew.bat' if os.name == 'nt' else 'gradlew')

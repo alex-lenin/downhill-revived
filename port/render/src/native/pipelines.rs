@@ -312,3 +312,232 @@ impl Drop for SpikeTimer {
         }
     }
 }
+
+/// DHD_GPU_TIMES=N (diagnostics): the native renderer's GPU time by kind of pass, from timestamp
+/// queries at each pass's start and end (wgpu's TIMESTAMP_QUERY, which device.rs asks for only
+/// when this is set; Metal on Apple GPUs samples only at pass boundaries, so the passes are the
+/// unit). Every N presented frames (default 600) one log line: the mean GPU milliseconds a frame
+/// by kind (draw passes; surface passes: transfers, self-copies and growth; conversions; scanout;
+/// present) with the passes a frame of each, and the frame's span (its first pass's start to its
+/// last pass's end). Without the variable, or on an adapter without timestamps, every pass gets
+/// None: no queries at all.
+pub(crate) mod gputimes {
+    #[cfg(target_arch = "wasm32")]
+    use crate::device::Gpu;
+
+    pub const DRAW: u8 = 0;
+    pub const SURFACE: u8 = 1;
+    pub const CONVERT: u8 = 2;
+    pub const SCANOUT: u8 = 3;
+    pub const PRESENT: u8 = 4;
+
+    /// A pass's two queries (start, end) in the frame's query set.
+    pub struct Slot(wgpu::QuerySet, u32);
+
+    impl Slot {
+        pub fn render(&self) -> wgpu::RenderPassTimestampWrites<'_> {
+            wgpu::RenderPassTimestampWrites { query_set: &self.0, beginning_of_pass_write_index: Some(self.1),
+                                              end_of_pass_write_index: Some(self.1 + 1) }
+        }
+        pub fn compute(&self) -> wgpu::ComputePassTimestampWrites<'_> {
+            wgpu::ComputePassTimestampWrites { query_set: &self.0, beginning_of_pass_write_index: Some(self.1),
+                                               end_of_pass_write_index: Some(self.1 + 1) }
+        }
+    }
+
+    /// Whether DHD_GPU_TIMES is set (device.rs then asks for timestamp queries).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wanted() -> bool {
+        std::env::var_os("DHD_GPU_TIMES").is_some()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn slot(_gpu: &Gpu, _kind: u8) -> Option<Slot> {
+        None
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn end_frame(_gpu: &Gpu, _encoder: &mut wgpu::CommandEncoder) {}
+    #[cfg(target_arch = "wasm32")]
+    pub fn submitted(_gpu: &Gpu) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use timed::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod timed {
+        use super::Slot;
+        use crate::device::Gpu;
+        use crate::exact::readback::{map_start, MapStatus};
+        use std::sync::{Mutex, OnceLock};
+
+        const NAMES: [&str; 5] = ["draw", "surface", "convert", "scanout", "present"];
+        /// Queries in one frame's set (two a pass); passes beyond go untimed.
+        const QUERIES: u32 = 1024;
+        /// Frames in flight; when the next set is still being read, a frame goes untimed.
+        const SETS: usize = 3;
+
+        struct Set {
+            queries: wgpu::QuerySet,
+            resolve: wgpu::Buffer,
+            read: wgpu::Buffer,
+            /// Each timed pass's kind, in query order.
+            kinds: Vec<u8>,
+            /// Queries resolved and copied for reading (at the frame's end).
+            resolved: u32,
+            /// The read buffer's map, once the frame is submitted.
+            map: Option<MapStatus>,
+        }
+
+        struct Times {
+            sets: Vec<Set>,
+            current: usize,
+            every: u32,
+            period: f64,
+            frames: u32,
+            ns: [f64; 5],
+            passes: [u64; 5],
+            span: f64,
+            untimed: u64,
+        }
+
+        static TIMES: OnceLock<Option<Mutex<Times>>> = OnceLock::new();
+
+        fn times(gpu: &Gpu) -> Option<&'static Mutex<Times>> {
+            TIMES.get_or_init(|| {
+                if !super::wanted() {
+                    return None;
+                }
+                if !gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                    crate::host::log("gpu_times: this adapter has no timestamp queries (DHD_GPU_TIMES ignored)");
+                    return None;
+                }
+                let every = std::env::var("DHD_GPU_TIMES").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0)
+                    .unwrap_or(600);
+                let buffer = |label, usage| gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label), size: QUERIES as u64 * 8, usage, mapped_at_creation: false });
+                let sets = (0..SETS).map(|_| Set {
+                    queries: gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+                        label: Some("gpu times"), ty: wgpu::QueryType::Timestamp, count: QUERIES }),
+                    resolve: buffer("gpu times resolve", wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
+                    read: buffer("gpu times read", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+                    kinds: Vec::new(),
+                    resolved: 0,
+                    map: None,
+                }).collect();
+                crate::host::log(&format!("gpu_times: GPU time by pass kind every {every} frames (DHD_GPU_TIMES)"));
+                Some(Mutex::new(Times { sets, current: 0, every, period: gpu.queue.get_timestamp_period() as f64,
+                                        frames: 0, ns: [0.0; 5], passes: [0; 5], span: 0.0, untimed: 0 }))
+            }).as_ref()
+        }
+
+        fn lock(t: &Mutex<Times>) -> std::sync::MutexGuard<'_, Times> {
+            t.lock().unwrap_or_else(|p| p.into_inner())
+        }
+
+        /// The current set, unless it is still being read (in flight from SETS frames ago).
+        fn open(t: &mut Times) -> Option<&mut Set> {
+            let current = t.current;
+            let set = &mut t.sets[current];
+            set.map.is_none().then_some(set)
+        }
+
+        /// The queries of a pass of `kind`, or None (timing off, the set full or still being read).
+        pub fn slot(gpu: &Gpu, kind: u8) -> Option<Slot> {
+            let mut t = lock(times(gpu)?);
+            let slot = open(&mut t).filter(|s| s.kinds.len() as u32 * 2 + 2 <= QUERIES).map(|set| {
+                let index = set.kinds.len() as u32 * 2;
+                set.kinds.push(kind);
+                Slot(set.queries.clone(), index)
+            });
+            if slot.is_none() {
+                t.untimed += 1;
+            }
+            slot
+        }
+
+        /// In the present's encoder, after its pass: reads every finished frame, then resolves this
+        /// frame's queries (written by this and the picture's earlier command buffers; a resolve
+        /// offset must be 256-byte aligned, so all at once) and copies them for reading
+        /// (`submitted` maps them after the submit).
+        pub fn end_frame(gpu: &Gpu, encoder: &mut wgpu::CommandEncoder) {
+            let Some(t) = times(gpu) else { return };
+            collect(gpu, t);
+            let mut t = lock(t);
+            let Some(set) = open(&mut t) else { return };
+            let used = set.kinds.len() as u32 * 2;
+            if used > 0 {
+                encoder.resolve_query_set(&set.queries, 0..used, &set.resolve, 0);
+                encoder.copy_buffer_to_buffer(&set.resolve, 0, &set.read, 0, used as u64 * 8);
+            }
+            set.resolved = used;
+        }
+
+        /// After the present's submit: maps the frame's copy and moves on to the next set.
+        pub fn submitted(gpu: &Gpu) {
+            let Some(t) = times(gpu) else { return };
+            let mut t = lock(t);
+            let Some(set) = open(&mut t) else { return };
+            if set.resolved == 0 {
+                return;
+            }
+            set.map = Some(map_start(&set.read, 0..set.resolved as u64 * 8));
+            t.current = (t.current + 1) % SETS;
+        }
+
+        /// Reads (and frees) every set whose map finished, adds it up, and logs every `every` frames.
+        fn collect(gpu: &Gpu, t: &Mutex<Times>) {
+            let _ = gpu.device.poll(wgpu::PollType::Poll);
+            let mut t = lock(t);
+            let period = t.period;
+            for i in 0..SETS {
+                let set = &mut t.sets[i];
+                let Some(result) = set.map.as_ref().and_then(|m| m.lock().unwrap_or_else(|p| p.into_inner()).clone())
+                else { continue };
+                let (mut ns, mut passes) = ([0.0f64; 5], [0u64; 5]);
+                let (mut first, mut last) = (u64::MAX, 0u64);
+                if result.is_ok() {
+                    {
+                        let data = set.read.slice(..set.resolved as u64 * 8).get_mapped_range();
+                        let stamp = |q: usize| u64::from_le_bytes(data[q * 8..q * 8 + 8].try_into().expect("8 bytes"));
+                        for (p, &kind) in set.kinds.iter().enumerate() {
+                            let (a, b) = (stamp(p * 2), stamp(p * 2 + 1));
+                            if a == 0 || b < a {
+                                continue;
+                            }
+                            ns[kind as usize] += (b - a) as f64 * period;
+                            passes[kind as usize] += 1;
+                            first = first.min(a);
+                            last = last.max(b);
+                        }
+                    }
+                    set.read.unmap();
+                }
+                set.kinds.clear();
+                set.resolved = 0;
+                set.map = None;
+                for k in 0..5 {
+                    t.ns[k] += ns[k];
+                    t.passes[k] += passes[k];
+                }
+                if last > first {
+                    t.span += (last - first) as f64 * period;
+                }
+                t.frames += 1;
+            }
+            if t.frames >= t.every {
+                let f = t.frames as f64;
+                let total: f64 = t.ns.iter().sum();
+                let parts: Vec<String> = (0..5)
+                    .map(|k| format!("{}={:.3}/{:.1}", NAMES[k], t.ns[k] / f / 1e6, t.passes[k] as f64 / f))
+                    .collect();
+                crate::host::log(&format!("gpu_times: frames={} gpu_ms={:.3} span_ms={:.3} ms/passes {} untimed_passes={}",
+                                          t.frames, total / f / 1e6, t.span / f / 1e6, parts.join(" "), t.untimed));
+                t.frames = 0;
+                t.ns = [0.0; 5];
+                t.passes = [0; 5];
+                t.span = 0.0;
+                t.untimed = 0;
+            }
+        }
+    }
+}

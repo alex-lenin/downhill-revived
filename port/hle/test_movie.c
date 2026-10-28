@@ -3,9 +3,10 @@
    WAV: a check of the demuxer, libmpeg2, the colour conversion and the sound's timing (finding
    055). Output is game data: keep it under build/.
 
-   build: clang --target=i686-pc-windows-msvc -O2 -msse2 -DMOVIE_TEST -I port/runtime
+   build: clang --target=x86_64-pc-windows-msvc -O2 -DMOVIE_TEST -I port/runtime -I <SDL3 include>
           -I port/third_party/libmpeg2 port/hle/test_movie.c port/hle/movie.c
           port/third_party/libmpeg2/{alloc,cpu_accel,cpu_state,decode,header,idct,motion_comp,slice}.c
+          <sdl3.py's SDL3-static.lib and its SYSTEM_LIBS>
    usage: test_movie ISO LSN SIZE AUDIO OUT_PREFIX [FIELD...]   (fields of 59.94 Hz) */
 #include "hle.h"
 
@@ -28,6 +29,7 @@ void hle_log(const char *fmt, ...)
     va_end(ap);
 }
 void host_thread_name(const char *name) { (void)name; }
+FILE *host_os_fopen(const char *path, const char *mode) { return fopen(path, mode); }  /* ASCII paths here */
 int cdvd_find(const char *path, uint32_t *lsn, uint32_t *size) { return 0; }
 
 static void bmp(const char *path, const uint32_t *image, unsigned w, unsigned h)

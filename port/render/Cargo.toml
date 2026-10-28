@@ -4,8 +4,13 @@
 # wgpu-native v29.0.1.1's Cargo.lock (the C path's renderer), so both paths run the same shader
 # translation and the same HAL. windows / windows-link likewise. wgpu (the safe front end, not used
 # by wgpu-native) is the 29.0 release of the same family. Every build runs --locked --offline.
+#
+# The native library also carries the port's WebSocket and HTTPS client (net/, dhd_net), dhd.ini's
+# settings (settings/, dhd_settings), Discord Rich Presence (presence/, dhd_presence) and the disc
+# image's online check (disc/, dhd_disc), so the game links one Rust static library (two would each
+# carry Rust's std).
 [workspace]
-members = [".", "tools"]
+members = [".", "tools", "net", "settings", "presence", "disc"]
 resolver = "2"
 
 [package]
@@ -14,7 +19,7 @@ version = "1.0.0"
 edition = "2021"
 rust-version = "1.97"
 license = "GPL-3.0-or-later"
-description = "The GS renderer of the PC port on wgpu (native: DX12/Vulkan; browser: WebGPU)"
+description = "The GS renderer of the PC port on wgpu (native: DX12/Vulkan/Metal; browser: WebGPU)"
 publish = false
 
 [lib]
@@ -23,7 +28,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
-native = ["wgpu/std", "wgpu/parking_lot", "wgpu/dx12", "wgpu/vulkan", "wgpu/wgsl", "dep:pollster"]
+native = ["wgpu/std", "wgpu/parking_lot", "wgpu/dx12", "wgpu/vulkan", "wgpu/metal", "wgpu/wgsl", "dep:pollster", "dep:dhd_net", "dep:dhd_settings", "dep:png",
+           "dep:dhd_presence", "dep:dhd_disc"]
 web = ["wgpu/std", "wgpu/webgpu", "wgpu/wgsl", "wgpu/fragile-send-sync-non-atomic-wasm",
        "dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures"]
 test-hooks = []
@@ -42,11 +48,21 @@ wgpu-hal = { version = "=29.0.3", default-features = false }
 naga = { version = "=29.0.3", default-features = false }
 wgpu-naga-bridge = { version = "=29.0.3", default-features = false }
 pollster = { version = "=1.0.1", optional = true }
+dhd_net = { path = "net", optional = true }
+dhd_settings = { path = "settings", optional = true }
+dhd_disc = { path = "disc", optional = true }
+# The texture packs' PNG decoder (src/png_decode.rs): pure Rust, the same on every platform.
+png = { version = "=0.18.1", default-features = false, optional = true }
+dhd_presence = { path = "presence", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.62.2", default-features = false }
 windows-link = { version = "=0.2.1", default-features = false }
 wgpu-core-deps-windows-linux-android = { version = "=29.0.3", default-features = false }
+
+# Metal (macOS on Apple silicon; PR #6's backend): the same family's Apple half.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu-core-deps-apple = { version = "=29.0.3", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "=0.2.129", optional = true }

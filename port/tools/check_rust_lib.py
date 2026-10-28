@@ -3,8 +3,9 @@
     python port/tools/check_rust_lib.py LIB [LIB ...] [--tree DIR ...] [--extra DIR ...]
                                         [--native-static-libs "kernel32.lib ..."]
 
-LIB is the x64 static library (dhd_render.lib, an archive of COFF objects), the Android one
-(libdhd_render.a, ELF objects), a .wasm module or the wasm-bindgen glue. Exit 0 when nothing is found; otherwise each problem is printed and the exit is 1.
+LIB is the x64 static library (dhd_render.lib, an archive of COFF objects), the Android or Linux one
+(libdhd_render.a, ELF objects), the macOS one (libdhd_render.a, Mach-O objects, read whole), a .wasm
+module or the wasm-bindgen glue. Exit 0 when nothing is found; otherwise each problem is printed and the exit is 1.
 
 Refused:
 - an absolute drive path (package_release.ABSOLUTE, as the release check reads it: ASCII in the data
@@ -33,7 +34,9 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parents[1]
 ALLOWED_LIBS_FILE = ROOT / 'port' / 'render' / 'native-static-libs-x86_64.txt'
-ALLOWED_LIBS_FILES = {'aarch64-linux-android': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-linux-android.txt'}
+ALLOWED_LIBS_FILES = {'aarch64-linux-android': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-linux-android.txt',
+                      'x86_64-unknown-linux-gnu': ROOT / 'port' / 'render' / 'native-static-libs-x86_64-unknown-linux-gnu.txt',
+                      'aarch64-apple-darwin': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-apple-darwin.txt'}
 DYNAMIC_CRT = re.compile(rb'[/-]defaultlib:\s*"?msvcrt', re.I)
 SCN_CODE = 0x00000020
 SCN_EXECUTE = 0x20000000
@@ -218,6 +221,24 @@ def toolchain_roots(sysroot_lib):
     return tuple(sorted(roots))
 
 
+# A POSIX build machine's folder in a library's bytes: rustup's std for macOS is built on Rust CI's
+# Mac runners, so its compiler_builtins objects name /Users/runner/work/rust/... (the /Users/ marker).
+POSIX_ROOT = re.compile(rb'(?<![A-Za-z0-9])/(?:Users|home)/[\x21-\x7e]+')
+
+
+@functools.lru_cache(maxsize=None)
+def toolchain_posix_roots(sysroot_lib):
+    """toolchain_roots' POSIX counterpart: the first four levels of each /Users/... or /home/... path
+    in the toolchain's own rlibs (/Users/runner/work/rust/). Paths under them are the toolchain's."""
+    roots = set()
+    for rlib in sorted(Path(sysroot_lib).glob('*.rlib')):
+        for m in POSIX_ROOT.finditer(rlib.read_bytes()):
+            cuts = [i for i, c in enumerate(m.group(0)) if c == ord('/')]
+            if len(cuts) >= 5:
+                roots.add(m.group(0)[:cuts[4] + 1])
+    return tuple(sorted(roots))
+
+
 def sysroot_lib(triple, cwd=None):
     import subprocess
     r = subprocess.run(['rustc', '--print', 'sysroot'], cwd=str(cwd or ROOT / 'port' / 'render'),
@@ -233,6 +254,7 @@ def problems(path, trees=(ROOT,), extra=(), native_static_libs=None, sysroot=Non
     pr = _release()
     found = []
     allowed = toolchain_roots(str(sysroot)) if sysroot else ()
+    posix_allowed = toolchain_posix_roots(str(sysroot)) if sysroot else ()
     marks = [(m, m.lower().encode()) for m in markers(trees, extra)]
     for label, data, plain in units(path):
         where = '%s(%s)' % (Path(path).name, label)
@@ -243,7 +265,10 @@ def problems(path, trees=(ROOT,), extra=(), native_static_libs=None, sysroot=Non
                 if m.group(0).startswith(allowed):
                     continue
                 found.append('%s: %s absolute path %r' % (where, kind, m.group(0)[:120].decode('ascii', 'replace')))
-        lowered = data.lower()
+        ours = data
+        for root in posix_allowed:  # the toolchain's own folders hold no marker of ours
+            ours = ours.replace(root, b'')
+        lowered = ours.lower()
         utf16 = pr.utf16_strings(data).lower()
         for m, low in marks:
             if low in lowered or low in utf16:

@@ -19,7 +19,7 @@
 //! Return values as `dhdr_present_exact`: 1 drawn (C paces, then presents); 0 skipped (no picture
 //! scanned out yet, minimised, Timeout / Occluded); -1 failed (logged).
 //!
-//! The pipeline (`present_pipe`, on the draw layout) and the layouts are `init.rs`'s; the present
+//! The pipeline (`present_pipe`, on the draw layout, in the surface's format) and the layouts are `init.rs`'s; the present
 //! uniform, the sampler and the picture's bind group are this file's, made by the first `options`
 //! call, which `Native::create` makes.
 //!
@@ -27,6 +27,7 @@
 //! `test_gs_wgpu.py --impl rust --arch x86_64 --only present` (N7).
 use crate::abi::{DhdrPresentRect, DHDR_NATIVE_POINT_FILTER};
 use crate::device::Gpu;
+use crate::native::pipelines::gputimes;
 use crate::native::scanout::Display;
 use crate::native::Native;
 use crate::present::surface::Surface;
@@ -191,6 +192,7 @@ impl Native {
             uniform.written = Some(rect);
         }
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("native present") });
+        let times = gputimes::slot(gpu, gputimes::PRESENT);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("native present"),
@@ -204,12 +206,12 @@ impl Native {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: times.as_ref().map(gputimes::Slot::render),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             if let Some((x, y, sw, sh)) = scissor(r.cut, w, h) {
-                pass.set_pipeline(&objects.present_pipe);
+                pass.set_pipeline(objects.present_pipe(gpu, surface.format()));
                 pass.set_bind_group(0, &uniform.group, &[0]);
                 pass.set_bind_group(1, group, &[]);
                 pass.set_scissor_rect(x, y, sw, sh);
@@ -218,7 +220,9 @@ impl Native {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _spike = crate::native::pipelines::SpikeTimer::new("present_submit", 0);
+        gputimes::end_frame(gpu, &mut encoder);
         gpu.queue.submit([encoder.finish()]);
+        gputimes::submitted(gpu);
         1
     }
 

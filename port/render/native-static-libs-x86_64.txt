@@ -2,3 +2,6 @@
 # wgpu 29.0.3 with dx12+vulkan+wgsl, +crt-static). The allow-list for rustgs.py / check_rust_lib.py (A1a).
 # d3d12, dxgi, dxcore etc. are raw-dylib imports (windows-link) or loaded at run time, so they are not listed.
 kernel32.lib ntdll.lib userenv.lib ws2_32.lib dbghelp.lib /defaultlib:libcmt
+# dhd_net (port/render/net, the WebSocket/HTTPS client): the system random source of ring and of
+# tungstenite's masking keys (getrandom: BCryptGenRandom, RtlGenRandom). Windows' own DLLs.
+bcrypt.lib advapi32.lib

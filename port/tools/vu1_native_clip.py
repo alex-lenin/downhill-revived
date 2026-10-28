@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def generate(destination, early_flags=True):
     destination=Path(destination).resolve()
-    if ROOT/'build' not in destination.parents:
+    if (ROOT/'build').resolve() not in destination.parents:  # build/ may be a junction off C:
         raise ValueError('generated clipping code must stay under build/')
     data=Path(os.environ.get('DHD_VUTEXT',ROOT/'assets/vutext.bin')).read_bytes()
     pairs,where=program(data,0x269c50)

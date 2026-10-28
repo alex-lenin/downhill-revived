@@ -128,17 +128,21 @@ DHDR_FN(dhdr_exact_stats)   void dhdr_exact_stats(const DhdrExact *x, DhdrExactS
 
 typedef struct DhdrSurface DhdrSurface;
 enum { DHDR_WINDOW_WIN32 = 1, DHDR_WINDOW_WEB_CANVAS = 2, DHDR_WINDOW_XLIB = 3, DHDR_WINDOW_WAYLAND = 4,
-       DHDR_WINDOW_ANDROID = 5, DHDR_WINDOW_METAL_LAYER = 6 };   /* 2: dhdr_web_surface only; 5: the Android
-                                                                   build only; 3, 4, 6 reserved, refused (NULL) */
+       DHDR_WINDOW_ANDROID = 5, DHDR_WINDOW_METAL_LAYER = 6 };   /* 2: dhdr_web_surface only; each native build
+                                                                   takes its platform's: Windows 1, Linux 3 and 4,
+                                                                   Android 5, Apple 6 (others refused: NULL) */
 typedef struct DhdrWindow {
     uint32_t kind;                   /* DHDR_WINDOW_* */
     uint32_t reserved;               /* 0 */
-    uint64_t a, b;                   /* WIN32: a = HWND, b = HINSTANCE; ANDROID: a = ANativeWindow * */
+    uint64_t a, b;                   /* WIN32: a = HWND, b = HINSTANCE; XLIB: a = Display *, b = Window;
+                                        WAYLAND: a = wl_display *, b = wl_surface *; ANDROID: a =
+                                        ANativeWindow *; METAL_LAYER: a = CAMetalLayer * */
 } DhdrWindow;
 enum { DHDR_PRESENT_NO_TEARING = 1, DHDR_PRESENT_VSYNC = 2 };   /* DHD_TEARING=0; VSYNC forces Fifo (DHD_INTERP) */
 enum { DHDR_SURFACE_COPY_SRC = 1 };
-/* A surface on the window: Immediate > Mailbox > Fifo (VSYNC: Fifo; NO_TEARING: no Immediate),
-   frame latency 1, opaque. NULL: unsupported kind or no surface (logged). */
+/* A surface on the window: RGBA8, else BGRA8 (whichever the surface offers first in that order),
+   Immediate > Mailbox > Fifo (VSYNC: Fifo; NO_TEARING: no Immediate), frame latency 1, opaque.
+   NULL: unsupported kind or no surface (logged). */
 DHDR_FN(dhdr_surface_create)  DhdrSurface *dhdr_surface_create(const DhdrWindow *w, uint32_t present_flags);
 DHDR_FN(dhdr_surface_destroy) void dhdr_surface_destroy(DhdrSurface *s);   /* NULL is ignored */
 /* DHDR_SURFACE_COPY_SRC: the surface textures can be copied from (the test hook reads them). */
@@ -272,6 +276,17 @@ DHDR_FN(dhdr_native_options) void dhdr_native_options(DhdrNative *n, uint32_t fl
 DHDR_FN(dhdr_native_zread_start) int dhdr_native_zread_start(DhdrNative *n, uint32_t index, const uint32_t rect[4], uint64_t tag);
 DHDR_FN(dhdr_native_zread_take) int dhdr_native_zread_take(DhdrNative *n, uint32_t *out, uint32_t cap, uint32_t rect_out[4],
                                                            uint64_t *tag_out);
+
+#if !defined(__wasm__)
+/* ---------------- the texture packs' PNG files (texpack.c), native only ---------------- */
+/* The width and height in a PNG's header (size bytes at data). 1 ok, 0 not a PNG (logged). */
+DHDR_FN(dhdr_png_size) int dhdr_png_size(const uint8_t *data, size_t size, uint32_t *w, uint32_t *h);
+/* Decodes the PNG into rgba, w * h * 4 bytes (w x h as dhdr_png_size gave): RGBA8 rows from any
+   colour type, bit depth and interlacing (16-bit samples cut to their high byte). A PNG with no
+   alpha channel and no tRNS gets opaque (0-255) as its alpha. 1 ok, 0 failed (logged). Any thread. */
+DHDR_FN(dhdr_png_decode) int dhdr_png_decode(const uint8_t *data, size_t size, uint8_t *rgba, uint32_t w, uint32_t h,
+                                             uint32_t opaque);
+#endif
 
 #if defined(__wasm__)
 /* The surface the async dhdr_web_init made on the OffscreenCanvas, or NULL. */

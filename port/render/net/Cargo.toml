@@ -1,0 +1,25 @@
+# The port's WebSocket and HTTPS client (port/net/ws.h).
+# A member of the renderer's workspace, inside its folder so cargo names its sources by relative
+# paths (no build folder in the library).
+#
+# One TLS stack on every native platform: rustls on ring, with Mozilla's roots bundled
+# (webpki-roots), so no platform certificate store is read. Linked into dhd_render's static library
+# (its `native` feature): the game has one Rust static library. Built only through
+# port/tools/rustgs.py (--locked --offline, its version gate, check_rust_lib.py).
+[package]
+name = "dhd_net"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+description = "The port's WebSocket and HTTPS client: tungstenite over rustls (ring, webpki-roots)"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "=1.0.11", default-features = false }
+httparse = { version = "=1.10.1", default-features = false, features = ["std"] }

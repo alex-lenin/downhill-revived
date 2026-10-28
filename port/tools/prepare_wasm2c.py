@@ -194,7 +194,7 @@ def prepare(path, *, minimum_size=True, dispatch=True, hot_functions=()):
 
 
 
-# ---- the module's C for the native hosts (build_host64.py, build_host64_linux.py) ----
+# ---- the module's C for the native hosts (build_host64.py, every target) ----
 
 def module_units(out, run, wasm2c, wasm=None, sources=(), num_outputs=1):
     """The module's C units in out: wasm2c's output for a .wasm (module name core), else copies

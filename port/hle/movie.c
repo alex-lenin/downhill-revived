@@ -31,13 +31,9 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <process.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#include "../host/win32_compat.h"
-#endif
+#include <SDL3/SDL_mutex.h>
+#include <SDL3/SDL_thread.h>
+#include "../host/host_os.h"  /* host_os_fopen (UTF-8 paths), host_fseek (64-bit) */
 
 #include "../third_party/libmpeg2/mpeg2.h"
 
@@ -56,9 +52,9 @@ typedef struct {
 } Slot;
 
 static struct {
-    CRITICAL_SECTION lock;
-    CONDITION_VARIABLE changed;
-    HANDLE thread;
+    SDL_Mutex *lock;
+    SDL_Condition *changed;
+    SDL_Thread *thread;
     volatile int stop;
     int active, audio;
     /* the decoder thread's results, under the lock */
@@ -88,8 +84,8 @@ static int inited;
 static void movie_init_once(void)
 {
     if (inited) return;
-    InitializeCriticalSection(&M.lock);
-    InitializeConditionVariable(&M.changed);
+    M.lock = SDL_CreateMutex();
+    M.changed = SDL_CreateCondition();
     inited = 1;
 }
 
@@ -129,7 +125,7 @@ static int refill(Demux *d, size_t want)
 
 /* Waits under the lock until cond holds or the movie stops; nonzero if it holds. */
 #define WAIT_UNTIL(cond) \
-    do { while (!(cond) && !M.stop) SleepConditionVariableCS(&M.changed, &M.lock, INFINITE); } while (0)
+    do { while (!(cond) && !M.stop) SDL_WaitCondition(M.changed, M.lock); } while (0)
 
 static int64_t clock_picture(void);
 
@@ -160,21 +156,21 @@ static void picture_out(Demux *d, const mpeg2_info_t *info)
     int w = (int)s->picture_width, h = (int)s->picture_height;
     if (w > PICTURE_WIDTH) w = PICTURE_WIDTH;
     if (h > PICTURE_HEIGHT) h = PICTURE_HEIGHT;
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     int64_t k = M.decoded;
     Slot *slot = &M.slots[k % SLOTS];
     /* A slot is free once the clock is past its picture, or the presenter has copied it. */
     WAIT_UNTIL(slot->index < 0 || slot->index <= M.shown || slot->index < clock_picture());
-    if (M.stop) { LeaveCriticalSection(&M.lock); return; }
+    if (M.stop) { SDL_UnlockMutex(M.lock); return; }
     M.width = w; M.height = h;
     if (s->frame_period) M.frame_period = s->frame_period;
-    LeaveCriticalSection(&M.lock);
+    SDL_UnlockMutex(M.lock);
     to_rgba(slot->rgba, w, h, info->display_fbuf->buf, (int)s->width, (int)s->chroma_width);
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     slot->index = k;
     M.decoded = k + 1;
-    WakeAllConditionVariable(&M.changed);
-    LeaveCriticalSection(&M.lock);
+    SDL_BroadcastCondition(M.changed);
+    SDL_UnlockMutex(M.lock);
 }
 
 static void video_feed(Demux *d, uint8_t *p, uint8_t *end)
@@ -195,7 +191,7 @@ static void video_feed(Demux *d, uint8_t *p, uint8_t *end)
 static void audio_block(Demux *d)
 {
     enum { HALF = 0x200, FRAMES = HALF / 2 };
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     if (M.ring_write + FRAMES - M.ring_read > RING) M.ring_read = M.ring_write + FRAMES - RING;
     if (!M.stop) {
         const int16_t *l = (const int16_t *)d->block, *r = (const int16_t *)(d->block + HALF);
@@ -205,9 +201,9 @@ static void audio_block(Demux *d)
             o[1] = r[i];
         }
         M.ring_write += FRAMES;
-        WakeAllConditionVariable(&M.changed);
+        SDL_BroadcastCondition(M.changed);
     }
-    LeaveCriticalSection(&M.lock);
+    SDL_UnlockMutex(M.lock);
 }
 
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -226,9 +222,9 @@ static void audio_feed(Demux *d, const uint8_t *p, size_t n)
                 int ok = !memcmp(h, "SShd", 4) && le32(h + 4) >= 24 && !memcmp(h + 32, "SSbd", 4)
                          && le32(h + 8) == 1 && le32(h + 12) == RATE && le32(h + 16) == 2 && le32(h + 20) == 0x200;
                 d->audio_bytes_left = le32(h + 36);
-                EnterCriticalSection(&M.lock);
+                SDL_LockMutex(M.lock);
                 M.audio_ok = ok;
-                LeaveCriticalSection(&M.lock);
+                SDL_UnlockMutex(M.lock);
                 if (!ok)
                     hle_log("movie: %s: sound not 48 kHz 16-bit stereo PCM (type %u, %u Hz, %u channels), silent\n",
                             M.name, le32(h + 8), le32(h + 12), le32(h + 16));
@@ -290,9 +286,9 @@ static void demux(Demux *d)
                 d->pts_first_audio = pts;
                 if (d->pts_first_video >= 0) {
                     int64_t offset = (pts - d->pts_first_video) * RATE / 90000;
-                    EnterCriticalSection(&M.lock);
+                    SDL_LockMutex(M.lock);
                     M.audio_offset = offset > 0 ? offset : 0;
-                    LeaveCriticalSection(&M.lock);
+                    SDL_UnlockMutex(M.lock);
                 }
             }
             audio_feed(d, payload + 4, (size_t)(end - payload - 4));
@@ -304,27 +300,27 @@ static void demux(Demux *d)
     }
 }
 
-static unsigned __stdcall decoder_thread(void *unused)
+static int SDLCALL decoder_thread(void *unused)
 {
     (void)unused;
     host_thread_name("movie");
     Demux d = {0};
     d.pts_first_video = d.pts_first_audio = -1;
     d.buf = malloc(READ);
-    d.f = fopen(M.iso, "rb");
+    d.f = host_os_fopen(M.iso, "rb");  /* its own FILE: this thread reads it alone */
     d.dec = mpeg2_init();
-    if (d.buf && d.f && d.dec && !_fseeki64(d.f, (long long)M.lsn * 2048, SEEK_SET)) {
+    if (d.buf && d.f && d.dec && !host_fseek(d.f, (int64_t)M.lsn * 2048, SEEK_SET)) {
         d.left = M.size;
         demux(&d);
     } else hle_log("movie: %s: can't read the disc image\n", M.name);
     if (d.dec) mpeg2_close(d.dec);
     if (d.f) fclose(d.f);
     free(d.buf);
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     M.ended = 1;
     if (!M.decoded) M.failed = 1;
-    WakeAllConditionVariable(&M.changed);
-    LeaveCriticalSection(&M.lock);
+    SDL_BroadcastCondition(M.changed);
+    SDL_UnlockMutex(M.lock);
     return 0;
 }
 
@@ -333,12 +329,11 @@ static unsigned __stdcall decoder_thread(void *unused)
 static void release(void)
 {
     if (M.thread) {
-        EnterCriticalSection(&M.lock);
+        SDL_LockMutex(M.lock);
         M.stop = 1;
-        WakeAllConditionVariable(&M.changed);
-        LeaveCriticalSection(&M.lock);
-        WaitForSingleObject(M.thread, INFINITE);
-        CloseHandle(M.thread);
+        SDL_BroadcastCondition(M.changed);
+        SDL_UnlockMutex(M.lock);
+        SDL_WaitThread(M.thread, NULL);
         M.thread = NULL;
     }
     for (int i = 0; i < SLOTS; i++) { free(M.slots[i].rgba); M.slots[i].rgba = NULL; }
@@ -370,15 +365,15 @@ int movie_open(const char *iso, uint32_t lsn, uint32_t size, int audio, const ch
     ok &= (M.picture = calloc(PICTURE_WIDTH * PICTURE_HEIGHT, 4)) != NULL;
     if (ok) {
         for (int i = 0; i < PICTURE_WIDTH * PICTURE_HEIGHT; i++) M.picture[i] = 0xFF000000u;
-        M.thread = (HANDLE)_beginthreadex(NULL, 0, decoder_thread, NULL, 0, NULL);
+        M.thread = SDL_CreateThread(decoder_thread, "movie", NULL);
     }
     if (!ok || !M.thread) { release(); return 0; }
     M.active = 1;
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     while (!M.decoded && !M.ended)
-        if (!SleepConditionVariableCS(&M.changed, &M.lock, 2000)) break;
+        if (!SDL_WaitConditionTimeout(M.changed, M.lock, 2000)) break;
     int failed = !M.decoded;
-    LeaveCriticalSection(&M.lock);
+    SDL_UnlockMutex(M.lock);
     if (failed) { hle_log("movie: %s: no picture decoded, skipped\n", name); release(); return 0; }
     return 1;
 }
@@ -404,9 +399,9 @@ static int64_t clock_picture(void)
 int movie_over(void)
 {
     if (!M.active) return 1;
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     int over = M.ended && clock_picture() >= M.decoded;
-    LeaveCriticalSection(&M.lock);
+    SDL_UnlockMutex(M.lock);
     return over;
 }
 
@@ -415,7 +410,7 @@ int movie_over(void)
 void movie_audio(int32_t *mix, int frames)
 {
     if (!M.active) return;
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     int64_t from = M.clock - M.audio_offset;  /* sound frame due at mix[0] */
     if (M.audio && M.audio_ok && M.ring)
         for (int i = 0; i < frames; i++, from++) {
@@ -429,8 +424,8 @@ void movie_audio(int32_t *mix, int frames)
     /* Played, or too late to play: the ring's room for the decoder. */
     int64_t done = M.clock - M.audio_offset;
     if (done > M.ring_read) M.ring_read = done < M.ring_write ? done : M.ring_write;
-    WakeAllConditionVariable(&M.changed);  /* the decoder may wait for either */
-    LeaveCriticalSection(&M.lock);
+    SDL_BroadcastCondition(M.changed);  /* the decoder may wait for either */
+    SDL_UnlockMutex(M.lock);
 }
 
 /* The picture to present now (PICTURE_WIDTH x PICTURE_HEIGHT RGBA, the movie centred on black),
@@ -438,7 +433,7 @@ void movie_audio(int32_t *mix, int frames)
 const uint32_t *movie_picture(unsigned *width, unsigned *height)
 {
     if (!M.active || !M.picture) return NULL;
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     int64_t want = clock_picture();
     if (want >= M.decoded) want = M.decoded - 1;        /* not decoded yet: the newest one */
     if (want > M.shown) {
@@ -448,10 +443,10 @@ const uint32_t *movie_picture(unsigned *width, unsigned *height)
             for (int y = 0; y < h; y++)
                 memcpy(M.picture + (y0 + y) * PICTURE_WIDTH + x0, slot->rgba + y * w, (size_t)w * 4);
             M.shown = want;
-            WakeAllConditionVariable(&M.changed);
+            SDL_BroadcastCondition(M.changed);
         }
     }
-    LeaveCriticalSection(&M.lock);
+    SDL_UnlockMutex(M.lock);
     *width = PICTURE_WIDTH;
     *height = PICTURE_HEIGHT;
     return M.picture;
@@ -461,10 +456,10 @@ const uint32_t *movie_picture(unsigned *width, unsigned *height)
 /* test_movie.c: the picture due now is decoded and a field of sound is there (or the file ended). */
 int movie_test_ready(void)
 {
-    EnterCriticalSection(&M.lock);
+    SDL_LockMutex(M.lock);
     int sound = !M.audio || !M.audio_ok || M.clock - M.audio_offset + 801 <= M.ring_write;
     int ready = M.ended || (clock_picture() < M.decoded && sound);
-    LeaveCriticalSection(&M.lock);
+    SDL_UnlockMutex(M.lock);
     return ready;
 }
 #else

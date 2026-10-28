@@ -116,8 +116,10 @@ pub struct Objects {
     pub blit_pipe: wgpu::RenderPipeline,
     /// `native_upload_alpha` (blit layout)
     pub upload_pipe: wgpu::RenderPipeline,
-    /// `present_pixel` (draw layout)
-    pub present_pipe: wgpu::RenderPipeline,
+    /// `present_pixel` (draw layout) into RGBA8; `present_pipe` gives it per surface format
+    present_rgba: wgpu::RenderPipeline,
+    /// the same into BGRA8, made at the first present on a surface without RGBA8 (Apple's)
+    present_bgra: std::sync::OnceLock<wgpu::RenderPipeline>,
     /// `native_grow_depth` (grow layout; depth only, writes Depth32Float with Always)
     pub grow_pipe: wgpu::RenderPipeline,
     /// `native_scanout` (scanout layout)
@@ -387,15 +389,13 @@ fn pipeline_layout(gpu: &Gpu, uniform: &wgpu::BindGroupLayout, group1: &wgpu::Bi
     })
 }
 
-/// A full-screen triangle pipeline (`fullscreen_vertex`): an RGBA8 target written whole with no
-/// blend, or (depth) no colour target and Depth32Float written with Always.
+/// A full-screen triangle pipeline (`fullscreen_vertex`): a `target` (RGBA8; the present pass: the
+/// surface's format) written whole with no blend, or (None) no colour target and Depth32Float
+/// written with Always.
 fn fullscreen_pipeline(gpu: &Gpu, module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, entry: &str,
-                       depth: bool) -> wgpu::RenderPipeline {
-    let target = [Some(wgpu::ColorTargetState {
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        blend: None,
-        write_mask: wgpu::ColorWrites::ALL,
-    })];
+                       target: Option<wgpu::TextureFormat>) -> wgpu::RenderPipeline {
+    let depth = target.is_none();
+    let target = [target.map(|format| wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })];
     gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(entry),
         layout: Some(layout),
@@ -441,6 +441,15 @@ impl Objects {
     pub fn create(gpu: &Gpu, dual: bool) -> Result<Objects, String> {
         let dual = dual && device::has_dual_source(gpu);
         scoped(gpu, "native objects", || Objects::build(gpu, dual))
+    }
+
+    /// `present_pixel` into a target of `format`, the window surface's (`Surface::format`: RGBA8,
+    /// else BGRA8); the BGRA8 one is made on its first use.
+    pub fn present_pipe(&self, gpu: &Gpu, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        if format == wgpu::TextureFormat::Rgba8Unorm {
+            return &self.present_rgba;
+        }
+        self.present_bgra.get_or_init(|| fullscreen_pipeline(gpu, &self.module, &self.draw_layout, "present_pixel", Some(format)))
     }
 
     fn build(gpu: &Gpu, dual: bool) -> Objects {
@@ -502,10 +511,11 @@ impl Objects {
         let convert_pipeline_layout = pipeline_layout(gpu, &uniform_layout, &convert_layout);
         let grow_pipeline_layout = pipeline_layout(gpu, &uniform_layout, &grow_layout);
 
-        let blit_pipe = fullscreen_pipeline(gpu, &main, &blit_pipeline_layout, "native_blit", false);
-        let upload_pipe = fullscreen_pipeline(gpu, &main, &blit_pipeline_layout, "native_upload_alpha", false);
-        let present_pipe = fullscreen_pipeline(gpu, &main, &draw_layout, "present_pixel", false);
-        let grow_pipe = fullscreen_pipeline(gpu, &main, &grow_pipeline_layout, "native_grow_depth", true);
+        let rgba = Some(wgpu::TextureFormat::Rgba8Unorm);
+        let blit_pipe = fullscreen_pipeline(gpu, &main, &blit_pipeline_layout, "native_blit", rgba);
+        let upload_pipe = fullscreen_pipeline(gpu, &main, &blit_pipeline_layout, "native_upload_alpha", rgba);
+        let present_rgba = fullscreen_pipeline(gpu, &main, &draw_layout, "present_pixel", rgba);
+        let grow_pipe = fullscreen_pipeline(gpu, &main, &grow_pipeline_layout, "native_grow_depth", None);
         let scanout_pipe = compute_pipeline(gpu, &main, &scanout_pipeline_layout, "native_scanout");
         let convert_pipe = compute_pipeline(gpu, &main, &convert_pipeline_layout, "native_convert");
 
@@ -539,7 +549,8 @@ impl Objects {
             grow_pipeline_layout,
             blit_pipe,
             upload_pipe,
-            present_pipe,
+            present_rgba,
+            present_bgra: std::sync::OnceLock::new(),
             grow_pipe,
             scanout_pipe,
             convert_pipe,

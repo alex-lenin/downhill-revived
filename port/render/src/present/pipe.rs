@@ -1,7 +1,8 @@
 //! present.wgsl's pipeline and the exact present pass (task A5).
 //!
 //! As the retired `gpu_wgpu.c`'s present_pipeline / wgpu_present (last at render/rust 3882d5576):
-//! RGBA8Unorm target, write mask all, no
+//! a target of the surface's format (RGBA8Unorm, or BGRA8Unorm where the surface has no RGBA8:
+//! Apple's CAMetalLayer), write mask all, no
 //! blending, triangle list, one sample; built inside a Validation error scope (None on failure:
 //! logged, not fatal; C then keeps the surface off). The pass clears, writes the 16-byte constants
 //! (display width, height, window width, height), sets the bind group (the source view at 0, the
@@ -11,6 +12,8 @@ use crate::device::Gpu;
 use std::sync::Mutex;
 
 pub struct PresentPipe {
+    /// The target's format (the surface's).
+    pub format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     /// present.wgsl's `present_state` (16 bytes; uniform, copy dst).
@@ -20,8 +23,9 @@ pub struct PresentPipe {
     group: Mutex<Option<(wgpu::TextureView, wgpu::BindGroup)>>,
 }
 
-/// The pipeline's descriptor parts: as gpu_wgpu.c's present_pipeline (automatic layout).
-fn build(gpu: &Gpu) -> wgpu::RenderPipeline {
+/// The pipeline's descriptor parts: as gpu_wgpu.c's present_pipeline (automatic layout), into a
+/// `format` target.
+fn build(gpu: &Gpu, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
     let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("present.wgsl"),
         source: wgpu::ShaderSource::Wgsl(crate::shaders::PRESENT.into()),
@@ -46,7 +50,7 @@ fn build(gpu: &Gpu) -> wgpu::RenderPipeline {
             entry_point: Some("present_fragment"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -57,7 +61,7 @@ fn build(gpu: &Gpu) -> wgpu::RenderPipeline {
 }
 
 impl PresentPipe {
-    fn finish(gpu: &Gpu, pipeline: wgpu::RenderPipeline) -> PresentPipe {
+    fn finish(gpu: &Gpu, pipeline: wgpu::RenderPipeline, format: wgpu::TextureFormat) -> PresentPipe {
         let layout = pipeline.get_bind_group_layout(0);
         let constants = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("present"),
@@ -65,38 +69,41 @@ impl PresentPipe {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        PresentPipe { pipeline, layout, constants, group: Mutex::new(None) }
+        PresentPipe { format, pipeline, layout, constants, group: Mutex::new(None) }
     }
 
-    /// present.wgsl's pipeline, or None (logged) when the device can't build it. Blocks on the
-    /// error scope (native builds).
+    /// present.wgsl's pipeline into `format`, or None (logged) when the device can't build it.
+    /// Blocks on the error scope (native builds).
     #[cfg(feature = "native")]
-    pub fn create(gpu: &Gpu) -> Option<PresentPipe> {
+    pub fn create(gpu: &Gpu, format: wgpu::TextureFormat) -> Option<PresentPipe> {
         let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = build(gpu);
+        let pipeline = build(gpu, format);
         let error = pollster::block_on(scope.pop());
-        Self::checked(gpu, pipeline, error)
+        Self::checked(gpu, pipeline, error, format)
     }
 
     /// Without the `native` feature there is no blocking executor (the browser uses `create_async`).
     #[cfg(not(feature = "native"))]
-    pub fn create(gpu: &Gpu) -> Option<PresentPipe> {
-        let _ = gpu;
+    pub fn create(gpu: &Gpu, format: wgpu::TextureFormat) -> Option<PresentPipe> {
+        let _ = (gpu, format);
         crate::host::log("dhd_render: present pipeline: no blocking executor in this build (create_async)");
         None
     }
 
-    /// present.wgsl's pipeline (the browser's async init awaits the error scope).
+    /// present.wgsl's pipeline into an RGBA8 target (the browser's canvas; its async init awaits
+    /// the error scope).
     pub async fn create_async(gpu: &Gpu) -> Option<PresentPipe> {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
         let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = build(gpu);
+        let pipeline = build(gpu, format);
         let error = scope.pop().await;
-        Self::checked(gpu, pipeline, error)
+        Self::checked(gpu, pipeline, error, format)
     }
 
-    fn checked(gpu: &Gpu, pipeline: wgpu::RenderPipeline, error: Option<wgpu::Error>) -> Option<PresentPipe> {
+    fn checked(gpu: &Gpu, pipeline: wgpu::RenderPipeline, error: Option<wgpu::Error>, format: wgpu::TextureFormat)
+               -> Option<PresentPipe> {
         match error {
-            None => Some(Self::finish(gpu, pipeline)),
+            None => Some(Self::finish(gpu, pipeline, format)),
             Some(e) => {
                 crate::host::log(&format!("dhd_render: present pipeline: {e}"));
                 None

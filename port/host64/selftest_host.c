@@ -13,6 +13,7 @@
 #include "wasm-rt-impl.h"
 #include "core_host.h"
 #include "memory_access.h"
+#include "memory_layout.h"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); exit(1); } } while (0)
 struct w2c_env { w2c_core *core; };
@@ -51,7 +52,7 @@ void w2c_env_probe(struct w2c_env *env,u32 id,u32 address,u32 depth) {
     (void)env; CHECK(id<3 && depth<=180);
     uint32_t top=host64_fiber_stack_top(threads[id]);
     CHECK(host_fiber_current()==threads[id]);
-    CHECK(address>=top-0x40000+0x1000 && address+128<=top); /* above the guard page */
+    CHECK(address>=top-0x40000+HOST64_PAGE && address+128<=top); /* above the guard page */
     CHECK(wasm_rt_call_stack_depth==182-depth);
     CHECK(fp_bits()==(id==1?FP_IEEE_EXPECTED:FP_EE_EXPECTED));
     if (address<minimum[id]) minimum[id]=address;
@@ -183,8 +184,8 @@ int main(int argc,char **argv) {
        above the null page, and the RAM views. */
     CHECK(*w2c_core_0x5F_stack_pointer(&core)==0x100000);
     CHECK(host64_memory_commit_stack(*w2c_core_0x5F_stack_pointer(&core)));
-    check_protection(0x1000,1); check_protection(0xff000,1);
-    static const uint64_t reserved[]={0,0x100000,0x003ff000,0x02000000,0x06000000,0x06ffffff,
+    check_protection(HOST64_NULL_GUARD,1); check_protection(0xff000,1);
+    static const uint64_t reserved[]={0,HOST64_NULL_GUARD-1,0x100000,0x003ff000,0x02000000,0x06000000,0x06ffffff,
         0x07000000,0x0a000000,0x10000000,0x11000000,0x12000000,0x13000000,0x3a000000,
         0x70000000,0x70004000,0x700ff000};
     for (unsigned i=0;i<sizeof reserved/sizeof reserved[0];i++) check_protection(reserved[i],0);
@@ -219,7 +220,7 @@ int main(int argc,char **argv) {
     for (unsigned i=0;i<3;i++) {
         threads[i]=host_fiber_create(entry,(void *)(uintptr_t)i); CHECK(threads[i]==i+1);
         CHECK(host64_fiber_stack_top(threads[i])==0x06040000+i*0x40000);
-        check_protection(0x06000000+i*0x40000,0); check_protection(0x06001000+i*0x40000,1);
+        check_protection(0x06000000+i*0x40000+HOST64_PAGE-1,0); check_protection(0x06000000+i*0x40000+HOST64_PAGE,1);
         minimum[i]=UINT32_MAX;
     }
     host_fiber_switch(threads[0]);

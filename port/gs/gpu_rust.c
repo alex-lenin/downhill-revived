@@ -22,18 +22,19 @@
    static int native_waits_for_vsync(struct Native *n); native_capture and native_profile are
    native_core.inc's.
 
-   Android (finding 091): the same file over the Android build's libdhd_render.a. No DXGI (the
-   device is Vulkan's, its memory unknown), the surface is on SDL's ANativeWindow
-   (DHDR_WINDOW_ANDROID), the window's size is present.c's (gs_window_pixels), and
-   gs_gpu_surface_reset swaps the surface when the app goes to the background and back. */
+   Every native platform builds this file over its dhd_render library: the window is present.c's
+   (a GsWindow: Win32's HWND, X11's or Wayland's window, Android's ANativeWindow, Apple's
+   CAMetalLayer, with its size function), and the renderer picks the backend (DX12 or Vulkan on
+   Windows, Metal on Apple, Vulkan elsewhere). Windows alone has DXGI (the adapter choice, the
+   video memory) and the DX12 shader compiler. gs_gpu_surface_reset swaps the surface when a
+   phone's app goes to the background and back (finding 091). */
 #define COBJMACROS
 #include "gpu.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <dxgi.h>
-#else
-#include "../host/win32_compat.h"  /* QueryPerformanceCounter and friends */
 #endif
+#include <SDL3/SDL_timer.h>  /* the performance counter */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,11 +76,12 @@ typedef struct Rust {
     unsigned display_width, display_height;
     DhdrExactStats stats;         /* dhdr_exact_stats at the last profile line */
     /* DHD_RENDER=native (gpu_rust_native.inc): this backend then only answers the Z probe, and
-       draws only inside clip when clip_on (nothing until a probe); window: rust_surface's HWND.
-       native_core.inc reads and writes native, clip_on and clip on its NativeExact (this struct). */
+       draws only inside clip when clip_on (nothing until a probe); window: the surface's (its size
+       function NULL without a surface). native_core.inc reads and writes native, clip_on and clip
+       on its NativeExact (this struct). */
     struct Native *native;
     int clip_on, clip[4];
-    void *window;
+    GsWindow window;
 } Rust;
 
 /* ---- the device ops (gpu_exact.inc's op_* seam): op_write, op_copy, op_batch, op_record,
@@ -97,7 +99,7 @@ static void op_read(Exact *gpu, int buffer, const uint32_t want[16], void *image
 
 /* ---- host hooks (not device calls) ---- */
 
-static uint64_t op_clock(void) { LARGE_INTEGER n; QueryPerformanceCounter(&n); return (uint64_t)n.QuadPart; }
+static uint64_t op_clock(void) { return SDL_GetPerformanceCounter(); }
 
 /* Diagnostic isolation by VU1 byte entry (DHD_DRAW_SKIP_VU, _PROGRAM, _OVERLAY). */
 static int op_draw_skipped(const Gs *g)
@@ -167,12 +169,13 @@ static int dxgi_adapter(unsigned vendor, unsigned id, DXGI_ADAPTER_DESC1 *desc, 
 }
 #endif
 
-/* The device's settings as DhdrDeviceDesc flags: DHD_WGPU_BACKEND=vulkan, DHD_WGPU_COMPILER=fxc
-   (else DXC when dxcompiler.dll is beside the exe), DHD_WGPU_DEBUG, DHD_WGPU_DUAL_SOURCE=0, and the
-   adapter: DHD_WGPU_ADAPTER=fallback (WARP), else DXGI's first adapter by its PCI ids (the GPU the
-   D3D11 presentation device took before), WARP when that is Microsoft's Basic Render Driver (no
-   graphics driver); with no DXGI adapter, or another DHD_WGPU_ADAPTER value, wgpu's
-   high-performance choice (WARP last).
+/* The device's settings as DhdrDeviceDesc flags: DHD_WGPU_BACKEND=vulkan (Windows; elsewhere the
+   platform's one API), DHD_WGPU_DEBUG, DHD_WGPU_DUAL_SOURCE=0; on Windows DHD_WGPU_COMPILER=fxc
+   (else DXC when dxcompiler.dll is beside the exe) and the adapter: DHD_WGPU_ADAPTER=fallback
+   (WARP), else DXGI's first adapter by its PCI ids (the GPU the D3D11 presentation device took
+   before), WARP when that is Microsoft's Basic Render Driver (no graphics driver); with no DXGI
+   adapter, or another DHD_WGPU_ADAPTER value, wgpu's high-performance choice (WARP last).
+   Elsewhere wgpu's high-performance adapter.
    Once the device exists later calls return 1 at once; a failure is latched by dhdr_device_init. */
 static int device_init(void)
 {
@@ -187,14 +190,7 @@ static int device_init(void)
     if (getenv("DHD_WGPU_DEBUG")) d.flags |= DHDR_DEV_DEBUG | DHDR_DEV_VALIDATION;
     if (dual && !atoi(dual)) d.flags |= DHDR_DEV_NO_DUAL_SOURCE;
     d.log_level = getenv("DHD_WGPU_DEBUG") ? DHDR_LOG_WARN : DHDR_LOG_ERROR;
-#ifndef _WIN32
-    /* Android: Vulkan, wgpu's high-performance adapter (the only one) */
-    (void)compiler; (void)choice;
-    d.flags |= DHDR_DEV_VULKAN;
-    if (!dhdr_device_init(&d)) return 0;
-    device.made = 1;
-    device.flags = d.flags;
-#else
+#ifdef _WIN32
     static char dxc[MAX_PATH + 16];
     DWORD length = GetModuleFileNameA(NULL, dxc, MAX_PATH);
     char *slash = length && length < MAX_PATH ? strrchr(dxc, '\\') : NULL;
@@ -212,9 +208,13 @@ static int device_init(void)
     else if (!choice && known) { d.vendor_id = desc.VendorId; d.device_id = desc.DeviceId; }
     if (getenv("DHD_PROFILE"))
         fprintf(stderr, "gs: WebGPU shader compiler %s\n", d.dxc_path ? d.dxc_path : "FXC");
+#else
+    (void)compiler; (void)choice;
+#endif
     if (!dhdr_device_init(&d)) return 0;
     device.made = 1;
     device.flags = d.flags;
+#ifdef _WIN32
     /* the adapter's PCI ids as far as they are known here: DXGI's first adapter (asked for by its
        ids), WARP's for the fallback adapter, else unknown (the high-performance adapter) */
     if (d.flags & DHDR_DEV_FALLBACK) { device.vendor_id = 0x1414; device.device_id = 0x8C; }
@@ -255,18 +255,12 @@ static void op_adapter(const Exact *gpu, ExactAdapter *a)
 }
 #endif
 
-/* The window's client size in pixels: GetClientRect of the HWND; elsewhere present.c's SDL window
-   (gs_window_pixels). 0 x 0 when there is none (minimised, or the app in the background). */
-static void window_size(void *window, unsigned *width, unsigned *height)
+/* The window's drawable size in pixels, from its own size function (present.c's SDL window, or a
+   test program's window). 0 x 0 when there is none (minimised, or the app in the background). */
+static void window_size(const GsWindow *window, unsigned *width, unsigned *height)
 {
-#ifdef _WIN32
-    RECT client = {0, 0, 0, 0};
-    if (window) GetClientRect((HWND)window, &client);
-    *width = (unsigned)client.right; *height = (unsigned)client.bottom;
-#else
     *width = *height = 0;
-    if (window) gs_window_pixels(width, height);
-#endif
+    if (window->size) window->size(width, height);
 }
 
 /* ---- the native renderer (DHD_RENDER=native) ---- */
@@ -301,10 +295,8 @@ void gs_gpu_profile(Gs *g, double seconds)
 {
     Rust *p = g->backend;
     Exact *gpu = p ? &p->e : NULL;
-    LARGE_INTEGER frequency;
     if (!gpu || !gpu->profile) return;
-    QueryPerformanceFrequency(&frequency);
-    double ms = 1000.0 / (double)frequency.QuadPart / seconds;
+    double ms = 1000.0 / (double)SDL_GetPerformanceFrequency() / seconds;
     fprintf(stderr, "profile GS (rust): %.1f draws/s, %.1f snapshots/s, %.1f uploads/s, draw %.1f ms/s, readback %.1f ms/s, %.1f dispatches/s, %.1f submits/s, %.1f local copies/s\n",
             gpu->draws / seconds, gpu->snapshots / seconds, gpu->uploads / seconds,
             gpu->draw_ticks * ms, gpu->sync_ticks * ms, gpu->dispatches / seconds, gpu->submits / seconds,
@@ -350,24 +342,23 @@ int gs_gpu_capture(Gs *g, uint32_t *pixels)
     return 1;
 }
 
-/* A surface on the window's HWND (SDL's, present.c; Android: its ANativeWindow): frame latency 1,
-   Immediate unless DHD_TEARING=0, else Mailbox, else Fifo; Fifo when the native renderer waits
-   for vsync. */
-int gs_gpu_surface(Gs *g, void *window)
+_Static_assert(GS_WINDOW_WIN32 == DHDR_WINDOW_WIN32 && GS_WINDOW_XLIB == DHDR_WINDOW_XLIB &&
+               GS_WINDOW_WAYLAND == DHDR_WINDOW_WAYLAND && GS_WINDOW_ANDROID == DHDR_WINDOW_ANDROID &&
+               GS_WINDOW_METAL_LAYER == DHDR_WINDOW_METAL_LAYER, "gpu.h's window kinds are dhd_render.h's");
+
+/* A surface on the window (present.c's SDL window: its HWND, X11 or Wayland window, ANativeWindow
+   or CAMetalLayer): frame latency 1, Immediate unless DHD_TEARING=0, else Mailbox, else Fifo; Fifo
+   when the native renderer waits for vsync. */
+int gs_gpu_surface(Gs *g, const GsWindow *window)
 {
     Rust *p = g->backend;
-    if (!p || !window || p->surface) return p && p->surface;
-    p->window = window;
+    if (!p || !window || !window->a || p->surface) return p && p->surface;
+    p->window = *window;
     DhdrWindow w;
     memset(&w, 0, sizeof w);
-#ifdef _WIN32
-    w.kind = DHDR_WINDOW_WIN32;
-    w.a = (uint64_t)(uintptr_t)window;
-    w.b = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
-#else
-    w.kind = DHDR_WINDOW_ANDROID;
-    w.a = (uint64_t)(uintptr_t)window;
-#endif
+    w.kind = window->kind;
+    w.a = window->a;
+    w.b = window->b;
     /* V-Sync (dhd.ini "vsync", PC SETTINGS): no tearing, without waiting where the display allows
        it (Mailbox, else Fifo; present/surface.rs). Off: pictures go out at once and may tear.
        DHD_TEARING=0 is the older name for it. */
@@ -375,6 +366,7 @@ int gs_gpu_surface(Gs *g, void *window)
     uint32_t flags = (vsync && atoi(vsync)) || (tearing && !atoi(tearing)) ? DHDR_PRESENT_NO_TEARING : 0;
     if (p->native && native_waits_for_vsync(p->native)) flags |= DHDR_PRESENT_VSYNC;
     p->surface = dhdr_surface_create(&w, flags);
+    if (!p->surface) memset(&p->window, 0, sizeof p->window);
     if (p->surface && getenv("DHD_PROFILE"))
         fprintf(stderr, "gs: WebGPU surface (dhd_render), present flags %u, usage %u\n", flags,
                 dhdr_surface_usage(p->surface));
@@ -385,14 +377,14 @@ int gs_gpu_surface(Gs *g, void *window)
    app went to the background; its surface comes back new). The native renderer's render thread
    is held off meanwhile (its context lock); a native present that failed on the lost surface is
    forgiven, and the next one reconfigures. */
-int gs_gpu_surface_reset(Gs *g, void *window)
+int gs_gpu_surface_reset(Gs *g, const GsWindow *window)
 {
     Rust *p = g->backend;
     if (!p) return 0;
     if (p->native) gs_native_lock(g, 1);
     dhdr_surface_destroy(p->surface);
     p->surface = NULL;
-    p->window = NULL;
+    memset(&p->window, 0, sizeof p->window);
     int ok = !window || gs_gpu_surface(g, window);
     if (p->native) native_surface_reset(p->native);
     if (p->native) gs_native_lock(g, 0);
