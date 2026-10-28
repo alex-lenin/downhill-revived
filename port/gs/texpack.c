@@ -20,9 +20,10 @@
    replacement is sampled over the same normalised texture space as the original (native.wgsl's
    replacement flag), with mipmaps made here, so a 4x pack draws 4x the detail.
 
-   Loading: the folder's file names are indexed at start. A texture's replacement is decoded
-   (WIC, part of Windows) and uploaded on loader threads the first time it is drawn; until then
-   the original is drawn. Uploaded replacements count against a memory budget (DHD_TEXTURE_
+   Loading: the folder's file names are indexed at start. A texture's replacement is read (the
+   host's files, host_api.h), decoded (the Rust library's PNG decoder, dhdr_png_*: the same on
+   every platform) and uploaded on loader threads the first time it is drawn; until then the
+   original is drawn. Uploaded replacements count against a memory budget (DHD_TEXTURE_
    CACHE_MB, dhd.ini texture_cache_mb; default half the graphics card's memory, 512-2048 MB);
    over it, those no field drew lately are released and loaded again when needed. The renderer
    that draws them makes the textures (replace_texture.h).
@@ -36,18 +37,19 @@
    where those draws are 8 ms apart; possible at 60 on a slow disk). In a live race (the
    countdown and the race, screen 9 phases 1-4) nothing waits, so a race never stalls on a
    texture: its replacement takes over a few fields later, as before. */
-#define COBJMACROS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <wincodec.h>
-#include <process.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h>
 #include "texpack.h"
 #include "memory.h"
+#include "../host/host_api.h"
 #include "../include/guest.h"
+#include "../render/include/dhd_render.h"  /* dhdr_png_size, dhdr_png_decode */
+#include <SDL3/SDL_mutex.h>
+#include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_timer.h>
 
 #define XXH_INLINE_ALL
 #define XXH_STATIC_LINKING_ONLY
@@ -56,13 +58,14 @@
 void host_thread_name(const char *name);  /* port/hle/host.c */
 
 enum { PACK_IDLE, PACK_QUEUED, PACK_READY, PACK_FAILED };
-enum { PACK_LOADERS = 2, PACK_MAX_SIDE = 4096, PACK_WAIT_MS = 200 };
+enum { PACK_LOADERS = 2, PACK_MAX_SIDE = 4096, PACK_WAIT_MS = 200, PACK_PATH = 4096 };
+#define PACK_MAX_FILE (256u << 20)     /* a 4096 x 4096 PNG of 16-bit RGBA samples, stored, fits */
 
 struct TexPackEntry {
     uint64_t tex0_hash, clut_hash;
     uint32_t bits;
-    wchar_t *path;
-    volatile LONG state;
+    char *path;                        /* below the pack's folder: UTF-8, '/' between names */
+    atomic_int state;
     void *view;                        /* the renderer's (ReplaceDevice); loader thread, before state becomes READY */
     uint32_t bytes;
     uint64_t used;                     /* GS worker: the last field that drew it */
@@ -74,21 +77,20 @@ static struct {
     unsigned count, capacity;
     int32_t *table;                    /* open addressing, entry index or -1 */
     unsigned mask;
-    wchar_t root[MAX_PATH];
-    unsigned root_length;
+    char root[PACK_PATH];              /* UTF-8 */
     unsigned skipped_names;
     /* loading */
-    CRITICAL_SECTION lock;
-    CONDITION_VARIABLE wake;
-    CONDITION_VARIABLE done;           /* a loader finished an entry (READY or FAILED) */
+    SDL_Mutex *lock;
+    SDL_Condition *wake;
+    SDL_Condition *done;               /* a loader finished an entry (READY or FAILED) */
     int64_t wait_us;                   /* waiting left this field (set at vsync, GS worker spends it) */
     uint64_t waits, waited_us, wait_misses;
     TexPackEntry **queue;              /* a ring one longer than the index: each entry is queued once at most */
     unsigned head, tail;
-    volatile LONG64 bytes;
+    _Atomic int64_t bytes;
     uint64_t budget, peak;
-    volatile LONG loaded, failed;
-    volatile LONG64 load_us;
+    atomic_long loaded, failed;
+    _Atomic int64_t load_us;
     uint64_t evicted, last_evict;
     /* GS worker */
     uint8_t *scratch;
@@ -119,14 +121,14 @@ static TexPackEntry *pack_lookup(uint64_t tex0_hash, uint64_t clut_hash, uint32_
     }
 }
 
-static int hex_field(const wchar_t *s, size_t length, uint64_t *out)
+static int hex_field(const char *s, size_t length, uint64_t *out)
 {
     uint64_t v = 0;
     if (!length || length > 16) return 0;
     for (size_t i = 0; i < length; i++) {
-        wchar_t c = s[i];
-        unsigned d = c >= L'0' && c <= L'9' ? c - L'0' : c >= L'a' && c <= L'f' ? c - L'a' + 10 :
-                     c >= L'A' && c <= L'F' ? c - L'A' + 10 : 16;
+        char c = s[i];
+        unsigned d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                     c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
         if (d == 16) return 0;
         v = v << 4 | d;
     }
@@ -136,15 +138,15 @@ static int hex_field(const wchar_t *s, size_t length, uint64_t *out)
 
 /* "<hash>-<clut>-<bits>.png" or "<hash>-<bits>.png" (PCSX2's ParseReplacementName, without
    the region forms). */
-static int pack_parse(const wchar_t *name, uint64_t *tex0_hash, uint64_t *clut_hash, uint32_t *bits)
+static int pack_parse(const char *name, uint64_t *tex0_hash, uint64_t *clut_hash, uint32_t *bits)
 {
-    size_t length = wcslen(name);
-    if (length < 5 || _wcsicmp(name + length - 4, L".png")) return 0;
+    size_t length = strlen(name);
+    if (length < 5 || SDL_strcasecmp(name + length - 4, ".png")) return 0;
     length -= 4;
-    const wchar_t *part[3];
+    const char *part[3];
     size_t size[3], parts = 0, start = 0;
     for (size_t i = 0; i <= length; i++)
-        if (i == length || name[i] == L'-') {
+        if (i == length || name[i] == '-') {
             if (parts == 3) return 0;
             part[parts] = name + start; size[parts++] = i - start;
             start = i + 1;
@@ -159,7 +161,7 @@ static int pack_parse(const wchar_t *name, uint64_t *tex0_hash, uint64_t *clut_h
     return 1;
 }
 
-static void pack_add(const wchar_t *relative, const wchar_t *name)
+static void pack_add(const char *relative, const char *name)
 {
     uint64_t tex0_hash, clut_hash;
     uint32_t bits;
@@ -170,101 +172,83 @@ static void pack_add(const wchar_t *relative, const wchar_t *name)
         if (!grown) return;
         pack.entries = grown; pack.capacity = capacity;
     }
-    size_t length = wcslen(relative);
-    wchar_t *path = malloc((length + 1) * sizeof *path);
+    char *path = SDL_strdup(relative);
     if (!path) return;
-    memcpy(path, relative, (length + 1) * sizeof *path);
     TexPackEntry *e = &pack.entries[pack.count++];
     memset(e, 0, sizeof *e);
     e->tex0_hash = tex0_hash; e->clut_hash = clut_hash; e->bits = bits; e->path = path;
 }
 
-/* Every PNG below the folder (PCSX2 searches it recursively too). */
-static void pack_scan(wchar_t *relative, size_t length, int depth)
+/* Every PNG below the folder (PCSX2 searches it recursively too); relative is "" or "a/b/". A
+   folder is closed before its subfolders are read, so one folder is open at a time. */
+static void pack_scan(const char *relative, int depth)
 {
-    wchar_t pattern[MAX_PATH * 2];
-    WIN32_FIND_DATAW found;
-    if (_snwprintf(pattern, MAX_PATH * 2, L"%ls\\%ls*", pack.root, relative) < 0) return;
-    HANDLE h = FindFirstFileExW(pattern, FindExInfoBasic, &found, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
-    if (h == INVALID_HANDLE_VALUE) return;
+    char folder[PACK_PATH], path[PACK_PATH];
+    char **below = NULL;
+    unsigned folders = 0;
+    HostDirEntry found;
+    if (snprintf(folder, sizeof folder, "%s/%s", pack.root, relative) >= (int)sizeof folder) return;
+    HostDir d = host_dir_open(folder, &found);
+    if (d == HOST_DIR_NONE) return;
     do {
-        size_t name = wcslen(found.cFileName);
-        if (found.cFileName[0] == L'.' || length + name + 2 >= MAX_PATH) continue;
-        memcpy(relative + length, found.cFileName, (name + 1) * sizeof *relative);
-        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (depth < 8) {
-                relative[length + name] = L'\\'; relative[length + name + 1] = 0;
-                pack_scan(relative, length + name + 1, depth + 1);
-            }
-        } else pack_add(relative, found.cFileName);
-        relative[length] = 0;
-    } while (FindNextFileW(h, &found));
-    FindClose(h);
-}
-
-static int pack_folder(const wchar_t *path)
-{
-    DWORD a = GetFileAttributesW(path);
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+        if (found.name[0] == '.' || snprintf(path, sizeof path, "%s%s", relative, found.name) >= (int)sizeof path - 1)
+            continue;
+        if (!found.is_dir) pack_add(path, found.name);
+        else if (depth < 8) {
+            char **grown = realloc(below, (folders + 1) * sizeof *below);
+            if (!grown) continue;
+            below = grown;
+            if ((below[folders] = SDL_strdup(path))) folders++;
+        }
+    } while (host_dir_next(d, &found));
+    host_dir_close(d);
+    for (unsigned i = 0; i < folders; i++) {
+        snprintf(path, sizeof path, "%s/", below[i]);
+        pack_scan(path, depth + 1);
+        SDL_free(below[i]);
+    }
+    free(below);
 }
 
 /* The pack's folder: DHD_TEXTURE_PACK (the replacements folder, or a folder holding
-   replacements\ or SCUS-97177\replacements\, as PCSX2's textures folder does), else
-   textures\SCUS-97177\replacements beside dhd.exe. */
-static int pack_find_root(wchar_t root[MAX_PATH], int quiet)
+   replacements/ or SCUS-97177/replacements/, as PCSX2's textures folder does), else
+   textures/SCUS-97177/replacements in DHD_DATA_DIR (the launcher's folder for the player's files),
+   else beside the game. Paths are UTF-8; either slash separates names. */
+static int pack_find_root(char root[PACK_PATH], int quiet)
 {
-    wchar_t base[MAX_PATH], tried[MAX_PATH];
-    static const wchar_t *const below[] = {L"", L"\\replacements", L"\\SCUS-97177\\replacements"};
-    const char *named = getenv("DHD_TEXTURE_PACK");
+    static const char *const below[] = {"", "/replacements", "/SCUS-97177/replacements"};
+    char base[PACK_PATH], tried[PACK_PATH + 32];
+    const char *named = host_getenv("DHD_TEXTURE_PACK"), *data = host_getenv("DHD_DATA_DIR");
     if (named && *named) {
-        if (!MultiByteToWideChar(CP_ACP, 0, named, -1, base, MAX_PATH)) return 0;
-        size_t n = wcslen(base);
-        while (n > 3 && (base[n - 1] == L'\\' || base[n - 1] == L'/')) base[--n] = 0;
+        snprintf(base, sizeof base, "%s", named);
+        size_t n = strlen(base);
+        while (n > 1 && (base[n - 1] == '\\' || base[n - 1] == '/') && base[n - 2] != ':') base[--n] = 0;
         for (int i = 2; i >= 0; i--) {
-            _snwprintf(tried, MAX_PATH, L"%ls%ls", base, below[i]);
-            tried[MAX_PATH - 1] = 0;
-            if (pack_folder(tried)) { wcscpy(root, tried); return 1; }
+            snprintf(tried, sizeof tried, "%s%s", base, below[i]);
+            if (strlen(tried) < PACK_PATH && host_path_is_dir(tried)) { strcpy(root, tried); return 1; }
         }
         if (!quiet) fprintf(stderr, "textures: pack folder %s not found (texture_pack in dhd.ini)\n", named);
         return 0;
     }
-    DWORD n = GetModuleFileNameW(NULL, base, MAX_PATH);
-    while (n && base[n - 1] != L'\\' && base[n - 1] != L'/') n--;
-    base[n] = 0;
-    _snwprintf(tried, MAX_PATH, L"%lstextures\\SCUS-97177\\replacements", base);
-    tried[MAX_PATH - 1] = 0;
-    if (!pack_folder(tried)) return 0;
-    wcscpy(root, tried);
+    if (data && *data) snprintf(base, sizeof base, "%s/", data);
+    else {
+        unsigned n = host_exe_path(base, sizeof base);
+        while (n && base[n - 1] != '\\' && base[n - 1] != '/') n--;
+        base[n] = 0;
+    }
+    snprintf(tried, sizeof tried, "%stextures/SCUS-97177/replacements", base);
+    if (strlen(tried) >= PACK_PATH || !host_path_is_dir(tried)) return 0;
+    strcpy(root, tried);
     return 1;
 }
 
 int texpack_available(void)
 {
-    wchar_t root[MAX_PATH];
+    char root[PACK_PATH];
     return pack_find_root(root, 1);
 }
 
 /* ---- loading (loader threads) ---- */
-
-static const GUID pack_clsid_wic = {0xcacaf262, 0x9370, 0x4615, {0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a}};
-static const GUID pack_iid_wic = {0xec5ec8a9, 0xc395, 0x4314, {0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70}};
-static const GUID pack_iid_format_info2 = {0xa9db33a2, 0xaf5f, 0x43c7, {0xb6, 0x79, 0x74, 0xf5, 0x98, 0x4b, 0x5a, 0xa4}};
-static const GUID pack_format_rgba = {0xf5c7ad2d, 0x6a8d, 0x43dd, {0xa7, 0xa8, 0xa2, 0x99, 0x35, 0x26, 0x1a, 0xe9}};
-
-static int pack_has_alpha(IWICImagingFactory *wic, const GUID *format)
-{
-    IWICComponentInfo *info = NULL;
-    IWICPixelFormatInfo2 *pixel = NULL;
-    BOOL alpha = TRUE;
-    if (SUCCEEDED(IWICImagingFactory_CreateComponentInfo(wic, format, &info))) {
-        if (SUCCEEDED(IWICComponentInfo_QueryInterface(info, &pack_iid_format_info2, (void **)&pixel))) {
-            IWICPixelFormatInfo2_SupportsTransparency(pixel, &alpha);
-            IWICPixelFormatInfo2_Release(pixel);
-        }
-        IWICComponentInfo_Release(info);
-    }
-    return alpha != FALSE;
-}
 
 /* The next level from this one, a 2x2 box (an odd side keeps its last texel). */
 static void pack_halve(const uint8_t *from, unsigned w, unsigned h, uint8_t *to)
@@ -282,30 +266,29 @@ static void pack_halve(const uint8_t *from, unsigned w, unsigned h, uint8_t *to)
     }
 }
 
-static int pack_load(IWICImagingFactory *wic, TexPackEntry *e)
+/* The whole file (*size bytes), or NULL. */
+static uint8_t *pack_read(const char *path, size_t *size)
 {
-    wchar_t path[MAX_PATH * 2];
-    IWICBitmapDecoder *decoder = NULL;
-    IWICBitmapFrameDecode *frame = NULL;
-    IWICFormatConverter *converter = NULL;
-    uint8_t *pixels = NULL;
-    UINT w = 0, h = 0;
+    HostFile f = host_file_open(path, HOST_FILE_READ);
+    if (f == HOST_FILE_NONE) return NULL;
+    uint64_t length = host_file_size(f);
+    uint8_t *data = length && length <= PACK_MAX_FILE ? malloc((size_t)length) : NULL;
+    if (data && host_file_read(f, data, (size_t)length) != (int64_t)length) { free(data); data = NULL; }
+    host_file_close(f);
+    *size = (size_t)length;
+    return data;
+}
+
+static int pack_load(TexPackEntry *e)
+{
+    char path[PACK_PATH * 2];
+    size_t size = 0;
+    uint8_t *file, *pixels = NULL;
+    uint32_t w = 0, h = 0;
     int ok = 0;
-    _snwprintf(path, MAX_PATH * 2, L"%ls\\%ls", pack.root, e->path);
-    path[MAX_PATH * 2 - 1] = 0;
-    if (FAILED(IWICImagingFactory_CreateDecoderFromFilename(wic, path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
-                                                            &decoder)))
-        goto done;
-    if (FAILED(IWICBitmapDecoder_GetFrame(decoder, 0, &frame))) goto done;
-    if (FAILED(IWICBitmapFrameDecode_GetSize(frame, &w, &h)) || !w || !h || w > PACK_MAX_SIDE || h > PACK_MAX_SIDE)
-        goto done;
-    WICPixelFormatGUID format;
-    if (FAILED(IWICBitmapFrameDecode_GetPixelFormat(frame, &format))) goto done;
-    int alpha = pack_has_alpha(wic, &format);
-    if (FAILED(IWICImagingFactory_CreateFormatConverter(wic, &converter))) goto done;
-    if (FAILED(IWICFormatConverter_Initialize(converter, (IWICBitmapSource *)frame, &pack_format_rgba,
-                                              WICBitmapDitherTypeNone, NULL, 0, WICBitmapPaletteTypeCustom)))
-        goto done;
+    snprintf(path, sizeof path, "%s/%s", pack.root, e->path);
+    if (!(file = pack_read(path, &size))) return 0;
+    if (!dhdr_png_size(file, size, &w, &h) || !w || !h || w > PACK_MAX_SIDE || h > PACK_MAX_SIDE) goto done;
     /* All the levels in one buffer, down to 1x1. */
     unsigned levels = 1;
     size_t total = (size_t)w * h * 4;
@@ -314,9 +297,7 @@ static int pack_load(IWICImagingFactory *wic, TexPackEntry *e)
         total += (size_t)lw * lh * 4;
     }
     if (!(pixels = malloc(total))) goto done;
-    if (FAILED(IWICFormatConverter_CopyPixels(converter, NULL, w * 4, w * h * 4, pixels))) goto done;
-    if (!alpha)
-        for (size_t i = 3; i < (size_t)w * h * 4; i += 4) pixels[i] = 0x80;  /* PCSX2: opaque in GS units */
+    if (!dhdr_png_decode(file, size, pixels, w, h, 0x80)) goto done;  /* PCSX2: opaque in GS units */
     uint8_t *level = pixels;
     unsigned lw = w, lh = h;
     for (unsigned i = 0; i + 1 < levels; i++) {
@@ -330,48 +311,35 @@ static int pack_load(IWICImagingFactory *wic, TexPackEntry *e)
     ok = 1;
 done:
     free(pixels);
-    if (converter) IWICFormatConverter_Release(converter);
-    if (frame) IWICBitmapFrameDecode_Release(frame);
-    if (decoder) IWICBitmapDecoder_Release(decoder);
+    free(file);
     return ok;
 }
 
-static unsigned __stdcall pack_loader(void *argument)
+static int SDLCALL pack_loader(void *argument)
 {
     (void)argument;
     host_thread_name("texpack");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    IWICImagingFactory *wic = NULL;
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(CoCreateInstance(&pack_clsid_wic, NULL, CLSCTX_INPROC_SERVER, &pack_iid_wic, (void **)&wic))) {
-        fprintf(stderr, "textures: WIC unavailable; no replacements load\n");
-        return 0;
-    }
+    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
     for (;;) {
-        EnterCriticalSection(&pack.lock);
-        while (pack.head == pack.tail) SleepConditionVariableCS(&pack.wake, &pack.lock, INFINITE);
+        SDL_LockMutex(pack.lock);
+        while (pack.head == pack.tail) SDL_WaitCondition(pack.wake, pack.lock);
         TexPackEntry *e = pack.queue[pack.head];
         pack.head = (pack.head + 1) % (pack.count + 1);
-        LeaveCriticalSection(&pack.lock);
-        LARGE_INTEGER t0, t1, f;
-        QueryPerformanceCounter(&t0);
-        int ok = pack_load(wic, e);
-        QueryPerformanceCounter(&t1);
-        QueryPerformanceFrequency(&f);
-        InterlockedExchangeAdd64(&pack.load_us, (LONG64)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart));
+        SDL_UnlockMutex(pack.lock);
+        uint64_t t0 = SDL_GetTicksNS();
+        int ok = pack_load(e);
+        atomic_fetch_add(&pack.load_us, (int64_t)((SDL_GetTicksNS() - t0) / 1000));
         if (ok) {
-            InterlockedExchangeAdd64(&pack.bytes, e->bytes);
-            InterlockedIncrement(&pack.loaded);
+            atomic_fetch_add(&pack.bytes, e->bytes);
+            atomic_fetch_add(&pack.loaded, 1);
         } else {
-            InterlockedIncrement(&pack.failed);
-            char narrow[MAX_PATH];
-            WideCharToMultiByte(CP_UTF8, 0, e->path, -1, narrow, MAX_PATH, NULL, NULL);
-            fprintf(stderr, "textures: can't load %s\n", narrow);
+            atomic_fetch_add(&pack.failed, 1);
+            fprintf(stderr, "textures: can't load %s\n", e->path);
         }
-        InterlockedExchange(&e->state, ok ? PACK_READY : PACK_FAILED);  /* a full barrier */
-        EnterCriticalSection(&pack.lock);  /* texpack_view may wait for it */
-        WakeAllConditionVariable(&pack.done);
-        LeaveCriticalSection(&pack.lock);
+        atomic_exchange(&e->state, ok ? PACK_READY : PACK_FAILED);  /* a full barrier */
+        SDL_LockMutex(pack.lock);  /* texpack_view may wait for it */
+        SDL_BroadcastCondition(pack.done);
+        SDL_UnlockMutex(pack.lock);
     }
 }
 
@@ -381,30 +349,25 @@ static uint64_t pack_default_budget(uint64_t video_memory)
 {
     uint64_t budget = video_memory ? video_memory / 2 : 1024ull << 20;
     if (budget < (512ull << 20)) budget = 512ull << 20;
-    if (budget > (2048ull << 20)) budget = 2048ull << 20;  /* a 32-bit process */
+    if (budget > (2048ull << 20)) budget = 2048ull << 20;
     return budget;
 }
 
 static int pack_switch(const char *v)
 {
-    return !v || !*v || !(!_stricmp(v, "off") || !_stricmp(v, "0") || !_stricmp(v, "false") || !_stricmp(v, "no"));
+    return !v || !*v || !(!SDL_strcasecmp(v, "off") || !SDL_strcasecmp(v, "0") || !SDL_strcasecmp(v, "false") ||
+                          !SDL_strcasecmp(v, "no"));
 }
 
 int texpack_open(const ReplaceDevice *device, uint64_t video_memory)
 {
-    if (!pack_switch(getenv("DHD_TEXTURES"))) return 0;
+    if (!pack_switch(host_getenv("DHD_TEXTURES"))) return 0;
     if (!pack_find_root(pack.root, 0)) return 0;
-    LARGE_INTEGER t0, t1, f;
-    QueryPerformanceCounter(&t0);
-    wchar_t relative[MAX_PATH] = L"";
-    pack.root_length = (unsigned)wcslen(pack.root);
-    pack_scan(relative, 0, 0);
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&f);
-    char narrow[MAX_PATH * 3];
-    WideCharToMultiByte(CP_UTF8, 0, pack.root, -1, narrow, sizeof narrow, NULL, NULL);
+    uint64_t t0 = SDL_GetTicksNS();
+    pack_scan("", 0);
+    double index_ms = (double)(SDL_GetTicksNS() - t0) / 1e6;
     if (!pack.count) {
-        fprintf(stderr, "textures: no replacement textures in %s\n", narrow);
+        fprintf(stderr, "textures: no replacement textures in %s\n", pack.root);
         return 0;
     }
     unsigned size = 1;
@@ -425,21 +388,18 @@ int texpack_open(const ReplaceDevice *device, uint64_t video_memory)
         pack.table[at] = (int32_t)i;
     }
     pack.device = *device;
-    const char *mb = getenv("DHD_TEXTURE_CACHE_MB");
+    const char *mb = host_getenv("DHD_TEXTURE_CACHE_MB");
     pack.budget = mb && atoi(mb) > 0 ? (uint64_t)atoi(mb) << 20 : pack_default_budget(video_memory);
-    InitializeCriticalSection(&pack.lock);
-    InitializeConditionVariable(&pack.wake);
-    InitializeConditionVariable(&pack.done);
-    for (unsigned i = 0; i < PACK_LOADERS; i++) {
-        HANDLE t = (HANDLE)_beginthreadex(NULL, 0, pack_loader, NULL, 0, NULL);
-        if (t) CloseHandle(t);
-    }
-    const char *log = getenv("DHD_TEXTURE_PACK_LOG");
+    pack.lock = SDL_CreateMutex();
+    pack.wake = SDL_CreateCondition();
+    pack.done = SDL_CreateCondition();
+    for (unsigned i = 0; i < PACK_LOADERS; i++) SDL_DetachThread(SDL_CreateThread(pack_loader, "texpack", NULL));
+    const char *log = host_getenv("DHD_TEXTURE_PACK_LOG");
     if (log && *log && (pack.log = fopen(log, "w")))
         fputs("field,psm,width,height,name,found,with_mips\n", pack.log);
     fprintf(stderr, "textures: %u replacements in %s (%u other files skipped, %u duplicates), indexed in %.0f ms, "
-            "cache %llu MB\n", pack.count - duplicates, narrow, pack.skipped_names, duplicates,
-            (double)(t1.QuadPart - t0.QuadPart) * 1000 / (double)f.QuadPart, (unsigned long long)(pack.budget >> 20));
+            "cache %llu MB\n", pack.count - duplicates, pack.root, pack.skipped_names, duplicates,
+            index_ms, (unsigned long long)(pack.budget >> 20));
     return 1;
 }
 
@@ -588,7 +548,7 @@ TexPackEntry *texpack_find(const Gs *g, unsigned ctxt)
 
 /* ---- use (GS worker) ---- */
 
-static uint64_t pack_bytes(void) { return (uint64_t)InterlockedCompareExchange64(&pack.bytes, 0, 0); }
+static uint64_t pack_bytes(void) { return (uint64_t)atomic_load(&pack.bytes); }
 
 static void pack_evict(uint64_t field)
 {
@@ -602,7 +562,7 @@ static void pack_evict(uint64_t field)
         if (!oldest) return;
         pack.device.release(oldest->view);
         oldest->view = NULL;
-        InterlockedExchangeAdd64(&pack.bytes, -(LONG64)oldest->bytes);
+        atomic_fetch_sub(&pack.bytes, (int64_t)oldest->bytes);
         oldest->state = PACK_IDLE;
         pack.evicted++;
     }
@@ -613,17 +573,14 @@ static void pack_evict(uint64_t field)
 static void *pack_wait(TexPackEntry *e, uint64_t field)
 {
     if (pack.wait_us <= 0) return NULL;
-    LARGE_INTEGER f, t0, t1;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&t0);
+    uint64_t t0 = SDL_GetTicksNS();
     int64_t spent = 0;
-    EnterCriticalSection(&pack.lock);
+    SDL_LockMutex(pack.lock);
     while (e->state == PACK_QUEUED && spent < pack.wait_us) {
-        SleepConditionVariableCS(&pack.done, &pack.lock, (DWORD)((pack.wait_us - spent + 999) / 1000));
-        QueryPerformanceCounter(&t1);
-        spent = (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;
+        SDL_WaitConditionTimeout(pack.done, pack.lock, (Sint32)((pack.wait_us - spent + 999) / 1000));
+        spent = (int64_t)((SDL_GetTicksNS() - t0) / 1000);
     }
-    LeaveCriticalSection(&pack.lock);
+    SDL_UnlockMutex(pack.lock);
     pack.wait_us -= spent;
     pack.waits++, pack.waited_us += (uint64_t)spent;
     if (e->state != PACK_READY) { pack.wait_misses++; return NULL; }
@@ -633,7 +590,7 @@ static void *pack_wait(TexPackEntry *e, uint64_t field)
 
 void *texpack_view(TexPackEntry *e, uint64_t field)
 {
-    LONG state = e->state;
+    int state = e->state;
     if (state == PACK_READY) {
         e->used = field;
         return e->view;
@@ -647,12 +604,12 @@ void *texpack_view(TexPackEntry *e, uint64_t field)
         if (pack_bytes() > pack.budget) return NULL;
     }
     e->used = field;
-    EnterCriticalSection(&pack.lock);
+    SDL_LockMutex(pack.lock);
     e->state = PACK_QUEUED;
     pack.queue[pack.tail] = e;
     pack.tail = (pack.tail + 1) % (pack.count + 1);
-    WakeConditionVariable(&pack.wake);
-    LeaveCriticalSection(&pack.lock);
+    SDL_SignalCondition(pack.wake);
+    SDL_UnlockMutex(pack.lock);
     return pack_wait(e, field);
 }
 
@@ -696,6 +653,4 @@ void texpack_report(void)
 }
 
 /* Guest-address-only module services. */
-#include "../host/host_api.h"
-#include "../include/guest.h"
 int host_service_texpack_available(void) { return texpack_available(); }

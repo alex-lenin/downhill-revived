@@ -111,7 +111,8 @@ pub struct DhdrWindow {
     pub kind: u32,
     /// 0
     pub reserved: u32,
-    /// WIN32: `a` = HWND, `b` = HINSTANCE.
+    /// WIN32: `a` = HWND, `b` = HINSTANCE; XLIB: `a` = Display *, `b` = Window; WAYLAND: `a` =
+    /// wl_display *, `b` = wl_surface *; ANDROID: `a` = ANativeWindow *; METAL_LAYER: `a` = CAMetalLayer *.
     pub a: u64,
     pub b: u64,
 }
@@ -372,6 +373,11 @@ pub type dhdr_native_options_fn = unsafe extern "C" fn(n: *mut DhdrNative, flags
 pub type dhdr_native_zread_start_fn = unsafe extern "C" fn(n: *mut DhdrNative, index: u32, rect: *const u32, tag: u64) -> i32;
 pub type dhdr_native_zread_take_fn =
     unsafe extern "C" fn(n: *mut DhdrNative, out: *mut u32, cap: u32, rect_out: *mut u32, tag_out: *mut u64) -> i32;
+
+/// The texture packs' PNG files, native only.
+pub type dhdr_png_size_fn = unsafe extern "C" fn(data: *const u8, size: usize, w: *mut u32, h: *mut u32) -> i32;
+pub type dhdr_png_decode_fn =
+    unsafe extern "C" fn(data: *const u8, size: usize, rgba: *mut u8, w: u32, h: u32, opaque: u32) -> i32;
 
 /// wasm only.
 pub type dhdr_web_surface_fn = unsafe extern "C" fn() -> *mut DhdrSurface;

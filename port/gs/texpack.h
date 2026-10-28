@@ -12,7 +12,8 @@ typedef struct TexPackEntry TexPackEntry;
    1 GB). 0: no pack, nothing else here may be called. */
 int texpack_open(const ReplaceDevice *device, uint64_t video_memory);
 
-/* Whether a pack folder is named or beside dhd.exe (whatever DHD_TEXTURES says). */
+/* Whether a pack folder is named, or in DHD_DATA_DIR or beside the game (whatever DHD_TEXTURES
+   says). */
 int texpack_available(void);
 
 /* A texture just decoded from GS memory: its replacement in the pack, or NULL. The name is

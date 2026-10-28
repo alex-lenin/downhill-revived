@@ -342,11 +342,9 @@ pub unsafe extern "C" fn dhdr_surface_create(w: *const DhdrWindow, present_flags
         log_err(E, "NULL window");
         return std::ptr::null_mut();
     };
-    // WIN32 on Windows, ANDROID (an ANativeWindow, finding 091) on Android
-    let supported = if cfg!(target_os = "android") { DHDR_WINDOW_ANDROID } else { DHDR_WINDOW_WIN32 };
-    if w.kind != supported {
-        log_err(E, &format!("window kind {} is not supported here (this build: {supported}; the browser's \
-                             canvas surface comes from dhdr_web_surface)", w.kind));
+    if !Surface::supports(w.kind) {
+        log_err(E, &format!("window kind {} is not supported here (this build: {:?}; the browser's \
+                             canvas surface comes from dhdr_web_surface)", w.kind, Surface::KINDS));
         return std::ptr::null_mut();
     }
     match Surface::create(gpu, w, present_flags) {
@@ -668,6 +666,52 @@ pub unsafe extern "C" fn dhdr_native_options(n: *mut DhdrNative, flags: u32) {
     let _g = Guard::enter(E);
     // SAFETY: as native().
     unsafe { native(n, E) }.with(E, |n| n.options(flags))
+}
+
+// ---------------------------------------------------------------- texture packs' PNG files
+
+#[cfg(feature = "native")]
+const _: dhdr_png_size_fn = dhdr_png_size;
+#[cfg(feature = "native")]
+const _: dhdr_png_decode_fn = dhdr_png_decode;
+
+#[cfg(feature = "native")]
+#[no_mangle]
+pub unsafe extern "C" fn dhdr_png_size(data: *const u8, size: usize, w: *mut u32, h: *mut u32) -> i32 {
+    const E: &str = "dhdr_png_size";
+    let _g = Guard::enter(E);
+    // SAFETY: size bytes at data; w and h are outputs (the header).
+    let (data, w, h) = unsafe { (slice(data, size, E), must(w, E), must(h, E)) };
+    match crate::png_decode::size(data) {
+        Ok(size) => {
+            (*w, *h) = size;
+            1
+        }
+        Err(e) => {
+            log_err(E, &e);
+            0
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+#[no_mangle]
+pub unsafe extern "C" fn dhdr_png_decode(data: *const u8, size: usize, rgba: *mut u8, w: u32, h: u32, opaque: u32) -> i32 {
+    const E: &str = "dhdr_png_decode";
+    let _g = Guard::enter(E);
+    let Some(bytes) = (w as usize).checked_mul(h as usize).and_then(|p| p.checked_mul(4)) else {
+        log_err(E, &format!("size {w} x {h}"));
+        return 0;
+    };
+    // SAFETY: size bytes at data, w * h * 4 writable bytes at rgba (the header).
+    let (data, rgba) = unsafe { (slice(data, size, E), slice_mut(rgba, bytes, E)) };
+    match crate::png_decode::decode(data, rgba, w, h, opaque as u8) {
+        Ok(()) => 1,
+        Err(e) => {
+            log_err(E, &e);
+            0
+        }
+    }
 }
 
 // ---------------------------------------------------------------- browser

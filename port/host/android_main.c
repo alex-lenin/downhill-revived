@@ -1,7 +1,10 @@
 /* The Android start (finding 091). SDL's Java activity (port/android: DhdActivity over SDL's
-   SDLActivity) loads libSDL3.so and libmain.so, then calls SDL_main here on its SDL thread. Before
-   the game's own main (port/host64/launcher.c, compiled as dhd_launcher_main):
-   - the log (stdout, stderr) goes to logcat (tag DownhillRevived) and to dhd.log;
+   SDLActivity) loads libSDL3.so and libmain.so, then calls SDL_main here on its SDL thread. That
+   thread becomes SDL's loop (port/host/sdl_host.c) and the game gets a thread of its own, as on
+   every platform, once the game's own main runs (port/host64/launcher.c, compiled as
+   dhd_launcher_main). Before it:
+   - the log (stdout, stderr) goes to logcat (tag DownhillRevived) and to dhd.log (host.c's
+     host_console_init, the log of every platform, started here before anything prints);
    - the app's files folder (internal storage, SDL_GetAndroidInternalStoragePath) stands for the
      folder of dhd.exe: host_exe_path names dhd64 there, so dhd.ini, saves, dhd.log and the disc
      image's copy live there;
@@ -12,24 +15,22 @@
      it); the player defaults (the native renderer at 2x, widescreen, movies skipped) come from
      host.c as on Windows;
    - SDL hints: landscape only, the Back button kept from closing the game.
-   The game ends with exit() (the close of the activity, gs_pump_messages); SDL_main never returns
-   to a second start in the same process. */
+   The game ends with exit() (the close of the activity, gs_pump_messages, on the game's thread);
+   SDL_main never returns to a second start in the same process. */
 #include <SDL3/SDL.h>
 #include <android/log.h>
-#include <errno.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <poll.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../render/include/dhd_settings.h"
 
 #define TAG "DownhillRevived"
 #define DISC_NAME "SCUS-97177.iso"
 
 int dhd_launcher_main(int argc, char **argv);   /* launcher.c's main */
+void host_console_init(void);                   /* host.c: the log */
 const char *host_disc_check(const char *path);  /* host.c: NULL when path is the game */
 
 static char files[1024];      /* the app's files folder, with a trailing slash */
@@ -37,85 +38,6 @@ static char exe[1100];        /* files + "dhd64": what host_exe_path answers */
 
 /* host_posix.c's host_exe_path on Android. */
 const char *android_exe_path(void) { return exe; }
-
-/* host_posix.c's host_error_box on Android: a message box (blocks until OK). */
-void android_error_box(const char *title, const char *message)
-{
-    __android_log_print(ANDROID_LOG_ERROR, TAG, "%s: %s", title, message);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, NULL);
-}
-
-/* ---- the log: stdout and stderr through a pipe, line by line to logcat and dhd.log ---- */
-
-static int log_pipe[2] = {-1, -1};
-static FILE *log_file;
-static volatile int log_busy;  /* the log thread is between a read and its last line written */
-
-static void log_line(char *line)
-{
-    __android_log_write(ANDROID_LOG_INFO, TAG, line);
-    if (log_file) { fputs(line, log_file); fputc('\n', log_file); fflush(log_file); }
-}
-
-/* Before the process ends (host_exit, exit, a fatal signal): the lines still in the pipe reach
-   logcat and dhd.log, at most half a second. Only async-signal-safe calls besides fflush. */
-void android_log_drain(void)
-{
-    if (log_pipe[0] < 0) return;
-    fflush(stdout);
-    for (int i = 0; i < 250; i++) {
-        int pending = 0;
-        if (ioctl(log_pipe[0], FIONREAD, &pending) != 0) return;
-        if (!pending && !log_busy) return;
-        usleep(2000);
-    }
-}
-
-static void *log_thread(void *unused)
-{
-    (void)unused;
-    char buf[2048];
-    size_t have = 0;
-    for (;;) {
-        /* busy goes up before the read empties the pipe, so android_log_drain never sees neither */
-        struct pollfd p = {log_pipe[0], POLLIN, 0};
-        log_busy = 0;
-        if (poll(&p, 1, -1) < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        log_busy = 1;
-        ssize_t n = read(log_pipe[0], buf + have, sizeof buf - 1 - have);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
-        have += (size_t)n;
-        char *start = buf, *nl;
-        while ((nl = memchr(start, '\n', (size_t)(buf + have - start)))) {
-            *nl = 0;
-            log_line(start);
-            start = nl + 1;
-        }
-        have -= (size_t)(start - buf);
-        memmove(buf, start, have);
-        if (have == sizeof buf - 1) { buf[have] = 0; log_line(buf); have = 0; }  /* a very long line */
-    }
-    return NULL;
-}
-
-static void log_start(void)
-{
-    char path[1200];
-    snprintf(path, sizeof path, "%sdhd.log", files);
-    log_file = fopen(path, "w");
-    if (pipe(log_pipe) != 0) return;
-    dup2(log_pipe[1], STDOUT_FILENO);
-    dup2(log_pipe[1], STDERR_FILENO);
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, log_thread, NULL) == 0) pthread_detach(thread);
-    atexit(android_log_drain);
-}
 
 /* ---- the disc image ---- */
 
@@ -197,31 +119,13 @@ static int disc_ready(const char *path)
 }
 
 /* dhd.ini names the copy of the disc (host_disc_ready checks it in the core; DHD_ISO would skip
-   that check) and turns the updater off. A new one gets both; an old one without an iso line gets
-   it appended. The player defaults apply as soon as dhd.ini exists (host_settings_load). */
+   that check): a dhd.ini without a disc gets it (dhd_settings, which starts a missing file). The
+   player defaults apply as soon as dhd.ini exists (host_settings_load). */
 static void settings_start(const char *disc)
 {
-    char path[1200], line[1400];
-    int has_iso = 0, exists = 0;
+    char path[1200], iso[8];
     snprintf(path, sizeof path, "%sdhd.ini", files);
-    FILE *f = fopen(path, "r");
-    if (f) {
-        exists = 1;
-        while (!has_iso && fgets(line, sizeof line, f)) {
-            const char *s = line;
-            while (*s == ' ' || *s == '\t') s++;
-            has_iso = !strncasecmp(s, "iso", 3) && s[3] && strchr(" \t=", s[3]);
-        }
-        fclose(f);
-    }
-    if (has_iso) return;
-    if (!(f = fopen(path, "a"))) return;
-    if (!exists)
-        fprintf(f, "; Downhill Revived (Android) settings: one \"key = value\" per line.\n"
-                   "; An APK is updated by installing the new one.\n"
-                   "auto_update = off\n");
-    fprintf(f, "iso = %s\n", disc);
-    fclose(f);
+    if (!dhd_settings_read(path, "iso", iso, sizeof iso)) dhd_settings_save(path, "iso", disc);
 }
 
 __attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
@@ -233,9 +137,9 @@ __attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
     }
     snprintf(files, sizeof files, "%s/", storage);
     snprintf(exe, sizeof exe, "%sdhd64", files);
-    log_start();
+    host_console_init();
     fprintf(stderr, "android: Downhill Revived in %s\n", files);
-    {   /* a profile-collecting build (build_host64_android.py --pgo-generate): its counters go to the
+    {   /* a profile-collecting build (build_host64.py --target android-arm64 --pgo-generate): its counters go to the
            files folder (host_exit writes them; the process ends with _exit, so no atexit runs) */
         extern void __llvm_profile_set_filename(const char *) __attribute__((weak));
         static char profile[1100];
@@ -243,7 +147,8 @@ __attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
         if (__llvm_profile_set_filename) __llvm_profile_set_filename(profile);
     }
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
-    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");    char disc[1200];
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+    char disc[1200];
     snprintf(disc, sizeof disc, "%s" DISC_NAME, files);
     if (!disc_ready(disc)) {
         fprintf(stderr, "android: no disc image; the game ends\n");
