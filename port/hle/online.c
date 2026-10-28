@@ -409,7 +409,7 @@ static void connect_lobby(void)
     if (!server || !*server) fail("no server address (DHD_NET_SERVER: the launcher's server field or dhd.ini).");
     const char *render = getenv("DHD_RENDER");
     if (!render || strcmp(render, "native")) fail("online races use the native renderer (DHD_RENDER=native).");
-    if (!iso || strlen(iso) != 64) fail("the ISO's SHA-256 is missing (start the game from the launcher).");
+    if (!iso || strlen(iso) != 64) fail("the disc image's hash is missing (DHD_NET_ISO_SHA256: 64 hex digits).");
     build_version(version, sizeof version);
     host_service_net_init(GADDR(server), GADDR(name && *name ? name : "Rider"), GADDR(version), GADDR(iso));
     if (join && *join) {

@@ -1,0 +1,19 @@
+# The disc image's online check (finding 098): one implementation for the game and the launcher.
+# A member of the renderer's workspace, inside its folder so cargo names its sources by relative
+# paths (no build folder in the library). Linked into dhd_render's static library (its `native`
+# feature: the game has one Rust static library) and a path dependency of port/launcher. Its one
+# dependency, ring (SHA-256), is the one rustls already brings to both, so neither lock grows.
+[package]
+name = "dhd_disc"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+description = "The disc image's game files hash for online races (ISO 9660), and its cache"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ring = { version = "=0.17.14", default-features = false }

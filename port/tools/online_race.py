@@ -11,9 +11,13 @@ each puppet, hits, finishes and results.
 
 Needs DHD_ISO, DHD_NET_SERVER (the official wss://dhd.skuza.app or
 your own; never write any other deployed address into a tracked file) and the
-x64 build (build_host64.py, default --exe build/host64-exe/dhd64.exe). At most two games of its own run; all are stopped by PID."""
-import argparse, hashlib, os, re, subprocess, sys, time
+x64 build (build_host64.py, default --exe build/host64-exe/dhd64.exe). At most two games of its own
+run; owned_process ends them and the bots, with whatever they started."""
+import argparse, contextlib, hashlib, os, re, subprocess, sys, time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import owned_process
 
 ROOT = Path(__file__).resolve().parents[2]
 # Both pedal all the way from GO. The guest throws punches and kicks for the first 40 s, while
@@ -26,20 +30,67 @@ KEEP = ('went at', 'countdown starts', 'rides', 'hit kind', 'finished', 'result'
         'starts at grid', 'Online play stopped', 'crash kind', 'has loaded')
 
 
-def iso_sha256(iso, cache):
-    """The ISO's SHA-256, cached under build/ beside its size and time (it takes a while)."""
+def iso_files_sha256(iso, cache):
+    """The image's game files hash (finding 098), the value the game sends and the server compares:
+    dhd_disc's rule (port/render/disc/src/lib.rs `entries`, `record`, `hash`) in Python. Every file of
+    the ISO 9660 file system, its path from the root (no ";1", "FILE." is "FILE"), a 0, its size (8
+    bytes LE) and its contents' SHA-256; the SHA-256 of those records sorted. Cached in cache in
+    iso-check.txt's line ("files:size:ns:hash:count:"), so the game's own iso-check.txt fits too."""
     st = os.stat(iso)
-    key = f'{st.st_size} {int(st.st_mtime)}'
+    key = f'files:{st.st_size}:{st.st_mtime_ns}:'
     if cache.exists():
-        k, _, h = cache.read_text().strip().rpartition(' ')
-        if k == key:
-            return h
-    d = hashlib.sha256()
+        line = cache.read_text().partition('\n')[0]
+        if line.startswith(key) and len(line) >= len(key) + 64:
+            return line[len(key):len(key) + 64]
+    sector = 2048
     with open(iso, 'rb') as f:
-        for block in iter(lambda: f.read(1 << 22), b''):
-            d.update(block)
-    cache.write_text(f'{key} {d.hexdigest()}\n')
-    return d.hexdigest()
+        def read(at, size):
+            f.seek(at * sector)
+            data = f.read(size)
+            if len(data) != size:
+                sys.exit(f"{iso}: a file or directory lies past the image's end")
+            return data
+        pvd = read(16, sector)
+        if pvd[0] != 1 or pvd[1:6] != b'CD001':
+            sys.exit(f'{iso} has no ISO 9660 volume')
+        le32 = lambda b, at: int.from_bytes(b[at:at + 4], 'little')
+        todo, seen, files = [(le32(pvd, 158), le32(pvd, 166), '')], set(), []
+        while todo:
+            at, size, prefix = todo.pop()
+            if at in seen:
+                continue
+            seen.add(at)
+            data, i, found = read(at, size), 0, []
+            while i < len(data):
+                n = data[i]
+                if n == 0:   # no record crosses a sector
+                    i = (i // sector + 1) * sector
+                    continue
+                rec = data[i:i + n]
+                i += n
+                name = rec[33:33 + rec[32]]
+                if name in (b'\0', b'\1'):
+                    continue
+                if rec[25] & 2:
+                    found.append((le32(rec, 2), le32(rec, 10), f'{prefix}{name.decode(errors="replace")}/'))
+                    continue
+                name = name.decode(errors='replace').split(';')[0]
+                files.append((le32(rec, 2), le32(rec, 10), prefix + (name[:-1] if name.endswith('.') else name)))
+            todo.extend(reversed(found))
+        records = []
+        for at, size, path in sorted(files):
+            f.seek(at * sector)
+            d, left = hashlib.sha256(), size
+            while left:
+                block = f.read(min(left, 1 << 22))
+                if not block:
+                    sys.exit(f"{iso}: {path} lies past the image's end")
+                d.update(block)
+                left -= len(block)
+            records.append(path.encode() + b'\0' + size.to_bytes(8, 'little') + d.digest())
+    h = hashlib.sha256(b''.join(sorted(records))).hexdigest()
+    cache.write_text(f'{key}{h}:{len(records)}:\n')
+    return h
 
 
 def game_env(iso_hash, pad, extra):
@@ -90,8 +141,9 @@ def main():
         sys.exit(f'{a.stop_if} exists: not starting')
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    iso_hash = iso_sha256(os.environ['DHD_ISO'], ROOT / 'build' / 'port' / 'iso-sha256.txt')
+    iso_hash = iso_files_sha256(os.environ['DHD_ISO'], ROOT / 'build' / 'port' / 'iso-check.txt')
     procs, dirs = [], []
+    owned = contextlib.ExitStack()   # the logs and the processes, closed and ended at its end
 
     def game(name, pad, extra):
         d = out / name
@@ -100,13 +152,14 @@ def main():
             f.unlink()
         (d / 'stderr.log').unlink(missing_ok=True)
         env = game_env(iso_hash, pad, {'DHD_RACE_CAPTURE': a.capture, **extra})
-        procs.append(subprocess.Popen([os.path.abspath(a.exe)], cwd=d, env=env, stdout=open(d / 'stdout.log', 'w'),
-                                      stderr=open(d / 'stderr.log', 'w')))
+        stdout, stderr = owned.enter_context(open(d / 'stdout.log', 'w')), owned.enter_context(open(d / 'stderr.log', 'w'))
+        procs.append(owned.enter_context(owned_process.start([os.path.abspath(a.exe)], cwd=d, env=env,
+                                                             stdout=stdout, stderr=stderr)))
         dirs.append(d)
         return d
 
     players = 2 + a.bots
-    try:
+    with owned:
         da = game('A', HOST_PAD, {'DHD_NET_CREATE': '1', 'DHD_NET_NAME': 'Host', 'DHD_NET_PLAYERS': str(players),
                                   'DHD_NET_TRACK': a.track, 'DHD_NET_RIDER': '4', **dict(x.split('=', 1) for x in a.a)})
         m = wait_line([da / 'stderr.log'], r'online: room (\w+) \(host\)', 120, procs, a.stop_if)[0]
@@ -121,26 +174,22 @@ def main():
         for k in range(a.bots):
             d = out / f'bot{k}'
             d.mkdir(exist_ok=True)
-            procs.append(subprocess.Popen([a.nettool, '--bot', '--version', version, '--iso', iso_hash, '--name',
-                                           f'Bot{k}', '--replay', a.replay, '--rider', str(k * 2 + 1), 'join', code],
-                                          stdout=open(d / 'stdout.log', 'w'), stderr=subprocess.STDOUT))
+            log = owned.enter_context(open(d / 'stdout.log', 'w'))
+            procs.append(owned.enter_context(owned_process.start(
+                [a.nettool, '--bot', '--version', version, '--iso', iso_hash, '--name', f'Bot{k}', '--replay', a.replay,
+                 '--rider', str(k * 2 + 1), 'join', code], stdout=log, stderr=subprocess.STDOUT)))
         go = wait_line([da / 'stderr.log', db / 'stderr.log'], r'countdown starts', 400, procs, a.stop_if)
         if not all(go):
             print('a game did not reach the countdown')
         elif a.kill_guest_at:
             time.sleep(4 + a.kill_guest_at)  # the countdown, then the race
-            subprocess.run(['taskkill', '/T', '/F', '/PID', str(procs[1].pid)], capture_output=True)
+            procs.pop(1).stop()
             print('guest stopped')
-            procs.pop(1)
         logs = [da / 'stderr.log'] + ([] if a.kill_guest_at else [db / 'stderr.log'])
         done = wait_line(logs, r'online: result 1\.', a.seconds, procs, a.stop_if)
         time.sleep(6)
         if not all(done):
             print('not every game got the results')
-    finally:
-        for p in procs:
-            if p.poll() is None:
-                subprocess.run(['taskkill', '/T', '/F', '/PID', str(p.pid)], capture_output=True)
     ok = True
     for d in dirs:
         text = (d / 'stderr.log').read_text(errors='replace') if (d / 'stderr.log').exists() else ''

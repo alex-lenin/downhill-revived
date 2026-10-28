@@ -8,14 +8,17 @@
 #include "hle.h"
 #include "menu_page.h"
 #include "text_input.h"
+#include "settings_table.h"  /* the rider name's rule (dhd_settings, port/render/settings) */
 #include "../net/net.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Downhill Domination (USA) SCUS-97177, redump disc 30393 */
-static const char us_iso_sha256[] = "0fe2b77713d3440cc3030741ea0b18f49e3feaa09671a30a421e0d4888a7eb86";
+/* Downhill Domination (USA) SCUS-97177, redump disc 30393 (whole file 0fe2b777...): its game files
+   hash, dhd_disc's USA_FILES_SHA256 (port/render/disc, finding 098). Only the files count, so a
+   good dump with other sectors around them is taken too. */
+static const char us_files_sha256[] = "c8c17bcae383daf9f2feadc7f6d7476c43d659ab8d66127a299b01311f2a3476";
 
 /* The tracks with a 2-4 player level (online.c mp_level) and the riders every save has
    (online.c regular): the game's indexes and names, as the online launcher lists them. */
@@ -31,8 +34,8 @@ static const struct { int index; const char *name; } riders[] = {
 #define COUNT(a) ((int)(sizeof a / sizeof *a))
 
 static const char code_letters[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";  /* the server's join codes */
-static const char name_letters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -";
-enum { NAME_MAX = 12, CODE_LENGTH = 6, ROW_TEXT = 96, MAX_ROWS = 12, LIST_MAX = 8, MEMBER_ROWS = 4 };
+static const char name_letters[] = SETTING_NAME_LETTERS;
+enum { NAME_MAX = SETTING_NAME_MAX, CODE_LENGTH = 6, ROW_TEXT = 96, MAX_ROWS = 12, LIST_MAX = 8, MEMBER_ROWS = 4 };
 
 enum { HOME, LIST, NAME, CODE, ROOM };
 /* The room's rows */
@@ -197,17 +200,33 @@ static const char *server(void)
     return s && *s ? s : NULL;
 }
 
-/* ---- the ISO check ---- */
+/* ---- the disc image's check ---- */
 
 static volatile int iso_state;  /* 0 not started, 1 hashing, 2 done, 3 failed */
 
 /* A thread's result for the screen: a sequentially consistent store (the Interlocked exchanges were these). */
 static void set_state(volatile int *state, int value) { __atomic_store_n(state, value, __ATOMIC_SEQ_CST); }
-static char iso_hash[65];
+static char iso_hash[65];  /* the game files hash, the one the server gets */
 
-/* The online launcher's cache: "size:ticks:hash", ticks the file's .NET LastWriteTimeUtc. */
+/* The check's result in the log, once: a disc image that boots (its SCUS_971.77 is right,
+   game_data.c) can still be a dump whose other files differ, and online needs the USA disc's.
+   note: what differs (the first file that isn't the USA disc's), or "". */
+static void log_iso(const char *how, const char *note)
+{
+    const char *path = getenv("DHD_ISO");
+    if (!strcmp(iso_hash, us_files_sha256))
+        hle_log("online menu: the disc image has the USA disc's game files (files SHA-256 %s, %s)\n", iso_hash, how);
+    else
+        hle_log("online menu: the disc image %s has game files different from the USA disc's (redump 30393)%s%s: "
+                "files SHA-256 %s, online needs %s (%s). A bad or modified dump: it can't be used online\n",
+                path ? path : "(none)", *note ? ": " : "", note, iso_hash, us_files_sha256, how);
+}
+
+/* iso-check.txt, the check's cache (dhd_disc, shared with the launcher). */
 static void iso_check_path(char *out, size_t size)
 {
+    const char *data = host_getenv("DHD_DATA_DIR");  /* the launcher's folder for the player's files */
+    if (data) { snprintf(out, size, "%s/iso-check.txt", data); return; }
     char exe[HOST_PATH_MAX];
     host_exe_path(exe, sizeof exe);
     char *slash = strrchr(exe, '\\');
@@ -215,67 +234,61 @@ static void iso_check_path(char *out, size_t size)
     snprintf(out, size, "%siso-check.txt", exe);
 }
 
-/* 64-bit hosts hash on a host thread (finding 082): the blocking part runs on the host,
-   and page_update picks up the digest, so the menu stays responsive. */
-/* The cache key of the pending check (the online launcher's "size:ticks" format). */
-static char cache_key[64];
-
+/* 64-bit hosts check on a host thread (finding 082): the blocking part (the cache, else reading
+   the image's files) runs on the host, and page_update picks up the answer, so the menu stays
+   responsive. */
 static void start_iso_check(void)
 {
-    const char *given = getenv("DHD_NET_ISO_SHA256");  /* the launcher's, when it started us */
+    const char *given = getenv("DHD_NET_ISO_SHA256");  /* a tool's files hash */
     const char *path = getenv("DHD_ISO");
-    uint64_t size, ticks;
-    char cache[HOST_PATH_MAX], line[160];
-    FILE *f;
+    char cache[HOST_PATH_MAX];
     if (iso_state) return;
     if (given && strlen(given) == 64) {
         snprintf(iso_hash, sizeof iso_hash, "%s", given);
         iso_state = 2;
+        log_iso("given by DHD_NET_ISO_SHA256", "");
         return;
     }
-    if (!path || !host_path_info(path, &size, &ticks)) {
+    if (!path || !host_path_exists(path)) {
+        hle_log("online menu: the disc image %s can't be found for the online check\n", path ? path : "(none)");
         set_state(&iso_state, 3);
         return;
     }
-    ticks += 504911232000000000ull;  /* the write time: FILETIME (1601) -> .NET ticks (0001) */
-    snprintf(cache_key, sizeof cache_key, "%llu:%llu:", (unsigned long long)size, (unsigned long long)ticks);
     iso_check_path(cache, sizeof cache);
-    f = fopen(cache, "r");
-    if (f) {
-        if (fgets(line, sizeof line, f) && !strncmp(line, cache_key, strlen(cache_key)) &&
-            strlen(line + strlen(cache_key)) >= 64) {
-            memcpy(iso_hash, line + strlen(cache_key), 64);
-            iso_hash[64] = 0;
-            fclose(f);
-            set_state(&iso_state, 2);
-            return;
-        }
-        fclose(f);
-    }
-    hle_log("online menu: checking the ISO's SHA-256\n");
+    hle_log("online menu: checking the disc image's game files\n");
     set_state(&iso_state, 1);
-    /* The hash itself runs on a host thread; page_update picks up the digest. */
-    if (!host_service_file_sha256_start(GADDR(path))) set_state(&iso_state, 3);
+    if (!host_service_disc_check_start(GADDR(path), GADDR(cache))) {
+        hle_log("online menu: the disc image's check couldn't start\n");
+        set_state(&iso_state, 3);
+    }
 }
 
-/* One poll of the hashing host job: the digest lands in iso_hash, as before. */
+/* One poll of the checking host job: the hash lands in iso_hash. */
 static void poll_iso(void)
 {
     static uint8_t digest[32];
-    char cache[HOST_PATH_MAX];
-    FILE *f;
+    static char note[256];
+    const char *path = getenv("DHD_ISO");
     int r;
     if (iso_state != 1) return;
-    r = host_service_file_sha256_poll(GADDR(digest));
+    r = host_service_disc_check_poll(GADDR(digest), GADDR(note), sizeof note);
     if (!r) return;
-    if (r < 0) {
+    if (r == -1) {
+        hle_log("online menu: reading the disc image %s failed during its online check: %s\n", path, note);
         set_state(&iso_state, 3);
         return;
     }
+    if (r == -2) {
+        /* no file system to hash, or a cut dump: no hash, and not the USA disc's files */
+        memset(iso_hash, '0', 64), iso_hash[64] = 0;
+        set_state(&iso_state, 2);
+        hle_log("online menu: the disc image %s can't have the USA disc's game files: %s. A bad or modified dump: "
+                "it can't be used online\n", path, note);
+        return;
+    }
     for (int i = 0; i < 32; i++) snprintf(iso_hash + 2 * i, 3, "%02x", digest[i]);
-    iso_check_path(cache, sizeof cache);
-    if ((f = fopen(cache, "w"))) fprintf(f, "%s%s\n", cache_key, iso_hash), fclose(f);
     set_state(&iso_state, 2);
+    log_iso(r == 2 ? "from iso-check.txt" : "checked now", note);
 }
 
 /* ---- the public list ---- */
@@ -292,6 +305,7 @@ static void poll_list(void)
     r = host_service_net_list_lobbies_poll(GADDR(list), LIST_MAX);
     if (r == -2) return;
     list_count = r;
+    if (r < 0) hle_log("online menu: the public list: the server %s didn't answer\n", server());
     set_state(&list_state, 2);
 }
 
@@ -310,7 +324,7 @@ static void load_player(void)
             if (strchr(name_letters, up)) name[k++] = up;
         }
         name[k] = 0;
-        if (!k) snprintf(name, sizeof name, "RIDER");
+        if (!k) snprintf(name, sizeof name, "%s", SETTING_NAME_UNNAMED);
         for (int i = 0; r && *r && i < COUNT(riders); i++)
             if (riders[i].index == atoi(r)) rider = i;
     }
@@ -331,9 +345,25 @@ static const char *not_ready(void)
     const char *render = getenv("DHD_RENDER");
     if (!server()) return "No server: set server = ... in dhd.ini";
     if (!render || strcmp(render, "native")) return "Online races need the native renderer";
-    if (iso_state == 1) return "Checking the ISO, a moment...";
-    if (iso_state != 2) return "The ISO couldn't be read";
-    if (strcmp(iso_hash, us_iso_sha256)) return "This ISO isn't the USA disc (SCUS-97177)";
+    if (iso_state == 1) return "Checking the disc image, a moment...";
+    if (iso_state != 2) return "Can't read the disc image: choose it again";
+    if (strcmp(iso_hash, us_files_sha256)) return "This disc's game files aren't the USA disc's";
+    return NULL;
+}
+
+/* Why the disc image keeps this PC offline, as lines under ONLINE's rows (the footer holds one
+   short line), NULL-ended; NULL when the image is fine. Each line fits the 640-wide screen. */
+static const char *const *disc_note(void)
+{
+    static const char *const hashing[] = {"", "Checking the disc image for online...", NULL};
+    static const char *const unreadable[] = {"", "The disc image couldn't be read for", "the online check. Choose it again",
+                                             "in the launcher.", NULL};
+    static const char *const different[] = {"", "The disc image's game files are", "different from the USA disc's (a bad",
+                                            "or modified dump). Make a new dump or", "choose another image in the launcher.",
+                                            NULL};
+    if (iso_state == 1) return hashing;
+    if (iso_state == 3) return unreadable;
+    if (iso_state == 2 && strcmp(iso_hash, us_files_sha256)) return different;
     return NULL;
 }
 
@@ -342,6 +372,7 @@ static const char *not_ready(void)
 static int entry_pick;           /* the letter on offer */
 static char entry[16];
 static int home_row;  /* HOME's row last chosen: the cursor goes back to it */
+static const char *const *disc_shown;  /* the disc_note HOME's rows have */
 
 static void go(int to)
 {
@@ -367,6 +398,7 @@ static void enter_room(int create, const char *code)
     const char *why = not_ready();
     if (why) {
         snprintf(status, sizeof status, "%s", why);
+        hle_log("online menu: can't %s: %s\n", create ? "create a room" : "join", why);
         return;
     }
     host_service_net_init(GADDR(server()), GADDR(name), GADDR(version), GADDR(iso_hash));
@@ -397,6 +429,8 @@ static void page_build(MenuPage *p)
         menu_page_row(p, "Create A Private Race", 1);
         menu_page_row(p, "Join With A Code", 1);
         if (outdated) menu_page_row(p, "Update Now", 1);
+        disc_shown = disc_note();
+        for (const char *const *line = disc_shown; line && *line; line++) menu_page_text(p, *line);
         break;
     case LIST:
         p->title = "PUBLIC RACES";
@@ -644,7 +678,11 @@ static void page_update(MenuPage *p, int cursor)
     }
     switch (screen) {
     case HOME:
-        if (!status[0] && cursor >= 2 && not_ready()) p->footer = not_ready();
+        if (disc_note() != disc_shown) {  /* the check has ended: its lines under the rows */
+            menu_page_rebuild_at(p, cursor);
+            break;
+        }
+        if (!status[0] && (cursor >= 2 || disc_shown) && not_ready()) p->footer = not_ready();
         break;
     case LIST:
         if (list_state == 2 && !list_shown) menu_page_rebuild(p);  /* the answer came: the rows again */
@@ -694,7 +732,7 @@ static void page_accept(MenuPage *p, int row)
             go(CODE);
         } else if (row == 5 && outdated) {
             hle_log("online menu: Update Now\n");
-            host_service_update_request();  /* ends the game; the first dhd.exe updates and starts it again */
+            host_service_update_request();  /* ends the game; the launcher updates it */
         }
         break;
     case LIST:
@@ -984,3 +1022,11 @@ int port_online_guest_track(void)
 }
 
 int port_online_single_race(void) { return choosing; }
+
+/* A track's name as the online launcher lists it (presence.c); NULL for a track not in the list. */
+const char *port_track_name(int index)
+{
+    for (int k = 0; k < COUNT(tracks); k++)
+        if (tracks[k].index == index) return tracks[k].name;
+    return NULL;
+}
