@@ -14,7 +14,8 @@
 //! **Fatal path.** A panic is logged through `host::log` (naming the export), then the
 //! `panic = "abort"` profile ends the process. An uncaptured device error is logged, then the
 //! process aborts (`install_error_handler`), as the C path's on_error does: a validation error
-//! means a wrong picture, never carry on.
+//! means a wrong picture, never carry on. Out of memory on Windows ends with an error box and exit
+//! code 1 instead (`out_of_memory`).
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
@@ -146,8 +147,48 @@ pub fn install_hooks() {
 /// inside an error scope instead.
 pub fn install_error_handler(device: &wgpu::Device) {
     device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
-        fatal(&format!("dhd_render: wgpu error in {}: {e}", current_export()))
+        let line = format!("dhd_render: wgpu error in {}: {e}", current_export());
+        if matches!(e, wgpu::Error::OutOfMemory { .. }) {
+            out_of_memory(&line);
+        }
+        fatal(&line)
     }));
+}
+
+/// The device ran out of memory: no wrong picture, but the game can't go on. On Windows it is
+/// logged, an error box says so (not with DHD_HEADLESS or a console: tools and test programs never
+/// wait on a box) and the process exits with 1; an abort would end it as a crash (fail-fast,
+/// 0xC0000409). Elsewhere `fatal`.
+fn out_of_memory(line: &str) {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32", kind = "raw-dylib")]
+        extern "system" {
+            fn GetConsoleWindow() -> *mut std::ffi::c_void;
+            fn ExitProcess(code: u32) -> !;
+        }
+        #[link(name = "user32", kind = "raw-dylib")]
+        extern "system" {
+            fn MessageBoxW(window: *mut std::ffi::c_void, text: *const u16, caption: *const u16, kind: u32) -> i32;
+        }
+        crate::host::log(line);
+        crate::host::log("dhd_render: the graphics card ran out of memory; the game ends");
+        // SAFETY: no arguments.
+        if std::env::var_os("DHD_HEADLESS").is_none() && unsafe { GetConsoleWindow() }.is_null() {
+            let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+            let text = wide("Downhill Revived ran out of graphics memory and has to close.\n\n\
+                             Close other programs that use the graphics card and start the game again. \
+                             The details are in dhd.log, next to the game.");
+            let caption = wide("Downhill Revived");
+            // SAFETY: both strings are NUL-terminated and live across the call. MB_OK |
+            // MB_ICONERROR | MB_SETFOREGROUND, as host_error_box.
+            unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), 0x10 | 0x10000) };
+        }
+        // SAFETY: ends the process.
+        unsafe { ExitProcess(1) }
+    }
+    #[cfg(not(windows))]
+    let _ = line;
 }
 
 /// One renderer object (`DhdrExact`, `DhdrNative`, `DhdrSurface`) behind a C handle: one entry at

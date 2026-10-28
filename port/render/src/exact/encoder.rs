@@ -8,6 +8,10 @@
 //! sizes the display texture: `display.rs`); `submit` ends the pass and submits (nothing recorded:
 //! nothing happens, as gpu.js's; queue writes then wait for the next submit, which still runs
 //! them before its commands). `write` is a queue write. `destroy` submits pending work.
+//! `frame_end` (each presented frame, `present/surface.rs`) keeps the GPU at most one frame
+//! behind: with the window minimised no frame is acquired, so nothing else waited for the GPU,
+//! and every queue write's staging memory and every command buffer lives until its submission
+//! has run: the backlog grew until the device was out of memory (finding 105).
 //! A buffer or pipeline number outside the header's is fatal (`guard::fatal`).
 //!
 //! Uses from `exact::pipelines` (A2): `Pipelines::create`, `Pipelines::main`, `local_copy` and
@@ -77,11 +81,15 @@ pub struct Encoder {
     pub pass: Option<wgpu::ComputePass<'static>>,
     /// The open command encoder, if anything was recorded since the last submit.
     pub encoder: Option<wgpu::CommandEncoder>,
+    /// The last submit since the last `frame_end`, if any.
+    pub last: Option<wgpu::SubmissionIndex>,
+    /// The last submit before the last `frame_end`: what the next `frame_end` waits for.
+    pub frame: Option<wgpu::SubmissionIndex>,
 }
 
 impl Encoder {
     pub fn new() -> Encoder {
-        Encoder { pass: None, encoder: None }
+        Encoder { pass: None, encoder: None, last: None, frame: None }
     }
 
     /// Ends the open compute pass, if any.
@@ -125,14 +133,18 @@ impl Encoder {
         match self.encoder.take() {
             Some(e) => {
                 let mut e = Some(e);
+                let mut index = None;
                 let mut job = || {
                     if let Some(e) = e.take() {
-                        gpu.queue.submit([e.finish()]);
+                        index = Some(gpu.queue.submit([e.finish()]));
                     }
                 };
                 #[cfg(target_os = "android")]
                 submitter::run(&mut job);
                 job();
+                if index.is_some() {
+                    self.last = index;
+                }
                 true
             }
             None => false,
@@ -213,6 +225,23 @@ impl Exact {
         if self.encoder.submit(self.gpu) {
             self.stats.submits += 1;
         }
+    }
+
+    /// The end of a presented frame (shown or skipped): waits until the previous frame's work has
+    /// run on the GPU, so at most this frame's is still queued. A shown frame has waited about as
+    /// long for the surface already (frame latency 1). In the browser the page's frame loop paces.
+    pub fn frame_end(&mut self) {
+        let previous = std::mem::replace(&mut self.encoder.frame, self.encoder.last.take());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(index) = previous {
+            let _spike = crate::native::pipelines::SpikeTimer::new("frame", 0);
+            let wait = wgpu::PollType::Wait { submission_index: Some(index), timeout: None };
+            if let Err(e) = self.gpu.device.poll(wait) {
+                crate::host::log(&format!("dhd_render: exact frame_end: poll: {e}"));
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = previous;
     }
 
     /// `dhdr_exact_stats`
