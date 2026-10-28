@@ -13,6 +13,10 @@
 members = [".", "tools", "net", "settings", "presence", "disc"]
 resolver = "2"
 
+# Keep the pinned family; only Vulkan framebuffer ownership differs (vendor/wgpu-hal/PATCH.md).
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }
+
 [package]
 name = "dhd_render"
 version = "1.0.0"

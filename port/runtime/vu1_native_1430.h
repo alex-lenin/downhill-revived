@@ -4,7 +4,8 @@
    DIV's D bit. FCAND reads the CLIP issued four pairs earlier. The closed
    clipping routine returns through VI5 to 15E0; it retains exact pipeline
    helpers. Unsupported vertex counts or a pending Q decline before writing. */
-static unsigned native_geometry_1430(Vu *u) {
+static inline __attribute__((always_inline)) unsigned native_geometry_1430_impl(Vu *u, int sticky_complete)
+{
     unsigned begin = u->c->vi[8], end = u->c->vi[10], distance = (end - begin) & 65535;
     if (!distance || distance % 3 || distance / 3 > 64 || (u->q_ready && u->q_ready > u->cycle))
         return 0;
@@ -18,6 +19,7 @@ static unsigned native_geometry_1430(Vu *u) {
         v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(),
                          _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q;
@@ -47,7 +49,8 @@ static unsigned native_geometry_1430(Vu *u) {
     } while (0)
 #define NADD(a, b, d) native_add(&flags, (a), (b), (d))
 #define NMUL(a, b, d) native_mul(&flags, (a), (b), (d))
-#define NMADD(a, b, c, d) native_madd(&flags, (a), (b), (c), (d))
+/* Every ACC input here follows an all-lane FMAC, including after clipping. */
+#define NMADD(a, b, c, d) native_madd_clean_acc(&flags, (a), (b), (c), (d))
 #define SET(r, x, d) v[r] = native_merge(v[r], (x), (d))
 #define LOAD(a) _mm_loadu_ps(memory[(a) & 1023].f)
 #define STORE(a, x, d) store_fields(memory[(a) & 1023].f, _mm_castps_si128(x), (d))
@@ -113,6 +116,7 @@ static unsigned native_geometry_1430(Vu *u) {
             entry_status = u->status;
             q_flags = u->status & 0x30;
             memset(&flags, 0, sizeof flags);
+            flags.sticky_complete = sticky_complete;
         }
         v[23] = minmax4(v[23], lane4(v[0], 0), 1);
         v[12] = LOAD(index + 4);
@@ -144,4 +148,8 @@ static unsigned native_geometry_1430(Vu *u) {
 #undef SET
 #undef LOAD
 #undef STORE
+}
+static unsigned native_geometry_1430(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_1430_impl(u, 1);
+    return native_geometry_1430_impl(u, 0);
 }

@@ -3,7 +3,7 @@
    changes no v1 struct; include it after dhd_render.h. port/web/build_graphics.py reads the
    DHDR_FN declarations of both headers.
 
-   SP10 (docs/findings/090-speed.md): an indexed native picture. Finding 103: the device's largest
+   SP10 (docs/findings/090-speed.md): an indexed native picture. Finding 109: the device's largest
    texture. */
 #ifndef DHD_RENDER_EXT_H
 #define DHD_RENDER_EXT_H

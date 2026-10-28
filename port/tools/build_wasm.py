@@ -753,7 +753,7 @@ def function_addresses(text, funcs):
     return LOCAL_LABEL.sub(lambda m: '#define %s ((char *)(unsigned)0x%s)' % (m.group(1), m.group(2)), text)
 
 
-def recompile_objects(objs, rewrite_aliases):
+def recompile_objects(objs, rewrite_aliases, max_workers=8):
     """{name: asm} of the asm-only functions the objects need, recompiled to C and compiled."""
     recomp.OUT = RECOMP_OUT
     recomp.WASM_EMIT = True
@@ -777,7 +777,7 @@ def recompile_objects(objs, rewrite_aliases):
     in_data |= set(recomp.data_entries())
     asm.update({n: e for n, (_, e) in recomp.data_entries().items()})
     names, out, failed, refused = set(), [], {}, {}
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(max_workers) as ex:
         while True:
             defined = {s for v in nm(objs + out, '--defined-only', '-g').values() for s in v}
             # port code may call a recompiled function at its register entry, rc_<name>
@@ -1054,7 +1054,7 @@ def libc_signatures(names):
     return {n: s for n, s in out.items() if s is not None}
 
 
-def abi_stage(objs, rc_objs, failed_units):
+def abi_stage(objs, rc_objs, failed_units, max_workers=8):
     """abi_stage_core, with the adapters that the C++ renames asked for (INTRA_THUNKS) compiled into
     the objects, until the set of adapters is stable."""
     c = os.path.join(OUT, 'abi', 'intra.c')
@@ -1069,17 +1069,17 @@ def abi_stage(objs, rc_objs, failed_units):
             JOBS[obj] = (compile_c, job)
             if obj not in objs:
                 objs.append(obj)
-        result = abi_stage_core(objs, rc_objs, failed_units)
+        result = abi_stage_core(objs, rc_objs, failed_units, max_workers)
         if keys == set(INTRA_THUNKS):
             return result
     sys.exit('intra-object adapters did not settle')
 
 
-def abi_stage_core(objs, rc_objs, failed_units):
+def abi_stage_core(objs, rc_objs, failed_units, max_workers=8):
     """Stubs for the uncompiled functions, then the signature table, the rebuilt callers and the
     thunks. Returns the extra objects to link, and the table."""
     all_objs = objs + rc_objs
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(max_workers) as ex:
         sigs = dict(zip(all_objs, ex.map(object_signatures, all_objs)))
     defined = {n for d, _ in sigs.values() for n in d}
     stubs = set(REFUSED) - defined
@@ -1268,7 +1268,7 @@ def main():
 
     # 5. recompiled asm-only functions, to a fixed point over the objects
     objs = src_objs + port_objs
-    rc_objs, rc_names, rc_failed = recompile_objects(objs, aliases)
+    rc_objs, rc_names, rc_failed = recompile_objects(objs, aliases, a.j)
     print('recompiled functions: %d (%d failed in the recompiler)' % (len(rc_names), len(rc_failed)), flush=True)
 
     # 5a. ps2asm.c again, with generated code for every inline asm template and recompiled COP2
@@ -1302,7 +1302,7 @@ def main():
         sys.exit('recompiled although a game unit defines them in C (%d): %s' % (len(ran_mips), ' '.join(ran_mips)))
 
     # 5b. signatures across objects: stubs, then thunks for the callers that disagree
-    abi = abi_stage(objs, rc_objs, [r['unit'] for r in records if r['status'] != 'ok'])
+    abi = abi_stage(objs, rc_objs, [r['unit'] for r in records if r['status'] != 'ok'], a.j)
     abi_objs = abi['objs']
 
     # 6. the fixups, once the functions and the data names of every object are known

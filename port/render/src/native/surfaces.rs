@@ -292,6 +292,7 @@ fn rect_pass(kit: &mut Kit, view: &wgpu::TextureView, size: [u32; 2], pipe: &wgp
         crate::host::log("gs native: a surface pass before the arenas were reserved (skipped)");
         return;
     };
+    crate::native::render::pass_trace::event("surface-rect:load/store", -1, -1);
     let times = gputimes::slot(kit.gpu, gputimes::SURFACE);
     let mut pass = kit.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: None,
@@ -345,6 +346,7 @@ fn grow_depth(kit: &mut Kit, from: &wgpu::TextureView, size: [u32; 2], to: &wgpu
     let (gpu, layout, pipe) = (kit.gpu, kit.grow_layout, kit.grow_pipe);
     let bind = group(gpu, layout, &[view_entry(0, from)]);
     let uniforms = kit.arenas.uniform_group().ok_or("gs native: a Z surface grown before the arenas were reserved")?;
+    crate::native::render::pass_trace::event("surface-rect:load/store", -1, -1);
     let times = gputimes::slot(gpu, gputimes::SURFACE);
     let mut pass = kit.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: None,

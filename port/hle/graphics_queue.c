@@ -176,8 +176,18 @@ static void execute(unsigned unit, const uint32_t *words, unsigned count)
     /* VIF1/GIF execute VU1 and host rendering, not EE game code. Host IEEE
        exceptional values must not inherit the game's diagnostic SSE mask. */
     unsigned control = fp_control();
+#if defined(__aarch64__) && (!defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST))
+    /* VIF decoding is integer work and its GS consumer owns a separate IEEE
+       environment. Keep VU rounding for this whole VIF1 packet, so each MSCAL
+       need not serialize the core twice to change/restore FPCR. ps2_vu1_run
+       retains its own guard and observes the same mode as before. */
+    if (unit == 1 && gs_worker)
+        fp_set_control((3u << 22) | (1u << 24)); /* toward zero, FZ, no traps */
+    else
+#endif
     fp_set_control(FP_IEEE(control));  /* IEEE: nearest, no FTZ/DAZ */
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    if (gs_worker) gs_batch_begin();
     if (unit == UNIT_MARK) {
         if (gs_worker) graphics_gif_feed(GS_PATH_MARK, words, count);
         else run_mark(words);
@@ -193,6 +203,9 @@ static void execute(unsigned unit, const uint32_t *words, unsigned count)
 #endif
     }
     else vif_feed((int)unit, words, count);
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    if (gs_worker) gs_batch_end();
+#endif
     fp_set_control(control);
 }
 

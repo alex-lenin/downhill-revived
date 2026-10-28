@@ -1,6 +1,6 @@
 static unsigned long long native_vertices, native_clipped_vertices;
 /* Direct-write SIMD geometry loop with a directly threaded clipping path. */
-typedef struct { __m128i sign, zero, overflow; __m128 last; int mask; } NativeFlags;
+typedef struct { __m128i sign, zero, overflow; __m128 last; int mask, sticky_complete; } NativeFlags;
 static __m128 native_mask(int d)
 {
     return _mm_castsi128_ps(_mm_setr_epi32(d & 8 ? -1 : 0, d & 4 ? -1 : 0, d & 2 ? -1 : 0, d & 1 ? -1 : 0));
@@ -19,8 +19,10 @@ static __m128 native_result(NativeFlags *f, __m128 value, int d)
 #ifdef PS2_VU_IEEE  /* FTZ and the overflow clamp of plain IEEE results (ieee_clamp4, vu0_interp.c) */
     value = ieee_clamp4(value);
 #endif
-    f->sign = _mm_or_si128(f->sign, _mm_and_si128(bits, mask));
-    f->zero = _mm_or_si128(f->zero, _mm_and_si128(_mm_castps_si128(_mm_cmpeq_ps(value, _mm_setzero_ps())), mask));
+    if (!f->sticky_complete) {
+        f->sign = _mm_or_si128(f->sign, _mm_and_si128(bits, mask));
+        f->zero = _mm_or_si128(f->zero, _mm_and_si128(_mm_castps_si128(_mm_cmpeq_ps(value, _mm_setzero_ps())), mask));
+    }
     /* f->overflow stays 0: no result has exponent 255 (fmac_flags4). */
     f->last = value; f->mask = d;
     /* All values here are SSE arithmetic results on operand4 values under FTZ/DAZ and
@@ -52,12 +54,7 @@ static __m128 native_itof(__m128 value, float scale)
 { return _mm_mul_ps(VU_ITOF4(_mm_castps_si128(value)), _mm_set1_ps(scale)); }
 static __m128 native_ftoi(__m128 value, float scale)
 {
-    __m128 scaled = _mm_mul_ps(value, _mm_set1_ps(scale));
-    __m128i bits = _mm_castps_si128(scaled);
-    __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7f800000));
-    __m128i huge = _mm_cmpgt_epi32(exponent, _mm_set1_epi32(0x4effffff));
-    __m128i saturated = _mm_xor_si128(_mm_srai_epi32(bits, 31), _mm_set1_epi32(0x7fffffff));
-    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(huge, saturated), _mm_andnot_si128(huge, _mm_cvttps_epi32(scaled))));
+    return vu1_ftoi4(value, scale);
 }
 #if defined(__aarch64__)
 /* NEON: the three lanes' signed compares against the bound at once; bits as below. */
@@ -85,7 +82,7 @@ static unsigned native_clip(__m128 value, __m128 limit)
     return bits;
 }
 #endif
-static unsigned native_geometry_loop(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_loop_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -97,6 +94,7 @@ static unsigned native_geometry_loop(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(cpu.vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q; unsigned q_flags = 0;
@@ -165,6 +163,7 @@ static unsigned native_geometry_loop(Vu *u)
             acc=_mm_loadu_ps(cpu.vacc);q=cpu.q;
             clip=u->clip;entry_status=u->status;q_flags=u->status&0x30;
             memset(&flags,0,sizeof flags);
+            flags.sticky_complete = sticky_complete;
         }
         /* Reestablish all-lane provenance after any clipping-path state reload. */
         acc = NMUL(v[4], lane4(v[0],3),15); v[11] = v[7];
@@ -189,4 +188,8 @@ static unsigned native_geometry_loop(Vu *u)
 #undef SET
 #undef LOAD
 #undef STORE
+}
+static unsigned native_geometry_loop(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_loop_impl(u, 1);
+    return native_geometry_loop_impl(u, 0);
 }

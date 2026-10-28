@@ -1,7 +1,7 @@
 /* Additional mesh loops sharing the native clipping routine. */
 #include "vu1_native_1430.h"
 #include "vu1_native_2dc8.h"
-static unsigned native_geometry_1638(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_1638_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -13,6 +13,7 @@ static unsigned native_geometry_1638(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(cpu.vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q; unsigned q_flags = 0;
@@ -32,7 +33,8 @@ static unsigned native_geometry_1638(Vu *u)
 #define NADD(a,b,d) native_add(&flags,(a),(b),(d))
 #define NSUB(a,b,d) native_sub(&flags,(a),(b),(d))
 #define NMUL(a,b,d) native_mul(&flags,(a),(b),(d))
-#define NMADD(a,b,c,d) native_madd(&flags,(a),(b),(c),(d))
+/* Every ACC input here follows an all-lane FMAC, including after clipping. */
+#define NMADD(a,b,c,d) native_madd_clean_acc(&flags,(a),(b),(c),(d))
 #define SET(r,x,d) v[r] = native_merge(v[r], (x), (d))
 #define LOAD(a) _mm_loadu_ps(memory[(a) & 1023].f)
 #define STORE(a,x,d) store_fields(memory[(a) & 1023].f, _mm_castps_si128(x), (d))
@@ -67,6 +69,7 @@ static unsigned native_geometry_1638(Vu *u)
             acc=_mm_loadu_ps(cpu.vacc); q=cpu.q;
             clip=u->clip; entry_status=u->status; q_flags=u->status&0x30;
             memset(&flags,0,sizeof flags);
+            flags.sticky_complete = sticky_complete;
         }
         acc=NMUL(v[4],lane4(v[0],3),15); v[11]=v[7];
         v[7]=native_itof(v[9],1.0f/4096); index=(index+3)&65535;vi[8]=(uint16_t)index;
@@ -89,8 +92,12 @@ static unsigned native_geometry_1638(Vu *u)
 #undef LOAD
 #undef STORE
 }
+static unsigned native_geometry_1638(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_1638_impl(u, 1);
+    return native_geometry_1638_impl(u, 0);
+}
 
-static unsigned native_geometry_17e0(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_17e0_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -102,6 +109,7 @@ static unsigned native_geometry_17e0(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(cpu.vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q; unsigned q_flags = u->status & 0x30;
@@ -121,7 +129,8 @@ static unsigned native_geometry_17e0(Vu *u)
 #define NADD(a,b,d) native_add(&flags,(a),(b),(d))
 #define NSUB(a,b,d) native_sub(&flags,(a),(b),(d))
 #define NMUL(a,b,d) native_mul(&flags,(a),(b),(d))
-#define NMADD(a,b,c,d) native_madd(&flags,(a),(b),(c),(d))
+/* Every ACC input here follows an all-lane FMAC, including after clipping. */
+#define NMADD(a,b,c,d) native_madd_clean_acc(&flags,(a),(b),(c),(d))
 #define SET(r,x,d) v[r] = native_merge(v[r], (x), (d))
 #define LOAD(a) _mm_loadu_ps(memory[(a) & 1023].f)
 #define STORE(a,x,d) store_fields(memory[(a) & 1023].f, _mm_castps_si128(x), (d))
@@ -147,6 +156,7 @@ static unsigned native_geometry_17e0(Vu *u)
             acc=_mm_loadu_ps(cpu.vacc); q=cpu.q;
             clip=u->clip; entry_status=u->status; q_flags=u->status&0x30;
             memset(&flags,0,sizeof flags);
+            flags.sticky_complete = sticky_complete;
         }
         v[30]=native_ftoi(v[24],16);v[11]=v[7];
         SET(5,NADD(v[13],lane4(v[25],3),2),2);index=(index+3)&65535;vi[8]=(uint16_t)index;
@@ -171,8 +181,12 @@ static unsigned native_geometry_17e0(Vu *u)
 #undef LOAD
 #undef STORE
 }
+static unsigned native_geometry_17e0(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_17e0_impl(u, 1);
+    return native_geometry_17e0_impl(u, 0);
+}
 
-static unsigned native_geometry_20c(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_20c_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -184,6 +198,7 @@ static unsigned native_geometry_20c(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(cpu.vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q; unsigned q_flags = u->status & 0x30;
@@ -203,7 +218,8 @@ static unsigned native_geometry_20c(Vu *u)
 #define NADD(a,b,d) native_add(&flags,(a),(b),(d))
 #define NSUB(a,b,d) native_sub(&flags,(a),(b),(d))
 #define NMUL(a,b,d) native_mul(&flags,(a),(b),(d))
-#define NMADD(a,b,c,d) native_madd(&flags,(a),(b),(c),(d))
+/* Every ACC input here follows an all-lane FMAC, including after clipping. */
+#define NMADD(a,b,c,d) native_madd_clean_acc(&flags,(a),(b),(c),(d))
 #define SET(r,x,d) v[r] = native_merge(v[r], (x), (d))
 #define LOAD(a) _mm_loadu_ps(memory[(a) & 1023].f)
 #define STORE(a,x,d) store_fields(memory[(a) & 1023].f, _mm_castps_si128(x), (d))
@@ -232,6 +248,7 @@ static unsigned native_geometry_20c(Vu *u)
             for(unsigned i=0;i<32;i++)v[i]=vf4(u,i);
             acc=_mm_loadu_ps(cpu.vacc);q=cpu.q;clip=u->clip;entry_status=u->status;q_flags=u->status&0x30;
             memset(&flags,0,sizeof flags);
+            flags.sticky_complete = sticky_complete;
         }
         SET(23,NMUL(v[23],lane4(v[23],3),1),1);index=(index+3)&65535;vi[8]=(uint16_t)index;
         v[7]=NMUL(v[7],v[8],15);v[29]=v[28];
@@ -258,8 +275,12 @@ static unsigned native_geometry_20c(Vu *u)
 #undef LOAD
 #undef STORE
 }
+static unsigned native_geometry_20c(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_20c_impl(u, 1);
+    return native_geometry_20c_impl(u, 0);
+}
 
-static unsigned native_geometry_260(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_260_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -271,6 +292,7 @@ static unsigned native_geometry_260(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(cpu.vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q; unsigned q_flags = u->status & 0x30;
@@ -290,7 +312,8 @@ static unsigned native_geometry_260(Vu *u)
 #define NADD(a,b,d) native_add(&flags,(a),(b),(d))
 #define NSUB(a,b,d) native_sub(&flags,(a),(b),(d))
 #define NMUL(a,b,d) native_mul(&flags,(a),(b),(d))
-#define NMADD(a,b,c,d) native_madd(&flags,(a),(b),(c),(d))
+/* Every ACC input here follows an all-lane FMAC, including after clipping. */
+#define NMADD(a,b,c,d) native_madd_clean_acc(&flags,(a),(b),(c),(d))
 #define SET(r,x,d) v[r] = native_merge(v[r], (x), (d))
 #define LOAD(a) _mm_loadu_ps(memory[(a) & 1023].f)
 #define STORE(a,x,d) store_fields(memory[(a) & 1023].f, _mm_castps_si128(x), (d))
@@ -328,6 +351,10 @@ static unsigned native_geometry_260(Vu *u)
 #undef LOAD
 #undef STORE
 }
+static unsigned native_geometry_260(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_260_impl(u, 1);
+    return native_geometry_260_impl(u, 0);
+}
 
 /* The unclipped mesh loop B 08B0..0930 (dispatch 0x100: MSCAL 07F0, then MSCNT 1040 or 1CB0).
    Three input and three output qwords a vertex, no CLIP and no flag reads. Its DIV at 08D8 is read
@@ -335,7 +362,7 @@ static unsigned native_geometry_260(Vu *u)
    The two accumulator products 0908 (vf0 * vf22) and 0930 (vf4 * vf0w) read registers the loop
    never writes: each is computed once, its sticky flags are the same every time. The vertex count
    is checked before anything is written; any other count leaves the pair-by-pair path to run. */
-static unsigned native_geometry_800(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_800_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -347,6 +374,7 @@ static unsigned native_geometry_800(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(cpu.vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q; unsigned q_flags = 0;
@@ -409,6 +437,10 @@ static unsigned native_geometry_800(Vu *u)
 #undef LOAD
 #undef STORE
 }
+static unsigned native_geometry_800(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_800_impl(u, 1);
+    return native_geometry_800_impl(u, 0);
+}
 
 /* The end state of a kernel with no clipping path: registers, then the flags as the exact path
    leaves them once every queued update has landed. The last FMAC gives MAC and the status bits
@@ -439,7 +471,7 @@ static void native_finish(Vu *u, const __m128 v[32], __m128 acc, float q, const 
    same every time. The last FMAC is 07D8's ADDw. Declines before writing anything when a
    division is pending or the count is not a whole number of vertices; the pairs then run as
    before. */
-static unsigned native_geometry_0798(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_0798_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -450,6 +482,7 @@ static unsigned native_geometry_0798(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(u->c->vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned pairs = 0, index = begin;
     uint16_t *vi = u->c->vi;
     float q = u->c->q; unsigned q_flags = 0;
@@ -482,12 +515,16 @@ static unsigned native_geometry_0798(Vu *u)
     native_finish(u, v, acc, q, &flags, entry_status, q_flags, u->clip);
     return pairs;
 }
+static unsigned native_geometry_0798(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_0798_impl(u, 1);
+    return native_geometry_0798_impl(u, 0);
+}
 
 /* The loop B 3140..3178 (dispatch 0x616: MSCAL 30A0, 0040 or 0020, then MSCNT 1040 or 12E0): 0798's
    loop without the perspective divide, 8 pairs a vertex (MULw by vf0w instead of MULq, a constant
    colour qword vf10 stored at +1). No CLIP, no flag, Q or P reads; the status Q bits stay as they
    are. The last FMAC is 3178's ADDw. */
-static unsigned native_geometry_3140(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_geometry_3140_impl(Vu *u, int sticky_complete)
 {
     unsigned begin = u->c->vi[8], end = u->c->vi[10];
     unsigned distance = (end - begin) & 0xffff;
@@ -498,6 +535,7 @@ static unsigned native_geometry_3140(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(u->c->vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned pairs = 0, index = begin;
     uint16_t *vi = u->c->vi;
     const __m128 one_w = lane4(v[0], 3);
@@ -524,6 +562,10 @@ static unsigned native_geometry_3140(Vu *u)
 #undef LOAD
 #undef STORE
 }
+static unsigned native_geometry_3140(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_3140_impl(u, 1);
+    return native_geometry_3140_impl(u, 0);
+}
 
 /* The skinning loop 0468-0570 (MSCAL 0010/0020 through 03C8): a vertex blended from three bone
    matrices by weights, its normal transformed and lit, 34 pairs a vertex. The loop reads no
@@ -532,7 +574,7 @@ static unsigned native_geometry_3140(Vu *u)
    it, and no lower reads its own pair's upper result). The last FMAC is 0570's MADDw. Declines
    before writing anything when a division or EFU result is still pending or the count could
    pass the run's step limit. */
-static unsigned native_skin_468(Vu *u)
+static inline __attribute__((always_inline)) unsigned native_skin_468_impl(Vu *u, int sticky_complete)
 {
     int16_t count = (int16_t)u->c->vi[10];
     if ((u->q_ready && u->q_ready > u->cycle) || (u->p_ready && u->p_ready > u->cycle) || count > 8192) return 0;
@@ -543,6 +585,7 @@ static unsigned native_skin_468(Vu *u)
     __m128 v[32], acc = _mm_loadu_ps(cpu.vacc);
     for (unsigned i = 0; i < 32; i++) v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     uint16_t *vi = cpu.vi;
     unsigned pairs = 0;
     const __m128 i_reg = _mm_set1_ps(cpu.i), one_w = lane4(v[0], 3), zero_x = lane4(v[0], 0);
@@ -613,6 +656,10 @@ static unsigned native_skin_468(Vu *u)
 #undef LOAD
 #undef STORE
 #undef LANE_BITS
+}
+static unsigned native_skin_468(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_skin_468_impl(u, 1);
+    return native_skin_468_impl(u, 0);
 }
 
 #include "vu1_native_0e10.h"

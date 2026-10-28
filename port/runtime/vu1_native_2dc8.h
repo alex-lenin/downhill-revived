@@ -3,7 +3,8 @@
    that pair. Its Z/S bits and the current DIV D bit control the fallback.
    The final DIV remains pending for two more issue slots; the guarded tail
    has no early MAC/status read. Register names preserve microcode ordering. */
-static unsigned native_geometry_2dc8(Vu *u) {
+static inline __attribute__((always_inline)) unsigned native_geometry_2dc8_impl(Vu *u, int sticky_complete)
+{
     unsigned begin = u->c->vi[8], end = u->c->vi[10], distance = (end - begin) & 65535;
     if (!distance || distance % 3 || distance / 3 > 64 || (u->q_ready && u->q_ready > u->cycle))
         return 0;
@@ -17,6 +18,7 @@ static unsigned native_geometry_2dc8(Vu *u) {
         v[i] = vf4(u, i);
     NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(),
                          _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
     unsigned clip = u->clip, pairs = 0, index = begin;
     uint16_t *vi = cpu.vi;
     float q = cpu.q, next_q = q;
@@ -105,6 +107,7 @@ static unsigned native_geometry_2dc8(Vu *u) {
             entry_status = u->status;
             q_flags = u->status & 0x30;
             memset(&flags, 0, sizeof flags);
+            flags.sticky_complete = sticky_complete;
         }
         v[30] = native_ftoi(v[24], 16);
         v[6] = LOAD(1013);
@@ -151,4 +154,8 @@ static unsigned native_geometry_2dc8(Vu *u) {
 #undef SET
 #undef LOAD
 #undef STORE
+}
+static unsigned native_geometry_2dc8(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_geometry_2dc8_impl(u, 1);
+    return native_geometry_2dc8_impl(u, 0);
 }

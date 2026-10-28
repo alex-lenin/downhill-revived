@@ -246,6 +246,135 @@ def fill_function(name, entries):
     return lines
 
 
+class ReadyOperands:
+    """Conservative component readiness within one straight-line block.
+
+    None means an unknown entry timestamp. A write is ready in four cycles;
+    every pair consumes at least one cycle, and a checked read is ready now.
+    Stalls can only expire more timestamps, so ignoring their extra cycles is
+    conservative. Runtime ready arrays remain intact for all other blocks.
+    """
+    def __init__(self):
+        self.remaining = [[None] * 4 for _ in range(32)]
+
+    def step(self, lo, hi):
+        lines = []
+
+        def read(reg, fields):
+            if not reg: return
+            need = 0
+            for c in range(4):
+                if fields & (8 >> c):
+                    if self.remaining[reg][c] != 0: need |= 8 >> c
+                    self.remaining[reg][c] = 0
+            if need: lines.append(f'read_fields(u, {reg}, {need});')
+
+        def write(reg, fields):
+            if reg:
+                for c in range(4):
+                    if fields & (8 >> c): self.remaining[reg][c] = 4
+
+        op, fs, ft, fd, d = hi & 63, hi >> 11 & 31, hi >> 16 & 31, hi >> 6 & 31, hi >> 21 & 15
+        sub = fd * 4 + (op & 3)
+        # Mirror pair_stalls(), including its ordering before upper/lower.
+        if not (op >= 60 and sub == 0x2f):
+            if op >= 60 and sub == 0x1f:
+                read(fs, 14); read(ft, 1)
+            else:
+                read(fs, d)
+                if op < 28: read(ft, 8 >> (op & 3))
+                elif 40 <= op < 48: read(ft, d)
+                elif op >= 60 and (sub < 16 or 24 <= sub < 28): read(ft, 8 >> (op & 3))
+                elif op >= 60 and 40 <= sub <= 46: read(ft, d)
+        lop, ls, lt, ld = lo >> 25, lo >> 11 & 31, lo >> 16 & 31, lo >> 21 & 15
+        lsub = (lo >> 6 & 31) * 4 + (lo & 3)
+        if not hi >> 31:
+            if lop == 1: read(ls, ld)
+            if lop == 0x40 and lo & 63 >= 60:
+                if lsub in (0x30, 0x35, 0x37): read(ls, ld)
+                elif lsub == 0x31: read(ls, (ld >> 1) | ((ld & 1) << 3))
+                elif lsub in (0x38, 0x3a):
+                    read(ls, 8 >> (lo >> 21 & 3)); read(lt, 8 >> (lo >> 23 & 3))
+                elif lsub == 0x39: read(lt, 8 >> (lo >> 23 & 3))
+                elif lsub in (0x3c, 0x42, 0x43): read(ls, 8 >> (lo >> 21 & 3))
+                elif lsub in (0x70, 0x71, 0x72, 0x73, 0x76): read(ls, 15 if lsub == 0x76 else 14)
+                elif lsub in (0x78, 0x79, 0x7a): read(ls, 8 >> (lo >> 21 & 3))
+                if lsub in (0x38, 0x39, 0x3a, 0x3b):
+                    lines.append('if (u->q_ready > u->cycle) u->cycle = u->q_ready;')
+                elif lsub in (0x70, 0x71, 0x72, 0x73, 0x76, 0x78, 0x79, 0x7a, 0x7b):
+                    lines.append('if (u->p_ready) { if (u->p_ready - 1 > u->cycle) u->cycle = u->p_ready - 1; u->c->p = u->p_next; u->p_ready = 0; }')
+            if lop == 0 or (lop == 0x40 and lo & 63 >= 60 and lsub in (0x30, 0x31, 0x34, 0x36, 0x3d, 0x40, 0x41, 0x64)):
+                write(lt, ld)
+        # Lower writes first; the upper destination wins a same-pair conflict.
+        if op >= 60:
+            if sub in (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1d): write(ft, d)
+        elif mac_writer(hi) or op in (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1d, 0x1f, 0x2b, 0x2f):
+            write(fd, d & 14 if op == 0x2e else d)
+        self.remaining = [[None if n is None else max(0, n - 1) for n in r] for r in self.remaining]
+        return ' '.join(lines)
+
+
+class FiniteOperands:
+    """Local, per-lane exponent-255 exclusion. Entry registers are unknown.
+
+    FMAC/ITOF results are finite under the VU rounding mode. Raw loads, FTOI,
+    MFIR and P remain unknown. Moves and MIN/MAX preserve only proven lanes.
+    Upper reads precede lower writes, and the upper destination wins a conflict.
+    Proofs never cross a block boundary or an XGKICK callback.
+    """
+    def __init__(self):
+        self.vf = [15] + [0] * 31
+        self.acc = 0
+        self.i = False
+
+    def step(self, lo, hi):
+        fs, ft, fd, d = hi >> 11 & 31, hi >> 16 & 31, hi >> 6 & 31, hi >> 21 & 15
+        op = hi & 63
+        sub = fd * 4 + (op & 3) if op >= 60 else None
+        s, t = self.vf[fs], self.vf[ft]
+        # Match upper()'s vector/broadcast/Q/I source selection. Do not infer Q.
+        if (op < 0x1c) or (sub is not None and (sub < 0x10 or 0x18 <= sub < 0x1c)):
+            t = 15 if t & (8 >> (op & 3)) else 0
+        elif op in (0x1c, 0x20, 0x21, 0x24, 0x25) or sub in (0x1c, 0x20, 0x21, 0x24, 0x25):
+            t = 0
+        elif op in (0x1d, 0x1e, 0x1f, 0x22, 0x23, 0x26, 0x27) or sub in (0x1e, 0x22, 0x23, 0x26, 0x27):
+            t = 15 if self.i else 0
+        if op == 0x2e or sub == 0x2e: d &= 14  # OPMULA/OPMSUB preserve W
+        # Only written lanes contribute a result or flags. Arithmetic in other
+        # lanes is discarded; it cannot make a raw W lane invalidate an XYZ
+        # proof (host VU exceptions are masked).
+        proof = (1 if s & d == d else 0) | (2 if t & d == d else 0) | (4 if self.acc & d == d else 0)
+        dst, finite, acc = None, 0, False
+        if op >= 60:
+            if sub in (0x10, 0x11, 0x12, 0x13): dst, finite = ft, 15
+            elif sub in (0x14, 0x15, 0x16, 0x17): dst = ft
+            elif sub == 0x1d: dst, finite = ft, s
+            elif mac_writer(hi): dst, finite, acc = 0, 15, True
+        elif mac_writer(hi): dst, finite = fd, 15
+        elif op in (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1d, 0x1f, 0x2b, 0x2f):
+            dst, finite = fd, s & t
+        # Lower reads the old file, before the upper result is committed.
+        if hi >> 31:
+            self.i = (lo & 0x7f800000) != 0x7f800000
+        else:
+            lop, lt, ls, ld = lo >> 25, lo >> 16 & 31, lo >> 11 & 31, lo >> 21 & 15
+            lsub = (lo >> 6 & 31) * 4 + (lo & 3)
+            lower_finite, writes = 0, lop == 0
+            if lop == 0x40:
+                writes = lsub in (0x30, 0x31, 0x34, 0x36, 0x3d, 0x40, 0x41, 0x64)
+                if lsub == 0x30: lower_finite = self.vf[ls]
+                elif lsub == 0x31:
+                    m = self.vf[ls]; lower_finite = ((m << 1) | (m >> 3)) & 15
+                if lsub == 0x6c:
+                    self.vf = [15] + [0] * 31; self.acc = 0; self.i = False
+            if writes and lt:
+                self.vf[lt] = (self.vf[lt] & ~ld) | (lower_finite & ld)
+        if dst is not None:
+            if acc: self.acc = (self.acc & ~d) | (finite & d)
+            elif dst: self.vf[dst] = (self.vf[dst] & ~d) | (finite & d)
+        return proof
+
+
 def emit_block(prefix, i, block, unit, lazy=(), words=None):
     """C for one straight-line block: the interpreter's steps for each pair with the words as
     constants (pair_stalls only on VU1, as in the interpreter). Pairs whose offset is in lazy
@@ -254,28 +383,39 @@ def emit_block(prefix, i, block, unit, lazy=(), words=None):
     hint = 'VU1(u); ' if unit else 'VU0(u); '
     fused = len(block) > 1 and ends_block(*block[-2])
     fused_end = fused and bool(block[-2][1] & (1 << 30))
-    lines = [f'static int {prefix}_block_{i}(Vu *u, unsigned pc, int *bad) {{',
+    name = f'{prefix}_block_{i}'
+    signature = (f'static inline __attribute__((always_inline)) int {name}_impl(Vu *u, unsigned pc, int *incoming_bad, int sticky_complete) {{'
+                 if lazy else f'static int {name}(Vu *u, unsigned pc, int *incoming_bad) {{')
+    lines = [signature,
+             '    int failure = *incoming_bad; int *bad = &failure;',
              '    Upper up; int next = -1, transfer = -1;', f'    u->unit = {unit};']
+    finite, ready = FiniteOperands(), ReadyOperands()
     for offset, (lo, hi) in enumerate(block):
+        proof = finite.step(lo, hi) if unit else 0
         lines += ['    {']
         if unit:
-            lines += [f'    VU1(u); pair_stalls(u, 0x{hi:08X}u, 0x{lo:08X}u);']
+            lines += [f'    VU1(u); {ready.step(lo, hi)}']
         lines += [f'    {hint}apply_flags(u); update_q(u);',
-                  f'    {hint}if (upper(u, 0x{hi:08X}u, &up) < 0) {{ *bad = 1; return -1; }}']
+                  f'    {hint}if (upper_proven(u, 0x{hi:08X}u, &up, {proof}) < 0) {{ *incoming_bad = 1; return -1; }}']
         if hi >> 31:
             lines += [f'    const uint32_t immediate = 0x{lo:08X}u;',
                       '    memcpy(&u->c->i, &immediate, 4);']
         else:
             lines += [f'    if (!(up.flags == 2 && {lo >> 25} == 0x11)) {{',
                       f'        {hint}next = lower(u, 0x{lo:08X}u, pc + {offset}, bad);', '    }']
-        commit = 'commit_upper_lazy' if offset in lazy else 'commit_upper'
-        lines += ['    if (*bad) return -1;', f'    {hint}{commit}(u, &up, {lo >> 16 & 31});']
+        commit = (f'commit_upper_lazy_proven(u, &up, {lo >> 16 & 31}, sticky_complete)' if offset in lazy
+                  else f'commit_upper(u, &up, {lo >> 16 & 31})')
+        lines += ['    if (*bad) { *incoming_bad = *bad; return -1; }', f'    {hint}{commit};']
         if fused and offset == len(block) - 2:
             lines += ['    transfer = next;']
         if offset != len(block) - 1:
             lines += [f'    trace_pair(u, pc + {offset});', '    u->cycle++;']
         lines += ['    }']
     lines += [f'    return {"transfer" if fused else "next"};', '}']
+    if lazy:
+        lines += [f'static int {name}(Vu *u, unsigned pc, int *bad) {{',
+                  f'    if ((u->status & 0xc0) == 0xc0) return {name}_impl(u, pc, bad, 1);',
+                  f'    return {name}_impl(u, pc, bad, 0);', '}']
     if words is None:
         words = f'{prefix}_words_{i}'
         lines += [f'AOT_WORDS({words}, {2 * len(block)}, ' + ','.join(f'0x{w:08X}u' for pair in block for w in pair) + ')']

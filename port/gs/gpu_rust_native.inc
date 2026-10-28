@@ -67,7 +67,9 @@ static void native_present(Native *n)
     static int spikes = -1;
     if (spikes < 0) spikes = getenv("DHD_SPIKES") != NULL;
     double start = spikes ? host_wall_seconds() : 0;
+    double rs = native_rstat_start();
     int drawn = native_present_draw(n, p->surface, w, h, n->resize != 0);
+    native_rstat_add(RSTAT_PRESENT, rs);
     double ready = spikes ? host_wall_seconds() : 0;
     if (drawn || n->display_width) n->resize = 0;   /* without a picture yet nothing was configured */
     if (drawn <= 0) return;   /* failed, or skipped: no picture yet, timeout */
@@ -77,8 +79,12 @@ static void native_present(Native *n)
         native_present_rect(n, w, h, viewport, &cut);
         gs_picture_rect(cut.left, cut.top, cut.right, cut.bottom, (int)w, (int)h);
     }
+    rs = native_rstat_start();
     if (!n->interp) pacing_present(n->present_due, n->present_began);  /* holds the picture to its due time */
+    native_rstat_add(RSTAT_PACE, rs);
+    rs = native_rstat_start();
     dhdr_surface_present(p->surface);
+    native_rstat_add(RSTAT_SHOW, rs);
     native_note_presented(n);
     if (spikes) {
         double end = host_wall_seconds();

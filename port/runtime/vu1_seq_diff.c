@@ -33,6 +33,10 @@ typedef struct { ps2_cpu cpu; ps2_q128 data[1024]; uint8_t gif[GIF_MAX]; unsigne
 
 static ps2_q128 *data;
 static Result *recording;
+#ifdef PS2_VU_COVERAGE
+extern unsigned long long ps2_vu1_interpreted[2048], ps2_vu1_translated;
+static unsigned long long translated_pairs[2], fallback_pairs[2][2048];
+#endif
 
 /* XGKICK: the GIF packet at `address` (tags and data, through the EOP tag's data) and where it was. */
 static int kick(void *opaque, unsigned address)
@@ -76,10 +80,23 @@ static void execute(const Run *r, Result *out)
     out->cpu.vu0_code = code_base; out->cpu.vu0_mem = memory;
     memcpy(memory, r->data, sizeof memory);
     data = memory; recording = out; out->gif_bytes = out->kicks = 0;
+#ifdef PS2_VU_COVERAGE
+    if (ps2_vu1_aot_mode) {
+        memset(ps2_vu1_interpreted, 0, sizeof ps2_vu1_interpreted);
+        ps2_vu1_translated = 0;
+    }
+#endif
     if (ps2_vu1_run(&out->cpu, r->header[0], r->header[1], r->header[2], kick, NULL)) {
         fprintf(stderr, "VU failure in run with entry %04X\n", r->header[0]); exit(1);
     }
     memcpy(out->data, memory, sizeof memory);
+#ifdef PS2_VU_COVERAGE
+    if (ps2_vu1_aot_mode) {
+        unsigned mode = ps2_vu1_native_mode == 1;
+        translated_pairs[mode] += ps2_vu1_translated;
+        for (unsigned i = 0; i < 2048; i++) fallback_pairs[mode][i] += ps2_vu1_interpreted[i];
+    }
+#endif
     recording = NULL;
 }
 
@@ -140,6 +157,11 @@ int main(int argc, char **argv)
     unsigned long long native_before[PS2_VU1_NATIVE_KINDS], coverage[PS2_VU1_NATIVE_KINDS] = {0};
     while (n < max && fread(&run, sizeof run, 1, f) == 1) {
         if (run.header[3] != sizeof(ps2_cpu)) { fprintf(stderr, "capture register size %u, this build %u\n", run.header[3], (unsigned)sizeof(ps2_cpu)); return 2; }
+        /* Optional input perturbation, applied identically before all three
+           executions: cover entry sticky Z/S = 00, 01, 10, 11, including the
+           transition from accumulating flags to the already-set fast path. */
+        if (getenv("DHD_VU_TEST_STICKY_CYCLE"))
+            run.cpu.vu0_ctrl[0] = (run.cpu.vu0_ctrl[0] & ~0xc0u) | ((n & 3) << 6);
         load_code(run.header[4]);
         ps2_vu1_aot_mode = 0; ps2_vu1_native_mode = 0;
         execute(&run, &referee);
@@ -187,5 +209,15 @@ int main(int argc, char **argv)
     if (repeat) fprintf(stderr, "; replay time exact %.3f ms, native %.3f ms (%.3fx)", exact_total * 1e3, native_total * 1e3,
                         exact_total / native_total);
     fprintf(stderr, "\n");
+#ifdef PS2_VU_COVERAGE
+    for (unsigned mode = 0; mode < 2; mode++) {
+        unsigned long long interpreted = 0;
+        for (unsigned i = 0; i < 2048; i++) interpreted += fallback_pairs[mode][i];
+        fprintf(stderr, "coverage %s: AOT %llu pairs, interpreter %llu pairs\n",
+                mode ? "blocks+kernels" : "blocks", translated_pairs[mode], interpreted);
+        for (unsigned i = 0; i < 2048; i++) if (fallback_pairs[mode][i])
+            fprintf(stderr, "  fallback %04X: %llu pairs\n", i * 8, fallback_pairs[mode][i]);
+    }
+#endif
     return differing ? 1 : 0;
 }

@@ -23,6 +23,28 @@ static uint32_t gs_position(_Atomic uint32_t *p)
 {
     return position(p);
 }
+/* One VIF packet can kick many GIF packets. Keep their individual headers,
+   bytes and provenance, but publish the completed prefix together. Only the
+   VU producer owns these two fields; consumers still use gs_written. */
+static uint32_t gs_pending;
+static uint32_t gs_cached_consumed;
+static int gs_batching;
+static void gs_publish(void)
+{
+    if (gs_pending == gs_position(&gs_written)) return;
+    atomic_exchange(&gs_written, gs_pending);
+    if (gs_position(&gs_sleeping)) wake(gs_available);
+}
+static void gs_batch_begin(void)
+{
+    gs_pending = gs_position(&gs_written);
+    gs_batching = 1;
+}
+static void gs_batch_end(void)
+{
+    gs_publish();
+    gs_batching = 0;
+}
 static void gs_execute(unsigned path, const uint32_t *words, unsigned count, const GraphicsProvenance *p)
 {
     gs.vu_entry = p->entry;
@@ -143,6 +165,8 @@ static void gs_queue_initialize(void)
 #ifdef GS_QUEUE_TEST
     gs_written = gs_consumed = 0xfffff800u;
 #endif
+    gs_pending = gs_position(&gs_written);
+    gs_cached_consumed = gs_position(&gs_consumed);
     gs_ring = malloc(GS_RING_BYTES);
     gs_available = SDL_CreateSemaphore(0);
     gs_retired = SDL_CreateSemaphore(0);
@@ -163,13 +187,20 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
     while (count) {
         unsigned take = count > GS_RING_BYTES / 16 ? GS_RING_BYTES / 16 : count;
         unsigned bytes = (sizeof(GsPacket) + take * 4 + 15) & ~15u;
-        uint32_t at = gs_position(&gs_written);
+        uint32_t at = gs_batching ? gs_pending : gs_position(&gs_written);
         unsigned tail = GS_RING_BYTES - (at & (GS_RING_BYTES - 1)), wrap = bytes > tail ? tail : 0;
-        if (GS_RING_BYTES - (at - gs_position(&gs_consumed)) < bytes + wrap) {
+        /* A previously observed retired position remains a safe lower bound.
+           Refresh it only when that bound no longer leaves enough room. */
+        if (GS_RING_BYTES - (at - gs_cached_consumed) < bytes + wrap)
+            gs_cached_consumed = gs_position(&gs_consumed);
+        if (GS_RING_BYTES - (at - gs_cached_consumed) < bytes + wrap) {
+            /* The consumer needs the preceding batch to free this space. */
+            if (gs_batching) gs_publish();
             int64_t full = tl_begin();
             uint32_t observed;
             while (GS_RING_BYTES - (at - (observed = gs_position(&gs_consumed))) < bytes + wrap)
                 idle_wait(&gs_consumed, observed, &gs_waiting, gs_retired, 1, NULL);
+            gs_cached_consumed = observed;
             tl_add(TL_VU_FULL, full);
         }
         if (wrap) {
@@ -185,9 +216,9 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
         p->pad = 0;
         p->provenance = graphics_provenance;
         memcpy(p + 1, words, take * 4);
-        atomic_exchange(&gs_written, at + bytes);
-        if (gs_position(&gs_sleeping))
-            wake(gs_available);
+        gs_pending = at + bytes;
+        if (!gs_batching || gs_pending - gs_position(&gs_written) >= 65536)
+            gs_publish();
         words += take;
         count -= take;
     }

@@ -143,6 +143,7 @@ impl Native {
     /// native_present. 1 drawn (C paces, then calls `dhdr_surface_present`), 0 skipped, -1 failed
     /// (logged).
     pub fn present(&mut self, surface: &mut Surface, r: &DhdrPresentRect) -> i32 {
+        let whole = crate::native::render::rstat::T::new();
         let gpu = self.gpu;
         let log = |e: &str| crate::host::log(&format!("dhd_render: dhdr_native_present: {e}"));
         // No picture scanned out yet: nothing to show.
@@ -161,7 +162,9 @@ impl Native {
         // once; Timeout skips.
         #[cfg(not(target_arch = "wasm32"))]
         let acquiring = crate::native::pipelines::SpikeTimer::new("acquire", 0);
+        let t = crate::native::render::rstat::T::new();
         let acquired = surface.acquire(r.window_w, r.window_h, r.resize != 0);
+        t.add(crate::native::render::rstat::ACQUIRE);
         #[cfg(not(target_arch = "wasm32"))]
         drop(acquiring);
         let target = match acquired {
@@ -191,9 +194,16 @@ impl Native {
             gpu.queue.write_buffer(&uniform.buffer, 0, &rect);
             uniform.written = Some(rect);
         }
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("native present") });
+        let mut separate = (!self.pass.deferred).then(|| gpu.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("native present") }));
+        let encoder = match separate.as_mut() {
+            Some(encoder) => encoder,
+            None => self.pass.encoder(gpu),
+        };
+        let t = crate::native::render::rstat::T::new();
         let times = gputimes::slot(gpu, gputimes::PRESENT);
         {
+            crate::native::render::pass_trace::event("present:clear/store", -1, -1);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("native present"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -220,8 +230,19 @@ impl Native {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _spike = crate::native::pipelines::SpikeTimer::new("present_submit", 0);
-        gputimes::end_frame(gpu, &mut encoder);
-        gpu.queue.submit([encoder.finish()]);
+        t.add(crate::native::render::rstat::PRESENT_RECORD);
+        let t = crate::native::render::rstat::T::new();
+        if let Some(encoder) = separate {
+            let mut encoder = encoder;
+            gputimes::end_frame(gpu, &mut encoder);
+            gpu.queue.submit([encoder.finish()]);
+        } else {
+            gputimes::end_frame(gpu, self.pass.encoder(gpu));
+            self.pass.submit_now(gpu, &self.arenas);
+            self.zread_map();
+        }
+        t.add(crate::native::render::rstat::PRESENT_SUBMIT);
+        whole.add(crate::native::render::rstat::PRESENT);
         gputimes::submitted(gpu);
         1
     }

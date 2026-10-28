@@ -192,8 +192,27 @@ mod native {
             adapter = self::adapter(&instance, backends, o)?;
         }
         let info = adapter.get_info();
+        // DHD_RSTAT (finding 108): whether the adapter offers GPU timers at all. The 120 field/s
+        // round had to estimate GPU time from the render thread's blocked submits because nothing
+        // asks for them; this says whether a later round could measure it directly.
+        if std::env::var_os("DHD_RSTAT").is_some() {
+            let f = adapter.features();
+            let has = |x: wgpu::Features| if f.contains(x) { "yes" } else { "no" };
+            crate::host::log(&format!(
+                "rstat: adapter {} ({:?}) TIMESTAMP_QUERY={} TIMESTAMP_QUERY_INSIDE_ENCODERS={} TIMESTAMP_QUERY_INSIDE_PASSES={}",
+                info.name,
+                info.backend,
+                has(wgpu::Features::TIMESTAMP_QUERY),
+                has(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+                has(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
+            ));
+        }
         let dual = adapter.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING)
             && o.flags & DHDR_DEV_NO_DUAL_SOURCE == 0;
+        let timers = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let timers = if std::env::var_os("DHD_GPU_TIMING").is_some() && adapter.features().contains(timers) {
+            timers
+        } else { wgpu::Features::empty() };
         let mut features = if dual { wgpu::Features::DUAL_SOURCE_BLENDING } else { wgpu::Features::empty() };
         // DHD_GPU_TIMES (diagnostics: native/pipelines.rs's gputimes) only.
         if crate::native::pipelines::gputimes::wanted() {
@@ -201,7 +220,7 @@ mod native {
         }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features: features,
+            required_features: features | timers,
             // the adapter's own, so a 4 MB bin list always fits (gpu_wgpu.c:195)
             required_limits: adapter.limits(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),

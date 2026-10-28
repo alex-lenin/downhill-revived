@@ -35,7 +35,7 @@ ENTRIES = (
 )
 
 
-def build(aot=False):
+def build(aot=False, isa="sse2", thinlto=False, pgo_use=None):
     upstream = OUT / 'upstream'
     upstream.mkdir(parents=True, exist_ok=True)
     for name, digest in HASHES.items():
@@ -54,35 +54,43 @@ def build(aot=False):
             source = source[:source.index('InterpVU1 CpuIntVU1;')]
         (OUT / name).write_text(source, encoding='utf-8')
     interp = ROOT / 'port/runtime/vu0_interp.c'
+    flags = ['-m' + isa, '-mno-fma'] if testprog.os.name == "nt" else []
+    if thinlto: flags += ['-flto=thin']
+    native_flags = ['-fprofile-instr-use=' + str(pgo_use.resolve()), '-Werror=profile-instr-out-of-date'] if pgo_use else []
+    if pgo_use and os.environ.get('DHD_VU_TRACE'):
+        raise ValueError('PGO oracle requires the normal, non-tracing runtime')
     defines, reference = [], []
     if aot:
         reference = [testprog.host_object(interp, OUT, 'reference', defines=[
             'PS2_VU_REFERENCE', 'ps2_vu0_run=ps2_vu0_reference', 'ps2_vu1_run=ps2_vu1_reference',
-            'ps2_vu_aot_load=ps2_vu_aot_reference_load'])]
+            'ps2_vu_aot_load=ps2_vu_aot_reference_load'], flags=flags)]
         from vu1_aot import generate
         print('VU1 AOT:', generate(OUT / 'vu1_aot.inc'), 'straight-line blocks', flush=True)
         defines = ['PS2_VU_AOT', 'PS2_VU_AOT_EMBED', 'PS2_VU_AOT_TEST']
     # The oracle compares complete final state; the optional textual pair tracing is extra.
-    native = testprog.host_object(interp, OUT, 'native', includes=[OUT], defines=defines + ['PS2_VU_TRACE'])
+    native = testprog.host_object(interp, OUT, 'native', includes=[OUT], defines=defines + ([] if pgo_use else ['PS2_VU_TRACE']), flags=flags + native_flags)
     oracle = testprog.host_object(ROOT / 'port/runtime/pcsx2_vu_oracle.cpp', OUT, 'oracle', includes=[OUT],
-                                  defines=defines)
-    testprog.host('oracle', [oracle, native, *reference, testprog.HOST_FP], out=OUT, low=aot)  # AOT: guest_base
+                                  defines=defines, flags=flags)
+    testprog.host('oracle', [oracle, native, *reference, testprog.HOST_FP], out=OUT, low=aot, flags=flags)  # AOT: guest_base
     if aot:
         # Synthetic programs also exercise the fallback for pairs absent from
         # the retail overlays, mixed with matching pairs in the same run.
         exe = testprog.host('aot-instructions', [native, ROOT / 'port/runtime/test_vu1.c', ROOT / 'port/gs/memory.c',
                                                  ROOT / 'port/gs/gs.c', testprog.HOST_FP], out=OUT, includes=[OUT], defines=defines,
-                            low=True)
+                            low=True, flags=flags)
         testprog.run(exe)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seeds', type=int, default=32, help='seeded float fixtures per entry')
+    parser.add_argument('--thinlto', action='store_true')
+    parser.add_argument('--pgo-use', type=Path)
+    parser.add_argument('--isa', choices=('sse2', 'sse4.1', 'avx2'), default='sse2')
     parser.add_argument('--aot', action='store_true', help='compare generated instruction pairs with PCSX2')
     parser.add_argument('captures', nargs='*')
     args = parser.parse_args()
-    build(args.aot)
+    build(args.aot, args.isa, args.thinlto, args.pgo_use)
     data = Path(os.environ.get('DHD_VUTEXT', ROOT / 'assets/vutext.bin')).read_bytes()
     results = []
 

@@ -320,7 +320,8 @@ def source_files():
         rel = p.relative_to(RENDER)
         if not p.is_file() or rel.parts[0] in ('target',) or '__pycache__' in rel.parts:
             continue
-        if p.name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') or rel.parts[0] == 'src' \
+        # Local HAL patches must change the object-cache key too, including build.rs and notices.
+        if p.name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') or rel.parts[0] in ('src', 'vendor') \
                 or rel.as_posix() == '.cargo/config.toml':
             files.append(('port/render/' + rel.as_posix(), p))
     for member in MEMBERS:

@@ -323,6 +323,53 @@ static void native_present(Native *n);  /* the last scanned-out picture again */
 static int native_read_display(Native *n, uint32_t *pixels);
 static void native_present_options(Native *n);  /* the present filter; then native_aspect_options */
 
+/* ---- DHD_RSTAT: the render thread's per-picture budget (finding 108) ----
+   The render thread's frame with the parts a 120 field/s budget (8.33 ms) is spent in: waiting for
+   the next field, the context lock, native_prepare_surfaces, the snapshot, the Rust draw call
+   (dhdr_native_picture, split further by port/render/src/native/render.rs's own rstat line), the
+   present (whose Rust acquire/record/submit the same line splits) and the Z copies after the
+   picture. A part costs two host_wall_seconds() calls while DHD_RSTAT is set and nothing without
+   it (the start is 0 then, RSTAT_ADD adds nothing). One line every 240 pictures, so a run's tail
+   holds the warmed means; the wait is the field clock's or the vsync's idle time, not work. */
+enum {
+    RSTAT_FRAME, RSTAT_WAIT, RSTAT_LOCK, RSTAT_PREPARE, RSTAT_SNAPSHOT, RSTAT_DRAW, RSTAT_PRESENT,
+    RSTAT_PACE, RSTAT_SHOW, RSTAT_ZREAD, RSTAT_PARTS
+};
+static double native_rstat[RSTAT_PARTS];
+static unsigned native_rstat_pictures;
+
+static inline int native_rstat_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("DHD_RSTAT") != NULL;
+    return on;
+}
+
+/* The clock, or 0 while off (RSTAT_ADD then adds nothing and reads no clock). */
+static inline double native_rstat_start(void)
+{
+    return native_rstat_on() ? host_wall_seconds() : 0;
+}
+
+static inline void native_rstat_add(int part, double start)
+{
+    if (start) native_rstat[part] += host_wall_seconds() - start;
+}
+
+/* One picture accounted: every 240 a line of means, then a fresh sum. */
+static inline void native_rstat_end(void)
+{
+    if (!native_rstat_on() || ++native_rstat_pictures % 240) return;
+    fprintf(stderr, "rstat: pictures=240 mean_ms frame=%.3f wait=%.3f lock=%.3f prepare=%.3f "
+            "snapshot=%.3f draw=%.3f present=%.3f pace=%.3f show=%.3f zread=%.3f\n",
+            native_rstat[RSTAT_FRAME] * 1e3 / 240, native_rstat[RSTAT_WAIT] * 1e3 / 240,
+            native_rstat[RSTAT_LOCK] * 1e3 / 240, native_rstat[RSTAT_PREPARE] * 1e3 / 240,
+            native_rstat[RSTAT_SNAPSHOT] * 1e3 / 240, native_rstat[RSTAT_DRAW] * 1e3 / 240,
+            native_rstat[RSTAT_PRESENT] * 1e3 / 240, native_rstat[RSTAT_PACE] * 1e3 / 240,
+            native_rstat[RSTAT_SHOW] * 1e3 / 240, native_rstat[RSTAT_ZREAD] * 1e3 / 240);
+    memset(native_rstat, 0, sizeof native_rstat);
+}
+
 static int psm_wide(unsigned psm) { return (psm & 7) == 2; }
 static int psm_color(unsigned psm) { return psm == 0 || psm == 1 || psm == 2 || psm == 10; }
 
@@ -2231,11 +2278,53 @@ static void native_interp_thread(Native *n)
 
 void host_thread_name(const char *name);  /* port/hle/host.c */
 
+/* DHD_ZREAD_FOLD and DHD_GPU_OVERLAP (finding 111): off unless set; 0 turns one off, any other
+   value on. They save Adreno CPU time but cost about 10% at 2x on Metal, and their probe timing is
+   not proven exact, so no platform has them on by default yet. zread.rs reads them the same way. */
+static int native_gpu_switch(const char *name)
+{
+    const char *s = getenv(name);
+    return s && strcmp(s, "0") != 0;
+}
+
+/* The experiment has no interpolation/browser publication hook. */
+static int native_fold_probe(const Native *n)
+{
+#ifdef NATIVE_INLINE
+    (void)n;
+    return 0;
+#else
+    static int on = -1;
+    if (on < 0) on = native_gpu_switch("DHD_ZREAD_FOLD");
+    return on && !n->interp;
+#endif
+}
+
+/* Experimental same-picture probe: request it before encoding, take at the old publication
+   point, and exclude the current tag in Rust. Disabled until the native-read exactness gate. */
+static void native_zread_start_picture(Native *n)
+{
+    if (n->exact_probe == 1) return;
+    native_mutex_lock(&n->queue_lock);
+    int on = n->zread_want.on, surface = n->zread_want.surface;
+    unsigned zbp = n->zread_want.zbp;
+    uint32_t want[4] = {(uint32_t)n->zread_want.rect[0], (uint32_t)n->zread_want.rect[1],
+                        (uint32_t)n->zread_want.rect[2], (uint32_t)n->zread_want.rect[3]};
+    native_mutex_unlock(&n->queue_lock);
+    if (want[2] > 64) want[2] = 64;
+    if (want[3] > 64) want[3] = 64;
+    int started = on ? dhdr_native_zread_start(n->r, (uint32_t)surface, want, (uint64_t)zbp << 32 | (n->zread_tag++ & 0xFFFFFFFFu)) : 0;
+    if (n->trace_probes && on)
+        fprintf(stderr, "native zread: picture surface %d zbp %u want %u,%u %ux%u started %d\n", surface, zbp, want[0], want[1],
+                want[2], want[3], started);
+}
+
 /* Render thread, after a picture (context lock held): the newest finished Z copy to the EE, and a
    copy of what the EE's probe asks for now, from the Z surface just drawn (finding 097). */
 static void native_zread_after(Native *n)
 {
-    if (n->exact_probe == 1) return;
+    /* Even with the exact probe, a skipped batched present must flush the picture. */
+    if (n->exact_probe == 1 && !(native_fold_probe(n) && native_gpu_switch("DHD_GPU_OVERLAP"))) return;
     uint32_t rect[4];
     uint64_t tag;
     if (dhdr_native_zread_take(n->r, n->zread_bits, 64 * 64, rect, &tag)) {
@@ -2256,24 +2345,15 @@ static void native_zread_after(Native *n)
                     (unsigned)(tag >> 32), rect[0], rect[1], rect[2], rect[3], lo, hi);
         }
     }
-    native_mutex_lock(&n->queue_lock);
-    int on = n->zread_want.on, surface = n->zread_want.surface;
-    unsigned zbp = n->zread_want.zbp;
-    uint32_t want[4] = {(uint32_t)n->zread_want.rect[0], (uint32_t)n->zread_want.rect[1],
-                        (uint32_t)n->zread_want.rect[2], (uint32_t)n->zread_want.rect[3]};
-    native_mutex_unlock(&n->queue_lock);
-    if (want[2] > 64) want[2] = 64;
-    if (want[3] > 64) want[3] = 64;
-    int started = on ? dhdr_native_zread_start(n->r, (uint32_t)surface, want, (uint64_t)zbp << 32 | (n->zread_tag++ & 0xFFFFFFFFu)) : 0;
-    if (n->trace_probes && on)
-        fprintf(stderr, "native zread: picture surface %d zbp %u want %u,%u %ux%u started %d\n", surface, zbp, want[0], want[1],
-                want[2], want[3], started);
+    if (!native_fold_probe(n)) native_zread_start_picture(n);
+
 }
 
 /* The next handed field drawn and its frame recycled; 0 once told to quit. The render thread's
    loop, or with NATIVE_INLINE the field's own vsync (the field is already pending, so no wait). */
 static int native_render_next(Native *n)
 {
+    double rs_wait = native_rstat_start();
     native_mutex_lock(&n->queue_lock);
     NATIVE_WAIT(n, !n->pending_count && !n->quit);
     if (n->quit) { native_mutex_unlock(&n->queue_lock); return 0; }
@@ -2282,17 +2362,26 @@ static int native_render_next(Native *n)
     n->pending_count--;
     native_cond_broadcast(&n->queue_changed);
     native_mutex_unlock(&n->queue_lock);
+    native_rstat_add(RSTAT_WAIT, rs_wait);
+    /* The frame from here (the field handed over) to the last Z copy: the render thread's work. */
+    double rs_frame = native_rstat_start();
     static int spikes = -1;
     if (spikes < 0) spikes = getenv("DHD_SPIKES") != NULL;
     double asked = spikes ? host_wall_seconds() : 0;
+    double rs_lock = native_rstat_start();
     native_mutex_lock(&n->context_lock);
+    native_rstat_add(RSTAT_LOCK, rs_lock);
     if (spikes && host_wall_seconds() - asked >= 0.002)   /* another thread held the context */
         fprintf(stderr, "spike_lock: field=%llu start=%.9f ms=%.3f\n", (unsigned long long)f->field, asked,
                 (host_wall_seconds() - asked) * 1e3);
     n->present_due = f->due, n->present_began = f->began;
     native_picture(n, f, f->vertices, 1);
+    double rs_zread = native_rstat_start();
     native_zread_after(n);
+    native_rstat_add(RSTAT_ZREAD, rs_zread);
     native_mutex_unlock(&n->context_lock);
+    native_rstat_add(RSTAT_FRAME, rs_frame);
+    native_rstat_end();
     native_recycle(f);
     native_mutex_lock(&n->queue_lock);
     n->free_frames[n->free_count++] = f;

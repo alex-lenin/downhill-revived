@@ -378,11 +378,21 @@ static inline float vu_daz(float x)
 #else
 static inline __attribute__((always_inline)) __m128 operand4(__m128 value)
 {
+#if defined(__aarch64__)
+    /* NEON can clamp the unsigned magnitude with UMIN and retain the sign. */
+    uint32x4_t bits = vreinterpretq_u32_f32(value);
+    const uint32x4_t sign = vdupq_n_u32(0x80000000u);
+    uint32x4_t magnitude = vbicq_u32(bits, sign);
+    value = vreinterpretq_f32_u32(vbslq_u32(sign, bits, vminq_u32(magnitude, vdupq_n_u32(0x7f7fffff))));
+    PS2_OPAQUE_M128(value);
+    return value;
+#else
     __m128i bits = _mm_castps_si128(value), magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7fffffff));
     __m128i large = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7f7fffff));
     __m128 result = _mm_castsi128_ps(_mm_xor_si128(bits, _mm_and_si128(large, _mm_xor_si128(magnitude, _mm_set1_epi32(0x7f7fffff)))));
     PS2_OPAQUE_M128(result);
     return result;
+#endif
 }
 /* The VU mode (toward zero, FTZ/DAZ) already rounds and flushes every result, intermediate too. */
 #define VU_ADD4(a, b) _mm_add_ps((a), (b))
@@ -404,8 +414,10 @@ static __m128 minmax4(__m128 a, __m128 b, int maximum)
 {
     __m128i x = _mm_castps_si128(a), y = _mm_castps_si128(b);
     __m128i both_negative = _mm_srai_epi32(_mm_and_si128(x, y), 31);
-    __m128i take = _mm_or_si128(_mm_and_si128(both_negative, _mm_cmplt_epi32(x, y)),
-                               _mm_andnot_si128(both_negative, _mm_cmpgt_epi32(x, y)));
+    /* Reverse signed-bit ordering when both signs are negative. Equal bit
+       patterns may select either input, so a second comparison is unnecessary.
+       Retain integer ordering for PS2 NaNs, denormals and signed zero. */
+    __m128i take = _mm_xor_si128(_mm_cmpgt_epi32(x, y), both_negative);
     if (!maximum) take = _mm_xor_si128(take, _mm_set1_epi32(-1));
     return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(take, x), _mm_andnot_si128(take, y)));
 }
@@ -578,7 +590,9 @@ static inline __attribute__((always_inline)) void write_vf(Vu *u, int r, int d, 
         return;
     store_fields(u->c->vf[r].f, _mm_loadu_si128((const __m128i *)v), d);
     store_fields(u->component_ready[r], _mm_set1_epi32((int)ready), d);
-    if (ready > u->vf_ready[r])
+    /* VU1 stalls read component_ready. vf_ready is the separate VU0
+       whole-register scoreboard, never read by a VU1 instruction. */
+    if (!u->unit && ready > u->vf_ready[r])
         u->vf_ready[r] = ready;
 }
 
@@ -588,7 +602,7 @@ static inline __attribute__((always_inline)) void write_vf_bits(Vu *u, int r, in
         return;
     store_fields(u->c->vf[r].w, _mm_loadu_si128((const __m128i *)v), d);
     store_fields(u->component_ready[r], _mm_set1_epi32((int)ready), d);
-    if (ready > u->vf_ready[r])
+    if (!u->unit && ready > u->vf_ready[r])
         u->vf_ready[r] = ready;
 }
 
@@ -647,7 +661,10 @@ void ps2_vu0_vu1_file(ps2_q128 file[64])
 }
 #endif
 
-static ps2_q128 *mem(Vu *u, uint32_t qword)
+/* AOT blocks know the unit. Inline this boundary so VU1 loads/stores become a
+   masked data-memory access, without the VU0 register-file slow path or a call
+   that forces the pending upper result and live pipeline state to spill. */
+static inline __attribute__((always_inline)) ps2_q128 *mem(Vu *u, uint32_t qword)
 {
     if (!u->unit && (qword & 0x400)) {
         if (!u->vu1_used) { ps2_vu0_vu1_file(u->vu1_file); u->vu1_used = 1; }
@@ -656,7 +673,36 @@ static ps2_q128 *mem(Vu *u, uint32_t qword)
     return &u->c->vu0_mem[qword & u->data_mask];
 }
 
-static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper *out)
+/* Bits 0/1/2 prove that the selected FS/FT/ACC arithmetic operands are finite.
+   Only generated VU1 code supplies proofs; the interpreter supplies zero. Keep
+   the rounding barrier even when the exponent-255 clamp is redundant. */
+static inline __attribute__((always_inline)) __m128 proven_operand4(__m128 v, int proven)
+{
+#ifndef PS2_VU_IEEE
+    if (proven) { PS2_OPAQUE_M128(v); return v; }
+#endif
+    return operand4(v);
+}
+
+/* VU1 FTOI saturates by the scaled value's sign, including NaNs. The exponent
+   test replaces the exceptional lanes after conversion. In-range FCVTZS lanes
+   need none of the SSE integer-indefinite emulation used by the general alias. */
+static inline __attribute__((always_inline)) __m128 vu1_ftoi4(__m128 value, float scale)
+{
+    __m128 scaled = _mm_mul_ps(value, _mm_set1_ps(scale));
+    __m128i bits = _mm_castps_si128(scaled);
+    __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7f800000));
+    __m128i huge = _mm_cmpgt_epi32(exponent, _mm_set1_epi32(0x4effffff));
+    __m128i saturated = _mm_xor_si128(_mm_srai_epi32(bits, 31), _mm_set1_epi32(0x7fffffff));
+#if defined(__aarch64__)
+    __m128i converted = vreinterpretq_s64_s32(vcvtq_s32_f32(scaled));
+#else
+    __m128i converted = _mm_cvttps_epi32(scaled);
+#endif
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(huge, saturated), _mm_andnot_si128(huge, converted)));
+}
+
+static inline __attribute__((always_inline)) int upper_proven(Vu *u, uint32_t w, Upper *out, unsigned proven)
 {
     int op = w & 0x3F, d = DEST(w), ft = FT(w), fs = FS(w), fd = FD(w), comp;
     float s[4], t[4], r[4], q = u->c->q, i = u->c->i;
@@ -675,6 +721,12 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
         switch (sub) {
         case 0x10: case 0x11: case 0x12: case 0x13: {  /* ITOF0/4/12/15 */
             static const float scale[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+            if (u->unit) {
+                __m128 value = VU_ITOF4(_mm_castps_si128(vf4(u, fs)));
+                _mm_storeu_ps(out->v, _mm_mul_ps(value, _mm_set1_ps(1.0f / scale[bc])));
+                out->reg = ft; out->dest = d;
+                return 0;
+            }
             for (comp = 0; comp < 4; comp++)
                 out->v[comp] = VU_ITOF((int32_t)vf_bits(u, fs, comp)) / scale[bc];
             out->reg = ft, out->dest = d;
@@ -682,6 +734,11 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
         }
         case 0x14: case 0x15: case 0x16: case 0x17: {  /* FTOI0/4/12/15 */
             static const int shift[4] = {0, 4, 12, 15};
+            if (u->unit) {
+                _mm_storeu_ps((float *)out->bits, vu1_ftoi4(vf4(u, fs), (float)(1 << shift[bc])));
+                out->reg = ft; out->dest = d; out->raw = 1;
+                return 0;
+            }
             for (comp = 0; comp < 4; comp++) {
                 if (u->unit) {
                     float x = s[comp] * (float)(1 << shift[bc]);
@@ -805,15 +862,15 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
         __m128 a = vf4(u, fs), b, result;
         int bc = w & 3;
         b = from == 0 ? lane4(vf4(u, ft), bc) : from == 1 ? _mm_set1_ps(q) : from == 2 ? _mm_set1_ps(i) : vf4(u, ft);
-        if (kind != MAX && kind != MINI) { a = operand4(a); b = operand4(b); }
+        if (kind != MAX && kind != MINI) { a = proven_operand4(a, proven & 1); b = proven_operand4(b, proven & 2); }
         switch (kind) {
         case ADD: result = VU_ADD4(a,b); break;
         case SUB: result = VU_SUB4(a,b); break;
         case MUL: result = VU_MUL4(a,b); break;
         case MAX: result = minmax4(a,b,1); sets_flags = 0; break;
         case MINI: result = minmax4(a,b,0); sets_flags = 0; break;
-        case MADD: result = VU_ADD4(operand4(_mm_loadu_ps(u->c->vacc)), VU_PRODUCT4(a,b)); break;
-        default: result = VU_SUB4(operand4(_mm_loadu_ps(u->c->vacc)), VU_PRODUCT4(a,b)); break;
+        case MADD: result = VU_ADD4(proven_operand4(_mm_loadu_ps(u->c->vacc), proven & 4), VU_PRODUCT4(a,b)); break;
+        default: result = VU_SUB4(proven_operand4(_mm_loadu_ps(u->c->vacc), proven & 4), VU_PRODUCT4(a,b)); break;
         }
         out->dest = d;
         if (sets_flags)
@@ -846,6 +903,11 @@ static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper 
     return 0;
 }
 
+static inline __attribute__((always_inline)) int upper(Vu *u, uint32_t w, Upper *out)
+{
+    return upper_proven(u, w, out, 0);
+}
+
 static inline __attribute__((always_inline)) void commit_result(Vu *u, const Upper *up, int lower_reg);
 
 static inline __attribute__((always_inline)) void commit_upper(Vu *u, const Upper *up, int lower_reg)
@@ -860,18 +922,27 @@ static inline __attribute__((always_inline)) void commit_upper(Vu *u, const Uppe
    only its sticky lanes and the result kept as the latest MAC for drain_flags. Its result is
    the value fmac_flags4 took the MAC flags from (never OPMULA/OPMSUB, whose stored result is
    clamped after). */
-static inline __attribute__((always_inline)) void commit_upper_lazy(Vu *u, const Upper *up, int lower_reg)
+static inline __attribute__((always_inline)) void commit_upper_lazy_proven(Vu *u, const Upper *up, int lower_reg, int sticky_complete)
 {
     if (up->flags == 1) {
         const int d = up->dest;
         const __m128i lanes = _mm_setr_epi32(d & 8 ? -1 : 0, d & 4 ? -1 : 0, d & 2 ? -1 : 0, d & 1 ? -1 : 0);
         const __m128 v = _mm_loadu_ps(up->v);
-        u->lazy_sign = _mm_or_si128(u->lazy_sign, _mm_and_si128(_mm_castps_si128(v), lanes));
-        u->lazy_zero = _mm_or_si128(u->lazy_zero, _mm_and_si128(_mm_castps_si128(_mm_cmpeq_ps(v, _mm_setzero_ps())), lanes));
+        /* Sticky bits only accumulate. Once both are already set, these ORs
+           cannot change the eventual status. Still retain the latest MAC.
+           Lazy blocks exclude FSSET/sticky readers (lazy_flags). */
+        if (!sticky_complete) {
+            u->lazy_sign = _mm_or_si128(u->lazy_sign, _mm_and_si128(_mm_castps_si128(v), lanes));
+            u->lazy_zero = _mm_or_si128(u->lazy_zero, _mm_and_si128(_mm_castps_si128(_mm_cmpeq_ps(v, _mm_setzero_ps())), lanes));
+        }
         u->lazy_last = v; u->lazy_dest = d; u->lazy_valid = u->lazy_used = 1;
     } else if (up->flags)
         queue_flags(u, up);
     commit_result(u, up, lower_reg);
+}
+static inline __attribute__((always_inline)) void commit_upper_lazy(Vu *u, const Upper *up, int lower_reg)
+{
+    commit_upper_lazy_proven(u, up, lower_reg, (u->status & 0xc0) == 0xc0);
 }
 #endif
 
@@ -915,7 +986,16 @@ static float vu_max(int negative) { return negative ? -FLT_MAX : FLT_MAX; }
 
 /* Executes the lower instruction; returns the branch target (instruction index) or -1, and
    *bad if the instruction isn't one VU0 has. */
-static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsigned pc, int *bad)
+static inline __attribute__((always_inline)) ps2_q128 *lower_data(Vu *u, uint32_t qword, ps2_q128 *data)
+{
+    return data ? &data[qword & u->data_mask] : mem(u, qword);
+}
+
+/* The closed native clipping caller supplies its fixed physical data memory.
+   Other callers pass NULL and retain the general VU0/VU1 accessor. The cached
+   buffer cannot alias the CPU register file or the private pipeline. */
+static inline __attribute__((always_inline)) int lower_cached(Vu *u, uint32_t w, unsigned pc, int *bad,
+                                                              ps2_q128 *__restrict data)
 {
     ps2_cpu *c = u->c;
     int op = w >> 25, it = FT(w), is = FS(w), d = DEST(w), comp;
@@ -949,7 +1029,7 @@ static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsign
             ps2_q128 *m;
             if ((sub & 3) == 2)
                 set_ialu(u, is, --vis);
-            m = mem(u, vis);
+            m = lower_data(u, vis, data);
             write_vf_bits(u, it, d, m->w, u->cycle + FMAC_LATENCY);
             if ((sub & 3) == 0)
                 set_ialu(u, is, vis + 1);
@@ -960,7 +1040,7 @@ static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsign
             stall_for(u, is);
             if ((sub & 3) == 3)
                 set_ialu(u, it, --vit);
-            m = mem(u, vit);
+            m = lower_data(u, vit, data);
             store_fields(m->w, _mm_castps_si128(vf4(u, is)), d);
             if ((sub & 3) == 1)
                 set_ialu(u, it, vit + 1);
@@ -1018,12 +1098,12 @@ static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsign
         case 0x3E:  /* ILWR it, (is) */
             for (comp = 0; comp < 4; comp++)
                 if (HAS(d, comp))
-                    set_vi(u, it, mem(u, vis)->w[comp]);
+                    set_vi(u, it, lower_data(u, vis, data)->w[comp]);
             return -1;
         case 0x3F:  /* ISWR it, (is) */
             for (comp = 0; comp < 4; comp++)
                 if (HAS(d, comp))
-                    mem(u, vis)->w[comp] = vit;
+                    lower_data(u, vis, data)->w[comp] = vit;
             return -1;
         case 0x40: case 0x41: {  /* RNEXT / RGET ft */
             uint32_t v[4];
@@ -1110,25 +1190,25 @@ static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsign
     }
     switch (op) {
     case 0x00: {  /* LQ ft, imm(is) */
-        write_vf_bits(u, it, d, mem(u, (uint32_t)(vis + imm11))->w, u->cycle + FMAC_LATENCY);
+        write_vf_bits(u, it, d, lower_data(u, (uint32_t)(vis + imm11), data)->w, u->cycle + FMAC_LATENCY);
         return -1;
     }
     case 0x01: {  /* SQ fs, imm(it) */
         ps2_q128 *m;
         stall_for(u, is);
-        m = mem(u, (uint32_t)(vit + imm11));
+        m = lower_data(u, (uint32_t)(vit + imm11), data);
         store_fields(m->w, _mm_castps_si128(vf4(u, is)), d);
         return -1;
     }
     case 0x04:  /* ILW it, imm(is) */
         for (comp = 0; comp < 4; comp++)
             if (HAS(d, comp))
-                set_vi(u, it, mem(u, (uint32_t)(vis + imm11))->w[comp]);
+                set_vi(u, it, lower_data(u, (uint32_t)(vis + imm11), data)->w[comp]);
         return -1;
     case 0x05:  /* ISW it, imm(is) */
         for (comp = 0; comp < 4; comp++)
             if (HAS(d, comp))
-                mem(u, (uint32_t)(vis + imm11))->w[comp] = vit;
+                lower_data(u, (uint32_t)(vis + imm11), data)->w[comp] = vit;
         return -1;
     case 0x08: case 0x09: {  /* IADDIU / ISUBIU it, is, imm15 */
         uint32_t imm15 = (w >> 10 & 0x7800) | (w & 0x7FF);
@@ -1176,6 +1256,11 @@ static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsign
 
 /* Both halves issue together, after all source and divider stalls. Disjoint
    fields of a VF register do not stall each other. */
+static inline __attribute__((always_inline)) int lower(Vu *u, uint32_t w, unsigned pc, int *bad)
+{
+    return lower_cached(u, w, pc, bad, NULL);
+}
+
 static inline __attribute__((always_inline)) void read_fields(Vu *u, unsigned reg, unsigned fields)
 {
     if (!reg) return;

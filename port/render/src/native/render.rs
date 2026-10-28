@@ -44,6 +44,8 @@ use crate::native::shared::NativeShared;
 use crate::native::surfaces::Kit;
 use crate::native::{Native, Picture};
 use std::collections::HashSet;
+#[path = "gpu_timing.rs"]
+mod gpu_timing;
 
 /// D3D11's SRC_ALPHA and INV_SRC_ALPHA (native_core.inc's BLEND_SA, BLEND_ISA).
 const BLEND_SA: u32 = 5;
@@ -56,6 +58,9 @@ const BLEND_INV_FACTOR: u32 = 15;
 /// commands, and the picture's counts.
 pub struct Pass {
     encoder: Option<wgpu::CommandEncoder>,
+    /// Diagnostic batching: present (or zread_take when skipped) submits the picture.
+    pub deferred: bool,
+    timing: gpu_timing::Timing,
     /// The open draw pass (`forget_lifetime`: it holds the encoder until dropped, so it is always
     /// ended before the encoder is used or finished).
     pass: Option<wgpu::RenderPass<'static>>,
@@ -101,7 +106,10 @@ impl Pass {
     pub fn new() -> Pass {
         Pass {
             encoder: None,
+            deferred: crate::native::zread::switch("DHD_GPU_OVERLAP")
+                && crate::native::zread::folded(),
             pass: None,
+            timing: gpu_timing::Timing::default(),
             target: -2,
             depth: -2,
             pipe: None,
@@ -116,8 +124,13 @@ impl Pass {
 
     /// native_end_pass: ends the open draw pass, if any.
     pub fn end(&mut self) {
+        self.end_reason("encoder/submit");
+    }
+
+    fn end_reason(&mut self, reason: &str) {
         self.flush();
         if let Some(pass) = self.pass.take() {
+            pass_trace::event(reason, self.target, self.depth);
             drop(pass);
             self.target = -2;
             self.depth = -2;
@@ -209,6 +222,7 @@ impl Pass {
     #[allow(clippy::too_many_arguments)]
     fn begin(&mut self, gpu: &Gpu, target: i32, depth: i32, color: &wgpu::TextureView, z: Option<&wgpu::TextureView>,
              vertices: &wgpu::Buffer, vertex_bytes: u64, indices: Option<&(wgpu::Buffer, u64)>) {
+        self.end_reason(if self.target != target { "target-change" } else { "depth-change" });
         let keep = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
         let times = gputimes::slot(gpu, gputimes::DRAW);
         let encoder = self.encoder(gpu);
@@ -239,6 +253,8 @@ impl Pass {
         self.target = target;
         self.depth = depth;
         self.pipe = None;
+        rstat::pass();
+        pass_trace::event("draw-begin:load/store", target, depth);
     }
 
     /// native_set_pipeline in the open pass: false (reported once per key) when the key has no
@@ -305,14 +321,33 @@ impl Pass {
 
     /// native_submit: ends the pass, writes the arenas the encoder's commands read, submits.
     fn submit(&mut self, gpu: &Gpu, arenas: &Arenas) {
+        if !self.deferred { self.submit_now(gpu, arenas); }
+    }
+
+    pub fn submit_now(&mut self, gpu: &Gpu, arenas: &Arenas) {
         self.end();
+        if self.encoder.is_none() { return; }
+        let t = rstat::T::new();
         arenas.write(&gpu.queue);
+        t.add(rstat::AWRITE);
         let encoder = self.encoder.take().unwrap_or_else(|| {
             gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("native picture") })
         });
         #[cfg(not(target_arch = "wasm32"))]
         crate::native::pipelines::pipelog::submit();
-        gpu.queue.submit([encoder.finish()]);
+        let t = rstat::T::new();
+        let commands = encoder.finish();
+        t.add(rstat::FINISH);
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os("DHD_SUBMIT_POLL").is_some() {
+            let t = rstat::T::new();
+            let _ = gpu.device.poll(wgpu::PollType::Poll);
+            t.add(rstat::PREPOLL);
+        }
+        let t = rstat::T::new();
+        gpu.queue.submit([commands]);
+        t.add(rstat::QSUB);
+        self.timing.map();
     }
 }
 
@@ -356,13 +391,16 @@ impl Native {
     pub fn picture_indexed(&mut self, p: &Picture, indices: Option<&[u32]>) -> Result<DhdrPictureResult, String> {
         #[cfg(not(target_arch = "wasm32"))]
         let _spike = crate::native::pipelines::SpikeTimer::new("picture", 0);
+        let whole = rstat::T::new();
         let gpu = self.gpu;
         let shared = NativeShared::get(gpu)?;
+        let t = rstat::T::new();
         self.arenas.reserve(Some((gpu, &self.objects.uniform_layout)), p.commands, p.vertices.len() as u32)?;
         if let Some(indices) = indices {
             let count = u32::try_from(indices.len()).map_err(|_| format!("gs native: {} indices", indices.len()))?;
             self.arenas.reserve_indices(gpu, p.commands, count)?;
         }
+        t.add(rstat::RESERVE);
         let uniforms = self.arenas.uniform_group().cloned().ok_or("gs native: no constants bind group")?;
         let vertices = self.arenas.vertex_buffer().cloned().ok_or("gs native: no vertex buffer")?;
         let vertex_bytes = self.arenas.vertex_capacity();
@@ -374,28 +412,49 @@ impl Native {
         self.pass.end();
         self.pass.indexed = indices.is_some();
         self.pass.drawn = DhdrPictureResult::default();
+        let mut timing = std::mem::take(&mut self.pass.timing);
+        timing.begin(gpu, self.pass.encoder(gpu));
+        self.pass.timing = timing;
         self.pass.constants = None; // reserve emptied the arena
+        let t = rstat::T::new();
         {
             // native_prepare_surfaces: grown surfaces' old contents first, in the picture's encoder.
             let encoder = self.pass.encoder(gpu);
             let mut kit = Kit::new(gpu, &self.objects, shared, &mut self.arenas, encoder);
             self.surfaces.prepare(&mut kit)?;
         }
+        t.add(rstat::SURFACES);
         let views = Views { shared, uniforms, vertices, vertex_bytes, indices: index_buffer };
+        let t = rstat::T::new();
         self.render(p, indices, &views);
-        self.pass.end();
+        t.add(rstat::RECORD);
+        let t = rstat::T::new();
+        self.pass.end_reason("picture-end/scanout");
         self.arenas.write_vertices(&gpu.queue, p.vertices);
         if let Some(indices) = indices {
             self.arenas.write_indices(&gpu.queue, indices);
         }
+        t.add(rstat::WRITE);
+        let t = rstat::T::new();
         let shown = match p.movie {
             Some((w, h, pixels)) => self.display.movie(gpu, w, h, pixels),
             None => self.scan_out(p),
         };
+        t.add(rstat::SCANOUT);
+        let t = rstat::T::new();
+        self.zread_record();
+        let mut timing = std::mem::take(&mut self.pass.timing);
+        timing.end(self.pass.encoder(gpu));
+        self.pass.timing = timing;
         self.pass.submit(gpu, &self.arenas);
+        if !self.pass.deferred { self.zread_map(); }
+        t.add(rstat::SUBMIT);
         let mut r = self.pass.drawn;
         r.shown = shown as u32;
         (r.display_width, r.display_height) = self.display.size();
+        whole.add(rstat::PICTURE);
+        rstat::picture();
+        pass_trace::picture();
         Ok(r)
     }
 
@@ -404,9 +463,15 @@ impl Native {
         let gpu = self.gpu;
         let mut last_convert: i32 = -1;
         let mut converted: Option<wgpu::BindGroup> = None;
+        // Conversion inputs are immutable base textures plus up to four surfaces.
+        // Reuse only while none of those surfaces has been written this picture.
+        // Keep the existing consecutive-run rule (last_convert) exactly as before.
+        let mut versions = vec![0u64; p.surfaces.len()];
+        let mut conversions: Vec<Option<([u64; 4], wgpu::BindGroup)>> = vec![None; p.converts.len()];
         for (i, k) in p.commands.iter().enumerate() {
             match k.kind {
                 DHDR_CMD_ALPHA_UPLOAD => {
+                    if let Some(v) = versions.get_mut(k.target as usize) { *v += 1; }
                     self.transfer(k, p.pixels(i), v.shared);
                     last_convert = -1;
                     continue;
@@ -417,6 +482,7 @@ impl Native {
                     if !has_texture(s) || s.is_some_and(|s| s.depth != 0) {
                         continue;
                     }
+                    if let Some(v) = versions.get_mut(k.target as usize) { *v += 1; }
                     self.transfer(k, p.pixels(i), v.shared);
                     continue;
                 }
@@ -425,6 +491,7 @@ impl Native {
                     if !has_texture(surface(p, k.source)) || !has_texture(surface(p, k.target)) {
                         continue;
                     }
+                    if let Some(v) = versions.get_mut(k.target as usize) { *v += 1; }
                     self.transfer(k, None, v.shared);
                     continue;
                 }
@@ -437,6 +504,29 @@ impl Native {
             let mut depth = if k.depth >= 0 && k.depth_key & 8 != 0 { surface(p, k.depth) } else { None };
             if depth.is_some_and(|d| !has_texture(Some(d)) || d.depth == 0 || d.size != target.size) {
                 depth = None;
+            }
+            // At an attachment boundary, prepare independent conversions for the
+            // upcoming draw run together. Their inputs cannot change in this run;
+            // this keeps compute work outside the render pass instead of splitting
+            // it once for every distinct converted texture. No draw is reordered.
+            let wanted_depth = if depth.is_some() { k.depth as i32 } else { -1 };
+            if !self.pass.open_on(k.target as i32, wanted_depth) {
+                let mut prepared = HashSet::new();
+                for (j, next) in p.commands.iter().enumerate().skip(i) {
+                    if next.kind != DHDR_CMD_DRAW || next.target != k.target || next.depth != k.depth
+                        || next.depth_key & 8 != k.depth_key & 8 { break; }
+                    if next.convert < 0 || next.convert as i32 == last_convert
+                        || next.texture_surface >= 0 || p.replacement(j).is_some()
+                        || p.texture(j).is_some() || !prepared.insert(next.convert) { continue; }
+                    let ci = next.convert as usize;
+                    let Some(c) = p.converts.get(ci) else { continue };
+                    if c.surface.iter().any(|&s| s >= 0 && (s == k.target || s == k.depth)) { continue; }
+                    let stamp = c.surface.map(|s| versions.get(s as usize).copied().unwrap_or(0));
+                    if conversions[ci].as_ref().is_some_and(|(old, _)| *old == stamp) { continue; }
+                    if let Some(group) = self.convert(p, ci, v.shared) {
+                        conversions[ci] = Some((stamp, group));
+                    }
+                }
             }
             let (tw, th) = (target.size[0], target.size[1]);
             let big_t = target.scale;
@@ -465,7 +555,22 @@ impl Native {
             } else if k.convert >= 0 {
                 // Again for each run of draws: the surface may have changed since.
                 if k.convert as i32 != last_convert {
-                    converted = self.convert(p, k.convert as usize, v.shared);
+                    let ci = k.convert as usize;
+                    let stamp = p.converts.get(ci).map(|c| c.surface.map(|s|
+                        versions.get(s as usize).copied().unwrap_or(0)));
+                    converted = match (stamp, conversions.get(ci).and_then(Option::as_ref)) {
+                        (Some(stamp), Some((old, group))) if stamp == *old => {
+                            pass_trace::event("conversion-reused", k.target as i32, -1);
+                            Some(group.clone())
+                        }
+                        _ => {
+                            let group = self.convert(p, ci, v.shared);
+                            if let (Some(stamp), Some(group), Some(slot)) = (stamp, group.as_ref(), conversions.get_mut(ci)) {
+                                *slot = Some((stamp, group.clone()));
+                            }
+                            group
+                        }
+                    };
                     last_convert = k.convert as i32;
                 }
                 if converted.is_none() {
@@ -477,7 +582,13 @@ impl Native {
                 last_convert = -1;
             }
             let Some(group) = group else { continue };
-            let depth_index = if depth.is_some() { k.depth as i32 } else { -1 };
+            // A depth-disabled draw may retain the current attachment. Its pipeline uses
+            // Always/no-write, including the alpha fallback, so no depth value is observed
+            // or modified. Never attach a new surface or bridge a color-target change.
+            let retained_depth = depth.is_none() && self.pass.target == k.target as i32
+                && self.pass.pass.is_some() && self.pass.depth >= 0;
+            let depth_index = if depth.is_some() { k.depth as i32 }
+                else if retained_depth { self.pass.depth } else { -1 };
             if !self.pass.open_on(k.target as i32, depth_index) {
                 let Some(color) = self.surface_view(k.target as usize) else { continue };
                 let z = match depth {
@@ -509,8 +620,14 @@ impl Native {
             }
             let scissor = [left as u32, top as u32, (right - left) as u32, (bottom - top) as u32];
             self.pass.set_state(tw, th, scissor, uses_constant(k.blend_key).then_some(k.blend_fix));
-            self.draw_passes(k, p.vertices, indices, depth.is_some(), offset, &v.uniforms, &group);
+            self.draw_passes(k, p.vertices, indices, depth.is_some(), retained_depth, offset, &v.uniforms, &group);
             self.pass.drawn.draws += 1;
+            // Conservative even for masked/empty writes: a false invalidation costs
+            // performance only. Depth also survives into later pictures/probes.
+            if let Some(v) = versions.get_mut(k.target as usize) { *v += 1; }
+            if depth.is_some() {
+                if let Some(v) = versions.get_mut(k.depth as usize) { *v += 1; }
+            }
         }
     }
 
@@ -518,6 +635,9 @@ impl Native {
     /// it), recorded after the open pass ends.
     fn transfer(&mut self, k: &DhdrCommand, pixels: Option<&[u32]>, shared: &NativeShared) {
         let gpu = self.gpu;
+        self.pass.end_reason(match k.kind {
+            DHDR_CMD_COPY => "copy", DHDR_CMD_IMPORT => "import", _ => "alpha-upload",
+        });
         let (encoder, drawn) = self.pass.split(gpu);
         let mut kit = Kit::new(gpu, &self.objects, shared, &mut self.arenas, encoder);
         self.surfaces.transfer(&mut kit, k, pixels, drawn);
@@ -535,6 +655,7 @@ impl Native {
     fn sample_target(&mut self, index: usize, c: &DhdrNativeConstants, shared: &NativeShared)
                      -> Option<wgpu::BindGroup> {
         let gpu = self.gpu;
+        self.pass.end_reason("feedback-copy");
         let (encoder, drawn) = self.pass.split(gpu);
         let mut kit = Kit::new(gpu, &self.objects, shared, &mut self.arenas, encoder);
         self.surfaces.sample_target(&mut kit, index, c, drawn).cloned()
@@ -576,7 +697,9 @@ impl Native {
             dummy_view: &shared.dummy_view,
             dummy_depth_view: &shared.dummy_depth_view,
         };
+        self.pass.end_reason("conversion");
         let encoder = self.pass.encoder(gpu);
+        pass_trace::event("compute-convert", -1, -1);
         self.converts.run(gpu, encoder, &mut self.arenas, &o, i, v, base, &sources)
     }
 
@@ -593,6 +716,7 @@ impl Native {
         let Some(view) = self.surface_view(p.display_surface as usize) else { return false };
         let o = ScanoutObjects { pipeline: &self.objects.scanout_pipe, layout: &self.objects.scanout_layout };
         let encoder = self.pass.encoder(gpu);
+        pass_trace::event("compute-scanout", p.display_surface as i32, -1);
         self.display.scanout(gpu, encoder, &mut self.arenas, &o, &view, info.scale, &p.display)
     }
 
@@ -605,12 +729,12 @@ impl Native {
     /// an equal Z lost); without, the same test on the unchanged Z buffer.
     #[allow(clippy::too_many_arguments)]
     fn draw_passes(&mut self, k: &DhdrCommand, vertices: &[DhdrVertex], indices: Option<&[u32]>, has_depth: bool,
-                   offset: u32, uniforms: &wgpu::BindGroup, group: &wgpu::BindGroup) {
+                   retained_depth: bool, offset: u32, uniforms: &wgpu::BindGroup, group: &wgpu::BindGroup) {
         let gpu = self.gpu;
         let (blend_key, mask, dk) = (k.blend_key, k.color_mask as u32, k.depth_key as u32);
         let (src, dst) = (blend_key >> 1 & 31, blend_key >> 6 & 31);
         let uses_as = blend_key & 1 != 0 && (src == BLEND_SA || src == BLEND_ISA || dst == BLEND_SA || dst == BLEND_ISA);
-        let depth = if has_depth { 16 | if dk & 4 != 0 { 8 } else { 0 } | (dk & 3) } else { 0 };
+        let depth = if has_depth { 16 | if dk & 4 != 0 { 8 } else { 0 } | (dk & 3) } else if retained_depth { 17 } else { 0 };
         let base = blend_key | depth << 18;
         self.pass.set_groups(uniforms, offset, group);
         if !uses_as || (self.objects.dual && self.objects.dual_module.is_some()) {
@@ -630,7 +754,7 @@ impl Native {
             return;
         }
         self.pass.drawn.two_pass_draws += 1;
-        let (mut second, mut first) = (0u32, k.first);
+        let (mut second, mut first) = (if retained_depth { 17u32 } else { 0 }, k.first);
         if has_depth {
             second = 16 | if dk & 4 != 0 { 4 } else { dk & 3 }; // no write; EQUAL after a write
             let len = indices.map_or(vertices.len(), |i| i.len());
@@ -727,4 +851,139 @@ pub unsafe extern "C" fn dhdr_native_picture_indexed(n: *mut DhdrNative, p: *con
             0
         }
     })
+}
+
+/// `DHD_RSTAT`: the render thread's per-picture budget (finding 108). C's DHD_RSTAT sets the
+/// variable; the first picture reads it. One line every 240 pictures gives the mean milliseconds of
+/// each part of the draw call and the present, which is what a 120 field/s frame's 8.33 ms is spent
+/// in (DHD_SPIKES' timers only log parts above a threshold, too coarse for that budget). Off: one
+/// cached branch per part and no clock read.
+pub mod rstat {
+    use std::cell::Cell;
+    use std::fmt::Write as _;
+    use std::time::Instant;
+
+    /// `picture_indexed` as a whole, then its parts; `present` and its parts; the Z copies.
+    pub const PICTURE: usize = 0;
+    pub const RESERVE: usize = 1;
+    pub const SURFACES: usize = 2;
+    pub const RECORD: usize = 3;
+    pub const WRITE: usize = 4;
+    pub const SCANOUT: usize = 5;
+    pub const SUBMIT: usize = 6;
+    pub const PRESENT: usize = 7;
+    pub const ACQUIRE: usize = 8;
+    pub const PRESENT_RECORD: usize = 9;
+    pub const PRESENT_SUBMIT: usize = 10;
+    pub const ZREAD_START: usize = 11;
+    pub const ZREAD_TAKE: usize = 12;
+    /// Inside `submit`: the arenas' `queue.write_buffer`s, `encoder.finish`, `queue.submit`.
+    pub const AWRITE: usize = 13;
+    pub const FINISH: usize = 14;
+    pub const QSUB: usize = 15;
+    pub const PREPOLL: usize = 16;
+    const PARTS: usize = 17;
+    const NAMES: [&str; PARTS] = [
+        "picture", "reserve", "surfaces", "record", "write", "scanout", "submit", "present", "acquire",
+        "precord", "psubmit", "zstart", "ztake", "awrite", "finish", "qsub", "prepoll",
+    ];
+    /// Pictures per log line (about two seconds at 120 field/s).
+    pub const EVERY: u32 = 240;
+
+    thread_local! {
+        static ON: Cell<u8> = const { Cell::new(0) };
+        static ACC: Cell<[u64; PARTS]> = const { Cell::new([0; PARTS]) };
+        static COUNT: Cell<u32> = const { Cell::new(0) };
+        /// Draw passes begun since the last line (each one creates a VkFramebuffer).
+        static PASSES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Counts a draw pass (`Pass::begin`).
+    #[inline]
+    pub fn pass() {
+        if on() {
+            PASSES.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    #[inline]
+    fn on() -> bool {
+        ON.with(|c| match c.get() {
+            0 => {
+                let v = std::env::var_os("DHD_RSTAT").is_some();
+                c.set(if v { 1 } else { 2 });
+                v
+            }
+            1 => true,
+            _ => false,
+        })
+    }
+
+    /// One part's stopwatch: reads the clock only while on, and adds nothing when off.
+    pub struct T(Option<Instant>);
+
+    impl T {
+        #[inline]
+        pub fn new() -> T {
+            T(if on() { Some(Instant::now()) } else { None })
+        }
+
+        /// Adds the time since `new` to `part`.
+        #[inline]
+        pub fn add(self, part: usize) {
+            if let Some(start) = self.0 {
+                let ns = start.elapsed().as_nanos() as u64;
+                ACC.with(|c| {
+                    let mut v = c.get();
+                    v[part] = v[part].saturating_add(ns);
+                    c.set(v);
+                });
+            }
+        }
+    }
+
+    /// Counts a picture (the render thread's frame) and, every `EVERY`, logs the means.
+    pub fn picture() {
+        if !on() {
+            return;
+        }
+        let n = COUNT.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        if n % EVERY != 0 {
+            return;
+        }
+        let v = ACC.with(|c| {
+            let v = c.get();
+            c.set([0; PARTS]);
+            v
+        });
+        let mut line = format!("rstat: pictures={EVERY} mean_ms");
+        for (i, name) in NAMES.iter().enumerate() {
+            let _ = write!(line, " {name}={:.3}", v[i] as f64 / 1e6 / EVERY as f64);
+        }
+        let passes = PASSES.with(|c| c.replace(0));
+        let _ = write!(line, " passes={:.1}", passes as f64 / EVERY as f64);
+        crate::host::log(&line);
+    }
+}
+
+/// Opt-in boundary transcript; one representative picture per 240, no clock reads.
+/// RSTAT counts draw passes only; these records also identify auxiliary work.
+pub mod pass_trace {
+    use std::cell::Cell;
+    thread_local! {
+        static ON: bool = std::env::var_os("DHD_PASS_TRACE").is_some();
+        static PICTURE: Cell<u32> = const { Cell::new(0) };
+    }
+    pub fn event(reason: &str, target: i32, depth: i32) {
+        if ON.with(|v| *v) {
+            let n = PICTURE.with(Cell::get);
+            if n % 240 == 0 {
+                crate::host::log(&format!("pass-trace: picture={n} {reason} target={target} depth={depth}"));
+            }
+        }
+    }
+    pub fn picture() { PICTURE.with(|v| v.set(v.get().wrapping_add(1))); }
 }

@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import struct
 from vudis import walk
-from vu1_aot import WORDS_MACRO, fill_function, fills, lazy_flags, program
+from vu1_aot import WORDS_MACRO, FiniteOperands, ReadyOperands, blocks, fill_function, fills, lazy_flags, program
 ROOT = Path(__file__).resolve().parents[2]
 
 def generate(destination, early_flags=True):
@@ -61,26 +61,40 @@ def generate(destination, early_flags=True):
     # issued its CLIP at least four slots earlier. No status flag reads occur.
     reads={pc*8 for pc in selected if pairs[pc][1]>>31==0 and pairs[pc][0]>>25 in range(0x10,0x1d)}
     assert reads == {0x1970,0x1a58,0x1a68,0x1a78,0x1a88,0x1a98,0x2600}, reads
+    # The private frame below preserves pending P unchanged and caches physical
+    # data memory, like its native callers. Reject a routine that reads/writes P.
+    special = {(lo >> 6 & 31) * 4 + (lo & 3)
+               for pc in selected for lo, hi in [pairs[pc]]
+               if not hi >> 31 and lo >> 25 == 0x40 and lo & 0x3f >= 0x3c}
+    assert not special & {0x64, 0x70, 0x71, 0x72, 0x73, 0x76, 0x78, 0x79, 0x7a, 0x7b}, special
     # FMACs whose MAC update the read at 1970 cannot see commit lazily (vu1_aot.py lazy_flags,
     # finding 090 VU1R), analysed on this closed routine alone: every way out of it (the return
     # to the kernel, any pair outside it) counts as reaching a read. drain_flags at the return
     # folds them in before the kernel reads the status again.
     lazy=lazy_flags({pc:pairs[pc] for pc in selected}) if early_flags else set()
+    # Use the same local proofs as AOT, restarting at every possible branch
+    # target/return and after each branch delay slot. No caller-state assumption.
+    starts = blocks({pc:pairs[pc] for pc in selected})
+    proofs, stalls, finite, ready = {}, {}, FiniteOperands(), ReadyOperands()
+    for pc in selected:
+        if pc in starts: finite, ready = FiniteOperands(), ReadyOperands()
+        proofs[pc] = finite.step(*pairs[pc])
+        stalls[pc] = ready.step(*pairs[pc])
     lines+=['static inline __attribute__((always_inline)) void native_clip_commit(Vu *u, Upper *up) {',
             'if(up->flags==1){unsigned m=up->mac; unsigned st=(m&15?1:0)|(m&240?2:0)|(m&3840?4:0)|(m&61440?8:0);',
             'u->mac=m;u->status=(u->status&~15u)|st|(st<<6);u->lazy_valid=0;}',
             'else if(up->flags==2){u->clip=u->clip_next=((u->clip<<6)|up->clip_bits)&0xffffff;}',
             'up->flags=0;commit_upper(u,up,0);}',
-            'static unsigned native_clip_run(Vu *u, unsigned resume) {','unsigned count=0; int target=-1,bad=0; Upper up;','goto L1948;']
+            'static inline __attribute__((always_inline)) unsigned native_clip_impl(Vu *u, unsigned resume, int sticky_complete, ps2_q128 *data) {','unsigned count=0; int target=-1,bad=0; Upper up;','goto L1948;']
     def emit(pc):
         lo,hi=pairs[pc]
-        out=[f'VU1(u); pair_stalls(u,0x{hi:08x}u,0x{lo:08x}u); apply_flags(u); update_q(u);',
-             f'if(upper(u,0x{hi:08x}u,&up)<0) return 0;']
+        out=[f'VU1(u); {stalls[pc]} apply_flags(u); update_q(u);',
+             f'if(upper_proven(u,0x{hi:08x}u,&up,{proofs.get(pc,0)})<0) return 0;']
         if hi>>31:
             out+=[f'{{uint32_t word=0x{lo:08x}u;memcpy(&u->c->i,&word,4);}}','target=-1;']
         else:
-            out+=[f'target=lower(u,0x{lo:08x}u,{pc},&bad); if(bad)return 0;']
-        commit='commit_upper_lazy(u,&up,0);' if pc in lazy else 'native_clip_commit(u,&up);' if early_flags else f'commit_upper(u,&up,{lo>>16&31});'
+            out+=[f'target=lower_cached(u,0x{lo:08x}u,{pc},&bad,data); if(bad)return 0;']
+        commit='commit_upper_lazy_proven(u,&up,0,sticky_complete);' if pc in lazy else 'native_clip_commit(u,&up);' if early_flags else f'commit_upper(u,&up,{lo>>16&31});'
         out += [commit + 'u->cycle++;count++;']
         return out
     branches=(0x20,0x21,0x24,0x25,0x28,0x29,0x2c,0x2d,0x2e,0x2f)
@@ -105,4 +119,34 @@ def generate(destination, early_flags=True):
         if not hi>>31 and lo>>25 in (0x21,0x25):
             lines+=[f'case {(pc+2)}:goto L{(pc+2)*8:04X};']
     lines+=['default:return 0;','}','}']
+    lines+=['static unsigned native_clip_run(Vu *u, unsigned resume) {',
+            '/* A private pipeline cannot alias the CPU or its data memory. This',
+            '   lets the compiler retain ready times and lazy flags across stores.',
+            '   Every caller NATIVE_SAVE advances 64 cycles and empties flags/Q:',
+            '   input register ready times and the integer bypass have expired.',
+            '   Return drains flags/Q; the caller again advances 64 cycles before',
+            '   interpreted/AOT code can observe the frame. Keep expired times in',
+            '   the caller instead of copying the ready arrays and empty queue.',
+            '   The code-word guard and the assertions above bound this proof. */',
+            'Vu local;',
+            'local.c = u->c; local.cycle = u->cycle; local.unit = 1;',
+            'local.code_mask = u->code_mask; local.data_mask = u->data_mask;',
+            'local.top = u->top; local.itop = u->itop; local.kick = u->kick; local.opaque = u->opaque;',
+            'local.mac = u->mac; local.status = u->status; local.clip = u->clip; local.clip_next = u->clip_next;',
+            'local.n_flags = local.flag_head = local.q_ready = 0; local.flag_cycle = local.cycle;',
+            'local.q_next = u->q_next; local.q_flags = u->q_flags; local.p_ready = u->p_ready; local.p_next = u->p_next;',
+            'local.vi_previous_reg = local.vi_previous_value = local.vi_written_at = local.vu1_used = 0;',
+            'local.lazy_sign = local.lazy_zero = _mm_setzero_si128();',
+            'local.lazy_valid = local.lazy_used = 0;',
+            'memset(local.component_ready, 0, sizeof local.component_ready);',
+            'ps2_q128 *data = u->c->vu0_mem; if (!data) __builtin_unreachable();',
+            'unsigned count = (local.status & 0xc0) == 0xc0 ? native_clip_impl(&local, resume, 1, data)',
+            '                                               : native_clip_impl(&local, resume, 0, data);',
+            'u->cycle = local.cycle; u->flag_cycle = local.flag_cycle;',
+            'u->mac = local.mac; u->status = local.status; u->clip = local.clip; u->clip_next = local.clip_next;',
+            'u->q_ready = local.q_ready; u->q_next = local.q_next; u->q_flags = local.q_flags;',
+            'u->n_flags = local.n_flags; u->flag_head = local.flag_head;',
+            'u->vi_previous_reg = local.vi_previous_reg; u->vi_previous_value = local.vi_previous_value; u->vi_written_at = local.vi_written_at;',
+            'u->lazy_sign = local.lazy_sign; u->lazy_zero = local.lazy_zero; u->lazy_valid = local.lazy_valid; u->lazy_used = local.lazy_used;',
+            'return count;','}']
     destination.write_text('\n'.join(lines)+'\n')

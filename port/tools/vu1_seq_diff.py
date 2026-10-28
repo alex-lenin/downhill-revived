@@ -14,6 +14,7 @@ any difference.
 """
 import argparse
 import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def build(out, negative=False):
+def build(out, negative=False, coverage=False):
     from vu1_aot import generate
     generate(out / 'vu1_aot.inc')  # also writes vu1_native_clip.inc beside it
     runtime = ROOT / 'port/runtime'
@@ -32,9 +33,9 @@ def build(out, negative=False):
         runtime.mkdir(exist_ok=True)
         (runtime / 'vu0_interp.c').write_bytes((ROOT / 'port/runtime/vu0_interp.c').read_bytes())
         header = (ROOT / 'port/runtime/vu1_native_geometry.h').read_text()
-        needle = 'return native_result(f, _mm_add_ps(acc, _mm_mul_ps(operand4(a), operand4(b))), d);'
+        needle = 'return native_result(f, VU_ADD4(acc, VU_PRODUCT4(operand4(a), operand4(b))), d);'
         assert header.count(needle) == 1
-        header = header.replace(needle, 'return native_result(f, _mm_xor_ps(_mm_add_ps(acc, _mm_mul_ps(operand4(a), operand4(b))), _mm_castsi128_ps(_mm_set1_epi32(1))), d);')
+        header = header.replace(needle, 'return native_result(f, _mm_xor_ps(VU_ADD4(acc, VU_PRODUCT4(operand4(a), operand4(b))), _mm_castsi128_ps(_mm_set1_epi32(1))), d);')
         (runtime / 'vu1_native_geometry.h').write_text(header)
     exe = out / 'vu1_seq_diff.exe'
     # x64, with the game build's code generation flags (build_host64.py): the captures come from
@@ -46,6 +47,7 @@ def build(out, negative=False):
            '/I' + str(out), '/I' + str(ROOT / 'port/runtime'), '/I' + str(ROOT / 'port/include'),
            '/I' + str(ROOT / 'port/host'), '/imsvc' + str(MSVC / 'include')]
     cmd += ['/imsvc' + str(SDK / 'Include' / VERSION / x) for x in ('ucrt', 'um', 'shared')]
+    if coverage: cmd += ['-DPS2_VU_COVERAGE']
     cmd += [str(runtime / 'vu0_interp.c'), str(ROOT / 'port/runtime/vu1_seq_diff.c'), '/Fe' + str(exe),
             '/link', '/libpath:' + str(MSVC / 'lib/x64'), '/libpath:' + str(SDK / 'Lib' / VERSION / 'ucrt/x64'),
             '/libpath:' + str(SDK / 'Lib' / VERSION / 'um/x64')]
@@ -60,19 +62,23 @@ def main():
     ap.add_argument('--repeat', type=int, default=0, help='timed replays of each run per mode')
     ap.add_argument('--max', type=int, default=0, help='runs per capture (default all)')
     ap.add_argument('--negative', action='store_true', help='private clamp-result corruption; comparison must fail')
+    ap.add_argument('--sticky-cycle', action='store_true', help='cycle entry sticky Z/S through all four states, identically for every compared mode')
+    ap.add_argument('--coverage', action='store_true', help='count AOT and interpreter fallback pairs (diagnostic instrumentation; use without --repeat for normal timings)')
     args = ap.parse_args()
     out = args.out.resolve()
     if ROOT / 'build' not in out.parents:
         ap.error('generated code holds game microcode: OUT must stay under build/')
     out.mkdir(parents=True, exist_ok=True)
-    exe = build(out, args.negative)
+    exe = build(out, args.negative, args.coverage)
     failed = 0
     for capture in args.captures:
         capture = capture.resolve()
         table = out / (capture.name + '.csv')
         with table.open('w') as log:
+            env = dict(os.environ)
+            if args.sticky_cycle: env['DHD_VU_TEST_STICKY_CYCLE'] = '1'
             p = subprocess.run([str(exe), str(capture), str(args.repeat)] + ([str(args.max)] if args.max else []),
-                               stdout=log, stderr=subprocess.PIPE, text=True, timeout=7200)
+                               stdout=log, stderr=subprocess.PIPE, text=True, timeout=7200, env=env)
         print('%s: %s' % (capture.name, p.stderr.strip()))
         failed |= p.returncode != 0
         if args.repeat:

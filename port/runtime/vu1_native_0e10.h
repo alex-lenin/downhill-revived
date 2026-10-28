@@ -5,7 +5,8 @@
    MR32 rotates raw UV bits, including NaNs. A clipped final sprite falls
    through a second MADD/ADDA and advances VI6, unlike a clipped interior one.
    Unsupported counts or a pending Q decline before any direct writes. */
-static unsigned native_particles_0e10(Vu *u) {
+static inline __attribute__((always_inline)) unsigned native_particles_0e10_impl(Vu *u, int sticky_complete)
+{
   unsigned remaining = u->c->vi[8];
   if (!remaining || remaining > 49 || (u->q_ready && u->q_ready > u->cycle))
     return 0;
@@ -19,6 +20,7 @@ static unsigned native_particles_0e10(Vu *u) {
     v[i] = vf4(u, i);
   NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(),
                        _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
   unsigned clip = u->clip, pairs = 0;
   uint16_t *vi = cpu.vi;
   float q = cpu.q;
@@ -130,4 +132,8 @@ static unsigned native_particles_0e10(Vu *u) {
 #undef SET
 #undef LOAD
 #undef STORE
+}
+static unsigned native_particles_0e10(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_particles_0e10_impl(u, 1);
+    return native_particles_0e10_impl(u, 0);
 }

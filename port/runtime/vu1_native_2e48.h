@@ -3,7 +3,8 @@
    Preserve raw MR32 moves, upper/lower issue order, both DIV results and the
    four-slot MAC/CLIP reads. Clipped quads mark both output corner W fields.
    Unsupported counts or pending Q decline before any direct writes. */
-static unsigned native_particles_2e48(Vu *u) {
+static inline __attribute__((always_inline)) unsigned native_particles_2e48_impl(Vu *u, int sticky_complete)
+{
   unsigned remaining = u->c->vi[8];
   if (!remaining || remaining > 41 || (u->q_ready && u->q_ready > u->cycle))
     return 0;
@@ -17,6 +18,7 @@ static unsigned native_particles_2e48(Vu *u) {
     v[i] = vf4(u, i);
   NativeFlags flags = {_mm_setzero_si128(), _mm_setzero_si128(),
                        _mm_setzero_si128(), _mm_setzero_ps(), 0};
+    flags.sticky_complete = sticky_complete;
   unsigned clip = u->clip, pairs = 0;
   uint16_t *vi = cpu.vi;
   float q = cpu.q;
@@ -159,4 +161,8 @@ static unsigned native_particles_2e48(Vu *u) {
 #undef LOAD
 #undef STORE
 #undef DIVIDE
+}
+static unsigned native_particles_2e48(Vu *u) {
+    if ((u->status & 0xc0) == 0xc0) return native_particles_2e48_impl(u, 1);
+    return native_particles_2e48_impl(u, 0);
 }

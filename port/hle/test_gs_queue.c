@@ -26,8 +26,13 @@ double host_wall_seconds(void)
 void vif_feed(int unit, const uint32_t *words, uint32_t count)
 {
     (void)unit;
-    graphics_provenance.program = words[4];
-    graphics_gif_feed(3, words, count);
+    /* Multiple GIF writes from one producer packet exercise deferred
+       publication, including flush-before-full on the 4 KiB test ring. */
+    for (unsigned at = 0; at < count; at += 8) {
+        graphics_provenance.program = words[at + 4];
+        graphics_gif_feed(3, words + at, 4);
+        graphics_gif_feed(3, words + at + 4, 4);
+    }
 }
 static uint32_t hash(uint32_t old, uint32_t word)
 {
@@ -72,11 +77,16 @@ int main(int argc, char **argv)
     gs_reset(&reference);
     gs.record_transfer = record;
     uint32_t packet[8] = {0x8001, 0x10000000, 14, 0, 0, 0, GS_RGBAQ, 0};
-    for (unsigned n = 0; n < 3000; n++) {
-        packet[4] = n;
-        expect(3, n, packet, 8);
-        graphics_feed(1, GADDR(packet), 8);
-        memset(packet + 4, 0, 8); /* queued bytes must survive producer reuse */
+    uint32_t stream[64 * 8];
+    for (unsigned base = 0; base < 3000; base += 64) {
+        unsigned batch = 3000 - base < 64 ? 3000 - base : 64;
+        for (unsigned i = 0; i < batch; i++) {
+            packet[4] = base + i;
+            expect(3, base + i, packet, 8);
+            memcpy(stream + i * 8, packet, sizeof packet);
+        }
+        graphics_feed(1, GADDR(stream), batch * 8);
+        memset(stream, 0, sizeof stream); /* queued bytes must survive producer reuse */
     }
     graphics_wait();
     uint32_t memory[4096] = {0};
