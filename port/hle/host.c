@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <SDL3/SDL_cpuinfo.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_thread.h>
 #include <SDL3/SDL_timer.h>
@@ -745,7 +746,8 @@ static void log_start(const char *path)
 
 /* The log's first line: the release and the build, "Downhill Revived 0.6.4 (dhd-port 0.6.4
    1a2b3c4d5e6f7a8b)", the same build name the online lobby shows (online.c build_version: the
-   start of the program file's SHA-256), so a player's log says which game wrote it. */
+   start of the program file's SHA-256), so a player's log says which game wrote it. The second:
+   the system (OS, CPU, threads, RAM), so a bug report needs nobody to look them up. */
 static void log_version(void)
 {
     char path[HOST_PATH_MAX], build[17] = "unknown";
@@ -763,6 +765,10 @@ static void log_version(void)
         for (int i = 0; i < 8; i++) snprintf(build + 2 * i, 3, "%02x", digest[i]);
     }
     fprintf(stderr, "Downhill Revived %s (dhd-port %s %s)\n", DHD_VERSION, DHD_VERSION, build);
+    char system[320];
+    host_os_system(system, sizeof system);
+    fprintf(stderr, "system: %s, %d threads, %.1f GB RAM\n", system, SDL_GetNumLogicalCPUCores(),
+            SDL_GetSystemRAM() / 1024.0);
 }
 
 #ifdef _WIN32
@@ -913,12 +919,42 @@ int host_setting_locked(const char *name)
 static const char *settings_get(const char *name) { return getenv(name); }
 static void settings_unknown(const char *key) { hle_log("settings: unknown key %s\n", key); }
 
+/* The settings into the log as one line, "settings: FPS=240 SCALE=8 ...", without paths (they
+   may hold the player's name); those the environment set (over dhd.ini) after "| from the environment:". */
+static char settings_seen[1024];
+static void settings_note(const char *name, const char *value)
+{
+    size_t n = strlen(settings_seen);
+    int path = strchr(value, '\\') || (strchr(value, '/') && !strstr(value, "://"));
+    snprintf(settings_seen + n, sizeof settings_seen - n, " %s=%s", name + (strncmp(name, "DHD_", 4) ? 0 : 4),
+             path ? "(a path)" : value);
+}
+
+static void settings_set(const char *name, const char *value)
+{
+    if (strcmp(name, "DHD_ENV_OVERRIDES")) settings_note(name, value);
+    host_putenv_s(name, value);
+}
+
 void host_settings_load(void)
 {
-    char path[HOST_PATH_MAX];
+    char path[HOST_PATH_MAX], name[64];
+    int marked = 0;
     iso_from_environment = getenv("DHD_ISO") != NULL;
     settings_path(path, sizeof path);
-    dhd_settings_load(path, settings_get, host_putenv_s, settings_unknown);
+    dhd_settings_load(path, settings_get, settings_set, settings_unknown);
+    const char *list = getenv("DHD_ENV_OVERRIDES");
+    for (const char *at = list ? list : ""; *at;) {
+        size_t n = strcspn(at, ",");
+        snprintf(name, sizeof name, "%.*s", (int)n, at);
+        const char *value = n ? getenv(name) : NULL;
+        if (value) {
+            if (!marked++) strncat(settings_seen, " | from the environment:", sizeof settings_seen - strlen(settings_seen) - 1);
+            settings_note(name, value);
+        }
+        at += n + (at[n] == ',');
+    }
+    hle_log("settings:%s\n", *settings_seen ? settings_seen : " (none)");
 }
 
 /* One dhd.ini line (the others kept). Nonzero when saved. */

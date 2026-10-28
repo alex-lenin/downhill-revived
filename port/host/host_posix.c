@@ -18,8 +18,12 @@
 #include <mach/mach.h>       /* the frame waits' time-constraint sleep */
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
+#include <sys/sysctl.h>     /* the system's names (host_os_system) */
 #else
 #include <elf.h>
+#endif
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
 #endif
 #include <errno.h>
 #include <limits.h>
@@ -30,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__x86_64__)
@@ -357,6 +362,57 @@ void host_os_sleep_ns(unsigned long long ns)
     }
 }
 #endif
+
+/* ---- the system (host_os.h) ---- */
+#if !defined(__APPLE__) && !defined(__ANDROID__)
+/* The value of path's first line that starts with key, after sep, quotes and spaces trimmed. */
+static void text_value(const char *path, const char *key, char sep, char *out, size_t size)
+{
+    char line[256];
+    FILE *f = fopen(path, "r");
+    out[0] = 0;
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *at = strchr(line, sep);
+        if (strncmp(line, key, strlen(key)) || !at) continue;
+        for (at++; *at == ' ' || *at == '\t' || *at == '"'; at++) {}
+        snprintf(out, size, "%.*s", (int)strcspn(at, "\"\n"), at);
+        break;
+    }
+    fclose(f);
+}
+#endif
+
+/* macOS: its product version and the CPU's brand string by sysctl; Android: the release, the
+   phone and its chip from the system properties; Linux: os-release's name, the kernel and
+   /proc/cpuinfo's model name. */
+void host_os_system(char *out, unsigned size)
+{
+    char os[160], cpu[128] = "";
+    struct utsname u;
+    if (uname(&u)) snprintf(u.machine, sizeof u.machine, "unknown");
+#if defined(__APPLE__)
+    char version[32] = "";
+    size_t n = sizeof version;
+    sysctlbyname("kern.osproductversion", version, &n, NULL, 0);
+    snprintf(os, sizeof os, "macOS %s", version);
+    n = sizeof cpu;
+    if (sysctlbyname("machdep.cpu.brand_string", cpu, &n, NULL, 0)) cpu[0] = 0;
+#elif defined(__ANDROID__)
+    char release[PROP_VALUE_MAX] = "", maker[PROP_VALUE_MAX] = "", model[PROP_VALUE_MAX] = "";
+    __system_property_get("ro.build.version.release", release);
+    __system_property_get("ro.product.manufacturer", maker);
+    __system_property_get("ro.product.model", model);
+    __system_property_get("ro.soc.model", cpu);
+    snprintf(os, sizeof os, "Android %s, %s %s", release, maker, model);
+#else
+    char name[96];
+    text_value("/etc/os-release", "PRETTY_NAME=", '=', name, sizeof name);
+    snprintf(os, sizeof os, "%s (Linux %s)", *name ? name : "Linux", u.release);
+    text_value("/proc/cpuinfo", "model name", ':', cpu, sizeof cpu);
+#endif
+    snprintf(out, size, "%s, %s (%s)", os, *cpu ? cpu : "unknown CPU", u.machine);
+}
 
 /* ---- files (host_os.h): the C library's ---- */
 FILE *host_os_fopen(const char *path, const char *mode) { return fopen(path, mode); }

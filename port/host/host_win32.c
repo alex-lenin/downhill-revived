@@ -140,6 +140,35 @@ uintptr_t host_heartbeat_eip(void)
     return eip;
 }
 
+/* ---- the system (host_os.h) ----
+   ntdll's RtlGetVersion, since GetVersionEx says 6.2 to a program without a manifest; the release
+   ("24H2") from the registry; Wine (Proton, for Linux and Mac players) by its wine_get_version;
+   the CPU's name from CPUID's brand string. */
+void host_os_system(char *out, unsigned size)
+{
+    RTL_OSVERSIONINFOW v = {sizeof v};
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    LONG(WINAPI *get_version)(RTL_OSVERSIONINFOW *) = (void *)GetProcAddress(ntdll, "RtlGetVersion");
+    const char *(CDECL *wine_version)(void) = (void *)GetProcAddress(ntdll, "wine_get_version");
+    if (get_version) get_version(&v);
+    char release[32] = "", windows[32], wine[48] = "", brand[49] = "", *cpu = brand;
+    DWORD n = sizeof release;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "DisplayVersion",
+                     RRF_RT_REG_SZ, NULL, release, &n) != ERROR_SUCCESS)
+        release[0] = 0;
+    if (v.dwMajorVersion == 10) snprintf(windows, sizeof windows, "%s", v.dwBuildNumber >= 22000 ? "11" : "10");
+    else snprintf(windows, sizeof windows, "%lu.%lu", v.dwMajorVersion, v.dwMinorVersion);
+    if (wine_version) snprintf(wine, sizeof wine, " on Wine %s", wine_version());
+    int r[4];
+    __cpuid(r, 0x80000000);
+    if ((unsigned)r[0] >= 0x80000004)
+        for (int i = 0; i < 3; i++) __cpuid(r, 0x80000002 + i), memcpy(brand + 16 * i, r, 16);
+    while (*cpu == ' ') cpu++;
+    for (size_t k = strlen(cpu); k && cpu[k - 1] == ' '; k--) cpu[k - 1] = 0;
+    snprintf(out, size, "Windows %s%s%s (build %lu)%s, %s", windows, *release ? " " : "", release, v.dwBuildNumber, wine,
+             *cpu ? cpu : "unknown CPU");
+}
+
 /* ---- files (host_os.h) ----
    The UTF-8 path as Windows' own; a read opens the file with write and delete sharing as well,
    the way the autopad script reader always has, so a driver can replace the script while it is

@@ -10,6 +10,10 @@
    reads it. */
 FILE *host_os_fopen(const char *path, const char *mode);
 
+/* The system for the log (host.c log_version): the OS with its version, and the CPU's name, as
+   "Windows 11 24H2 (build 26200), AMD Ryzen 5 7600 6-Core Processor". */
+void host_os_system(char *out, unsigned size);
+
 /* 64-bit seek and position of a FILE: the C library's own names for them. */
 #ifdef _WIN32
 #define host_fseek _fseeki64

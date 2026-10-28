@@ -192,6 +192,9 @@ mod native {
             adapter = self::adapter(&instance, backends, o)?;
         }
         let info = adapter.get_info();
+        // The driver in the log, for bug reports: many draw faults are one driver's.
+        crate::host::log(format!("gs: GPU {} on {:?}, driver {} {}", info.name, info.backend, info.driver,
+                                 info.driver_info).trim_end());
         // DHD_RSTAT (finding 108): whether the adapter offers GPU timers at all. The 120 field/s
         // round had to estimate GPU time from the render thread's blocked submits because nothing
         // asks for them; this says whether a later round could measure it directly.
