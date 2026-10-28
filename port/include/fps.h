@@ -10,6 +10,7 @@ int port_fps_max(void);  /* 240, or DHD_FPS_MAX when lower */
 int port_fps_high(void);
 void port_fps_wall_mode(int enabled);
 double port_frame_period(void);
+double port_vblank_seconds(void);  /* the mixer's time for one VBLANK above 60 */
 int port_input_stamp(int legacy_field);
 
 /* Elapsed time of this real update, and its conversions of per-field constants. */

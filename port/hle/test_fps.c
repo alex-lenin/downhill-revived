@@ -81,6 +81,31 @@ int main(int argc,char **argv)
         point[0]=1.0f/n;point[4]=0;
         float start=point[0];port_ragdoll_step(point,1,sizeof point,1);
         assert(fabs((point[0]-start)-D_0029E400)<.000001);
+        /* The mixer's VBLANK time (finding 113): two VBLANKs per update, both at its end, add up
+           to wall time, not twice it; a 50-ms hitch is repaid in full at a field per VBLANK, a
+           2-s stall by 0.1 s. */
+        port_fps_wall_mode(1);
+        double audio=0,wall=0;
+        for (int i=0;i<4000;i++) {
+            double dt=i%3 ? 1.0/550 : 1.0/400;
+            fake_wall+=dt,wall+=dt;
+            audio+=port_vblank_seconds();
+            audio+=port_vblank_seconds();
+        }
+        assert(fabs(audio-wall)<1.0/n+.003); /* the first VBLANK counts a nominal field */
+        for (int k=0;k<2;k++) {
+            double stall=k ? 2 : .05;
+            fake_wall+=stall;audio=0;
+            for (int i=0;i<40;i++) {
+                double t=port_vblank_seconds();
+                assert(t>=0 && t<=1.0/60+1e-12);
+                audio+=t;
+            }
+            assert(fabs(audio-(k ? .1 : stall))<1e-9);
+        }
+        port_fps_wall_mode(0);
+        assert(port_vblank_seconds()==1.0/n);
+        port_fps_wall_mode(1);
         online=1;D_0029E3D0=1;
         assert(port_fps()==60 && port_step()==1);
         fake_wall+=10;port_fps_wall_mode(1); /* kernel's online VBLANK path */

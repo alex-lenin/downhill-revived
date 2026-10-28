@@ -856,11 +856,12 @@ static void vsync(void)
     if (!fresh) host_pacing_input();
     host_widescreen_vsync();
     /* Mixer/SPU time stays at the NTSC field rate, independently of real
-       offline simulation frames. Preserve the exact original call at 60. */
+       offline simulation frames and of the VBLANKs per frame (port_vblank_seconds).
+       Preserve the exact original call at 60. */
     if (!port_fps_high()) sound_tick();
     else {
         static double audio_time;
-        audio_time += (double)port_step()/60.0;
+        audio_time += port_vblank_seconds();
         while (audio_time >= 1001.0/60000.0) {
             audio_time -= 1001.0/60000.0;
             sound_tick();

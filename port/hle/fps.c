@@ -22,7 +22,8 @@ static unsigned clock_serial;
    time; deterministic/unpaced diagnostics keep the original rational clock.
    Spread clock error over eight updates instead of feeding frame jitter to
    physics. Retaining the residual makes this a time-conserving filter. */
-void port_fps_wall_mode(int enabled) { wall_mode=enabled; previous_wall=0; wall_error=0; }
+static double vblank_wall, vblank_debt;
+void port_fps_wall_mode(int enabled) { wall_mode=enabled; previous_wall=0; wall_error=0; vblank_wall=0; vblank_debt=0; }
 static double clock_interval(void)
 {
     const double nominal=60.0/port_fps();
@@ -47,6 +48,29 @@ static double clock_interval(void)
         previous_wall=0;
         wall_error=0;
     }
+    return result;
+}
+/* The mixer's time for one VBLANK above 60 (kernel.c vsync; finding 113). The frame clock
+   delivers a VBLANK every BUS_HZ/N cycles, 1024 per kernel boundary (timer.c), and a frame
+   crosses about 400 boundaries: above about 360 one update spans several VBLANKs (at 960 three
+   in the menus, two in a race). The update's step charged on each VBLANK ran the sound that many
+   times too fast.
+   Paced, a VBLANK is the wall time since the previous one, at most a field each. A hitch is
+   caught up (the device played on from its cushion meanwhile), but only by 0.1 s: a longer
+   stall already played as a gap, and more would only overfill the output queue, which skips it
+   (port/host/sound_out_win32.c; boot otherwise skipped 0.45 s). Unpaced, it is the virtual
+   field, 1/N s, which equals the nominal step that was charged before. */
+double port_vblank_seconds(void)
+{
+    const double nominal=1.0/port_fps(), field=1.0/60;
+    if (!wall_mode) return nominal;
+    double now=host_wall_seconds();
+    if (vblank_wall && now>=vblank_wall && isfinite(now-vblank_wall)) vblank_debt+=now-vblank_wall;
+    else vblank_debt+=nominal;
+    vblank_wall=now;
+    if (vblank_debt>0.1) vblank_debt=0.1;
+    double result=vblank_debt<field ? vblank_debt : field;
+    vblank_debt-=result;
     return result;
 }
 static int whole;
