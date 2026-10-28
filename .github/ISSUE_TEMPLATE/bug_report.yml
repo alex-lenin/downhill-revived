@@ -1,0 +1,56 @@
+name: Bug report
+description: Something doesn't work, crashes, looks wrong or sounds wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The **dhd.log** file is the most useful thing you can send: it shows what the game did just before the problem.
+        Close the game first (it writes the log while it runs), then find dhd.log:
+        - **Windows:** in the folder with `dhd.exe` and `DownhillRevived.exe` (or `%APPDATA%\Downhill Revived` if that folder can't be written to).
+        - **Mac:** `~/Library/Application Support/Downhill Revived` (Finder: Go > Go to Folder).
+        - **Linux:** beside `DownhillRevived` (or `~/.local/share/downhill-revived`).
+        dhd.log is overwritten at every start, so grab it **right after** the problem happens, before you play again.
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it happen?
+      options:
+        - Starting the game / launcher
+        - Menus
+        - Offline race
+        - Online race (lobby, race or after the race)
+        - Updating
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to make it happen
+      description: Track, rider, menu choices, settings you changed. Does it happen every time?
+      placeholder: |
+        1. Online race on Peru TD with one friend, I was the host
+        2. After the results I chose NEW LEVEL and picked Alaska
+        3. Stuck on the loading screen (every time / once)
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: dhd.log
+      description: Drag the file here (or paste its contents). It already holds the version, your system (OS, CPU, RAM), graphics card and driver, and your settings. For online problems, attach **every player's** dhd.log if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or video
+      description: Optional, but very helpful for anything you can see or hear. Drag images or a short video here.
