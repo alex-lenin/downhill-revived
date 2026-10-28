@@ -94,6 +94,23 @@ whenever not online). No game RAM layout or retail code changed.
     runs and is not traced).
   144.cmd"). Both players need this exe.
 
+## The next race after the results (issue #15)
+
+- Repro: `port/tools/online_race.py --next again|new` (new): the host's test pad
+  (`DHD_NET_HOST_NEXT`, online.c `host_next_pad`) picks TRY AGAIN or NEW LEVEL on the results
+  menu, and the run waits for both games' next countdown. With `DHD_NET_TEST_FINISH=40`.
+- Before the fix (60 fps, TRY AGAIN): both games reached the next race, but the host waited
+  61.5 s and the guest 75 s on "waiting for 1 player to load". `start_together` sent EVENT_LOADED
+  once. The guest loaded first, before the host's `rematch_reset`, which clears `on.loaded`; the
+  host never saw it, started at its 60 s timeout, and its START came after the guest's 75 s
+  limit. To a player that is the friend not coming along.
+- Fix: LOADED, and once announced START (same `go_at`), are sent again every 0.5 s until the
+  countdown. The online lines that matter here now carry wall times (choice, accept, reset,
+  loaded), and the host says when it starts without someone.
+- After the fix: NEW LEVEL to track 6, both at 60 and both at 144: the guest followed, the
+  countdown came 1.5-1.9 s after loading on both PCs.
+- The level list moves with RIGHT (cursor 0 -> 1 is ALPINE -> track 6); DOWN does nothing there.
+
 ## Open
 
 - High-rate physics equivalence is still open (finding 067: a full-pedal race finished in

@@ -593,7 +593,7 @@ static void receive_frames(void)
         if (frame[0] != NET_FRAME_EVENT || n < 4 || e[0] != EVENT_VERSION || sender >= NET_MAX_SLOTS) continue;
         switch (e[1]) {
         case EVENT_LOADED:
-            if (!on.loaded[sender]++) fprintf(stderr, "online: player %d has loaded\n", sender);
+            if (!on.loaded[sender]++) fprintf(stderr, "online: player %d has loaded (at %.1f s)\n", sender, host_wall_seconds());
             break;
         case EVENT_SETUP:
             if (n - 2 >= 30) {
@@ -625,7 +625,8 @@ static void receive_frames(void)
                 !on.rematch_want && !on.restart_accepted) {
                 on.rematch_want = e[2] ? 2 : 1, on.rematch_track = e[3], on.rematch_fields = 0;
                 on.rematch_at = host_wall_seconds();
-                fprintf(stderr, "online: the host chose %s (track %d)\n", e[2] ? "NEW LEVEL" : "TRY AGAIN", e[3]);
+                fprintf(stderr, "online: the host chose %s (track %d) at %.1f s\n", e[2] ? "NEW LEVEL" : "TRY AGAIN", e[3],
+                        on.rematch_at);
             }
             break;
         default:  /* EVENT_HIT */
@@ -729,16 +730,27 @@ void hle_online_riders(void *game)
 
 /* At the countdown: every PC says it has loaded; when all have (at most 60 s), the host names a
    moment on the server's clock and every PC holds the countdown until then, so the GOs land
-   within a frame or two of each other on every PC. */
+   within a frame or two of each other on every PC. Both are said again every half second: after
+   a TRY AGAIN or NEW LEVEL the PC that loads first is here before the other has reset for the next
+   race (rematch_reset), which would drop a single message, and the start would wait 60 s. */
 static void start_together(void)
 {
     static const uint8_t loaded[2] = {EVENT_VERSION, EVENT_LOADED};
-    double entered = host_wall_seconds();
+    double entered = host_wall_seconds(), said = -1;
     int host = on.local_slot == on.host_slot, announced = 0;
-    send_event(loaded, sizeof loaded);
+    fprintf(stderr, "online: loaded at %.1f s, waiting for the others\n", entered);
     for (;;) {
         NetLobby lobby;
         host_service_net_get_lobby(GADDR(&lobby));
+        if (host_wall_seconds() - said >= 0.5) {
+            said = host_wall_seconds();
+            send_event(loaded, sizeof loaded);
+            if (announced) {
+                uint8_t e[10] = {EVENT_VERSION, EVENT_START};
+                memcpy(e + 2, &on.go_at, 8);
+                send_event(e, sizeof e);
+            }
+        }
         receive_frames();
         int missing = 0;
         for (int i = 0; i < lobby.nslots; i++)
@@ -751,6 +763,8 @@ static void start_together(void)
             memcpy(e + 2, &on.go_at, 8);
             send_event(e, sizeof e);
             announced = 1;
+            if (missing) fprintf(stderr, "online: %d player%s never said they loaded: starting without waiting\n",
+                                 missing, missing == 1 ? "" : "s");
         }
         if (on.go_at && host_service_net_server_ms() >= on.go_at) break;
         if (missing) title("Downhill Revived online - room %s - waiting for %d player%s to load", on.code, missing,
@@ -1060,7 +1074,7 @@ static int others_here(void)
    is agreed again (start_together), and the puppets drop what they had (hle_puppet_rematch). */
 static void rematch_reset(int track)
 {
-    fprintf(stderr, "online: the next race in room %s: track %d\n", on.code, track);
+    fprintf(stderr, "online: the next race in room %s: track %d (at %.1f s)\n", on.code, track, host_wall_seconds());
     on.started = on.go_sent = 0;
     on.go_at = on.go_server = 0;
     memset(on.their_go, 0, sizeof on.their_go);
@@ -1096,8 +1110,8 @@ void hle_online_restart(void)
         int track = EE32(SETUP + 0x2A0);
         uint8_t e[4] = {EVENT_VERSION, EVENT_REMATCH, (uint8_t)(track != on.setup.track), (uint8_t)track};
         send_event(e, sizeof e);
-        fprintf(stderr, "online: accepted %s for everyone (track %d)\n",
-                track != on.setup.track ? "NEW LEVEL" : "RE-START", track);
+        fprintf(stderr, "online: accepted %s for everyone (track %d) at %.1f s\n",
+                track != on.setup.track ? "NEW LEVEL" : "RE-START", track, host_wall_seconds());
     }
 }
 
@@ -1116,7 +1130,8 @@ static int rematch_step(void)
     if (!on.rematch_want) return 0;
     on.rematch_fields += port_fps_high() ? port_whole_step() : 1;
     if (!others_here() || on.rematch_fields > 1800 || host_wall_seconds() - on.rematch_at > 30) {
-        fprintf(stderr, "online: stopped following the host's stale restart request\n");
+        fprintf(stderr, "online: stopped following the host's stale restart request (at %.1f s, %d fields, menu %08X)\n",
+                host_wall_seconds(), on.rematch_fields, EE32(OPEN_MENU));
         on.rematch_want = on.rematch_fields = 0;
         on.rematch_at = 0;
         return 1;
@@ -1169,6 +1184,37 @@ static int follow_pad(HostPad *out)
         else press = PAD_TRIANGLE;
     }
     if (f < 4) out->buttons = press;
+    return 1;
+}
+
+/* DHD_NET_HOST_NEXT (tests, online_race.py --next): the host's own choice on the results menu,
+   pressed as a player would: "again" TRY AGAIN, "new" NEW LEVEL and another track on the level
+   list (DOWN, else RIGHT, until the cursor moves). One press of 0.08 s every 0.25 s of wall time,
+   chosen from what is on the screen then. */
+static int host_next_pad(HostPad *out)
+{
+    static HleEnv env;
+    static uint16_t press;
+    static long period = -1;
+    static int moved, first;
+    const char *next = hle_env(&env, "DHD_NET_HOST_NEXT");
+    if (!next || on.local_slot != on.host_slot || !on.end_done || on.restart_accepted ||
+        host_wall_seconds() - on.end_done_at < 8) return 0;
+    neutral(out);
+    double t = host_wall_seconds();
+    int row = strcmp(next, "again") ? 1 : 0;
+    if ((long)(t / 0.25) != period) {
+        period = (long)(t / 0.25);
+        if (menu_open(RESULTS_MENU))
+            press = EE32(RESULTS_MENU) < row ? PAD_DOWN : EE32(RESULTS_MENU) > row ? PAD_UP : PAD_CROSS, moved = 0;
+        else if (menu_open(LEVEL_LIST)) {
+            if (!moved) first = EE32(LEVEL_LIST);
+            press = EE32(LEVEL_LIST) != first || moved >= 8 ? PAD_CROSS : moved < 4 ? PAD_DOWN : PAD_RIGHT;
+            fprintf(stderr, "online: test: level list cursor %d, press %04X\n", EE32(LEVEL_LIST), press);
+            moved++;
+        } else press = 0;
+    }
+    if (t - period * 0.25 < 0.08) out->buttons = press;
     return 1;
 }
 
@@ -1260,7 +1306,7 @@ void pads_read(int player, HostPad *out)
         /* Once setup has been exchanged, the flyby and its skip prompt belong to the
            player too. The boot script may already be spent after an earlier race. */
         int race = EE32(MENU) == LOAD_MENU && on.setup_done;
-        if (player == 0 && race && (rematch_pad(out) || follow_pad(out))) {
+        if (player == 0 && race && (rematch_pad(out) || follow_pad(out) || host_next_pad(out))) {
         } else if (player == 0 && race && !hle_env(&scripted_env, "DHD_NET_SCRIPTED")) {
             host_service_host_pad_device(0, GADDR(out));
             menu_mouse_merge(0, out);  /* the pause menu by mouse, under the same rules */
