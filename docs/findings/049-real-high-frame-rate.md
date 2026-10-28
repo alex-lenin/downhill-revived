@@ -247,9 +247,12 @@ and tuning about a week. Roughly 3-6 weeks, and the result can't be proven compl
   what players notice first.
 - **Exactness**: state at 120 can't match PCSX2 (finer steps, different floats, different random
   sequence). 60 stays the exact mode; 120 can only be checked statistically.
-- **Online**: lockstep or rollback needs every peer on the same simulation rate and bit-identical
-  floats; mixed 60/120 races are impossible, and a 120 race doubles per-peer CPU and rollback
-  re-simulation cost. Online should use one rate (60).
+- **Online** (corrected 2026-10-28): this point assumed input lockstep, which was dropped on
+  2026-10-16. Online races are **state sync** (findings 044, 041): each PC runs its own race and
+  the others are puppet riders moved from ~20 snapshots a second, so peers need neither the same
+  rate nor identical floats, and mixed 60/144 races are possible. What a higher rate changes there
+  is only what counts in ticks: the snapshot clock, the puppet delay, the send rate and timeouts
+  (finding 114).
 - **Determinism** of replays and ghosts: `001A8EF0` records one sample per frame with the step in
   fields; recordings at 120 differ in format and content from 60.
 

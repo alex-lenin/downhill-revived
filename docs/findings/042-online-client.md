@@ -1,4 +1,8 @@
-# 042 — Online client: lockstep core, lobby and WebSocket transport
+# 042 — Online client: lobby and WebSocket transport (and the dropped lockstep core)
+
+**Superseded for races:** the lockstep core below (`lockstep.c`) was dropped on 2026-10-16 and
+later deleted; races use state sync (findings 041, 044). The lobby, JSON and WebSocket parts are
+still what runs.
 
 2026-10-16. Step 2 of `docs/ONLINE-PLAN.md`: the game-side network module, `port/net/`. It
 speaks protocol v1 (`docs/online-protocol.md`, server in finding 039) and is not wired into

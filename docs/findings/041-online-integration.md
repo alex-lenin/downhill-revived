@@ -1,4 +1,4 @@
-# 041 — Online races in the port: four pads, lockstep, full-screen view, launcher
+# 041 — Online races in the port: four pads, full-screen view, launcher (first design: input lockstep, dropped for state sync)
 
 2026-10-16. Step 3 of `docs/ONLINE-PLAN.md`: the client module (`port/net/`, finding 042) wired
 into the game, following finding 040's recipe, with the relay of finding 039.

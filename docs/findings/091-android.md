@@ -505,7 +505,8 @@ stays.
     `host_service_gs_*` getter called from EE code.
   - The trace and lockstep paths must keep the full wait (an env switch, as with
     `DHD_SCREENSHOT`).
-- **Online lockstep.** Input sampling and the race-clock pad scripts key on vsync. The pad and
+- **Online and pad timing** (online is state sync, not lockstep). Input sampling and the
+  race-clock pad scripts key on vsync. The pad and
   sound tick stay on the EE at vsync, so game timing is unchanged, but the picture shown lags by
   up to one field.
 - **The Z probe.** It already syncs (guarded pages, `graphics_settle`). With the AND3 fix, an exact

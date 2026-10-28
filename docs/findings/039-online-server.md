@@ -1,4 +1,4 @@
-# 039: Online server (lobbies and lockstep relay)
+# 039: Online server (lobbies and the race relay)
 
 **Superseded for races:** input lockstep was dropped on 2026-10-16; races use state sync
 (findings 041, 044). The lobby and relay here are still what runs.
