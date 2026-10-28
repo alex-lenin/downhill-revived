@@ -1341,6 +1341,15 @@ void host_pacing_wait(void)
                                   : last_due + period - shown < 1e-6 && shown - last_due - period < 1e-6;
     if (shown && last_due == shown && last_at > shown) shown = last_at;
     else if (shown && last_due > 0 && previous && last_at + spacing > shown) shown = last_at + spacing;
+    else if (shown && last_due > 0 && shown - last_due > 1.5 * period && now - last_at < 4 * period) {
+        /* Two or more pictures still before the presenter (the start or a load left a queue): it
+           presents one a period, so the queue stayed for good and every pad read waited for it
+           (key to present 90 ms on the title at 144 Hz, 25 ms without it). The picture handed now
+           is shown after them, so the grid follows that once and the queue is gone. Only while the
+           presenter is presenting (a minimised window presents nothing). */
+        double behind = floor((shown - last_due) / period + 0.5);
+        if (last_at + behind * spacing > shown) shown = last_at + behind * spacing;
+    }
     double due = shown + period;
     if (!shown || now > due) {  /* the first field, or more than a field late: start again from now */
         jit_due = now + (work < period ? work : period);
