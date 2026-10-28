@@ -9,7 +9,8 @@ game program byte for byte, built for the PC with the PS2 hardware replaced by n
 
 **[Download](https://github.com/skuza-oss/downhill-revived/releases/latest)** ·
 **[Discord](https://discord.gg/XrSeTyzfr2)** (news, help and races) ·
-**[Players' guide](docs/PLAYING.md)** (controls, online, texture packs, settings)
+**[Players' guide](docs/PLAYING.md)** (controls, online, texture packs, settings) ·
+**[Support on Ko-fi](https://ko-fi.com/skuza)**
 
 ## Features
 
@@ -48,7 +49,8 @@ with glibc 2.35+ and Vulkan) and a Direct3D 12 or Vulkan graphics card.
   checking it is the unchanged original.
 - To play you need your own dump of the USA disc. Other regions and modified images are not
   supported (why: [docs/findings/100-other-releases.md](docs/findings/100-other-releases.md)).
-- The project takes no donations and sells nothing.
+- The project sells nothing. Donations on Ko-fi are voluntary and unlock nothing: every release
+  is free and the same for everyone.
 
 ## Decompilation progress
 
