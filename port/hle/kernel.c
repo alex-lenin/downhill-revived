@@ -743,6 +743,7 @@ static double pace_base;
 void kernel_pace_slip(double seconds)
 {
     if (pace_base) pace_base += seconds;
+    port_fps_wall_mode(wall_steps);  /* above 60: the wait is no stall for the steps to repay */
 }
 
 /* An online race keeps every PC's fields on the clock they share from the synced start
@@ -750,7 +751,9 @@ void kernel_pace_slip(double seconds)
    not start again from now. It runs without waiting, and while it is still more than a field late
    each game frame gets two fields (the game measures the frame so and moves everything twice as
    far, as on a PS2 that drops a frame), until it is back on time; the race clock counts both.
-   Three fields a frame lost race-clock time against the other PCs (finding 047), so two at most. */
+   Three fields a frame lost race-clock time against the other PCs (finding 047), so two at most.
+   Above 60 the steps themselves follow wall time (fps.c's wall mode, online without the offline
+   half-second cap) and catch up so, so those frames are paced as offline ones (finding 114). */
 static int pace_shared, extras;  /* extras: fields given since the game last waited */
 static uint64_t frame_waits, extra_wait;  /* the game's vsync waits (intc_read); the one extras counts from */
 unsigned kernel_pace_extra_fields, kernel_pace_late_ms;  /* for the online log: extra fields given, how late */
@@ -759,6 +762,7 @@ void kernel_pace_shared(int on)
 {
     if (on && !pace_shared) pace_base = 0;  /* from this field */
     pace_shared = on;
+    port_fps_wall_mode(wall_steps);  /* above 60: from this step (the start's wait is no stall) */
 }
 
 static void pace(void)
@@ -766,13 +770,15 @@ static void pace(void)
     double base = pace_base;
     static uint64_t fields;
     const double period = port_frame_period();
+    const int shared = pace_shared && !port_fps_high();
     double now = host_wall_seconds(), due = base + (double)++fields * period;
-    if (!base || (!pace_shared && now > due + 2 * period)) {  /* the first field, or behind: start again from now */
+    if (pace_shared && !shared) kernel_pace_late_ms = (unsigned)(port_fps_behind() * 1000);
+    if (!base || (!shared && now > due + 2 * period)) {  /* the first field, or behind: start again from now */
         pace_base = now, fields = 0;
         return;
     }
-    if (pace_shared) kernel_pace_late_ms = now > due ? (unsigned)((now - due) * 1000) : 0;
-    if (pace_shared && now > due + period) {
+    if (shared) kernel_pace_late_ms = now > due ? (unsigned)((now - due) * 1000) : 0;
+    if (shared && now > due + period) {
         if (extra_wait != frame_waits) extra_wait = frame_waits, extras = 0;
         if (!extras && ee_frame_clock_enabled()) {
             extras++, kernel_pace_extra_fields++;
@@ -827,9 +833,6 @@ static int vsync_deferred, csr_exact;
 
 static void vsync(void)
 {
-    /* The original online clock accounts for this time. Do not charge it
-       again if the player returns to an offline high-rate menu/race. */
-    if (pads_online()) port_fps_wall_mode(wall_steps);
     int fresh = paced && jit_on();
     if (paced && !fresh) pace();
     host_pacing_handoff(fresh);

@@ -17,8 +17,9 @@ What works today:
   code as the reference it is tested against.
 - **60 fps or more, with even frame pacing.** The game runs at its original 59.94 Hz, and each
   picture is shown on a fixed grid, so frames don't come out long-short-long. PC SETTINGS > Frame
-  Rate also offers 120, 144, 165 or 240 fps, or the monitor's rate; online races stay at 60. Pad
-  input is read as late as possible before each frame.
+  Rate also offers 120, 144, 165 or 240 fps, or the monitor's rate, online too (experimental:
+  players at different rates race together). Pad input is read as late as possible before each
+  frame.
 - **Higher resolution and widescreen.** Internal resolution 1x to 8x (or matched to the window).
   Widescreen at the monitor's shape (16:9, 21:9 or any other) is Hor+: a wider view with the same
   vertical framing, and the HUD, menus and 2D screens keep their shape. Windowed, borderless and
@@ -44,8 +45,8 @@ What works today:
 - **Online races** for 2 to 4 players (experimental): an ONLINE entry in the main menu, a list of
   public races, private races joined with a 6-character code, and a race room where the host
   picks the track, on the project's official server (see [Online](#online)). After the
-  results the game goes back to offline play with your own controller (TRY AGAIN, NEW LEVEL or
-  QUIT).
+  results the host's TRY AGAIN or NEW LEVEL takes everyone to the next race; QUIT leaves the
+  room.
 - **Memory card saves**, stored as plain files beside the game.
 - **Controllers**: Xbox pads, DualSense, DualShock 4, Switch Pro, 8BitDo and most other USB or
   Bluetooth pads (through SDL3 and its controller database), with vibration where the pad has

@@ -174,6 +174,11 @@ State sync: a STATE frame is a snapshot of riders the sender owns, an EVENT fram
 it decided for another rider (a hit). The server forwards both, slot corrected, to every other
 racer and keeps nothing.
 
+Each PC races at its player's frame rate (60-240 fps). A snapshot (payload version 3) is stamped
+with the sender's race time in ms since GO, not its frame or tick count, about 20 a second at any
+rate; the receiver puts it on its own race clock (finding 114). Finish times in EVENT frames stay
+in race ticks (1/60 s of game time), the same at every rate. The server reads none of this.
+
 ### Leaving
 
 A racer leaves by closing the socket (or sends `{"type":"leave"}` first, which only changes

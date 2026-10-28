@@ -131,6 +131,7 @@ def main():
     ap.add_argument('--kill-guest-at', type=float, help='stop the guest this many seconds after GO')
     ap.add_argument('--stop-if', default=os.path.join(ROOT, 'build', 'port', 'BENCH.lock'),
                     help='stop everything as soon as this file exists (the benchmark lock)')
+    ap.add_argument('--minimized', action='store_true', help='both games start minimised (the PC stays usable)')
     ap.add_argument('--a', action='append', default=[], help='extra NAME=VALUE for the host game')
     ap.add_argument('--b', action='append', default=[], help='extra NAME=VALUE for the joining game')
     a = ap.parse_args()
@@ -154,7 +155,9 @@ def main():
         env = game_env(iso_hash, pad, {'DHD_RACE_CAPTURE': a.capture, **extra})
         stdout, stderr = owned.enter_context(open(d / 'stdout.log', 'w')), owned.enter_context(open(d / 'stderr.log', 'w'))
         procs.append(owned.enter_context(owned_process.start([os.path.abspath(a.exe)], cwd=d, env=env,
-                                                             stdout=stdout, stderr=stderr)))
+                                                             stdout=stdout, stderr=stderr, minimized=a.minimized)))
+        if a.minimized:
+            procs[-1].minimize()
         dirs.append(d)
         return d
 
@@ -179,6 +182,8 @@ def main():
                 [a.nettool, '--bot', '--version', version, '--iso', iso_hash, '--name', f'Bot{k}', '--replay', a.replay,
                  '--rider', str(k * 2 + 1), 'join', code], stdout=log, stderr=subprocess.STDOUT)))
         go = wait_line([da / 'stderr.log', db / 'stderr.log'], r'countdown starts', 400, procs, a.stop_if)
+        for p in procs if a.minimized else ():
+            p.minimize()  # a window SDL showed after the start
         if not all(go):
             print('a game did not reach the countdown')
         elif a.kill_guest_at:

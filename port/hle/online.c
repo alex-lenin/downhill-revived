@@ -17,7 +17,9 @@
    - In the race this PC's controller rides rider 0, from the grid place the host has for this
      player. About 20 times a second it sends a snapshot of the riders it runs (its own; the host
      also the AI riders) as STATE frames; the other humans, and on the other PCs the AI, are
-     puppets in AI rider slots. A hit this PC's rider deals to a puppet goes to the puppet's PC as
+     puppets in AI rider slots (each PC at its player's frame rate, 60-240: snapshots carry race
+     time, and every count here is of race ticks, 1/60 s fields, or wall time, never of frames;
+     finding 114). A hit this PC's rider deals to a puppet goes to the puppet's PC as
      an EVENT frame, which applies it.
    - The finish: each PC reports its rider's time, the host publishes the order once everyone has
      finished, and every PC's results screen waits for it. A player who leaves becomes the host's
@@ -27,6 +29,7 @@
 #include "../net/net.h"
 #include "../include/version.h"
 #include "../runtime/sha256.h"
+#include "../include/fps.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -273,7 +276,7 @@ enum {
     EVENT_VERSION = 2, EVENT_HIT = 1, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_START = 4, EVENT_GO = 5,
     EVENT_FINISH = 6, EVENT_RESULTS = 7, EVENT_REMATCH = 8
 };
-enum { SNAPSHOT_TICKS = 3 };  /* a snapshot every 3 race ticks: 20 a second */
+enum { SNAPSHOT_TICKS = 3 };  /* a snapshot every 3 race ticks: 20 a second at any frame rate */
 enum { NRIDERS = 10, START_LEAD_MS = 1500 };
 #define RACE_CLOCK EE32(0x43EEC8)
 /* The race object D_0043EEC0 (func_0019F210): +8 the race clock, +0x1C finish times (race ticks)
@@ -323,7 +326,7 @@ static struct {
     int end_held, end_done;     /* the race-end countdown, held for the results */
     int no_bots;                /* the room's computer riders off (its "laps" option 1) */
     /* the host's next race after the results (EVENT_REMATCH): 1 TRY AGAIN, 2 NEW LEVEL on
-       rematch_track; rematch_fields: fields since this PC began choosing it on its menu */
+       rematch_track; rematch_fields: 1/60 s fields (not frames) since this PC began choosing it */
     int rematch_want, rematch_track, rematch_fields;
     int restart_accepted;        /* a retail menu action, never inferred from a phase */
     double rematch_at;
@@ -907,7 +910,7 @@ static void state_sync(void)
     if (EE32(MENU) != LOAD_MENU || on.restart_accepted) return;
     if (race_running() && !on.go_sent) {  /* GO: when it was, on the server's clock */
         uint8_t e[10] = {EVENT_VERSION, EVENT_GO};
-        on.go_server = host_service_net_server_ms() - clock * (1000 / 59.94);
+        on.go_server = host_service_net_server_ms() - port_field_seconds(clock) * 1000;
         memcpy(e + 2, &on.go_server, 8);
         send_event(e, sizeof e);
         on.go_sent = 1;
@@ -958,9 +961,9 @@ static void state_sync(void)
                   on.nslots, lobby.ping_ms, lobby.offline ? " - offline" : "",
                   on.end_held ? " - finished, waiting for the others" : "");
         extern unsigned kernel_pace_extra_fields, kernel_pace_late_ms;
-        fprintf(stderr, "online: race clock %d, %u snapshots sent, %u received, hits taken %d, %u ms late, %u extra "
-                "fields, lag (ticks):%s\n", clock, on.sent, on.received, hle_puppet_hits_taken(), kernel_pace_late_ms,
-                kernel_pace_extra_fields, lag);
+        fprintf(stderr, "online: race clock %d (%d fps), %u snapshots sent, %u received, hits taken %d, %u ms late, %u "
+                "extra fields, lag (ms):%s\n", clock, port_fps(), on.sent, on.received, hle_puppet_hits_taken(),
+                kernel_pace_late_ms, kernel_pace_extra_fields, lag);
     }
 }
 
@@ -1105,12 +1108,14 @@ void hle_online_restart_ready(void)
     if (online_mode() && on.restart_accepted) rematch_reset(EE32(SETUP + 0x2A0));
 }
 
-/* Count fields once, independently of pad reads. A stale request, a closed room,
-   or an unrecognised menu must release the controller instead of pressing forever. */
+/* Count fields once, independently of pad reads (above 60 a field has several frames, so whole
+   fields: port_whole_step). A stale request, a closed room, or an unrecognised menu must release
+   the controller instead of pressing forever. */
 static int rematch_step(void)
 {
     if (!on.rematch_want) return 0;
-    if (!others_here() || ++on.rematch_fields > 1800 || host_wall_seconds() - on.rematch_at > 30) {
+    on.rematch_fields += port_fps_high() ? port_whole_step() : 1;
+    if (!others_here() || on.rematch_fields > 1800 || host_wall_seconds() - on.rematch_at > 30) {
         fprintf(stderr, "online: stopped following the host's stale restart request\n");
         on.rematch_want = on.rematch_fields = 0;
         on.rematch_at = 0;
@@ -1129,7 +1134,8 @@ static int rematch_pad(HostPad *out)
     if (on.local_slot == on.host_slot || !on.end_done || !others_here()) return 0;
     neutral(out);
     if (!on.rematch_want || on.restart_accepted || host_wall_seconds() - on.end_done_at < 6) return 1;
-    int f = (on.rematch_fields - 1) % 12, row = on.rematch_want == 1 ? 0 : 1;
+    /* 11: no press before the first whole field (above 60 that takes a few frames) */
+    int f = on.rematch_fields > 0 ? (on.rematch_fields - 1) % 12 : 11, row = on.rematch_want == 1 ? 0 : 1;
     if (f == 0) {
         if (menu_open(RESULTS_MENU))
             press = EE32(RESULTS_MENU) < row ? PAD_DOWN : EE32(RESULTS_MENU) > row ? PAD_UP : PAD_CROSS;
@@ -1154,7 +1160,7 @@ static int follow_pad(HostPad *out)
     static uint16_t press;
     if (on.local_slot == on.host_slot || on.end_done || !on.rematch_want || on.restart_accepted || !others_here()) return 0;
     neutral(out);
-    int f = (on.rematch_fields - 1) % 12, row = on.rematch_want == 1 ? PAUSE_RESTART : PAUSE_NEW_LEVEL;
+    int f = on.rematch_fields > 0 ? (on.rematch_fields - 1) % 12 : 11, row = on.rematch_want == 1 ? PAUSE_RESTART : PAUSE_NEW_LEVEL;
     if (f == 0) {
         if (EE32(RIDING)) press = PAD_START;
         else if (menu_open(PAUSE_MENU)) press = EE32(PAUSE_MENU) < row ? PAD_DOWN : EE32(PAUSE_MENU) > row ? PAD_UP : PAD_CROSS;

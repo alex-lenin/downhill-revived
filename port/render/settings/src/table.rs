@@ -102,7 +102,7 @@ pub const SETTINGS: &[Setting] = &[
     text("texture_cache_mb", "DHD_TEXTURE_CACHE_MB"),
     // sharp: the game's font with clean edges at any resolution; original: as the PS2 draws it.
     switch("font", "DHD_FONT", &[c("original", "Original"), c("sharp", "Sharp")], "sharp", "sharp"),
-    // Offline simulation steps a second (finding 067); online races always run at 60.
+    // Simulation steps a second (findings 067, 114), offline and online.
     choice("fps", "DHD_FPS", &[c("60", "60 fps"), c("120", "120 fps"), c("144", "144 fps"), c("165", "165 fps"),
                                c("240", "240 fps"), c("monitor", "Monitor")], "60", "60"),
     switch("vsync", "DHD_VSYNC", SWITCH, "1", "0"),

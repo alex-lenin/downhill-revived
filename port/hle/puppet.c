@@ -18,15 +18,20 @@
    the thrown body are simulated locally until the respawn).
 
    Snapshots arrive about 20 a second. Each puppet keeps the last few and shows the remote rider
-   DELAY ticks behind the newest it has (interpolated between the two around that moment, a short
-   extrapolation when one is late); the remote clock is estimated from the arrivals.
+   DELAY behind the newest it has (interpolated between the two around that moment, a short
+   extrapolation when one is late); the remote clock is estimated from the arrivals. Every PC
+   runs at its own frame rate (60-240), so the clocks here are race time in seconds, not ticks:
+   a tick (the race clock's field) is 1001/60000 s at 60 and 1/60 s above, and above 60 a step
+   is part of one (port_field_seconds, finding 114).
 
    Tests, one PC:
-   DHD_PUPPET_RECORD=file   each race tick, a snapshot of rider DHD_PUPPET_FROM (default 0)
+   DHD_PUPPET_RECORD=file   each race step, a snapshot of rider DHD_PUPPET_FROM (default 0)
    DHD_PUPPET_PLAY=file     replay those snapshots onto slot DHD_PUPPET_SLOT (default 1), one in
-                            DHD_PUPPET_RATE (default 3) arriving as it was taken
-   DHD_PUPPET_DELAY=ticks   how far behind the newest snapshot (default 6: 100 ms)
+                            DHD_PUPPET_RATE (default 3) ticks arriving as it was taken
+   DHD_PUPPET_DELAY=ms      how far behind the newest snapshot (default 100)
    DHD_PUPPET_CAMERA=1      player 0's camera follows the puppet (slot DHD_PUPPET_SLOT, online too)
+   DHD_PUPPET_TRACE=file    each race step, each puppet as shown: race time here, the sender's
+                            race time it shows, slot, position (text; tests, finding 114)
    Online (port/hle/online.c): hle_puppet_online, hle_puppet_pack, hle_puppet_receive. */
 #include <stdint.h>
 #include <stdio.h>
@@ -39,6 +44,8 @@
 #define NRIDERS 10
 int hle_online_race_riders(void);  /* online.c: the riders in the online race (computer riders off: fewer) */
 #define RACE_CLOCK (*(volatile int32_t *)0x0843EEC8)  /* ticks since GO in phase 2 */
+double port_field_seconds(int counter);  /* fps.c */
+#define RACE_TIME port_field_seconds(RACE_CLOCK)      /* seconds since GO, part of a tick too */
 #define RACE_PHASE (*(volatile int32_t *)0x0843F348)  /* on the race screen: 1 countdown, 2-4 race */
 #define MENU (*(volatile int32_t *)0x0829DED8)        /* 9: the race screen */
 #define RACING (MENU == 9 && RACE_PHASE >= 2 && RACE_PHASE <= 4)  /* func_0016B5A8 */
@@ -68,7 +75,8 @@ int hle_online_race_riders(void);  /* online.c: the riders in the online race (c
 #define BOTTLES_AT 0x7ADC     /* bottles left to throw (func_00179A60 shows both) */
 
 typedef struct Snapshot {
-    int32_t clock;
+    int32_t clock;           /* race ticks (DHD_PUPPET_PLAY's one in RATE) */
+    double time;             /* race time, seconds (on the wire in ms) */
     int32_t state;           /* offset of the current State in the rider */
     float pos[4], rot[3][4], vel[4], spin[4];
     float wheel[2][2];       /* (c, s) of the front and back wheel */
@@ -80,16 +88,17 @@ typedef struct Snapshot {
 } Snapshot;
 
 enum { RING = 32, MAX_EVENTS = 16, NET_SLOTS = 8 };
-/* Wire format version 2: rider ids are global (a human's lobby slot, an AI rider's slot) and the
-   snapshot carries the checkpoints passed and the attack power-ups. STATE_FIXED: the payload
-   before the pad words. */
-enum { WIRE_VERSION = 2, STATE_FIXED = 104, EVENT_HIT = 1 };
+/* Wire format version 3: rider ids are global (a human's lobby slot, an AI rider's slot), the
+   snapshot carries the checkpoints passed and the attack power-ups (version 2), and its clock is
+   the sender's race time in ms, not its ticks (finding 114). STATE_FIXED: the payload before the
+   pad words. */
+enum { WIRE_VERSION = 3, STATE_FIXED = 104, EVENT_VERSION = 2, EVENT_HIT = 1 };  /* a hit: online.c's EVENT version */
 
 typedef struct Puppet {
     int on;                  /* this slot is a puppet */
     Snapshot ring[RING];     /* by clock, oldest first */
     int count;
-    double offset;           /* remote clock - local clock, smoothed over arrivals */
+    double offset;           /* remote race time - local race time (s), smoothed over arrivals */
     int have_offset;
     uint32_t mirror[PAD_WORDS];  /* the remote virtual pad, as the deltas built it */
     int remote_crash;
@@ -103,11 +112,12 @@ extern void func_00155E78(void *crash, int kind);    /* start a crash */
 extern void func_0012E940(void *self, int kind, void *direction, void *other);  /* other hits self */
 
 static struct {
-    int init, from, rate, delay, camera, play_slot;  /* camera: the slot player 0's camera follows, 0 none */
+    int init, from, rate, camera, play_slot;  /* camera: the slot player 0's camera follows, 0 none */
+    double delay;            /* seconds */
     int allow;               /* the puppet code itself starts this crash / applies this hit */
-    FILE *record;
+    FILE *record, *trace;
     Snapshot *file;          /* DHD_PUPPET_PLAY, in clock order */
-    int file_count, file_next;
+    int file_count, file_next, file_fed;
     Puppet p[NRIDERS];
     /* online */
     int online, local, nslots, host;
@@ -126,11 +136,14 @@ static void setup(void)
     pp.init = 1;
     pp.from = (s = getenv("DHD_PUPPET_FROM")) ? atoi(s) : 0;
     pp.rate = (s = getenv("DHD_PUPPET_RATE")) && atoi(s) > 0 ? atoi(s) : 3;
-    pp.delay = (s = getenv("DHD_PUPPET_DELAY")) ? atoi(s) : 6;
+    pp.delay = ((s = getenv("DHD_PUPPET_DELAY")) ? atoi(s) : 100) / 1000.0;
     pp.camera = (s = getenv("DHD_PUPPET_CAMERA")) && *s == '1' ? (s = getenv("DHD_PUPPET_SLOT")) ? atoi(s) : 1 : 0;
     pp.play_slot = -1;
     if ((s = getenv("DHD_PUPPET_RECORD")) && *s && !(pp.record = fopen(s, "wb")))
         fprintf(stderr, "puppet: cannot write %s\n", s);
+    if ((s = getenv("DHD_PUPPET_TRACE")) && *s && !(pp.trace = fopen(s, "w")))
+        fprintf(stderr, "puppet: cannot write %s\n", s);
+    pp.file_fed = -1;
     if ((s = getenv("DHD_PUPPET_PLAY")) && *s) {
         FILE *f = fopen(s, "rb");
         Snapshot one;
@@ -145,8 +158,8 @@ static void setup(void)
         fclose(f);
         pp.play_slot = (s = getenv("DHD_PUPPET_SLOT")) ? atoi(s) : 1;
         if (pp.play_slot >= 1 && pp.play_slot < NRIDERS) pp.p[pp.play_slot].on = 1;
-        fprintf(stderr, "puppet: %d snapshots onto slot %d, one in %d, %d ticks behind\n", pp.file_count,
-                pp.play_slot, pp.rate, pp.delay);
+        fprintf(stderr, "puppet: %d snapshots onto slot %d, one in %d ticks, %.0f ms behind\n", pp.file_count,
+                pp.play_slot, pp.rate, pp.delay * 1000);
     }
 }
 
@@ -154,6 +167,7 @@ static void take(Snapshot *s, const uint8_t *r)
 {
     memset(s, 0, sizeof *s);
     s->clock = RACE_CLOCK;
+    s->time = RACE_TIME;
     s->state = (int32_t)(FIELD(r, STATE_AT, uint8_t *) - r);
     memcpy(s->pos, r + POS_AT, 16);
     memcpy(s->rot, r + ROT_AT, 48);
@@ -180,13 +194,13 @@ static void take(Snapshot *s, const uint8_t *r)
 static void feed(int slot, const Snapshot *s)
 {
     Puppet *p = &pp.p[slot];
-    if (p->count && s->clock < p->ring[p->count - 1].clock - 60)
+    if (p->count && s->time < p->ring[p->count - 1].time - 1)
         p->count = 0, p->have_offset = 0;  /* a new race */
-    if (p->count && s->clock <= p->ring[p->count - 1].clock) return;
+    if (p->count && s->time <= p->ring[p->count - 1].time) return;
     if (p->count == RING) memmove(p->ring, p->ring + 1, --p->count * sizeof *p->ring);
     p->ring[p->count++] = *s;
-    double sample = (double)s->clock - RACE_CLOCK;
-    if (!p->have_offset || sample > p->offset + 30 || sample < p->offset - 30)
+    double sample = s->time - RACE_TIME;
+    if (!p->have_offset || sample > p->offset + 0.5 || sample < p->offset - 0.5)
         p->offset = sample, p->have_offset = 1;  /* first, or the remote clock jumped */
     else
         p->offset += 0.05 * (sample - p->offset);
@@ -213,24 +227,26 @@ static void blend_rotation(float out[3][4], const float a[3][4], const float b[3
     }
 }
 
-/* What to show now: the remote rider pp.delay ticks behind its newest snapshot. */
+/* What to show now: the remote rider pp.delay behind its newest snapshot (out->time: that moment
+   on the remote race clock). */
 static int wanted(int slot, Snapshot *out)
 {
     Puppet *p = &pp.p[slot];
     if (!p->count) return 0;
-    double t = RACE_CLOCK + p->offset - pp.delay;
+    double t = RACE_TIME + p->offset - pp.delay;
     int i = p->count - 1;
-    while (i > 0 && p->ring[i].clock > t) i--;
+    while (i > 0 && p->ring[i].time > t) i--;
     const Snapshot *a = &p->ring[i], *b = i + 1 < p->count ? &p->ring[i + 1] : NULL;
     *out = *a;
-    if (b && t > a->clock) {
-        float f = (float)((t - a->clock) / (b->clock - a->clock));
+    out->time = t;
+    if (b && t > a->time) {
+        float f = (float)((t - a->time) / (b->time - a->time));
         lerp(out->pos, a->pos, b->pos, f, 3);
         lerp(out->vel, a->vel, b->vel, f, 3);
         lerp(out->spin, a->spin, b->spin, f, 3);
         blend_rotation(out->rot, a->rot, b->rot, f);
-    } else if (!b && t > a->clock) {  /* late: carry on along the velocity, up to 12 ticks */
-        float dt = (float)((t - a->clock > 12 ? 12 : t - a->clock) / 60);
+    } else if (!b && t > a->time) {  /* late: carry on along the velocity, up to 0.2 s */
+        float dt = (float)(t - a->time > 0.2 ? 0.2 : t - a->time);
         for (int k = 0; k < 3; k++) out->pos[k] += a->vel[k] * dt;
     }
     return 1;
@@ -314,6 +330,7 @@ int hle_puppet_physics(uint8_t *r)
     FIELD(r, ATTACK_AT, int32_t) = s.attack;
     FIELD(r, BOTTLES_AT, int32_t) = s.bottles;
     func_0012DDC0(r);
+    if (pp.trace) fprintf(pp.trace, "%.6f %.6f %d %.5f %.5f %.5f\n", RACE_TIME, s.time, slot, s.pos[0], s.pos[1], s.pos[2]);
     return 1;
 }
 
@@ -444,7 +461,7 @@ void hle_puppet_start_point(uint8_t *race, uint8_t *r)
 
 static uint8_t *put(uint8_t *o, const void *v, size_t n) { memcpy(o, v, n); return o + n; }
 
-/* One STATE payload for an owned slot: version, rider (global id), clock, body, wheels, contacts,
+/* One STATE payload for an owned slot: version, rider (global id), race time (ms), body, wheels, contacts,
    State, crash, checkpoints passed, attack kind, bottles, then the virtual pad words changed since the last one sent (the
    relay keeps order and loses nothing; last tick's actions don't travel). 0: not owned. */
 int hle_puppet_pack(int slot, uint8_t *out, int max)
@@ -455,9 +472,10 @@ int hle_puppet_pack(int slot, uint8_t *out, int max)
     take(&s, rider(slot));
     uint8_t *o = out, *count;
     uint16_t state = (uint16_t)s.state;
+    int32_t ms = (int32_t)floor(s.time * 1000 + 0.5);
     *o++ = WIRE_VERSION;
     *o++ = (uint8_t)to_global(slot);
-    o = put(o, &s.clock, 4);
+    o = put(o, &ms, 4);
     o = put(o, s.pos, 12);
     for (int k = 0; k < 3; k++) o = put(o, s.rot[k], 12);
     o = put(o, s.vel, 12);
@@ -492,9 +510,11 @@ void hle_puppet_receive(int sender, const uint8_t *in, int n)
     Puppet *p = &pp.p[slot];
     const uint8_t *i = in + 2, *end = in + n;
     uint16_t state;
+    int32_t ms;
     Snapshot s;
     memset(&s, 0, sizeof s);
-    i = get(i, &s.clock, 4);
+    i = get(i, &ms, 4);
+    s.time = ms / 1000.0;
     i = get(i, s.pos, 12);
     for (int k = 0; k < 3; k++) i = get(i, s.rot[k], 12);
     i = get(i, s.vel, 12);
@@ -524,7 +544,7 @@ int hle_puppet_hit(uint8_t *self, int kind, void *direction, uint8_t *other)
     int victim = slot_of(self), attacker = slot_of(other);
     if (pp.online && !puppet(other) && pp.nevents < MAX_EVENTS) {
         uint8_t *e = pp.events[pp.nevents], *o = e;
-        *o++ = WIRE_VERSION;
+        *o++ = EVENT_VERSION;
         *o++ = EVENT_HIT;
         *o++ = (uint8_t)owner_of(victim);  /* the PC that applies it */
         *o++ = (uint8_t)to_global(victim);
@@ -553,7 +573,7 @@ int hle_puppet_take_event(uint8_t *out, int max)
 /* A hit EVENT payload from the PC in lobby slot sender, on a rider this PC runs. */
 void hle_puppet_event(int sender, const uint8_t *in, int n)
 {
-    if (!pp.online || n < 18 || in[0] != WIRE_VERSION || in[1] != EVENT_HIT || in[2] != pp.local || !RACING) return;
+    if (!pp.online || n < 18 || in[0] != EVENT_VERSION || in[1] != EVENT_HIT || in[2] != pp.local || !RACING) return;
     int victim = to_local(in[3]), attacker = to_local(in[4]);
     float direction[4] __attribute__((aligned(16))) = {0, 0, 0, 0};
     if (victim < 0 || victim >= NRIDERS || attacker <= 0 || attacker >= NRIDERS || !owned(victim)) return;
@@ -567,15 +587,15 @@ void hle_puppet_event(int sender, const uint8_t *in, int n)
     pp.allow = 0;
 }
 
-/* How far behind each puppet shows its rider, in ticks at the same race clock: the delay plus
-   the trip, plus or minus how far apart the two GOs were (finding 044). As text, for the log. */
+/* How far behind each puppet shows its rider, in ms of race time: the delay plus the trip, plus
+   or minus how far apart the two GOs were (finding 044). As text, for the log. */
 int hle_puppet_lag(char *out, int size)
 {
     int n = 0;
     out[0] = 0;
     for (int i = 1; i < NRIDERS && n < size - 32; i++)
         if (pp.p[i].on && pp.p[i].have_offset)
-            n += snprintf(out + n, size - n, " %d:%.1f", to_global(i), pp.delay - pp.p[i].offset);
+            n += snprintf(out + n, size - n, " %d:%.0f", to_global(i), (pp.delay - pp.p[i].offset) * 1000);
     return n;
 }
 
@@ -584,7 +604,8 @@ int hle_puppet_global(int slot) { return to_global(slot); }
 int hle_puppet_local(int global) { return to_local(global); }
 int hle_puppet_owned(int slot) { return owned(slot); }
 
-/* After the race step: record this tick's snapshot, and the replayed ones arrive. */
+/* After the race step: record this step's snapshot, and the replayed ones arrive (the first of
+   each RATE-th tick; above 60 a tick has several steps). */
 void hle_puppet_field(void)
 {
     if (!pp.init) setup();
@@ -595,8 +616,9 @@ void hle_puppet_field(void)
         fwrite(&s, sizeof s, 1, pp.record);
         fflush(pp.record);
     }
-    while (pp.play_slot > 0 && pp.file_next < pp.file_count && pp.file[pp.file_next].clock <= RACE_CLOCK) {
+    if (pp.trace) fflush(pp.trace);
+    while (pp.play_slot > 0 && pp.file_next < pp.file_count && pp.file[pp.file_next].time <= RACE_TIME) {
         const Snapshot *s = &pp.file[pp.file_next++];
-        if (s->clock % pp.rate == 0) feed(pp.play_slot, s);
+        if (s->clock % pp.rate == 0 && s->clock != pp.file_fed) feed(pp.play_slot, s), pp.file_fed = s->clock;
     }
 }

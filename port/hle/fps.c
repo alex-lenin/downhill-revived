@@ -1,4 +1,4 @@
-/* Real offline steps; never synthesized pictures. See finding 067. */
+/* Real steps above 60, offline and online; never synthesized pictures. See findings 067, 114. */
 #include "hle.h"
 #include "../runtime/portable.h"
 #include "../include/fps.h"
@@ -17,8 +17,14 @@ static double phase, anim_phase;
 static double step_fields, previous_wall, wall_error;
 static int wall_mode;
 static unsigned clock_serial;
+/* Online, from the countdown to the finish (race screen, race phase 1-4). */
+static int online_race(void)
+{
+    int race_phase=*(int *)GUEST(0x0843F348);
+    return pads_online() && *(int *)GUEST(0x0829DED8)==9 && race_phase>=1 && race_phase<=4;
+}
 
-/* The selected rate limits pictures. Only paced offline updates track wall
+/* The selected rate limits pictures. Only paced updates (offline and online) track wall
    time; deterministic/unpaced diagnostics keep the original rational clock.
    Spread clock error over eight updates instead of feeding frame jitter to
    physics. Retaining the residual makes this a time-conserving filter. */
@@ -35,9 +41,11 @@ static double clock_interval(void)
             /* Retain late-frame debt even when this step hits the 1/60 cap.
                A later faster stretch repays it without an oversized step. */
             if (elapsed>=0 && isfinite(elapsed)) wall_error+=elapsed-nominal;
-            /* A stall (a hidden browser tab, a window drag) is not repaid in full: at most half
-               a second of game time is caught up, at up to one field per update. */
-            if (wall_error>30) wall_error=30;
+            /* A stall (a hidden browser tab, a window drag) is not repaid in full offline: at
+               most half a second of game time is caught up, at up to one field per update. An
+               online race repays all of it, as the 60 path's extra fields do (kernel.c pace):
+               the others see this rider where its own race clock is (finding 114). */
+            if (wall_error>30 && !online_race()) wall_error=30;
             result=nominal+wall_error/8;
             if (result<nominal) result=nominal;
             if (result>1) result=1;
@@ -101,9 +109,9 @@ int port_fps(void)
         }
         if (requested < 60) requested = 60;
         if (requested > port_fps_max()) requested = port_fps_max();
-        hle_log("fps: requested %d real offline steps/s (online: 60)\n", requested);
+        hle_log("fps: requested %d real steps/s\n", requested);
     }
-    return pads_online() ? 60 : requested;
+    return requested;
 }
 int port_fps_high(void) { return port_fps() > 60; }
 double port_frame_period(void) { int n = port_fps(); return n == 60 ? 1001.0 / 60000.0 : 1.0 / n; }
@@ -285,6 +293,15 @@ void port_fps_force_window(void *body,int clear)
     }
 }
 float port_counter_fields(int counter) { return port_fps_high() ? counter+(float)phase/port_fps() : (float)counter; }
+/* A whole-field counter the game advanced this update (the race clock), in seconds: a field is
+   1001/60000 s at 60 (the NTSC grid the frames keep) and 1/60 s above (wall-clock steps), plus
+   the part of a field the high-rate clock is past it. Online snapshots carry this (finding 114). */
+double port_field_seconds(int counter)
+{
+    return port_fps_high() ? (counter+phase/port_fps())/60.0 : counter*(1001.0/60000.0);
+}
+/* Game time still owed to wall time above 60 (a stall being caught up), in seconds. */
+double port_fps_behind(void) { return wall_mode && port_fps_high() && wall_error>0 ? wall_error/60.0 : 0; }
 
 /* prev comes from the preceding real animation/simulation step, including at
    crash entry (001B1C20). Its displacement already has the selected step's

@@ -44,7 +44,7 @@ static int racing(const NetLobby *l) { return l->state == NET_RACING; }
 /* --replay FILE (with --bot): a player of a state-sync race (port/hle/online.c, finding 047)
    without a game. It says it has loaded and what it rides, takes the race's GO from the first
    game's GO event, then sends the snapshots a game recorded (DHD_NET_RECORD) as its own rider when
-   the race clock reaches each one's, and its finish when they run out. */
+   the race time reaches each one's (ms, finding 114), and its finish when they run out. */
 enum { EVENT_VERSION = 2, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_GO = 5, EVENT_FINISH = 6, EVENT_RESULTS = 7 };
 
 static void put32(uint8_t *o, int32_t v) { memcpy(o, &v, 4); }
@@ -75,7 +75,7 @@ static int replay(const char *path, int slot, int rider, double seconds)
                     printf("GO from player %d\n", frame[1]);
                 } else if (frame[3] == EVENT_RESULTS) results = 1;
             }
-        double clock = go ? (net_server_ms() - go) / (1000 / 59.94) : -1;
+        double clock = go ? net_server_ms() - go : -1;  /* race time, ms */
         while (go && at + 2 <= size) {
             uint16_t len;
             int32_t when;
@@ -89,9 +89,9 @@ static int replay(const char *path, int slot, int rider, double seconds)
         }
         if (go && at + 2 > size && last_clock) {
             uint8_t f[7] = {EVENT_VERSION, EVENT_FINISH, (uint8_t)slot};
-            put32(f + 3, last_clock);
+            put32(f + 3, (int32_t)(last_clock * 0.06));  /* race ticks (1/60 s fields) */
             net_send_frame(NET_FRAME_EVENT, f, sizeof f);
-            printf("FINISH at race tick %d after %d snapshots\n", last_clock, sent);
+            printf("FINISH at race time %d ms after %d snapshots\n", last_clock, sent);
             last_clock = 0;
         }
         Sleep(5);

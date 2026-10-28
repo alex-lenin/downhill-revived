@@ -3,8 +3,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Offline simulation clock (port/hle/fps.c, finding 067). 60 retains the original NTSC
-   path and arithmetic; online always runs at 60. */
+/* Simulation clock (port/hle/fps.c, finding 067). 60 retains the original NTSC path and
+   arithmetic; online races run at the selected rate too (finding 114). */
 int port_fps(void);
 int port_fps_max(void);  /* 240, or DHD_FPS_MAX when lower */
 int port_fps_high(void);
@@ -22,6 +22,8 @@ float port_particle_sum(float factor);
 void port_particle_rotation(float *cosine,float *sine);
 int port_particle_dead(float age,float life_per_field);
 float port_counter_fields(int counter);
+double port_field_seconds(int counter);  /* a field counter as seconds, part of a field too */
+double port_fps_behind(void);            /* game time owed to wall time above 60, seconds */
 
 /* The game clock (00238A68/00238C00/00238D98) at high rates. */
 void port_clock_reset(void);

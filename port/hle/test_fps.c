@@ -105,13 +105,27 @@ int main(int argc,char **argv)
         }
         port_fps_wall_mode(0);
         assert(port_vblank_seconds()==1.0/n);
-        port_fps_wall_mode(1);
-        online=1;D_0029E3D0=1;
-        assert(port_fps()==60 && port_step()==1);
-        fake_wall+=10;port_fps_wall_mode(1); /* kernel's online VBLANK path */
+        /* A two-second stall: offline at most half a second is repaid, in an online race all of
+           it (finding 114). A lobby or start wait (kernel_pace_slip/shared) is no stall at all. */
+        for (int pass=0;pass<2;pass++) {
+            online=pass;
+            assert(port_fps()==n);
+            port_fps_wall_mode(1);port_clock_wait(NULL);port_clock_step();
+            double before=port_field_seconds(D_0029E3D8);
+            fake_wall+=2;
+            /* a step repays at most 1 - 60/n fields: 84 a second at 144, one at 61 */
+            int steps=(int)((2+130.0/(n-60))*n);
+            for (int i=0;i<steps;i++) { fake_wall+=1.0/n;port_clock_wait(NULL);port_clock_step(); }
+            double gained=port_field_seconds(D_0029E3D8)-before, want=(double)steps/n+(pass ? 2 : .5);
+            printf("%d: %s race, 2 s stall then %.1f s: %.4f s of game time (want %.4f)\n",n,pass ? "online" : "offline",
+                   (double)steps/n,gained,want);
+            fflush(stdout);
+            assert(fabs(gained-want)<1.0/60+.00001);
+        }
+        fake_wall+=10;port_fps_wall_mode(1); /* kernel's online wait (kernel_pace_slip) */
         online=0;port_clock_wait(NULL);port_clock_step();
         assert(fabs(port_step()-60.0/n)<.000001); /* no double-counted online time */
-        printf("%d: paced wall speed %.9f, bounded smoothed steps, timers/animation, online 60\n",n,simulated/(elapsed+1.0/n));
+        printf("%d: paced wall speed %.9f, bounded smoothed steps, timers/animation\n",n,simulated/(elapsed+1.0/n));
         return 0;
     }
     *(void **)(bike+0x158)=rider;bike[0x354]=bike[0x3D4]=1;
@@ -210,10 +224,9 @@ int main(int argc,char **argv)
     assert(fabsf(x-cosf(6))<.0001f && fabsf(y-sinf(6))<.0001f);
     int scale=port_animation_scale();
     online=1;
-    assert(port_fps()==60 && !port_fps_high());
+    assert(port_fps()==n && port_fps_high()); /* online keeps the selected rate (finding 114) */
     assert(port_animation_scale()==scale); /* joining online cannot reinterpret timestamps */
-    assert(port_animation_step()==1024);
-    printf("%d: 10 seconds, %d timer ticks, %.6f thrust velocity, particle displacement %.6f / %.6f; online 60\n",
-           n,ticks,velocity,particle_displacement,expected);
+    printf("%d: 10 seconds, %d timer ticks, %.6f thrust velocity, particle displacement %.6f / %.6f; online %d\n",
+           n,ticks,velocity,particle_displacement,expected,port_fps());
     return 0;
 }

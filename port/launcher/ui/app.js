@@ -17,7 +17,7 @@ const TABS = [
     { key: 'scale', label: 'Resolution', hint: 'How sharp the 3D picture is drawn. 1x is the PS2\'s own.', type: 'select' },
     { key: 'DHD_ASPECT', label: 'Aspect', hint: 'Wide fits your monitor\'s shape; 16:9 is always 16:9', type: 'seg' },
     { key: 'DHD_PRESENT_FILTER', label: 'Scaling', type: 'seg' },
-    { key: 'fps', label: 'Frame rate', hint: 'Offline races. Online races always run at 60.', type: 'select' },
+    { key: 'fps', label: 'Frame rate', hint: 'Game steps a second, offline and online.', type: 'select' },
     { key: 'vsync', label: 'V-Sync', hint: 'No tearing', type: 'switch' },
     { key: 'textures', label: 'Texture pack', hint: 'Uses the installed PCSX2 texture pack', type: 'switch',
       when: () => state.texturePack, offHint: 'No pack found. README.txt says where one goes.' },
