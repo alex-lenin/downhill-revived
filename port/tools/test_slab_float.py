@@ -1,9 +1,8 @@
 """Execute real segment/slab clipping with finite EE bounding sentinels."""
 from pathlib import Path
 import re
-import subprocess
 import sys
-from pctarget import HOST_TARGET
+import testprog
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -23,7 +22,6 @@ def main():
     source.write_text('''#include "ps2float.h"
 #include <assert.h>
 #include <stdio.h>
-#include <xmmintrin.h>
 static float ps2_fsub(float a,float b){return ps2_float_sub(a,b);}
 static float ps2_fmul(float a,float b){return ps2_float_mul(a,b);}
 static float ps2_fadd(float a,float b){return ps2_float_add(a,b);}
@@ -35,7 +33,6 @@ static int clip(float *start,float *end,float *lo,float *hi,float radius,float *
 }
 int main(void){
  float n,f,start[3]={-2,0,0},end[3]={2,0,0},lo[3]={-1,-1,-1},hi[3]={1,1,1};
- _mm_setcsr((_mm_getcsr()&~0x680u)&~63u);
  assert(clip(start,end,lo,hi,0,&n,&f)==1 && n==.25f && f==.75f);
  assert(clip(start,end,lo,hi,.5f,&n,&f)==1 && n==.125f && f==.875f);
  start[0]=end[0]=2;assert(!clip(start,end,lo,hi,.5f,&n,&f));
@@ -45,13 +42,10 @@ int main(void){
  end[0]=.5f;assert(clip(start,end,lo,hi,0,&n,&f)==1 && n==0 && f==1);
  start[0]=-3.4028234663852886e38f;end[0]=3.4028234663852886e38f;
  assert(clip(start,end,lo,hi,0,&n,&f)==1 && n==0 && f==0);
- puts("Real slab clipping: ordinary, stationary, expanded, signed sentinel and overflow cases pass with SSE traps");return 0;
+ puts("Real slab clipping: ordinary, stationary, expanded, signed sentinel and overflow cases pass");return 0;
 }
 ''')
-    exe=out/'fixture.exe'
-    subprocess.run(['clang','--target='+HOST_TARGET,'-O1','-w','-msse2','-mfpmath=sse','-fwrapv',
-                    '-ffp-contract=off','-I',str(ROOT/'port/runtime'),str(source),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
+    testprog.run(testprog.guest('slab-float', [source], out=out))
 
 
 if __name__=='__main__':main()

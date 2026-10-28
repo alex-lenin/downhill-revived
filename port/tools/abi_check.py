@@ -2,9 +2,9 @@
 
 The EE allocates integer and float arguments independently. Only permutations
 which preserve the order within each bank are repaired. Other ABI differences
-are reported, never guessed. clang resolves typedefs, asm aliases and casts.
-Run with LLVM on PATH; --check verifies the committed manifest is current.
-Every invocation fails on unsafe float/double returns, including callbacks.
+are reported, never guessed. clang resolves typedefs, asm aliases and casts, for wasm32 (the game
+core's target, with wasi-sdk's clang and sysroot). --check verifies the committed manifest is
+current. Every invocation fails on unsafe float/double returns, including callbacks.
 """
 import argparse
 from collections import Counter, defaultdict
@@ -15,16 +15,41 @@ import json
 from pathlib import Path
 import re
 import subprocess
-import sys
 
+import data
 import float_abi
 import scalar_abi
-import pctarget
-from recomp import split_type
+import transform
+from build_host64 import WASI
+from port_source import apply_patches
+from recomp import TARGET, split_type
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / 'build/port/abi'
 MANIFEST = ROOT / 'port/abi_calls.json'
+CLANG = [str(WASI / 'bin' / 'clang'), '--target=' + TARGET, '--sysroot=' + str(WASI / 'share' / 'wasi-sysroot')]
+
+
+def prepare(out, sites=None, fix=False, jobs=8):
+    """Every src/ unit after the port patches and transform.py, as the core transforms it, into
+    out/src: unfixed, or (fix) with the call permutations of sites (the candidate manifest)."""
+    from build_wasm import WASM_VA_LIST
+    image = data.ImageNames()
+    def one(path):
+        rel = path.relative_to(ROOT / 'src').as_posix()
+        text = path.read_text(encoding='utf-8', errors='replace')
+        if fix:
+            text = transform.fix_abi_calls(text, rel, sites)
+        text = apply_patches(rel, text)
+        if rel in WASM_VA_LIST:  # as build_wasm.py: wasm32's own va_list type
+            text = text.replace('typedef char *va_list;', 'typedef __builtin_va_list va_list;')
+        text = transform.transform(text, path.suffix != '.c', data.LABEL_PREFIX, image)
+        dst = out / 'src' / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text('#include "port.h"\n#line 1 "src/%s"\n%s' % (rel, text), encoding='utf-8', newline='\n')
+    paths = [p for p in sorted((ROOT / 'src').rglob('*')) if p.suffix in ('.c', '.cpp')]
+    with ThreadPoolExecutor(jobs) as pool:
+        list(pool.map(one, paths))
 
 
 def walk(node):
@@ -88,7 +113,7 @@ def inspect(path):
     rel = path.relative_to(OUT / 'src').as_posix()
     text = path.read_bytes()  # clang offsets are bytes, not Unicode characters
     cpp = path.suffix != '.c'
-    cmd = ['clang', '--target=' + pctarget.TARGET, '-w', '-fsyntax-only',
+    cmd = CLANG + ['-w', '-fsyntax-only',
            '-std=gnu++98' if cpp else '-std=gnu89', '-Wno-error=int-conversion',
            '-Wno-error=incompatible-pointer-types', '-Wno-error=implicit-function-declaration',
            '-Wno-error=incompatible-function-pointer-types', '-Wno-return-mismatch',
@@ -110,7 +135,7 @@ def inspect(path):
         # Explicit asm labels are final linker names. Otherwise retain the
         # retail func_X identity, shared by C and C++ units after link renaming.
         has_label = any(c.get('kind') == 'AsmLabelAttr' for c in n.get('inner', []))
-        symbol = label.removeprefix('_') if has_label else name
+        symbol = label if has_label else name
         if n.get('storageClass') == 'static': symbol = rel + ':' + (label or symbol)
         d = dict(symbol=symbol, signature=signature(spelling(n['type']), typedefs), file=rel)
         if kind != 'FunctionDecl' and n.get('storageClass') != 'static':
@@ -179,23 +204,27 @@ def source_site(call, cache):
 _REVIEWED_COLOR_CACHE = {}
 
 def reviewed_packed_color(candidates):
-    """One reviewed physical ABI equivalence, revalidated against current C++."""
+    """One reviewed physical ABI equivalence, revalidated against current C++: wasm32 passes a Color
+    by pointer (byval), so the core's definition takes its packed bits instead (build_wasm.py's
+    SCALAR_ABI), the single i32 the packed SI declarations pass."""
     if len(candidates)!=1:return False
     d=candidates[0]
     if d['symbol']!='func_00161868' or d['signature']['local_args']!=['Color','float *']:return False
     path=OUT/'src'/d['file'];source=path.read_bytes()
     key=(str(path),hashlib.sha256(source).hexdigest())
     if key not in _REVIEWED_COLOR_CACHE:
-        probe=source+b'\ntypedef char ReviewedColorWord[(sizeof(Color)==4 && __alignof__(Color)==4 && __is_pod(Color))?1:-1];\n'
-        cmd=['clang','--target='+pctarget.TARGET,'-w','-x','c++','-std=gnu++98',
+        from build_wasm import SCALAR_ABI
+        old,new=next(pair for pair in SCALAR_ABI if 'func_00161868' in pair[0])
+        text=source.decode('utf-8',errors='replace').replace('\r\n','\n')
+        probe=(text.replace(old,new)+'\ntypedef char ReviewedColorWord[(sizeof(Color)==4 && __alignof__(Color)==4 && __is_pod(Color))?1:-1];\n').encode()
+        cmd=CLANG+['-w','-x','c++','-std=gnu++98',
              '-S','-emit-llvm','-O0','-I',str(ROOT/'port/include'),'-I',str(ROOT/'include'),'-o','-','-']
         result=subprocess.run(cmd,input=probe,capture_output=True)
         line=next((line for line in result.stdout.decode(errors='replace').splitlines()
                    if line.startswith('define ') and 'func_00161868' in line),'')
-        # On native i386 this POD is a four-byte stack byval, matching an SI slot.
-        _REVIEWED_COLOR_CACHE[key]=(result.returncode==0 and 'i32' in line.split('@')[0]
-            and (('byval(' in line and 'align 4' in line) or line.split('(',1)[-1].startswith('i32 '))
-            and line.count(',')==1 and 'x86_' not in line)
+        # the rewritten definition: an i32 result from (i32 bits, pointer), no byval
+        _REVIEWED_COLOR_CACHE[key]=(text.count(old)==1 and result.returncode==0 and 'i32' in line.split('@')[0]
+            and line.split('(',1)[-1].startswith('i32 ') and line.count(',')==1 and 'byval(' not in line)
     return _REVIEWED_COLOR_CACHE[key]
 
 def classified_counts(warnings, reviewed):
@@ -261,7 +290,7 @@ def audit(units):
             continue
         if (reason=='parameter ABI mismatch' and src==['int','int'] and
                 c['symbol']=='func_00161868' and reviewed_packed_color(candidates)):
-            record['reviewed_reason']='Color is a verified four-byte POD passed in one i386 stack slot; the packed SI declaration has the same ABI.'
+            record['reviewed_reason']='Color is a verified four-byte POD; the core passes it as its packed bits (build_wasm.py SCALAR_ABI), the ABI of the packed SI declaration.'
             reviewed.append(record)
             continue
         order = permutation(src, dst) if reason in ('parameter ABI mismatch', 'return ABI mismatch') else None
@@ -289,7 +318,7 @@ def main():
     ap.add_argument('--check', action='store_true')
     ap.add_argument('-j', type=int, default=8)
     args = ap.parse_args()
-    subprocess.run([sys.executable, str(ROOT / 'port/tools/build.py'), '--abi-audit'], check=True, cwd=ROOT)
+    prepare(OUT, jobs=args.j)
     paths = [OUT / 'src' / p.relative_to(ROOT / 'src') for p in sorted((ROOT / 'src').rglob('*'))
              if p.suffix in ('.c', '.cpp')]
     with ThreadPoolExecutor(args.j) as pool:
@@ -298,9 +327,8 @@ def main():
     # Do not publish a manifest which has passed only the unfixed-source audit.
     candidate=OUT/'candidate.json'
     candidate.write_text(json.dumps(manifest,indent=2)+'\n')
-    subprocess.run([sys.executable,str(ROOT/'port/tools/build.py'),'--scalar-audit',
-                    '--abi-manifest',str(candidate),'-j',str(args.j)],check=True,cwd=ROOT)
     native_out=ROOT/'build/port/abi-native'
+    prepare(native_out,manifest['sites'],fix=True,jobs=args.j)
     native_paths=[native_out/'src'/p.relative_to(OUT/'src') for p in paths]
     original_out=OUT
     globals()['OUT']=native_out

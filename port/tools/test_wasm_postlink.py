@@ -1,18 +1,20 @@
 """wasm_postlink.py on a synthetic module: each kind of mismatched indirect call found in
 dhd_core.wasm (build/audit/w7f-indirect.md) traps without the step and works with it, with the
-values the i686 build produces.
+values of the port's call contract (wasm_postlink.py's adapter semantics: arguments by 4-byte
+slot, missing slots 0, the documented results).
 
-The same C runs three ways: native i686 (the reference), wasm32 -> wasm2c -> x64 unfixed (must
-trap on every mismatched case) and fixed by wasm_postlink.py (must match i686 on every word i686
-defines, and the documented choice on the others). All products stay under build/.
+The same C runs twice through wasm32 -> wasm2c -> x64: unfixed (must trap on every mismatched
+case) and fixed by wasm_postlink.py (must give every expected word). All products stay under
+build/.
 """
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from build_host64 import ROOT, WABT, WASI, LLVM, MSVC, SDK, VERSION as VER
+from build_host64 import ROOT, WABT, WASI
 from prepare_wasm2c import specialize_dispatch
+import testprog
 import wasm_postlink
 DEVCACHES = Path(os.environ.get('DHD_DEVCACHES') or Path.home() / 'DevCaches')  # downloaded tools and caches
 
@@ -44,13 +46,9 @@ NOINLINE u32 tx(u32 a, u32 b) { rec[0] = a; rec[1] = b; return a + b; }
 /* small, with locals and a loop: the step clones it rather than calling it */
 NOINLINE u32 lp(u32 n, u32 k) { u32 s = 0; for (u32 i = 0; i < n; i++) s = s * 31 + (i ^ k); rec[0] = n; rec[1] = k; return s; }
 /* build_wasm.py's ABI thunk for a caller that declares tx as void(void): the wasm table holds
-   it, the i686 build holds tx itself. */
+   it; the step must call tx itself with the caller's arguments. */
 NOINLINE void tx__as__v(void) { tx(0, 0); }
-#ifdef __wasm__
 #define TX tx__as__v
-#else
-#define TX tx
-#endif
 
 typedef void (*fn)(void);
 fn volatile table[] = {0, (fn)v1, (fn)r8, (fn)v1b, (fn)vf, (fn)vl, (fn)rd, (fn)rl, (fn)TX, (fn)vv, (fn)lp};
@@ -67,14 +65,10 @@ typedef float (*i_f)(u32);
 typedef u32 (*ii_i)(u32, u32);
 typedef u32 (*iiii_i)(u32, u32, u32, u32);
 
-#ifdef __wasm__
 __attribute__((export_name("rec_get")))
-#endif
 u32 rec_get(u32 i) { return rec[i]; }
 
-#ifdef __wasm__
 __attribute__((export_name("run_case")))
-#endif
 u32 run_case(u32 k) {
     clear();
     switch (k) {
@@ -101,34 +95,20 @@ u32 run_case(u32 k) {
 DRIVER = r'''
 #include <stdio.h>
 #include <windows.h>
-typedef unsigned int u32;
-#ifdef NATIVE
-u32 run_case(u32), rec_get(u32);
-#define RUN(k) run_case(k)
-#define REC(i) rec_get(i)
-#else
 #include "probe.h"
 #include "wasm-rt-impl.h"
+typedef unsigned int u32;
 static w2c_probe p;
-#define RUN(k) w2c_probe_run_case(&p, k)
-#define REC(i) w2c_probe_rec_get(&p, i)
-#endif
 int main(void) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-#ifndef NATIVE
     wasm_rt_init();
     wasm2c_probe_instantiate(&p);
-#endif
     for (u32 k = 0; k < 15; k++) {
-#ifdef NATIVE
-        if (k == 12) { printf("%u TRAP\n", k); continue; }  /* a null call faults natively */
-#else
         wasm_rt_trap_t t = WASM_RT_SETJMP(g_wasm_rt_jmp_buf);
         if (t) { printf("%u TRAP %d\n", k, (int)t); continue; }
-#endif
-        u32 r = RUN(k);
+        u32 r = w2c_probe_run_case(&p, k);
         printf("%u %08x", k, r);
-        for (u32 i = 0; i < 8; i++) printf(" %08x", REC(i));
+        for (u32 i = 0; i < 8; i++) printf(" %08x", w2c_probe_rec_get(&p, i));
         printf("\n");
     }
     return 0;
@@ -136,24 +116,24 @@ int main(void) {
 '''
 
 E = 0xEEEEEEEE  # untouched record word
-# Per case: words compared with i686 (indices into [result, rec0..rec7]), and the documented
-# value of every word i686 leaves undefined (missing slots, eax that is not a constant).
-CASES = {
-    0: ([0, 1, 2, 3, 4, 5, 6, 7, 8], {}),
-    1: ([1, 2], {0: 0}),
-    2: ([0, 1], {2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0}),
-    3: ([1], {0: 0}),
-    4: ([0, 1, 2, 3, 4, 5, 6], {7: 0, 8: 0}),
-    5: ([0, 1, 2, 3], {}),
-    6: ([0, 1, 2, 3, 4], {}),
-    7: ([0, 1, 2], {}),
-    8: ([0, 1, 2], {}),
-    9: ([0, 1, 2, 3], {}),
-    10: ([0, 1, 2], {}),
-    11: ([], {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0}),
-    13: ([1, 2], {0: 0}),
-    14: ([0, 1, 2, 3], {}),
+# Per case: the result, then rec[0..7], from the C above and wasm_postlink.py's adapter rules.
+EXPECTED = {
+    0: [11, 1, 2, 3, 4, 5, 6, 7, 8],                    # control: r8(1..8) returns 1*3+8
+    1: [0, 11, E, E, E, E, E, E, E],                    # extra slots dropped; int from void: 0
+    2: [0, 21, 0, 0, 0, 0, 0, 0, 0],                    # missing slots read 0
+    3: [0, 32, E, E, E, E, E, E, E],                    # int caller of a void callee: 0
+    4: [0, 41, 42, 43, 44, 45, 46, 0, 0],               # six slots given, two missing
+    5: [0, 51, 0x3FC00000, E, E, E, E, E, E],           # the int slot's bits are the float
+    6: [0, 61, 0x89ABCDEF, 0x01234567, E, E, E, E, E],  # two slots, low then high, are the i64
+    7: [0x428E3333, 71, E, E, E, E, E, E, E],           # double 71.1 demoted: (float)71.1
+    8: [0xFFC00000, 82, E, E, E, E, E, E, E],           # float from a void callee: the indefinite
+    9: [183, 91, 92, E, E, E, E, E, E],                 # thunk unwrapped: tx(91, 92) itself
+    10: [0x556677ED, 101, E, E, E, E, E, E, E],         # i32 from i64: the low half
+    11: [0, 0, 0, 0, 0, 0, 0, 0, 0],                    # no slots at all: r8(0, ..., 0)
+    13: [0, 0x77, E, E, E, E, E, E, E],                 # void(void) target, slots dropped
+    14: [0xFF8B7089, 9, 141, E, E, E, E, E, E],         # cloned lp(9, 141): its loop's sum
 }
+CASES = EXPECTED  # every case but 12, a null entry, which must trap
 MISMATCHED = set(CASES) - {0}
 
 
@@ -173,38 +153,22 @@ def parse(text):
     return out
 
 
-def native(arch, sources, exe, defines=(), extra=()):
-    inc = ['/imsvc' + str(MSVC / 'include')] + ['/imsvc' + str(SDK / 'Include' / VER / x) for x in ('ucrt', 'um', 'shared')]
-    target = 'i686' if arch == 'x86' else 'x86_64'
-    flags = ['--target=%s-pc-windows-msvc' % target, '/O2', '/clang:-ffp-model=strict', '/clang:-ffp-contract=off',
-             '/clang:-Wno-everything', *inc, *['-D' + d for d in defines], *extra]
-    objs = []
-    for s in sources:
-        obj = exe.parent / ('%s-%s.obj' % (exe.stem, s.stem))
-        run([LLVM / 'clang-cl.exe', *flags, '/c', s, '/Fo' + str(obj)])
-        objs.append(obj)
-    run([LLVM / 'clang-cl.exe', '--target=%s-pc-windows-msvc' % target, *objs, '/Fe' + str(exe), '/link',
-         '/libpath:' + str(MSVC / 'lib' / arch), '/libpath:' + str(SDK / 'Lib' / VER / 'ucrt' / arch),
-         '/libpath:' + str(SDK / 'Lib' / VER / 'um' / arch)])
-    return parse(run([exe]))
-
-
-def through_wasm2c(wasm, name):
+def through_wasm2c(wasm, name, driver=None):
+    """wasm -> wasm2c (the pipeline's guarded dispatch on every table) -> an x64 program; runs it."""
     d = OUT / name
     d.mkdir(exist_ok=True)
     run([WABT / 'bin/wasm2c.exe', wasm, '-n', 'probe', '-o', d / 'probe.c'])
     c = (d / 'probe.c').read_text()
-    (d / 'probe.c').write_text(specialize_dispatch(c))  # the pipeline's guarded dispatch, on every table
-    (d / 'driver.c').write_text(DRIVER)
-    return native('x64', [d / 'driver.c', d / 'probe.c', RT / 'wasm-rt-impl.c', RT / 'wasm-rt-mem-impl.c'], d / 'probe.exe',
-                  extra=['-I' + str(WABT / 'include'), '-I' + str(RT), '-I' + str(d)])
+    (d / 'probe.c').write_text(specialize_dispatch(c))
+    (d / 'driver.c').write_text(driver or DRIVER)
+    exe = testprog.host('probe', [d / 'driver.c', d / 'probe.c', RT / 'wasm-rt-impl.c', RT / 'wasm-rt-mem-impl.c'],
+                        out=d, includes=[WABT / 'include', RT, d])
+    return parse(run([exe]))
 
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / 'probe_src.c').write_text(SOURCE)
-    (OUT / 'driver.c').write_text(DRIVER)
-    ref = native('x86', [OUT / 'probe_src.c', OUT / 'driver.c'], OUT / 'i686.exe', defines=['NATIVE'])
     run([WASI / 'bin/clang.exe', '--target=wasm32', '-O2', '-nostdlib', '-Wno-everything', '-Wl,--no-entry',
          OUT / 'probe_src.c', '-o', OUT / 'probe.wasm'])
     report = wasm_postlink.postlink(OUT / 'probe.wasm', OUT / 'fixed.wasm')
@@ -219,45 +183,40 @@ def main():
             continue
         if k in MISMATCHED and unfixed[k] != 'TRAP':
             fails.append('case %d: no trap without the step: %s' % (k, unfixed[k]))
-        if k == 0 and unfixed[k] != ref[k]:
+        if k == 0 and unfixed[k] != EXPECTED[k]:
             fails.append('case 0 (control) differs without the step')
-        got = fixed[k]
-        if got == 'TRAP':
+        if fixed[k] == 'TRAP':
             fails.append('case %d traps with the step' % k)
             continue
-        same, chosen = CASES[k]
-        for i in same:
-            if got[i] != ref[k][i]:
-                fails.append('case %d word %d: %08x, i686 %08x' % (k, i, got[i], ref[k][i]))
-        for i, v in chosen.items():
-            if got[i] != v:
-                fails.append('case %d word %d: %08x, documented choice %08x' % (k, i, got[i], v))
+        for i, (got, want) in enumerate(zip(fixed[k], EXPECTED[k])):
+            if got != want:
+                fails.append('case %d word %d: %08x, expected %08x' % (k, i, got, want))
     # for comparison only: binaryen's FuncCastEmulation on the same module (not a pass condition)
     run([BINARYEN / 'bin/wasm-opt.exe', '--all-features', '--fpcast-emu', OUT / 'probe.wasm', '-o', OUT / 'fpcast.wasm'])
     fpcast = through_wasm2c(OUT / 'fpcast.wasm', 'fpcast')
-    lines = ['case | i686 | unfixed | fixed | fpcast-emu (words that differ from i686)']
+    lines = ['case | expected | unfixed | fixed | fpcast-emu (words that differ from expected)']
     fp_diffs = 0
     for k in sorted(fixed):
         show = lambda r: r if r == 'TRAP' else ' '.join('%08x' % x for x in r)
+        want = EXPECTED.get(k, 'TRAP')
         bad = [] if k == 12 else ['trap'] if fpcast[k] == 'TRAP' else [
-            str(i) for i in CASES[k][0] if fpcast[k][i] != ref[k][i]]
+            str(i) for i, (a, b) in enumerate(zip(fpcast[k], want)) if a != b]
         fp_diffs += bool(bad)
-        lines.append('%d | %s | %s | %s | %s (%s)' % (k, show(ref[k]), show(unfixed[k]), show(fixed[k]),
+        lines.append('%d | %s | %s | %s | %s (%s)' % (k, show(want), show(unfixed[k]), show(fixed[k]),
                                                      show(fpcast[k]), ','.join(bad) or 'same'))
     (OUT / 'results.txt').write_text('\n'.join(lines) + '\n')
     print('\n'.join(lines))
     print('postlink: %d sites, %d shadow tables, %d adapters (%d cloned targets), %d thunk entries unwrapped' % (
         report['sites'], report['shadow_tables'], report['adapters'], report['cloned_targets'],
         report['thunk_entries_unwrapped']))
-    print('fpcast-emu: %d of %d cases differ from i686 on a word i686 defines' % (fp_diffs, len(CASES)))
+    print('fpcast-emu: %d of %d cases differ from the expected words' % (fp_diffs, len(CASES)))
     if report['cloned_targets'] < 2:
         fails.append('expected the void(void) and loop targets to be cloned')
     if fails:
         print('FAIL\n' + '\n'.join(fails))
         return 1
-    print('PASS wasm_postlink: %d mismatched cases trap without the step and match i686 with it '
-          '(%d words compared with i686, %d documented choices), control and null unchanged' % (
-              len(MISMATCHED), sum(len(CASES[k][0]) for k in CASES), sum(len(CASES[k][1]) for k in CASES)))
+    print('PASS wasm_postlink: %d mismatched cases trap without the step and give the contract words '
+          '(%d) with it, control and null unchanged' % (len(MISMATCHED), 9 * len(CASES)))
     return 0
 
 

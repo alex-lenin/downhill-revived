@@ -19,21 +19,12 @@ static int snd_gain_peak[3], snd_gain_frames, snd_gain_voices, snd_gain_streams;
 static int snd_gain_voice_max, snd_gain_lfo_min, snd_gain_lfo_max;
 static int snd_gain_duck_min = 65536, snd_gain_duck_max;
 
-#ifdef _WIN32
-/* Also available in the standalone SND_NO_HOST tests, without windows.h. */
-__declspec(dllimport) int __stdcall MoveFileExA(const char *, const char *, unsigned long);
-#endif
-
-static int snd_report_publish(FILE *file, const char *temporary, const char *path)
+/* A report is rewritten in place: the module's files have no rename (wasi_adapter.c), so a
+   reader can see one half written. */
+static int snd_report_close(FILE *file)
 {
     int ok = !ferror(file);
-    if (fclose(file)) ok = 0;
-    if (!ok) { remove(temporary); return 0; }
-#ifdef _WIN32
-    return MoveFileExA(temporary, path, 1); /* replace the previous complete report */
-#else
-    return rename(temporary, path) == 0;
-#endif
+    return !fclose(file) && ok;
 }
 
 static void snd_debug_lfo(int volume)
@@ -168,11 +159,8 @@ static void snd_debug_report(void)
 {
     FILE *f;
     unsigned i;
-    char temporary[1024];
     if (!snd_report_dirty || !snd_report_path || !*snd_report_path) return;
-    if (strlen(snd_report_path) + 5 >= sizeof temporary) return;
-    snprintf(temporary, sizeof temporary, "%s.tmp", snd_report_path);
-    f = fopen(temporary, "w");
+    f = fopen(snd_report_path, "w");
     if (!f) return;
     fprintf(f, "# game_samples=%llu; mix_clipped_left=%llu; mix_clipped_right=%llu; wet_samples_core0=%llu; wet_samples_core1=%llu; unimplemented=missing dispatcher; unsupported=missing sub-operation\n",
             (unsigned long long)rendered_samples, (unsigned long long)snd_mix_clipped[0],
@@ -185,19 +173,18 @@ static void snd_debug_report(void)
                     (unsigned long long)snd_commands[i].calls,
                     (unsigned long long)snd_commands[i].unimplemented,
                     (unsigned long long)snd_commands[i].unsupported);
-    if (snd_report_publish(f, temporary, snd_report_path)) snd_report_dirty = 0;
+    if (snd_report_close(f)) snd_report_dirty = 0;
     {
         char path[1024];
         if (strlen(snd_report_path) + 16 >= sizeof path) return;
         snprintf(path, sizeof path, "%s.grains.csv", snd_report_path);
-        snprintf(temporary, sizeof temporary, "%s.tmp", path);
-        f = fopen(temporary, "w");
+        f = fopen(path, "w");
         if (!f) return;
         fprintf(f, "grain,calls,unsupported\n");
         for (i = 0; i < 46; i++) if (snd_grain_calls[i])
             fprintf(f, "%u,%llu,%llu\n", i, (unsigned long long)snd_grain_calls[i],
                     (unsigned long long)snd_grain_unsupported[i]);
-        snd_report_publish(f, temporary, path);
+        snd_report_close(f);
     }
 }
 

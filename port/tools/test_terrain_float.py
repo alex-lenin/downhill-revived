@@ -1,9 +1,8 @@
 """Execute the real terrain-index interpolator with EE finite arithmetic."""
 from pathlib import Path
 import re
-import subprocess
 import sys
-from pctarget import HOST_TARGET
+import testprog
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -26,7 +25,6 @@ def main():
     source.write_text('''#include "ps2float.h"
 #include <assert.h>
 #include <stdio.h>
-#include <xmmintrin.h>
 static float ps2_fsub(float a,float b){return ps2_float_sub(a,b);}
 static float ps2_fmul(float a,float b){return ps2_float_mul(a,b);}
 static float ps2_fdiv(float a,float b){return ps2_float_div(a,b);}
@@ -43,19 +41,15 @@ static void check(float z,float ground,float other,int a,int b,float weight,int 
  func_00111F98(&obj,&result);assert(result==expected);
 }
 int main(void){
- _mm_setcsr((_mm_getcsr()&~0x680u)&~63u);
  check(10,5,0,4,8,0,6); check(10,10,10,5,5,0,5);
  check(10,10,10,5,6,0,(int32_t)(5u+0x7FFFFFFFu));
  check(10,10,10,8,4,0,(int32_t)(8u+0x80000000u));
  check(10,5,0,7,9,3.4028234663852886e38f,0);
  check(3.4028234663852886e38f,-3.4028234663852886e38f,-3.4028234663852886e38f,4,8,0,5);
- puts("Real terrain interpolation: flat, ordinary, signed zero and saturation cases pass with SSE traps");return 0;
+ puts("Real terrain interpolation: flat, ordinary, signed zero and saturation cases pass");return 0;
 }
 ''')
-    exe = out/'fixture.exe'
-    subprocess.run(['clang','--target='+HOST_TARGET,'-O1','-w','-msse2','-mfpmath=sse','-fwrapv',
-                    '-ffp-contract=off','-I',str(ROOT/'port/runtime'),str(source),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
+    testprog.run(testprog.guest('terrain-float', [source], out=out))
 
 
 if __name__ == '__main__': main()

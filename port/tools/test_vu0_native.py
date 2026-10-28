@@ -1,14 +1,15 @@
 """Check guarded native VU0 against the original interpreter and pinned PCSX2.
 
-Requires local DHD_VU0_CAPTURE inputs and clang-cl/x86 libraries. Generated words,
+On the 64-bit host (testprog.host), as test_vu0_pcsx2.py. Requires local DHD_VU0_CAPTURE inputs
+and LLVM. Generated words,
 objects and captured input variants remain in ignored build/. No game data is
 downloaded. --negative corrupts the native result in a private copy; must fail.
 """
 from pathlib import Path
 import argparse
-import os
 import subprocess
 
+import testprog
 import test_vu0_pcsx2 as oracle
 from vu1_aot import generate
 
@@ -30,8 +31,6 @@ def main():
     if not captures:
         ap.error('local VU0 0000 captures are required')
     out.mkdir(parents=True, exist_ok=True)
-    flags = ['clang-cl', '-m32', '/nologo', '/O2', '-w', '-msse2', '-mno-fma', '-mfpmath=sse',
-             '/clang:-ffp-contract=off', '/I' + str(ROOT / 'port/runtime')]
     generate(out / 'vu1_aot.inc')
     source = ROOT / 'port/runtime/vu0_interp.c'
     if args.negative:
@@ -47,16 +46,17 @@ def main():
             'cpu->vi[1]^=1;cpu->vu0_ctrl[1]=mac;cpu->vu0_ctrl[10]=0x830;'))
         (out / 'negative.c').write_text(source.read_text())
         source = out / 'negative.c'
-    subprocess.run(flags + ['/DPS2_VU_AOT', '/DPS2_VU_AOT_EMBED', '/I' + str(out), '/c', str(source),
-                            '/Fo' + str(out / 'native.obj')], check=True)
-    subprocess.run(flags + ['/DPS2_VU_REFERENCE', '/Dps2_vu0_run=ps2_vu0_reference',
-                            '/Dps2_vu1_run=ps2_vu1_reference', '/Dps2_vu_aot_load=ps2_vu_aot_reference_load',
-                            '/c', str(ROOT / 'port/runtime/vu0_interp.c'), '/Fo' + str(out / 'reference.obj')], check=True)
-    subprocess.run(flags + [str(out / 'native.obj'), str(out / 'reference.obj'),
-                            str(ROOT / 'port/runtime/vu0_native_diff.c'), '/Fe' + str(out / 'diff.exe')], check=True)
+    # vu0_native.h comes from out/ in the negative build (the corrupted copy)
+    native = testprog.host_object(source, out, 'native', includes=[out],
+                                  defines=['PS2_VU_AOT', 'PS2_VU_AOT_EMBED'])
+    reference = testprog.host_object(ROOT / 'port/runtime/vu0_interp.c', out, 'reference', defines=[
+        'PS2_VU_REFERENCE', 'ps2_vu0_run=ps2_vu0_reference', 'ps2_vu1_run=ps2_vu1_reference',
+        'ps2_vu_aot_load=ps2_vu_aot_reference_load'])
+    diff = testprog.host('diff', [native, reference, ROOT / 'port/runtime/vu0_native_diff.c', testprog.HOST_FP],
+                         out=out, low=True)
     for entry in entries:
         capture = next(p for p in captures if p.stem.split('-')[1] == entry)
-        run = subprocess.run([str(out / 'diff.exe'), str(capture)], check=not args.negative)
+        run = subprocess.run([str(diff), str(capture)], check=not args.negative)
         if args.negative and run.returncode != 1:
             raise AssertionError(f'negative control did not fail comparison for {entry}: {run.returncode}')
     if args.negative:
@@ -71,13 +71,13 @@ def main():
         'ps2_vu0_native_mode = 1; int result = ps2_vu0_run(&native, address);\n'
         '    if (ps2_vu0_native_runs != 1) return 3;')
     (out / 'oracle.cpp').write_text(adapter)
-    subprocess.run(flags + ['/std:c++20', '/I' + str(oracle.OUT), str(out / 'oracle.cpp'), str(out / 'native.obj'),
-                            '/Fe' + str(out / 'oracle.exe')], check=True)
+    exe = testprog.host('oracle', [out / 'oracle.cpp', native, testprog.HOST_FP], out=out,
+                        includes=[oracle.OUT, ROOT / 'port/runtime'], low=True)
     count = 0
     for capture in captures:
         for seed in range(33):
             path = capture if not seed else oracle.seeded(capture, seed)
-            run = subprocess.run([str(out / 'oracle.exe'), str(path)], capture_output=True, text=True, check=True)
+            run = subprocess.run([str(exe), str(path)], capture_output=True, text=True, check=True)
             if '0 differences' not in run.stdout:
                 raise AssertionError(run.stdout)
             count += 1

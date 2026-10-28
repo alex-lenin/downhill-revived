@@ -36,6 +36,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_pcsx2 as compare
+import owned_process
 import pcsx2_retail as retail
 
 # Navigation: the standard script, with a Cross every 20 s up to 10 minutes so
@@ -145,7 +146,7 @@ def launch_retail(args, directory, race_events, moments):
     command = [str(runtime / emulator.name), '-datapath', str(data), '-batch', '-nogui', '-fastboot',
                '-unlimited', '-logfile', str(directory / 'pcsx2.log'), '--', str(Path(iso).resolve())]
     log = (directory / 'retail-stdout.log').open('wb')
-    return subprocess.Popen(command, cwd=runtime, env=env, stdout=log, stderr=subprocess.STDOUT), bios
+    return owned_process.start(command, cwd=runtime, env=env, stdout=log, stderr=subprocess.STDOUT), bios
 
 
 def launch_port(args, directory, race_events, moments):
@@ -173,9 +174,10 @@ def launch_port(args, directory, race_events, moments):
     env.update(getattr(args, 'port_env', {}))
     log = (directory / 'port.log').open('wb')
     # Above normal: a game or build sharing the machine otherwise starves the port's EE thread, and a
-    # run that should take 25 minutes takes hours (port/hle/host.c passes the class to its child).
-    process = subprocess.Popen([str(executable)], cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT,
-                               creationflags=getattr(subprocess, 'ABOVE_NORMAL_PRIORITY_CLASS', 0))
+    # run that should take 25 minutes takes hours. The caller stops it (owned_process: with whatever
+    # it started).
+    process = owned_process.start([str(executable)], cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                  creationflags=getattr(subprocess, 'ABOVE_NORMAL_PRIORITY_CLASS', 0))
     return process, digest
 
 
@@ -229,7 +231,7 @@ def main():
         try:
             while pcsx2.poll() is None or port.poll() is None:
                 if len(list((directory / 'port').glob('*.bmp'))) >= expected:
-                    compare.stop(port)
+                    port.stop()
                 stall = port_stall(directory / 'port.log')
                 if stall:
                     raise RuntimeError(stall)
@@ -237,8 +239,8 @@ def main():
                     raise RuntimeError('deadline exceeded; see pcsx2.log, retail-stdout.log, port.log')
                 time.sleep(1)
         finally:
-            compare.stop(pcsx2)
-            compare.stop(port)
+            pcsx2.stop()
+            port.stop()
         (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
     pair(args, directory, manifest)

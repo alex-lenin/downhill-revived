@@ -1,7 +1,7 @@
 """Execute real generated formatted wrappers with mixed native vararg widths."""
 from pathlib import Path
 from unittest.mock import patch
-import subprocess
+import testprog
 import recomp
 
 
@@ -43,9 +43,8 @@ int main(void) {
  return 0;
 }
 '''
-    path=out/'test.c';path.write_text(source);exe=out/'test.exe'
-    subprocess.run(['clang','--target=i686-pc-windows-msvc','-fuse-ld=lld','-O2','-I'+str(root/'port/runtime'),str(path),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
+    path=out/'test.c';path.write_text(source)
+    testprog.run(testprog.guest('format-abi',[path],out=out))
 
 
 if __name__=='__main__':main()

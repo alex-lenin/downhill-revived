@@ -1,15 +1,16 @@
 /* Tests for the inline asm runtime: every template the game uses must parse (generated list from
-   port/tools/test_runtime.py), and the common shapes must compute what the PS2 computes. */
+   port/tools/test_runtime.py), and the common shapes must compute what the PS2 computes. A guest
+   program (wasm32 -> wasm2c), as the game core runs the runtime; the hardware registers at
+   0x10000000 are guest memory. */
 #include "ps2asm.h"
 #include "ps2float.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <xmmintrin.h>
+
+#include "../host/host_api.h"  /* the host's float control word and files */
 
 typedef struct {
     void *p;
@@ -50,14 +51,12 @@ static void expect_bits(const char *what, float got, uint32_t want)
 
 static void exceptional_macro(void)
 {
-    /* Execute the real EE/VU macro interpreter with host FP faults unmasked. */
-    unsigned control = _mm_getcsr();
+    /* The real EE/VU macro interpreter on exceptional operands. */
     ps2_cpu saved = ps2;
     memset(&ps2, 0, sizeof ps2);
     ps2.vf[1].w[0] = 0x7f7fffff; ps2.vf[2].f[0] = 2;
     ps2.vf[1].w[1] = 0x7fc00000; ps2.vf[2].f[1] = 0;
     ps2.vf[1].w[2] = 0x80800000; ps2.vf[2].f[2] = 0.5f;
-    _mm_setcsr(control & ~(0x680u | 63u));
     ps2_asm("vmul.xyz $vf3,$vf1,$vf2", "", 0, NULL);
     expect_bits("VU mul overflow", ps2.vf[3].f[0], 0x7f7fffff);
     expect_bits("VU raw exp255 times zero", ps2.vf[3].f[1], 0);
@@ -122,7 +121,6 @@ static void exceptional_macro(void)
         expect_bits("VU MAX 7fffffff", ps2.vf[3].f[2], 0x7fffffff);
         expect_bits("VU MINI ffffffff", ps2.vf[4].f[3], 0xffffffff);
     }
-    _mm_setcsr(control);
     ps2 = saved;
 }
 
@@ -145,13 +143,15 @@ static int load_vu0_microcode(void)
 {
     static unsigned char data[0x10000];
     const char *path = getenv("DHD_VUTEXT");
-    FILE *f = path ? fopen(path, "rb") : NULL;
+    HostFile f = path ? host_file_open(path, HOST_FILE_READ) : HOST_FILE_NONE;  /* as the module reads files */
+    int64_t read;
     size_t n, p;
     unsigned qwc;
-    if (!f)
+    if (f == HOST_FILE_NONE)
         return 0;
-    n = fread(data, 1, sizeof data, f);
-    fclose(f);
+    read = host_file_read(f, data, sizeof data);
+    host_file_close(f);
+    n = read > 0 ? (size_t)read : 0;
     p = 0x26CF80 - 0x263BC0;
     if (p + 16 > n)
         return 0;
@@ -262,13 +262,15 @@ int main(void)
         expect("INTC_STAT loads reaching the kernel", intc_reads, 1);
     }
     {
-        unsigned original = _mm_getcsr(), diagnostic = (original & ~0x6BFu);
+        /* VU0 programs run in the VU's own float mode and give the caller its control word back:
+           here the EE's (toward zero, FTZ/DAZ, port/host64/fp_mode.c), as the game calls them. */
+        unsigned original = host_fp_csr(), ee = 0xFFC0u;
         ps2_vu0_register_micro(0xFF8, exceptional_micro);
-        _mm_setcsr(diagnostic);
+        host_fp_set_csr(ee);
         ps2_asm("vcallms 0xff8", "", 0, NULL);
-        unsigned restored = _mm_getcsr();
-        _mm_setcsr(original);
-        if (restored != diagnostic || ps2.vf[3].w[0] != 0x7F800000u) return 1;
+        unsigned restored = host_fp_csr() & ~0x3Fu;  /* the control bits: wasm has no status flags */
+        host_fp_set_csr(original);
+        if (restored != ee || ps2.vf[3].w[0] != 0x7F800000u) return 1;
         /* A synthetic MUL overflow in the interpreted VU0 path. It rounds toward zero, so the
            overflow gives the largest float, as on the VU and in PCSX2 (VU0FPCR chop). */
         uint32_t code[4] = {0x8000033Cu,
@@ -277,10 +279,10 @@ int main(void)
         ps2_cpu cpu = {0}; ps2_q128 data[256] = {0};
         cpu.vu0_code = (uint8_t *)code; cpu.vu0_mem = data;
         for (unsigned lane=0; lane<4; lane++) cpu.vf[1].w[lane] = cpu.vf[2].w[lane] = 0x7F7FFFFFu;
-        _mm_setcsr(diagnostic);
-        int result = ps2_vu0_run(&cpu, 0); restored = _mm_getcsr();
-        _mm_setcsr(original);
-        if (result || restored != diagnostic || cpu.vf[3].w[0] != 0x7F7FFFFFu) return 1;
+        host_fp_set_csr(ee);
+        int result = ps2_vu0_run(&cpu, 0); restored = host_fp_csr() & ~0x3Fu;
+        host_fp_set_csr(original);
+        if (result || restored != ee || cpu.vf[3].w[0] != 0x7F7FFFFFu) return 1;
     }
     {
         uintptr_t fenced[] = {0x11008000, 0x1100FFFF, 0x10003C00, 0x10005000, 0x10003020, 0x12001000};
@@ -297,8 +299,6 @@ int main(void)
         expect("VPU idle after fence", ps2.gpr[2].w[0], 0);
         ps2_exec("ctc2 $0,$vi28");
         expect("FBRST fence", sync_calls, 8);
-        void *hw = VirtualAlloc((void *)0x10000000, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (hw != (void *)0x10000000) return 1;
         ps2_mmio_write = fifo_write;
         ps2.gpr[2].w[0] = 0x12345678; ps2.gpr[2].w[1] = 0x89abcdef;
         ps2.gpr[2].w[2] = 0x99887766; ps2.gpr[2].w[3] = 0x55443322;
@@ -309,7 +309,6 @@ int main(void)
         ps2_exec("sqc2 $vf1,0($4)");
         expect("VF quadword FIFO notification", fifo_calls, 2);
         ps2_mmio_write = NULL;
-        VirtualFree(hw, 0, MEM_RELEASE);
         ps2_graphics_sync = NULL;
     }
     for (i = 0; i < sizeof sites / sizeof *sites; i++)

@@ -1,6 +1,6 @@
 """EE float semantics for natively compiled game units (finding 026). Rewrites a unit's LLVM IR,
 before optimisation, so that float add, subtract and divide and all double arithmetic call the
-helpers of port/runtime/ee_native_float.h, which build.py includes in every unit."""
+helpers of port/runtime/ee_native_float.h, which build_wasm.py includes in every unit."""
 import os
 import re
 

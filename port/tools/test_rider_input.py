@@ -1,7 +1,6 @@
 """Exercise rider input/camera channel selection and float forwarding."""
 from pathlib import Path
-import subprocess
-import pctarget
+import testprog
 import transform
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,12 +15,7 @@ def main():
         source = OUT / name
         source.write_text('#include "port.h"\n' + transform.transform(
             (ROOT / "src/unsorted" / name).read_text()))
-        obj = source.with_suffix(".o")
-        subprocess.run(["clang", "--target=" + pctarget.TARGET, "-c", "-O1",
-                        "-Wno-gnu-folding-constant", "-msse2", "-mfpmath=sse", "-ffp-contract=off", "-malign-double",
-                        "-I" + str(ROOT / "port/include"), "-I" + str(include),
-                        str(source), "-o", str(obj)], check=True)
-        objects.append(str(obj))
+        objects.append(source)
     driver = OUT / "driver.c"
     driver.write_text(r'''#include "port.h"
 #include "camera.h"
@@ -49,12 +43,7 @@ int main(void) {
  return failures != 0;
 }
 ''')
-    exe = driver.with_suffix(".exe")
-    subprocess.run(["clang", "--target=" + pctarget.HOST_TARGET, "-fuse-ld=lld", "-O1",
-                    "-Wno-gnu-folding-constant", "-msse2", "-mfpmath=sse", "-ffp-contract=off", "-malign-double",
-                    "-I" + str(ROOT / "port/include"), "-I" + str(include),
-                    str(driver), *objects, "-o", str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest("rider-input", [driver, *objects], out=OUT, includes=[include]))
 
 if __name__ == "__main__":
     main()

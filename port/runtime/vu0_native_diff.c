@@ -3,6 +3,7 @@
    independently and the entire CPU state is compared. Game data stays local.
    usage: vu0_native_diff CAPTURE [CASES] */
 #include "ps2asm.h"
+#include "vu0_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +25,7 @@ int main(int argc, char **argv)
     ps2_q128 memory[256], reference_memory[256], native_memory[256];
     FILE *f = fopen(argv[1], "rb");
     if (!f) return 2;
-    if (fread(h, 16, 1, f) != 1 || h[1] != sizeof input || fread(&input, sizeof input, 1, f) != 1 ||
+    if (fread(h, 16, 1, f) != 1 || !vu0_capture_cpu(f, h[1], &input) ||
         fread(code, 4096, 1, f) != 1 || fread(memory, 4096, 1, f) != 1)
         return 2;
     fclose(f);

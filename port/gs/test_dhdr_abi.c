@@ -1,6 +1,6 @@
 /* The C compiler's view of port/render/include/dhd_render.h, for port/tools/test_dhdr_abi.py
   . Never linked or run: the script compiles this file to LLVM IR for each target
-   (i686, x86_64, wasm32) and reads two constant arrays out of it:
+   (x86_64, wasm32) and reads two constant arrays out of it:
      dhdr_abi_names   the row names, NUL-separated: "T#size", "T#align", "T.f" (offset),
                       "T.f#size" (the member's size), "=NAME" (a constant's value);
      dhdr_abi_values  one int64 per row, in the same order.

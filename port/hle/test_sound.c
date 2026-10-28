@@ -634,11 +634,7 @@ static void test_grain_random_replay(void)
 
 static void debug_env(const char *name, const char *value)
 {
-#ifdef _WIN32
-    _putenv_s(name, value);
-#else
-    if (*value) setenv(name, value, 1); else unsetenv(name);
-#endif
+    host_putenv_s(name, value);
 }
 
 static void test_stream_parameters(void)

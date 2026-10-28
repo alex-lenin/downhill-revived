@@ -1,7 +1,7 @@
-"""Exercise the real particle constructor's duration divisions with SSE traps."""
+"""Exercise the real particle constructor's duration divisions."""
 from pathlib import Path
-import subprocess
 import sys
+import testprog
 import transform
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -22,25 +22,20 @@ def main():
     end = transform.close_paren(transform.code_mask(text), brace) + 1
     text = 'extern unsigned char D_0029DBA5;\n' + text[start:end]
     unit = OUT / 'constructor.c'
-    unit.write_text('#include "port.h"\n' + transform.transform(text, False, '_', None))
-    obj = unit.with_suffix('.o')
-    subprocess.run(['clang', '--target=i686-pc-windows-itanium', '-O1', '-c', '-w',
-                    '-msse2', '-mfpmath=sse', '-ffp-contract=off',
-                    '-I' + str(ROOT / 'port/include'), str(unit), '-o', str(obj)], check=True)
+    unit.write_text('#include "port.h"\n' + transform.transform(text))
     driver = OUT / 'driver.c'
     driver.write_text(r'''#include "ps2float.h"
-#include <xmmintrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 unsigned char D_0029DBA5 = 1;
 int D_0029E308, D_0029E30C;
 int D_0071F980[3];
-__declspec(align(16)) unsigned char D_0067E180[0x2860];
-__declspec(align(16)) unsigned char D_0027BFC0[64*0x40];
-__declspec(align(16)) unsigned char D_0027A4B0[64*0x50];
-__declspec(align(16)) unsigned char D_0027D300[64*0x50];
-__declspec(align(16)) unsigned char D_00279B00[64*0x20];
+unsigned char __attribute__((aligned(16))) D_0067E180[0x2860];
+unsigned char __attribute__((aligned(16))) D_0027BFC0[64*0x40];
+unsigned char __attribute__((aligned(16))) D_0027A4B0[64*0x50];
+unsigned char __attribute__((aligned(16))) D_0027D300[64*0x50];
+unsigned char __attribute__((aligned(16))) D_00279B00[64*0x20];
 float ps2_fdiv(float a,float b) { return ps2_float_div(a,b); }
 int func_0023D608(void) { return 0; }
 void func_0022A280(void *p) { abort(); }
@@ -59,20 +54,16 @@ int main(void) {
   D_0029E308=-1;D_0029E30C=0;D_0071F980[2]=-1;
   memcpy(D_0027D300+42*0x50+0x1a,&d,2);
   memcpy(D_0027D300+42*0x50+0x28,&numerators[i],4);
-  _mm_setcsr((_mm_getcsr()|0x8040)&~(0x680|63));
   if(func_0022C468(42,1)!=0 || bits(D_0067E180+0x2764)!=reciprocal[i]
      || bits(D_0067E180+0x2808)!=slope[i]
      || bits(D_0067E180+0x27b4)!=0x7f7fffff
      || bits(D_0067E180+0x27b8)!=0xff7fffff) return 1;
  }
- puts("Real particle constructor: zero, positive and signed durations pass with SSE traps");
+ puts("Real particle constructor: zero, positive and signed durations pass");
  return 0;
 }
 ''')
-    exe = driver.with_suffix('.exe')
-    subprocess.run(['clang', '--target=i686-pc-windows-msvc', '-fuse-ld=lld', '-O1',
-                    '-I' + str(ROOT / 'port/runtime'), str(driver), str(obj), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest('particle-float', [unit, driver], out=OUT))
 
 
 if __name__ == '__main__': main()

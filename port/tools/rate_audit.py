@@ -31,7 +31,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from owned_process import stop_verified  # noqa: E402
+import owned_process  # noqa: E402
 import state_trace_run  # noqa: E402
 
 OUT_DIR = ROOT / 'build' / 'rate-audit'
@@ -91,14 +91,9 @@ def run(args):
           f'(menu {menu}, phase {phase}), skip {skip}, samples {samples}: audit {audit_path}')
     start = time.monotonic()
     with open(log_path, 'wb') as log:
-        process = subprocess.Popen([str(exe)], cwd=str(OUT_DIR), env=env, stdout=log,
-                                   stderr=subprocess.STDOUT)
-        status = 'ok'
-        try:
-            process.wait(timeout=args.timeout)
-        except subprocess.TimeoutExpired:
-            status = 'timeout'
-            stop_verified(process, exe)
+        process = owned_process.run([str(exe)], timeout=args.timeout, cwd=str(OUT_DIR), env=env, stdout=log,
+                                    stderr=subprocess.STDOUT)
+    status = 'timeout' if process.timed_out else 'ok'
     rows = 0
     summary = ''
     if audit_path.exists():

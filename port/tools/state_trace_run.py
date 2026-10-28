@@ -11,8 +11,8 @@
 
 Output: build/state-trace/<name>.tsv (and <name>-f<field>-*.bin with --dump). Game data: stays
 under build/. The game runs headless (DHD_HEADLESS=1, no window) and ends itself at the last
-field (DHD_STATE_STOP); if it hasn't ended after --timeout seconds it is stopped by PID
-(owned_process.stop_verified) and the run fails.
+field (DHD_STATE_STOP); if it hasn't ended after --timeout seconds it is stopped, with whatever it
+started (owned_process), and the run fails.
 
 The recipe (build/audit/h4-state-trace.md, section 7): the virtual clock (DHD_FRAME_CLOCK=1),
 no movies, no memory card, no sound device, native renderer, default settings only
@@ -29,7 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from owned_process import stop_verified  # noqa: E402
+import owned_process  # noqa: E402
 
 DEFAULT_ISO = ''
 WINDOWS_EXE = 'build/host64-exe/dhd64.exe'  # build_host64.py's default output
@@ -166,14 +166,9 @@ def main():
     print(f'{args.scenario}: {fields} fields, exe {exe} (sha256 {sha[:16]}...), log {log_path}')
     start = time.monotonic()
     with open(log_path, 'wb') as log:
-        process = subprocess.Popen([str(exe)], cwd=str(out_dir), env=env, stdout=log,
-                                   stderr=subprocess.STDOUT)
-        status = 'ok'
-        try:
-            process.wait(timeout=args.timeout)
-        except subprocess.TimeoutExpired:
-            status = 'timeout'
-            stop_verified(process, exe)
+        process = owned_process.run([str(exe)], timeout=args.timeout, cwd=str(out_dir), env=env, stdout=log,
+                                    stderr=subprocess.STDOUT)
+    status = 'timeout' if process.timed_out else 'ok'
     rows = 0
     if tsv.exists():
         rows = max(0, sum(1 for line in open(tsv, 'rb') if line[:1].isdigit()))

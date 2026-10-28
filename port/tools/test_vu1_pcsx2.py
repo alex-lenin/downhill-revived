@@ -1,6 +1,7 @@
-"""Compare VU1 with a pinned, independently compiled PCSX2 interpreter.
+"""Compare VU1 with a pinned, independently compiled PCSX2 interpreter, both on the 64-bit host
+(where VU1 runs: vu0_interp.c is a host unit).
 
-Requires clang-cl/x86 libraries. Downloads public GPL reference sources into build/;
+Needs LLVM (testprog.py). Downloads public GPL reference sources into build/;
 retail microcode comes only from the user's DHD_VUTEXT (or assets/vutext.bin).
 Optional positional arguments are local DHD_VU_CAPTURE files. No game data is embedded.
 Mesh fixtures exercise setup and an unclipped three/four-vertex MSCNT packet.
@@ -14,6 +15,7 @@ import re
 import subprocess
 import urllib.request
 
+import testprog
 from vudis import walk
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,7 +35,7 @@ ENTRIES = (
 )
 
 
-def build(aot=False, isa="sse2", thinlto=False, pgo_use=None):
+def build(aot=False):
     upstream = OUT / 'upstream'
     upstream.mkdir(parents=True, exist_ok=True)
     for name, digest in HASHES.items():
@@ -51,55 +53,41 @@ def build(aot=False, isa="sse2", thinlto=False, pgo_use=None):
         if name == 'VU1microInterp.cpp':
             source = source[:source.index('InterpVU1 CpuIntVU1;')]
         (OUT / name).write_text(source, encoding='utf-8')
-    flags = ['clang-cl', '-m32', '/nologo', '/O2', '-Wno-deprecated-declarations',
-             '-m' + isa, '-mno-fma', '-mfpmath=sse', '/clang:-ffp-contract=off']
-    if thinlto: flags += ['-flto=thin', '-fuse-ld=lld']
-    reference = []
+    interp = ROOT / 'port/runtime/vu0_interp.c'
+    defines, reference = [], []
     if aot:
-        subprocess.run(flags + ['/DPS2_VU_REFERENCE', '/Dps2_vu0_run=ps2_vu0_reference', '/Dps2_vu1_run=ps2_vu1_reference',
-                                '/Dps2_vu_aot_load=ps2_vu_aot_reference_load',
-                                '/c', str(ROOT / 'port/runtime/vu0_interp.c'), '/Foreference.obj'],
-                       cwd=OUT, check=True)
-        reference = ['reference.obj']
+        reference = [testprog.host_object(interp, OUT, 'reference', defines=[
+            'PS2_VU_REFERENCE', 'ps2_vu0_run=ps2_vu0_reference', 'ps2_vu1_run=ps2_vu1_reference',
+            'ps2_vu_aot_load=ps2_vu_aot_reference_load'])]
         from vu1_aot import generate
         print('VU1 AOT:', generate(OUT / 'vu1_aot.inc'), 'straight-line blocks', flush=True)
-        flags += ['/DPS2_VU_AOT', '/DPS2_VU_AOT_EMBED', '/DPS2_VU_AOT_TEST', '/I' + str(OUT)]
-    native_flags = ['-fprofile-instr-use=' + str(pgo_use.resolve()), '-Werror=profile-instr-out-of-date'] if pgo_use else []
-    # Match the trained runtime's trace_pair body for PGO. The oracle compares
-    # complete final state; optional textual pair tracing is not part of that check.
-    if pgo_use and os.environ.get('DHD_VU_TRACE'):
-        raise ValueError('PGO oracle requires the normal, non-tracing runtime')
-    trace_flags = [] if pgo_use else ['/DPS2_VU_TRACE']
-    subprocess.run(flags + native_flags + trace_flags + ['/c', str(ROOT / 'port/runtime/vu0_interp.c'),
-                            '/Fonative.obj'], cwd=OUT, check=True)
-    subprocess.run(flags + ['/std:c++20', '/I' + str(OUT), '/c',
-                            str(ROOT / 'port/runtime/pcsx2_vu_oracle.cpp'), '/Fooracle.obj'], cwd=OUT, check=True)
-    subprocess.run(['clang-cl', '-m32', '/nologo', '-fuse-ld=lld', 'oracle.obj', 'native.obj', *reference, '/Feoracle.exe', '/link', '/threads:6', '/opt:lldltojobs=6'],
-                   cwd=OUT, check=True)
+        defines = ['PS2_VU_AOT', 'PS2_VU_AOT_EMBED', 'PS2_VU_AOT_TEST']
+    # The oracle compares complete final state; the optional textual pair tracing is extra.
+    native = testprog.host_object(interp, OUT, 'native', includes=[OUT], defines=defines + ['PS2_VU_TRACE'])
+    oracle = testprog.host_object(ROOT / 'port/runtime/pcsx2_vu_oracle.cpp', OUT, 'oracle', includes=[OUT],
+                                  defines=defines)
+    testprog.host('oracle', [oracle, native, *reference, testprog.HOST_FP], out=OUT, low=aot)  # AOT: guest_base
     if aot:
         # Synthetic programs also exercise the fallback for pairs absent from
         # the retail overlays, mixed with matching pairs in the same run.
-        subprocess.run(flags + ['native.obj', str(ROOT / 'port/runtime/test_vu1.c'),
-                                str(ROOT / 'port/gs/memory.c'), str(ROOT / 'port/gs/gs.c'),
-                                '/Feaot-instructions.exe', '/link', '/threads:6', '/opt:lldltojobs=6'], cwd=OUT, check=True)
-        subprocess.run([str(OUT / 'aot-instructions.exe')], cwd=OUT, check=True)
+        exe = testprog.host('aot-instructions', [native, ROOT / 'port/runtime/test_vu1.c', ROOT / 'port/gs/memory.c',
+                                                 ROOT / 'port/gs/gs.c', testprog.HOST_FP], out=OUT, includes=[OUT], defines=defines,
+                            low=True)
+        testprog.run(exe)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seeds', type=int, default=32, help='seeded float fixtures per entry')
-    parser.add_argument('--thinlto', action='store_true')
-    parser.add_argument('--pgo-use', type=Path)
-    parser.add_argument('--isa', choices=('sse2', 'sse4.1', 'avx2'), default='sse2')
     parser.add_argument('--aot', action='store_true', help='compare generated instruction pairs with PCSX2')
     parser.add_argument('captures', nargs='*')
     args = parser.parse_args()
-    build(args.aot, args.isa, args.thinlto, args.pgo_use)
+    build(args.aot)
     data = Path(os.environ.get('DHD_VUTEXT', ROOT / 'assets/vutext.bin')).read_bytes()
     results = []
 
     def check(label, command):
-        run = subprocess.run([str(OUT / 'oracle.exe'), *command], capture_output=True, text=True, timeout=30)
+        run = subprocess.run([str(OUT / ('oracle' + testprog.EXE)), *command], capture_output=True, text=True, timeout=30)
         results.append(dict(case=label, result=run.returncode, output=run.stdout, error=run.stderr))
         if run.returncode:
             print(label, run.stdout, run.stderr)

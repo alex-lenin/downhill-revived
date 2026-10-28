@@ -19,13 +19,17 @@
    - no texture packs in the browser (texpack_* are empty; n->texpack stays 0). The sharp font is
      the same font_sharp.c (build_graphics.py builds it into the reactor);
    - widescreen: port/hle/widescreen.c runs in the core; the reactor reads the shape it publishes
-     (DHD_WIDESCREEN_ASPECT, "N:1000") and the menu state from guest RAM, as widescreen.c does;
+     (DHD_WIDESCREEN_ASPECT, "N:1000") and the menu state from guest RAM with widescreen.c's own
+     rule (port/hle/widescreen_flat.h);
    - the display read (screenshots only; the page never asks for one) suspends in web_gpu_await
-     between dhdr_native_read_begin and _finish, as the exact read does;
+     between dhdr_native_read_begin and _finish (native_read_wait), as the exact read does;
+   - the scale limit (native_scale_hold) has the device's largest texture but no memory size;
    - PC SETTINGS > Resolution and Scaling apply while the game runs (native_rescale, web_display's
      web_env_changed): x64 changes the scale at the next start. */
 
 #define NATIVE_INLINE 1
+
+#include "../hle/widescreen_flat.h"
 
 typedef Web NativeExact;
 
@@ -54,18 +58,9 @@ double host_widescreen_aspect(void)
     unsigned a = 0, b = 0;
     return v && sscanf(v, "%u:%u", &a, &b) == 2 && a && b ? (double)a / b : 0;
 }
-int host_widescreen_flat_limit(void)
-{
-    int menu = *(volatile int32_t *)(uintptr_t)(0x08000000u + 0x29DED8u);
-    int phase = *(volatile int32_t *)(uintptr_t)(0x08000000u + 0x43F348u);
-    if (menu == 18 || (menu == 9 && phase == 0)) return 4096;
-    if (menu == 0 || (menu == 9 && phase == 5)) return 1000;
-    return 0;
-}
+int host_widescreen_flat_limit(void) { return widescreen_flat_limit(); }
 
-/* DHD_SCALE up to 8, as on x64 (gpu_rust_native.inc). The device asks for the adapter's largest
-   texture size; a surface it still refuses fails in dhdr_native_surface with a log line. */
-#define NATIVE_SCALE_MAX 8u
+#define NATIVE_WINDOW "canvas"
 #define gs_gpu_native web_native
 #define gs_native_vsync web_native_vsync
 #define gs_native_bench web_native_bench
@@ -87,14 +82,11 @@ static NativeView native_replacement_view(Native *n, NativeTexture *t)
     return t->sharp;
 }
 
-/* DHD_SCALE=window: the smallest scale whose picture is as tall as the canvas. */
-static unsigned native_match_window(Native *n, const NativeFrame *f)
+/* DHD_SCALE=window's height: the canvas's. */
+static unsigned native_window_height(Native *n)
 {
     (void)n;
-    unsigned lines = f->display_surface >= 0 && f->display[6] ? f->display[6] : 448, scale = 1;
-    while (scale < 4 && scale * lines < canvas_height) scale++;
-    fprintf(stderr, "gs native: resolution scale %u (canvas %u lines, picture %u)\n", scale, canvas_height, lines);
-    return scale;
+    return canvas_height;
 }
 
 /* PC SETTINGS > Resolution while the game runs (DHD_SCALE changed; web_display calls this after a
@@ -111,7 +103,7 @@ static void native_rescale(Native *n)
     unsigned setting = 2;
     if (scale && (!native_stricmp(scale, "window") || !native_stricmp(scale, "match"))) setting = 0;
     else if (scale && atoi(scale) >= 1) setting = (unsigned)atoi(scale);
-    if (setting > NATIVE_SCALE_MAX) setting = NATIVE_SCALE_MAX;
+    if (setting > n->scale_limit) setting = n->scale_limit;   /* native_scale_hold's */
     if (setting == n->scale_setting) return;
     unsigned count = (unsigned)n->surface_count;
     uint8_t dropped[NATIVE_SURFACES] = {0};
@@ -163,21 +155,9 @@ static int native_show(Native *n, DhdrSurface *surface, unsigned w, unsigned h)
     return 1;
 }
 
-/* The displayed picture (display_width x display_height) into pixels; 0 when there is none. The
-   read suspends in web_gpu_await, so only from the core's calls (a promising root). */
-static int native_read_display(Native *n, uint32_t *pixels)
-{
-    uint32_t w = 0, h = 0;
-    if (!n->display_width || !dhdr_native_read_begin(n->r, &w, &h)) return 0;
-    int mapped = web_gpu_await();
-    if (w == n->display_width && h == n->display_height) return dhdr_native_read_finish(n->r, pixels) && mapped;
-    uint32_t *other = malloc((size_t)w * h * 4);
-    if (!other) native_oom("display read");
-    dhdr_native_read_finish(n->r, other);
-    free(other);
-    fprintf(stderr, "gs native: display read %ux%u, expected %ux%u\n", w, h, n->display_width, n->display_height);
-    return 0;
-}
+/* The display read (native_read_display) suspends here between begin and finish, so only from the
+   core's calls (a promising root). */
+static int native_read_wait(void) { return web_gpu_await(); }
 
 /* A read of GS memory (gs_read_image's pages). The browser's reads are never deferred
    (port/hle/graphics.c defers only behind a memory fault guard, which wasm has not), so the Z
@@ -204,7 +184,7 @@ static void native_sync_range(Gs *g, unsigned address, unsigned bytes)
 static int native_init(Gs *g, Web *exact)
 {
     double start;
-    Native *n = native_create_rust(exact, &start);   /* with the sharp font's replacements (no texture packs here) */
+    Native *n = native_create_rust(exact, 0, &start);   /* memory unknown; the sharp font's replacements (no texture packs) */
     if (!n) return 0;
     fprintf(stderr, "gs native: WebGPU shaders and pipelines built in %.2f s\n", host_wall_seconds() - start);
     native_install(g, exact, n, "WebGPU (browser)");

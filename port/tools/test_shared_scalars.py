@@ -1,6 +1,6 @@
 """Execute matching camera and GS bodies through the new shared scalar APIs."""
 from pathlib import Path
-import subprocess
+import testprog
 import transform
 
 
@@ -23,7 +23,8 @@ int main(void) {
 }
 '''
     particle=(src/'00228BE8.c').read_text()
-    particle=particle.split('/* ---- merged from src/unsorted/0022B1F0.c ---- */',1)[1].split('INCLUDE_ASM("asm/nonmatchings/text", func_0022B258);',1)[0]
+    particle=particle.split('/* ---- merged from src/unsorted/0022B1F0.c ---- */',1)[1]
+    particle=particle[:particle.rindex('#ifdef NONMATCHING',0,particle.index('INCLUDE_ASM("asm/nonmatchings/text", func_0022B258);'))]  # up to func_0022B258
     particle+='''
 static int fade_failures;
 void func_0022B028(void *p,void *v,void *c,int *n,const float *offset,float *values,float velocityScale) {
@@ -180,7 +181,7 @@ int main(void) {
             assert sig['ret']==ret and sig['args']==['i32']*nargs and not sig['variadic'],sig
     finally:recomp.OUT=saved_out
     files={'camera.cpp':camera,'channel.c':(src/'001B3D58.c').read_text(),'packet.c':(src/'0023B220.c').read_text()+(src/'0023D4F8.c').read_text(),'particle.c':particle,'blend.c':blend,'selector.c':selector,'style.c':style,'menu.c':menu,'probe.c':probe,'projection.c':projection,'derived.cpp':derived,'rtc.c':rtc}
-    for name,s in files.items():(out/name).write_text('#include "port.h"\n'+transform.transform(s.replace('#include "rtc.h"',(root/'include/rtc.h').read_text()).replace('#include "derived_menu.h"',(root/'include/derived_menu.h').read_text()).replace('#include "particle_update.h"',(root/'include/particle_update.h').read_text()).replace('#include "tween.h"',(root/'include/tween.h').read_text()).replace('#include "animation_select.h"',(root/'include/animation_select.h').read_text()).replace('#include "ui_style.h"',(root/'include/ui_style.h').read_text()).replace('#include "menu_items.h"',(root/'include/menu_items.h').read_text()).replace('#include "menu.h"',(root/'include/menu.h').read_text()).replace('#include "ground_probe.h"',(root/'include/ground_probe.h').read_text()).replace('#include "track_projection.h"',(root/'include/track_projection.h').read_text()),name.endswith('cpp'),'_',None))
+    for name,s in files.items():(out/name).write_text('#include "port.h"\n'+transform.transform(s.replace('#include "rtc.h"',(root/'include/rtc.h').read_text()).replace('#include "derived_menu.h"',(root/'include/derived_menu.h').read_text()).replace('#include "particle_update.h"',(root/'include/particle_update.h').read_text()).replace('#include "tween.h"',(root/'include/tween.h').read_text()).replace('#include "animation_select.h"',(root/'include/animation_select.h').read_text()).replace('#include "ui_style.h"',(root/'include/ui_style.h').read_text()).replace('#include "menu_items.h"',(root/'include/menu_items.h').read_text()).replace('#include "menu.h"',(root/'include/menu.h').read_text()).replace('#include "ground_probe.h"',(root/'include/ground_probe.h').read_text()).replace('#include "track_projection.h"',(root/'include/track_projection.h').read_text()),name.endswith('cpp')))
     driver=out/'gs.c';driver.write_text('''#include "scalar_api.h"
 #include <stdio.h>
 int D_0029E41C,D_0029E420,D_0029E424,D_0029E428;
@@ -200,9 +201,6 @@ int main(void) {
  return 0;
 }
 ''')
-    flags=['clang','--target=i686-pc-windows-msvc','-fuse-ld=lld','-O1','-w','-msse2','-mfpmath=sse','-I'+str(root/'port/include'),'-I'+str(root/'include')]
-    for names,exe in [(['camera.cpp','channel.c'],'camera.exe'),(['gs.c','packet.c'],'gs.exe'),(['particle.c'],'particle.exe'),(['blend.c'],'blend.exe'),(['selector.c'],'selector.exe'),(['style.c'],'style.exe'),(['menu.c'],'menu.exe'),(['probe.c'],'probe.exe'),(['projection.c'],'projection.exe'),(['derived.cpp'],'derived.exe'),(['rtc.c'],'rtc.exe')]:
-        subprocess.run(flags+[str(out/n) for n in names]+['-o',str(out/exe)],check=True);subprocess.run([str(out/exe)],check=True)
-
-
+    for names,exe in [(['camera.cpp','channel.c'],'camera'),(['gs.c','packet.c'],'gs'),(['particle.c'],'particle'),(['blend.c'],'blend'),(['selector.c'],'selector'),(['style.c'],'style'),(['menu.c'],'menu'),(['probe.c'],'probe'),(['projection.c'],'projection'),(['derived.cpp'],'derived'),(['rtc.c'],'rtc')]:
+        testprog.run(testprog.guest(exe,[out/n for n in names],out=out/exe,includes=[root/'include']))
 if __name__=='__main__':main()

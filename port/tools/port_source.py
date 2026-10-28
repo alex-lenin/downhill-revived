@@ -1,4 +1,4 @@
-"""The source and IR steps every game-unit build shares (build.py, build_wasm.py): the port patches
+"""The source and IR steps every game-unit build shares (build_wasm.py, testprog.game_unit, abi_check.py): the port patches
 (port/patches.py) and the 16-byte alignment of aggregate locals."""
 import os
 import re

@@ -1,5 +1,5 @@
-/* EE float arithmetic for natively compiled game code. port/tools/build.py includes this in every
-   unit and rewrites the unit's IR (port/tools/eefloat.py): float add, subtract and divide, and all
+/* EE float arithmetic for natively compiled game code. port/tools/build_wasm.py includes this in
+   every unit and rewrites the unit's IR (port/tools/eefloat.py): float add, subtract and divide, and all
    double arithmetic, become calls to these. Multiplies and int-to-float conversions stay native:
    EE code runs rounding toward zero (kernel.c ee_float_mode), as PCSX2 runs the EE FPU, and that
    is already their result.

@@ -121,7 +121,7 @@ static void report(Prog *p, const char *what, const char *detail)
 
 /* lq/sq/lqc2/sqc2 ignore the low 4 address bits, as on the EE and in recompiled code (recomp.h
    M128), so both sides agree on which quadword an address names. The port build gives local
-   aggregates the EE's 16-byte alignment (build.py align_quadword_objects); DHD_QUAD_CHECK=1
+   aggregates the EE's 16-byte alignment (port_source.py align_aggregate_allocas); DHD_QUAD_CHECK=1
    reports any access still unaligned, with the calling function's return address. */
 static const void *asm_caller; /* return address of the current ps2_asm call */
 

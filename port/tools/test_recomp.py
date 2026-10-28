@@ -85,9 +85,11 @@ void (*ps2_graphics_sync)(void);
 void (*ps2_intc_read)(void);
 static uint64_t stack[8];
 void ps2_recomp_enter(void) { ps2.gpr[29].d[0] = (uintptr_t)(stack + 8); }
-void ps2_store64(uint32_t address, uint64_t value) { memcpy((void *)(uintptr_t)address, &value, 8); }
+void ps2_store64(uintptr_t address, uint64_t value) { memcpy((void *)address, &value, 8); }
 uint32_t timer_target(uint32_t arg) { return arg == 0x12345678 ? 0x87654321 : 0; }
+#ifndef D_00123458  /* test_runtime.py names it the function it forwards to, as the core does */
 extern char D_00123458[];
+#endif
 #include "timer_thunk.c"
 int main(void) {
     ps2.gpr[4].d[0] = 0x4c;

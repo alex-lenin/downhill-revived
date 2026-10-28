@@ -9,6 +9,7 @@
 
    usage: vu0_aot_diff [-seeds N] [-repeat N] capture.bin...   (summary and differences on stderr) */
 #include "ps2asm.h"
+#include "vu0_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,8 +51,8 @@ int main(int argc, char **argv)
     for (int a = first; a < argc; a++) {
         ps2_cpu input; unsigned header[4];
         FILE *f = fopen(argv[a], "rb");
-        if (!f || fread(header, sizeof header, 1, f) != 1 || header[1] != sizeof input || header[2] != sizeof vu1_file ||
-            fread(&input, sizeof input, 1, f) != 1 || fread(code, sizeof code, 1, f) != 1 ||
+        if (!f || fread(header, sizeof header, 1, f) != 1 || header[2] != sizeof vu1_file ||
+            !vu0_capture_cpu(f, header[1], &input) || fread(code, sizeof code, 1, f) != 1 ||
             fread(input_memory, sizeof input_memory, 1, f) != 1 || fread(vu1_file, sizeof vu1_file, 1, f) != 1) {
             fprintf(stderr, "bad capture %s\n", argv[a]); return 2;
         }

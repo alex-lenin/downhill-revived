@@ -15,28 +15,16 @@ the summary (stutter_report.py).
 """
 from pathlib import Path
 import argparse
-import ctypes
 import os
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import owned_process
 import race_compare as race
-from bench_race import focus_game, user32, WINDOW_CALLBACK, process_name
-from ctypes import wintypes
 
 PRESENTMON = os.environ.get('DHD_PRESENTMON') or 'PresentMon.exe'
-
-
-def close_game(names):
-    def each(hwnd, _):
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if user32.IsWindowVisible(hwnd) and Path(process_name(pid.value)).name.lower() in names:
-            user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
-        return True
-    user32.EnumWindows(WINDOW_CALLBACK(each), 0)
 
 
 def main():
@@ -57,45 +45,38 @@ def main():
     ini = out / 'dhd.ini'
     ini.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
-    env.update(DHD_SETTINGS=str(ini), DHD_SKIP_MOVIES='1', DHD_MEMCARD='0', DHD_LAUNCHER_MODE='off',
-               DHD_AUTO_UPDATE='off', DHD_NAV='0:triangle|cross' if args.menu else race.NAV)
+    env.update(DHD_SETTINGS=str(ini), DHD_SKIP_MOVIES='1', DHD_MEMCARD='0',
+               DHD_NAV='0:triangle|cross' if args.menu else race.NAV)
     if not args.menu:
         env.update(DHD_RACE_SYNC='1', DHD_RACE_PAD='0:600:cross')
     env.update(dict(item.split('=', 1) for item in args.env))
     for old in out.glob('pacing-*.csv'):
         old.unlink()
-    names = {args.exe.name.lower(), 'dhd.exe', 'dhd64.exe'}
-    with open(out / 'dhd.log', 'wb') as log:
-        game = subprocess.Popen([str(args.exe)], cwd=args.exe.parent, env=env, stdout=log, stderr=subprocess.STDOUT)
+    # Every process (without elevation PresentMon cannot name a process that started after it;
+    # stutter_report.py keeps the game's rows by game.pid). Stopped through its ETW session (close):
+    # a killed PresentMon leaves the session running, and a few of those starve new ones.
+    session = f'dhd_stutter_{os.getpid()}'
+
+    def stop_session(_):
+        subprocess.run(['logman', 'stop', session, '-ets'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    samples = focused = 0
+    # The game closes its window (WM_CLOSE, so the logs flush) when it is stopped: after --seconds,
+    # or on an error or Ctrl+C here.
+    with open(out / 'dhd.log', 'wb') as log, open(out / 'presentmon.out', 'wb') as monitor_log, \
+            owned_process.start([str(args.exe)], cwd=args.exe.parent, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                close=owned_process.Owned.close_windows, grace=20) as game, \
+            owned_process.start([str(PRESENTMON), '--output_file', str(out / 'presentmon.csv'), '--no_console_stats',
+                                 '--session_name', session], stdout=monitor_log, stderr=subprocess.STDOUT,
+                                close=stop_session, grace=30):
         (out / 'game.pid').write_text(str(game.pid))
-        # Every process (without elevation PresentMon cannot name a process that started after it;
-        # stutter_report.py keeps the game's rows by game.pid). Stopped through its ETW session
-        # below: a killed PresentMon leaves the session running, and a few of those starve new ones.
-        session = f'dhd_stutter_{os.getpid()}'
-        monitor = subprocess.Popen([str(PRESENTMON), '--output_file', str(out / 'presentmon.csv'), '--no_console_stats',
-                                    '--session_name', session],
-                                   stdout=open(out / 'presentmon.out', 'wb'), stderr=subprocess.STDOUT)
         start = time.monotonic()
-        samples = focused = 0
-        while game.poll() is None:
-            elapsed = time.monotonic() - start
-            if elapsed > args.seconds:
-                close_game(names)
-                try:
-                    game.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    game.kill()
-                break
-            state = focus_game(names)
+        while game.poll() is None and time.monotonic() - start <= args.seconds:
+            state = game.focus()
             if state is not None:
                 samples += 1
                 focused += state
             time.sleep(0.5)
-    subprocess.run(['logman', 'stop', session, '-ets'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        monitor.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        monitor.kill()
+        game.stop()
     print(f'exit {game.returncode}, in front {focused}/{samples} samples')
     subprocess.run([sys.executable, str(Path(__file__).with_name('stutter_report.py')), str(out)])
 

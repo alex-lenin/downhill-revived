@@ -11,6 +11,7 @@
 #include <vector>
 #include <xmmintrin.h>
 #include "ps2asm.h"
+#include "vu0_capture.h"
 using u8 = uint8_t; using s8 = int8_t; using u16 = uint16_t; using s16 = int16_t;
 using u32 = uint32_t; using s32 = int32_t; using u64 = uint64_t; using s64 = int64_t; using uint = unsigned;
 struct u128 { u64 data[2]; }; using s128 = u128;
@@ -71,8 +72,8 @@ int main(int argc, char **argv)
     if (argc != 2) { fprintf(stderr, "usage: vu0-oracle captured-vu0-input.bin\n"); return 2; }
     ps2_cpu input; unsigned header[4];
     FILE *f = fopen(argv[1], "rb");
-    if (!f || fread(header, sizeof header, 1, f) != 1 || header[1] != sizeof input || header[2] != sizeof vu1_file ||
-        fread(&input, sizeof input, 1, f) != 1 || fread(code, sizeof code, 1, f) != 1 ||
+    if (!f || fread(header, sizeof header, 1, f) != 1 || header[2] != sizeof vu1_file ||
+        !vu0_capture_cpu(f, header[1], &input) || fread(code, sizeof code, 1, f) != 1 ||
         fread(input_memory, sizeof input_memory, 1, f) != 1 || fread(vu1_file, sizeof vu1_file, 1, f) != 1) {
         fprintf(stderr, "bad capture\n"); return 2;
     }

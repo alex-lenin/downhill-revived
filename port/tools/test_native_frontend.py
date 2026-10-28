@@ -1,15 +1,15 @@
-"""Strict 32-bit metadata and ordered full-GS-state differential, including corruption control."""
-import subprocess
-from pathlib import Path
-ROOT=Path(__file__).resolve().parents[2]
+"""Strict 32-bit GS metadata and ordered full-GS-state differential, including corruption control
+(port/gs/test_native_frontend.c on the 64-bit host, where the GS front end runs)."""
+import testprog
+
+
 def main():
-    out=ROOT/'build/port/native-frontend-test';out.mkdir(parents=True,exist_ok=True)
-    exe=out/'test.exe'
-    subprocess.run(['clang-cl','-m32','/nologo','/O2','-msse2','-mno-fma','/clang:-ffp-contract=off',
-        '-Wno-deprecated-declarations',str(ROOT/'port/gs/test_native_frontend.c'),
-        str(ROOT/'port/gs/gs.c'),str(ROOT/'port/gs/memory.c'),'/Fe'+str(exe)],cwd=out,check=True)
-    subprocess.run([str(exe)],check=True,timeout=60)
-    if subprocess.run([str(exe),'negative'],timeout=60).returncode != 1:
-        raise RuntimeError('corruption control did not fail')
+    gs = testprog.ROOT / 'port/gs'
+    exe = testprog.host('native-frontend', [gs / 'test_native_frontend.c', gs / 'gs.c', gs / 'memory.c'], low=True)
+    testprog.run(exe, timeout=60)
+    testprog.run(exe, 'negative', expect=1, timeout=60, quiet=True)
     print('negative control failed as required')
-if __name__=='__main__': main()
+
+
+if __name__ == '__main__':
+    main()

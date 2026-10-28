@@ -35,10 +35,10 @@ void f() { int D_0029E164 = 2; }
     fixture = assembly / 'func_00123450.s'
     fixture.write_text(source)
     with patch.object(data.recomp, 'ASM', str(assembly)):
-        aliases = data.forwarding_aliases({'_D_00123458', '_D_00123460', '_D_00270000'})
-        assert aliases == {'_D_00123458': '_timer_target'}, aliases
+        aliases = data.forwarding_aliases({'D_00123458', 'D_00123460', 'D_00270000'})
+        assert aliases == {'D_00123458': 'timer_target'}, aliases
         fixture.write_text(source.replace('nop\n', 'addu $a0, $a1, $zero\n'))
-        assert data.forwarding_aliases({'_D_00123458'}) == {}
+        assert data.forwarding_aliases({'D_00123458'}) == {}
     (Path(directory) / 'code-alias.s').write_text('\n'.join(data.alias_directives(aliases)) + '\n')
     path = Path(directory) / 'pointer-text.s'
     path.write_text('''dlabel D_00275728
@@ -47,22 +47,24 @@ void f() { int D_0029E164 = 2; }
     /* 000004 0027572C 804A2900 */ .word D_00294A80
     /* 000008 00275730 */ .asciz "hJ)"
 ''')
-    out, refs = [], set()
+    # Pointer words are not the retail bytes: each goes to the fixups under its own label.
+    out, refs, fixups = [], set(), data.Fixups()
     with patch.object(data, 'data_entries', return_value={}):
-        data.convert(str(path), out, {'D_00275728': 0x275728}, refs)
-    assert out[2:] == ['.long _D_00294A68', '.p2align 2', '.long _D_00294A80', '.asciz "hJ)"'], out
-    assert refs == {'_D_00294A68', '_D_00294A80'}, refs
+        data.convert(str(path), out, {'D_00275728': 0x275728}, refs, fixups)
+    assert out[2:] == ['fix.0:', '.long D_00294A68', '.p2align 2', 'fix.1:', '.long D_00294A80', '.asciz "hJ)"'], out
+    assert fixups == [('fix.0', ['D_00294A68']), ('fix.1', ['D_00294A80'])], fixups
+    assert refs == {'D_00294A68', 'D_00294A80'}, refs
     for slot, target in data.ASCIZ_POINTERS.items():
         value = int(target[2:], 16).to_bytes(4, 'little')
         assert value[-1] == 0 and 0 not in value[:-1]
         path.write_text('/* 000000 %08X */ .asciz %s\n' % (slot, json.dumps(value[:-1].decode('ascii'))))
         out, refs = [], set()
-        data.convert(str(path), out, {}, refs)
-        assert out == ['.long _' + target] and refs == {'_' + target}, (out, refs)
+        data.convert(str(path), out, {}, refs, data.Fixups())
+        assert out == ['fix.0:', '.long ' + target] and refs == {target}, (out, refs)
     # A source-layout change must fail rather than silently replace real text.
     path.write_text('/* 000000 00275728 */ .asciz "abc"\n')
     try:
-        data.convert(str(path), [], {}, set())
+        data.convert(str(path), [], {}, set(), data.Fixups())
     except ValueError:
         pass
     else:
@@ -72,16 +74,16 @@ void f() { int D_0029E164 = 2; }
         literal = repr(struct.unpack('<f', value)[0])
         path.write_text('/* 000000 %08X %s */ .float %s\n' % (slot, value.hex().upper(), literal))
         out, refs = [], set()
-        data.convert(str(path), out, {}, refs)
-        assert out == ['.long _' + target] and refs == {'_' + target}
+        data.convert(str(path), out, {}, refs, data.Fixups())
+        assert out == ['fix.0:', '.long ' + target] and refs == {target}
     # The same subnormal outside the audited slots is still a float.
     path.write_text('/* 000000 00270000 30BD2700 */ .float 3.649452037e-39\n')
     out = []
-    data.convert(str(path), out, {}, set())
+    data.convert(str(path), out, {}, set(), data.Fixups())
     assert out == ['.float 3.649452037e-39']
     path.write_text('/* 000000 0027C414 30BD2700 */ .float 1.0\n')
     try:
-        data.convert(str(path), [], {}, set())
+        data.convert(str(path), [], {}, set(), data.Fixups())
     except ValueError:
         pass
     else:

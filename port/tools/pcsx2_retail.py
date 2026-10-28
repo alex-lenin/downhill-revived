@@ -15,6 +15,8 @@ import time
 import numpy as np
 from PIL import Image
 
+import owned_process
+
 RETAIL_LIMIT = ('Independent retail PCSX2 boot versus native port. Both receive identically quantized frame-indexed pad input; '
                 'the port uses a deterministic HLE scheduler clock, not EE instruction cycle accounting. '
                 'Startup movies are bypassed only in the port, and boot/load timing can differ. '
@@ -110,21 +112,18 @@ def run_reference(args, directory, targets, manifest, compare):
                     memory_cards_disabled=True, startup_movies='retail plays; native explicit bypass')
     print('Booting retail PCSX2 with frame-indexed movie input', flush=True)
     log_path = directory / 'retail-stdout.log'
-    with log_path.open('wb') as file:
-        process = subprocess.Popen(command, cwd=emulator.parent, env=env, stdout=file, stderr=subprocess.STDOUT)
+    with log_path.open('wb') as file, \
+            owned_process.start(command, cwd=emulator.parent, env=env, stdout=file, stderr=subprocess.STDOUT) as process:
         deadline = time.monotonic() + args.timeout
-        try:
-            while process.poll() is None:
-                emulog = directory / 'pcsx2.log'
-                if emulog.exists() and 'ReportErrorAsync: Startup Error' in emulog.read_text(errors='replace'):
-                    raise RuntimeError('retail PCSX2 startup failed; see pcsx2.log')
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('retail PCSX2 deadline exceeded; see pcsx2.log and retail-stdout.log')
-                time.sleep(0.2)
-            if process.returncode:
-                raise RuntimeError(f'retail PCSX2 exited {process.returncode}; see retail-stdout.log')
-        finally:
-            compare.stop(process)
+        while process.poll() is None:
+            emulog = directory / 'pcsx2.log'
+            if emulog.exists() and 'ReportErrorAsync: Startup Error' in emulog.read_text(errors='replace'):
+                raise RuntimeError('retail PCSX2 startup failed; see pcsx2.log')
+            if time.monotonic() >= deadline:
+                raise RuntimeError('retail PCSX2 deadline exceeded; see pcsx2.log and retail-stdout.log')
+            time.sleep(0.2)
+        if process.returncode:
+            raise RuntimeError(f'retail PCSX2 exited {process.returncode}; see retail-stdout.log')
     log = log_path.read_text(errors='replace')
     if 'DHD_COMPARE_ADAPTER=2' not in log:
         raise RuntimeError('retail adapter did not acknowledge movie playback')
@@ -157,20 +156,17 @@ def run_native(args, directory, script, events, manifest, compare):
     manifest.update(port_exe_sha256=digest, virtual_clock=True, pad_script=script,
                     pad_frames=compare.frame_script(events), native_requested_captures=count)
     log_path = directory / 'port.log'
-    with log_path.open('wb') as file:
-        process = subprocess.Popen([str(executable)], cwd=executable.parent, env=env,
-                                   stdout=file, stderr=subprocess.STDOUT)
+    with log_path.open('wb') as file, \
+            owned_process.start([str(executable)], cwd=executable.parent, env=env,
+                                stdout=file, stderr=subprocess.STDOUT) as process:
         deadline = time.monotonic()+args.timeout
-        try:
-            while process.poll() is None:
-                log = log_path.read_text(errors='replace')
-                if len(re.findall(r'compare: capture .*? field=\d+', log)) >= count:
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('native virtual-clock capture deadline exceeded')
-                time.sleep(0.2)
-        finally:
-            compare.stop(process)
+        while process.poll() is None:
+            log = log_path.read_text(errors='replace')
+            if len(re.findall(r'compare: capture .*? field=\d+', log)) >= count:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('native virtual-clock capture deadline exceeded')
+            time.sleep(0.2)
     metadata = re.findall(r'compare: capture (.*?) field=(\d+) host=([\d.]+) game=([\d.]+)',
                           log_path.read_text(errors='replace'))
     if len(metadata) < count:

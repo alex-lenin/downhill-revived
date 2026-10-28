@@ -82,6 +82,9 @@ int __imported_wasi_snapshot_preview1_fd_write(uint32_t fd, uint32_t iovs, uint3
         total += n;
         if (n < v[k].len) break;
     }
+    /* The C library's buffer is the only one, as for a native program: its fflush reaches the
+       file (a report read while the game runs, sound_debug.h's WAV header). */
+    host_file_flush(s->file);
     put_u32(nwritten, (uint32_t)total);
     return 0;
 }

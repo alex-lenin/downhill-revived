@@ -282,9 +282,10 @@ PATCHES = {
                           ('text', '    Huft r;', '    Huft r = {0};'),
                           ('text', '            r.b = k - w;\n',
                            '            r.v.bits = 0; /* invalid leaves also have defined bytes */\n            r.b = k - w;\n'),
-                          # The callers read the inflate block status. i686's void
-                          # body tail-calls the block decoder, retaining its EAX;
-                          # wasm's in-TU bitcast shim instead returns its argument.
+                          # The callers read the inflate block status ($v0 on the PS2):
+                          # the block decoder's, or 2 for the invalid type 3 (the delay
+                          # slot at 00241F50). wasm's in-TU bitcast shim of the void body
+                          # would return its argument instead (test_inflate_status.py).
                           ('text', 'void func_00241E70(int *e)', 'int func_00241E70(int *e)'),
                           ('text', '    if (t == 0) {\n        func_002413E8();\n'
                                    '    } else if (t == 1) {\n        func_00241598();\n'
@@ -292,7 +293,7 @@ PATCHES = {
                            '    if (t == 0) {\n        return func_002413E8();\n'
                            '    } else if (t == 1) {\n        return func_00241598();\n'
                            '    } else if (t == 2) {\n        return func_002417E0();\n'
-                           '    }\n    return (int)t; /* i686 leaves the invalid block type in EAX */\n}'),
+                           '    }\n    return 2; /* the retail $v0: the last compare\'s 2 */\n}'),
                           ('re', (r'\(\(int \(\*\)\(int \*\)\)func_00241E70\)\(&done\)', 2),
                            'func_00241E70(&done)')],
     # STR8 defines an 8-byte name string as two words; the PS2 data image has them, so the PC

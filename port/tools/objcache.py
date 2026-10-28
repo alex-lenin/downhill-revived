@@ -1,6 +1,6 @@
 """Object cache shared by every PC build on this machine (finding 082, "Object cache"): build_wasm.py
-(wasm32), build_host64.py (x64) and build.py (the native test objects) look an object up before they
-compile it, so a unit already compiled in any worktree is copied instead of compiled again.
+(wasm32) and build_host64.py (x64) look an object up before they compile it, so a unit already
+compiled in any worktree is copied instead of compiled again.
 
 Key: SHA-256 of the compiler (resolved path, size, mtime, --version), the command line without the
 output path, the working directory, the PREPROCESSED source (the same command with -E, or /E for
@@ -27,8 +27,8 @@ DIR = os.environ.get('DHD_OBJCACHE_DIR', str(DEVCACHES / 'dhd-objcache'))
 ENABLED = os.environ.get('DHD_OBJCACHE', '1') != '0'
 LIMIT = int(float(os.environ.get('DHD_OBJCACHE_GB', '30')) * 2**30)
 VERSION = b'dhd-objcache 1'
-if os.path.splitdrive(os.path.abspath(DIR))[0].upper() == 'C:':
-    ENABLED = False  # the system drive stays free (global rule): no cache rather than one on C:
+if os.path.splitdrive(os.path.abspath(DIR))[0].upper() == 'C:' or (os.name != 'nt' and 'DHD_OBJCACHE_DIR' not in os.environ):
+    ENABLED = False  # the system drive stays free (global rule): no cache rather than one on C:; off Windows only a named one
 
 _lock = threading.Lock()
 _stats = {'hit': 0, 'miss': 0, 'uncached': 0}

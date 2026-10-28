@@ -1,14 +1,13 @@
 """Full-state fixed-template oracle, including a required failing corruption control.
 
-Synthetic inputs only (port/runtime/test_ps2asm_fast.c).
+Synthetic inputs only (port/runtime/test_ps2asm_fast.c), as a guest program: wasm32 -> wasm2c.
 """
 import argparse
 import json
-import os
 import re
 from pathlib import Path
-import shutil
-import subprocess
+
+import testprog
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -21,19 +20,11 @@ def main():
     if not out.is_relative_to(ROOT / 'build'):
         ap.error('output must be under this checkout\'s build/')
     out.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    llvm = Path.home() / 'scoop/apps/llvm/current/bin'
-    env['PATH'] = str(llvm) + os.pathsep + env.get('PATH', '')
-    clang = shutil.which('clang', path=env['PATH']) or 'clang'
-    exe = out / 'test.exe'
-    subprocess.run([clang, '--target=i686-pc-windows-msvc', '-O2', '-msse2',
-                    '-mno-fma', '-mfpmath=sse', '-ffp-contract=off',
-                    str(ROOT / 'port/runtime/test_ps2asm_fast.c'), '-o', str(exe)],
-                   env=env, check=True)
+    exe = testprog.guest('asm-fast', [ROOT / 'port/runtime/test_ps2asm_fast.c'], out=out, memory=0x12010000)
     results = []
     controls = [('check', 0, [])]
     for mode, expected, extra in controls:
-        run = subprocess.run([str(exe), mode, *extra], capture_output=True, text=True, env=env)
+        run = testprog.run(exe, mode, *extra, expect=None, quiet=True)
         label = mode + ('-' + extra[0] if extra else '')
         (out / (label + '.log')).write_text(run.stdout + run.stderr)
         results.append(dict(mode=label, exit=run.returncode))

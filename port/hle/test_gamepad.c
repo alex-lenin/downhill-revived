@@ -10,10 +10,14 @@
 
 void host_thread_name(const char *name) { (void)name; }
 void gs_window_event(unsigned type) { (void)type; }  /* present.c's: this test has no window */
+void gs_mouse_event(const void *event) { (void)event; }
+void gs_window_tick(void) {}
+double host_pacing_period(void) { return 1.0 / 60; }  /* host.c's, for keyboard.c's field timing */
 
-int main(int argc, char **argv)
+/* the game thread's side, as the game's: SDL's own loop runs on the main thread (sdl_host_main) */
+static int run(void *arg)
 {
-    double seconds = argc > 1 ? atof(argv[1]) : 0;
+    double seconds = *(double *)arg;
     if (!gamepad_start()) {
         puts("test_gamepad: SDL didn't start");
         return 1;
@@ -42,4 +46,10 @@ int main(int argc, char **argv)
     for (int i = 0; i < 4; i++) gamepad_vibrate(i, 0, 0);
     Sleep(50);
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    double seconds = argc > 1 ? atof(argv[1]) : 0;
+    return sdl_host_main(run, &seconds);
 }

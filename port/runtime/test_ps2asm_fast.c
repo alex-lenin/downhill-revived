@@ -1,9 +1,14 @@
 /* Full-state oracle for the fixed asm templates (ps2asm_fast.h); never linked into the game.
    Each case runs the same asm statement through the generic interpreter and the fast
-   template and compares the whole CPU state, memory and MXCSR. "negative N" corrupts
-   case N's fast result and must fail. */
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+   template and compares the whole CPU state, memory and the host's float control word
+   (host_fp_csr: its control bits; wasm has no status flags, so the ones x64 raises while running
+   the translated code are not guest state). "negative N" corrupts case N's fast result and must fail. A guest program
+   (port/tools/test_ps2asm_fast.py): the game core runs these templates. */
+#include "ps2asm.h"
+/* Cases alias operands onto $zero (&ps2.gpr[0]); lqc2/sqc2 round an address down to 16 bytes, so
+   ps2 must start on 16 for those quadwords to stay inside it. wasm32 aligns it to 8 only, and the
+   quadword would then begin in the variables before it, which differ between the two runs. */
+extern ps2_cpu ps2 __attribute__((aligned(16)));
 #include "ps2asm.c"
 
 int ps2_vu0_run(ps2_cpu *c, unsigned a) { (void)c; (void)a; abort(); return -1; }
@@ -34,6 +39,7 @@ static const TestCase cases[] = {
 };
 enum { CASES = sizeof cases / sizeof *cases };
 static unsigned active;
+#define FP_CONTROL(csr) ((csr) & ~0x3Fu)  /* rounding, flush-to-zero, denormals-are-zero, masks */
 
 static void invoke(void *m, void *v, void *o)
 {
@@ -50,8 +56,8 @@ static void invoke(void *m, void *v, void *o)
     }
     ps2_asm(c->text, c->constraints, c->operands, ops);
 }
-__declspec(noinline) static void original(void *m, void *v, void *o) { fast_enabled = 0; invoke(m, v, o); }
-__declspec(noinline) static void specialized(void *m, void *v, void *o) { fast_enabled = 1; invoke(m, v, o); }
+__attribute__((noinline)) static void original(void *m, void *v, void *o) { fast_enabled = 0; invoke(m, v, o); }
+__attribute__((noinline)) static void specialized(void *m, void *v, void *o) { fast_enabled = 1; invoke(m, v, o); }
 
 static unsigned seed = 12345;
 static unsigned random32(void)
@@ -76,8 +82,7 @@ static void write_probe(uintptr_t address, uint64_t value, unsigned size)
 }
 static int mapped_cases(void)
 {
-    unsigned char *page = VirtualAlloc((void *)0x12000000, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (page != (void *)0x12000000) return 2;
+    unsigned char *page = (unsigned char *)0x12000000;  /* the GS registers: the guest's memory reaches them */
     unsigned char before[256], want[256];
     ps2_cpu initial, expected;
     for (unsigned i = 0; i < 256; i++) before[i] = (unsigned char)random32();
@@ -90,33 +95,32 @@ static int mapped_cases(void)
         memcpy(page + 0x1000, before, 256);
         ps2 = initial;
         callback_trace = 0;
-        _mm_setcsr(0x1f80);
+        host_fp_set_csr(0x1f80);
         original(m, v, o);
         expected = ps2;
         uint64_t trace = callback_trace;
-        unsigned mxcsr = _mm_getcsr();
+        unsigned control = host_fp_csr();
         memcpy(want, page + 0x1000, 256);
         memcpy(page + 0x1000, before, 256);
         ps2 = initial;
         callback_trace = 0;
-        _mm_setcsr(0x1f80);
+        host_fp_set_csr(0x1f80);
         specialized(m, v, o);
         if (memcmp(&ps2, &expected, sizeof ps2) || memcmp(page + 0x1000, want, 256) ||
-            trace != callback_trace || mxcsr != _mm_getcsr())
+            trace != callback_trace || FP_CONTROL(control) != FP_CONTROL(host_fp_csr()))
             return 1;
     }
     ps2_graphics_sync = NULL;
     ps2_mmio_write = NULL;
-    VirtualFree(page, 0, MEM_RELEASE);
     puts("MATCH 64 mapped-memory/fence/MMIO trace cases");
     return 0;
 }
 
 static int run_case(int negative)
 {
-    __declspec(align(16)) unsigned arena[32], initial[32], want[32];
+    _Alignas(16) unsigned arena[32], initial[32], want[32];
     ps2_cpu start, expected;
-    unsigned csr = _mm_getcsr();
+    unsigned csr = host_fp_csr();
     const TestCase *c = &cases[active];
     printf("case=%u %s\n", active, c->name);
     Prog *program = lookup(c->text, c->constraints, c->operands);
@@ -159,29 +163,34 @@ static int run_case(int negative)
         if (t % 10 == 0) o = &ps2.gpr[0];
         if (t % 10 == 1) o = &ps2.vf[11];
         if (t % 10 == 2) o = ps2.vacc;
-        unsigned mode = 0x1f80 | ((t % 4) << 13) | ((t % 8 < 4) ? 0x8040 : 0);
+        /* The game's two rounding modes, each with and without FTZ/DAZ: to nearest (the host's IEEE
+           mode, fp_mode.c, and the browser's only one) and toward zero (the EE and VU, 0xFFC0).
+           Never up or down: wasm defines round to nearest only and its compiler folds float code
+           on that, so under those modes the translated program is not the C it came from. */
+        unsigned mode = 0x1f80 | ((t % 4 < 2 ? 0 : 3) << 13) | ((t % 8 < 4) ? 0x8040 : 0);
         memcpy(arena, initial, sizeof arena);
         ps2 = start;
-        _mm_setcsr(mode);
+        host_fp_set_csr(mode);
         original(m, v, o);
         expected = ps2;
         memcpy(want, arena, sizeof arena);
-        unsigned want_csr = _mm_getcsr();
+        unsigned want_csr = host_fp_csr();
         memcpy(arena, initial, sizeof arena);
         ps2 = start;
-        _mm_setcsr(mode);
+        host_fp_set_csr(mode);
         specialized(m, v, o);
         if (negative) ps2.vf[11].w[0] ^= 1;
-        if (memcmp(&ps2, &expected, sizeof ps2) || memcmp(arena, want, sizeof arena) || _mm_getcsr() != want_csr) {
-            printf("DIFF trial=%u csr=%x/%x\n", t, _mm_getcsr(), want_csr);
+        if (memcmp(&ps2, &expected, sizeof ps2) || memcmp(arena, want, sizeof arena) ||
+            FP_CONTROL(host_fp_csr()) != FP_CONTROL(want_csr)) {
+            printf("DIFF trial=%u csr=%x/%x\n", t, host_fp_csr(), want_csr);
             for (unsigned z = 0; z < sizeof ps2 / 4; z++)
                 if (((unsigned *)&ps2)[z] != ((unsigned *)&expected)[z])
                     printf("cpu[%u]=%x want=%x\n", z, ((unsigned *)&ps2)[z], ((unsigned *)&expected)[z]);
             return 1;
         }
     }
-    _mm_setcsr(csr);
-    printf("MATCH 200000 complete CPU/memory/MXCSR cases (alias + unaligned + raw bits)\n");
+    host_fp_set_csr(csr);
+    printf("MATCH 200000 complete CPU/memory/float control cases (alias + unaligned + raw bits)\n");
     return mapped_cases() ? 3 : 0;
 }
 

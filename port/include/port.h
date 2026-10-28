@@ -60,7 +60,7 @@ void ps2_asm(const char *tmpl, const char *constraints, int n, ps2_op *ops);
 #endif
 
 /* A fixed PS2 RAM address written as a number in the game's code (a buffer at the top of RAM):
-   its host address in the emulated RAM (port/runtime/memory.h, port/tools/pctarget.py). */
+   its host address in the emulated RAM (port/runtime/memory.h, port/tools/data.py). */
 #define PS2_RAM(addr) (0x08000000u + (unsigned int)(addr))
 
 /* Widescreen: the scale of the game's X field of view constants (port/patches.py), 1 unless

@@ -3,7 +3,8 @@
    changes no v1 struct; include it after dhd_render.h. port/web/build_graphics.py reads the
    DHDR_FN declarations of both headers.
 
-   SP10 (docs/findings/090-speed.md): an indexed native picture. */
+   SP10 (docs/findings/090-speed.md): an indexed native picture. Finding 103: the device's largest
+   texture. */
 #ifndef DHD_RENDER_EXT_H
 #define DHD_RENDER_EXT_H
 
@@ -21,6 +22,11 @@ extern "C" {
 DHDR_FN(dhdr_native_picture_indexed) int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p,
                                                                      const uint32_t *indices, uint32_t index_count,
                                                                      DhdrPictureResult *out);
+
+/* The device's largest 2D texture side in texels (its maxTextureDimension2D; the device is made
+   with the adapter's own), 0 before init. The native renderer's scale limit
+   (port/gs/gpu_rust_shared.inc, native_scale_hold). */
+DHDR_FN(dhdr_device_max_texture) uint32_t dhdr_device_max_texture(void);
 
 #ifdef __cplusplus
 }

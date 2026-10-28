@@ -1,9 +1,8 @@
 """Execute the real rider substep expression at a zero angular speed."""
 from pathlib import Path
-import subprocess
 import sys
 import re
-from pctarget import HOST_TARGET
+import testprog
 ROOT=Path(__file__).resolve().parents[2]
 
 
@@ -20,15 +19,14 @@ def main():
         'static float Min(float a,float b){return a<b?a:b;}\n'
         'static float substep(float remaining,float speed){return '+expression+';}\n'+r'''
 int main(void){
- _mm_setcsr((_mm_getcsr()&~0x680u)&~63u);
  assert(substep(1,0)==1);assert(substep(0.125f,0)==0.125f);
  float expected=30.0f*1.5707963705062866f/100.0f;
  assert(substep(1,100)==expected);assert(substep(1,-100)==-expected);
  rate=0;assert(substep(1,0)==1);
- puts("Rider substep: stopped, ordinary, signed and zero-rate cases pass with SSE traps");return 0;
+ puts("Rider substep: stopped, ordinary, signed and zero-rate cases pass");return 0;
 }
 ''')
-    exe=out/'fixture.exe';subprocess.run(['clang','--target='+HOST_TARGET,'-O1','-w','-msse2','-mfpmath=sse','-I',str(ROOT/'port/runtime'),str(source),'-o',str(exe)],check=True);subprocess.run([str(exe)],check=True)
+    testprog.run(testprog.guest('rider-step', [source], out=out))
 
 
 if __name__=='__main__':main()

@@ -1,7 +1,6 @@
 """Execute NPC animation state changes against the shared pointer APIs."""
 from pathlib import Path
-import subprocess
-import pctarget
+import testprog
 import transform
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "build/port/runtime/npc-animation"
@@ -13,11 +12,6 @@ def main():
     source = OUT / "00126B20.cpp"
     source.write_text('#include "port.h"\n' + transform.transform(
         (ROOT / "src/unsorted/00126B20.cpp").read_text()))
-    obj = source.with_suffix(".o")
-    subprocess.run(["clang", "--target=" + pctarget.TARGET, "-c", "-O1",
-                    "-msse2", "-mfpmath=sse", "-ffp-contract=off", "-malign-double",
-                    "-I" + str(ROOT / "port/include"), "-I" + str(include),
-                    str(source), "-o", str(obj)], check=True)
     driver = OUT / "driver.c"
     driver.write_text(r'''#include "port.h"
 #include "animation.h"
@@ -65,11 +59,6 @@ int main(void) {
  return failures != 0;
 }
 ''')
-    exe = driver.with_suffix(".exe")
-    subprocess.run(["clang", "--target=" + pctarget.HOST_TARGET, "-fuse-ld=lld", "-O1",
-                    "-msse2", "-mfpmath=sse", "-ffp-contract=off", "-malign-double",
-                    "-I" + str(ROOT / "port/include"), "-I" + str(include),
-                    str(driver), str(obj), "-o", str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest("npc-animation", [driver, source], out=OUT, includes=[include]))
 if __name__ == "__main__":
     main()

@@ -35,7 +35,8 @@ static void reply(int fno, void *send, int ssize, void *recv, int rsize)
 #define SERVER(name) void name(int f, void *s, int sn, void *r, int rn) { reply(f, s, sn, r, rn); }
 SERVER(rpc_fileio) SERVER(rpc_iop_heap) SERVER(rpc_loadfile) SERVER(rpc_pad) SERVER(rpc_pad_ext)
 SERVER(rpc_mc) SERVER(rpc_cd_init) SERVER(rpc_cd_scmd) SERVER(rpc_cd_ncmd)
-SERVER(rpc_cd_search) SERVER(rpc_cd_diskready) SERVER(rpc_mtap) SERVER(rpc_sound) SERVER(rpc_sound2)
+SERVER(rpc_cd_search) SERVER(rpc_cd_diskready) SERVER(rpc_mtap) SERVER(rpc_mtap_open) SERVER(rpc_mtap_connection)
+SERVER(rpc_mtap_version) SERVER(rpc_sound) SERVER(rpc_sound2)
 static void completed(uint32_t arg)
 {
     assert(arg == 123 && *callback_reply == 42);

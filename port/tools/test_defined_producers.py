@@ -5,27 +5,12 @@ actual four patched production functions. Check all sixteen neutral vector
 bytes and every byte of both 48-byte sound payloads under stack poisoning.
 """
 from pathlib import Path
-import os
-import subprocess
-import shutil
-import sys
+
+import testprog
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / 'build/port/defined-producers'
 UNITS = ('001306C0', '00201B68', '00201BD0', '00136038')
-def find_clang():
-    requested = os.environ.get('CLANG', 'clang')
-    found = shutil.which(requested)
-    if not found and 'CLANG' not in os.environ:
-        fallback = Path.home() / 'scoop/apps/llvm/current/bin/clang.exe'
-        if fallback.is_file():
-            found = str(fallback)
-    if not found:
-        raise SystemExit('clang not found: set CLANG to its executable or add LLVM to PATH')
-    return Path(found).resolve()
-
-
-CLANG = find_clang()
 
 HARNESS = r'''
 typedef unsigned int uint32_t;
@@ -80,9 +65,8 @@ void func_00202048(int command,int length,void *data,SoundCompletionCallback cb,
 
 /* Execute the actual gravity-force producer up to its first consumer. The
    full remaining function is linked, but longjmp bounds this focused test. */
-extern int _setjmp(int *);
-extern void longjmp(int *,int) __attribute__((noreturn));
-static int force_jump[16] __attribute__((aligned(16)));
+#include <setjmp.h>
+static jmp_buf force_jump;
 static unsigned char body[0x4C0] __attribute__((aligned(16)));
 static unsigned char world[0x7BC0] __attribute__((aligned(16)));
 float D_0029C2E8=1,D_0029C2EC=1,D_0029C314=1;
@@ -99,6 +83,12 @@ void func_00231C20(void *o,float *force) {
 }
 void func_00231D48(void *o,const void *p) {abort();}
 int func_00238F60(void){return 1;}
+/* the frame-rate hooks of the patched units (port/hle/fps.c) at 60 fields/s, the retail rate:
+   no high-rate path, the retail decay, no force window */
+int port_fps_high(void){return 0;}
+float port_decay(float factor){return factor;}
+float port_air_age(void *body,int current){abort();}
+void port_fps_force_window(void *body,int clear){}
 float func_0012C9B8(void *o){return 1;}
 float func_0012E028(void *o){return 0;}
 #define NOOP(n) void n(void *p) { }
@@ -117,7 +107,7 @@ int main(void) {
   memset(body,0xCD,sizeof body);memset(world,0,sizeof world);
   *(void**)(body+0x158)=world;*(float*)(body+0x150)=2;*(float*)(body+0x418)=1;
   force_mode=1;force_calls=0;
-  if(!_setjmp(force_jump)) {poison(seed);func_00136038(body);CHECK(0);}
+  if(!setjmp(force_jump)) {poison(seed);func_00136038(body);CHECK(0);}
   force_mode=0;CHECK(force_calls==1);
   for(mode=0;mode<4;mode++) {
    memset(owner,0,sizeof owner);memset(state,0,sizeof state);memset(other,0,sizeof other);memset(item,0,sizeof item);
@@ -150,17 +140,10 @@ int main(void) {
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, PATH=str(CLANG.parent) + os.pathsep + os.environ.get('PATH', ''))
-    subprocess.run([sys.executable, str(ROOT/'port/tools/build.py'), '--out', str(OUT), '--opt', '1', '-j', '1',
-                    *[str(ROOT/f'src/unsorted/{unit}.c') for unit in UNITS]], env=env, check=True)
+    objects = [testprog.game_unit(f'unsorted/{unit}.c', OUT) for unit in UNITS]
     source=OUT/'test.c';source.write_text(HARNESS)
-    obj=OUT/'test.obj';exe=OUT/'test.exe'
-    subprocess.run([str(CLANG),'--target=i686-pc-windows-itanium','-c','-O1','-malign-double','-msse2','-mfpmath=sse','-ffp-contract=off',
-                    '-Wno-incompatible-pointer-types','-Wno-gnu-folding-constant','-I',str(ROOT/'port/include'),'-I',str(OUT/'include'),'-I',str(ROOT/'include'),str(source),'-o',str(obj)],check=True)
-    subprocess.run([str(CLANG),'--target=i686-pc-windows-msvc','-fuse-ld=lld',str(obj),
-                    *[str(OUT/f'obj/unsorted/{unit}.c.o') for unit in UNITS],'-o',str(exe),'-Wl,legacy_stdio_definitions.lib'],check=True)
-    subprocess.run([str(exe)],check=True,timeout=30)
-
+    testprog.run(testprog.guest('defined-producers', [source, *objects], out=OUT,
+                                includes=[testprog.OUT/'include', ROOT/'include'], sjlj=True), timeout=30)
 
 if __name__=='__main__':
     main()

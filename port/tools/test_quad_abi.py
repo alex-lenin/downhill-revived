@@ -1,4 +1,4 @@
-"""Exercise full EE quadwords through native/recompiled calls on real i386 ABI.
+"""Exercise full EE quadwords through native/recompiled calls in the core (wasm32).
 
 Synthetic functions only. Checks a 48-byte named-play-shaped packet, following
 scalars, signed/unsigned aliases, stale signatures, quadword returns, and
@@ -6,7 +6,7 @@ scalars, signed/unsigned aliases, stale signatures, quadword returns, and
 """
 import json
 from pathlib import Path
-import subprocess
+import testprog
 from unittest.mock import patch
 
 import recomp
@@ -115,10 +115,7 @@ int main(void) {
  return 0;
 }
 ''', encoding='utf-8')
-    executable = OUT / 'test.exe'
-    subprocess.run(['clang','--target=i686-pc-windows-msvc','-fuse-ld=lld','-O2',
-                    '-I'+str(ROOT/'port/runtime'),str(source),str(driver),'-o',str(executable)], check=True)
-    subprocess.run([str(executable)], check=True)
+    testprog.run(testprog.guest('quad-abi', [source, driver], out=OUT))
 
 
 if __name__ == '__main__':

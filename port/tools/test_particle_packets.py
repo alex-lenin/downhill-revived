@@ -1,6 +1,6 @@
 """Execute shared matrix/particle packet APIs through the real native bodies."""
 from pathlib import Path
-import subprocess
+import testprog
 import transform
 
 
@@ -10,7 +10,7 @@ def main():
     for name in ('002239B0.c','00223A38.c','00223A68.c'):
         source=(root/'src/unsorted'/name).read_text()
         source=source.replace('#include "matrix_packets.h"',(root/'include/matrix_packets.h').read_text()).replace('#include "vector.h"',(root/'include/vector.h').read_text())
-        (out/name).write_text('#include "port.h"\n'+transform.transform(source,False,'_',None))
+        (out/name).write_text('#include "port.h"\n'+transform.transform(source))
     driver=out/'driver.c'
     driver.write_text(r'''#include "matrix_packets.h"
 #include "ps2asm.h"
@@ -42,10 +42,8 @@ int main(void) {
  return 0;
 }
 ''')
-    exe=out/'test.exe'
-    flags=['clang','--target=i686-pc-windows-msvc','-fuse-ld=lld','-O1','-w','-msse2','-mfpmath=sse','-I'+str(root/'port/include'),'-I'+str(root/'include'),'-I'+str(root/'port/runtime')]
-    subprocess.run(flags+[str(out/n) for n in ('002239B0.c','00223A38.c','00223A68.c','driver.c')]+[str(root/'port/runtime/ps2asm.c'),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
+    def run(name,sources):testprog.run(testprog.guest(name,sources,out=out/name,includes=[root/'include']))
+    run('matrix',[out/n for n in ('002239B0.c','00223A38.c','00223A68.c','driver.c')]+[root/'port/runtime/ps2asm.c'])
     descriptor=(root/'include/particle_descriptor.h').read_text()+r'''
 #include <string.h>
 #include <stddef.h>
@@ -72,10 +70,8 @@ int main(void) {
  puts("Shared particle descriptor: complete matrix, high DI flags, following pointers and result pass");return 0;
 }
 '''
-    descriptor_path=out/'descriptor.c';descriptor_path.write_text('#include "port.h"\n'+transform.transform(descriptor,False,'_',None))
-    descriptor_exe=out/'descriptor.exe'
-    subprocess.run(flags+[str(descriptor_path),'-o',str(descriptor_exe)],check=True)
-    subprocess.run([str(descriptor_exe)],check=True)
+    descriptor_path=out/'descriptor.c';descriptor_path.write_text('#include "port.h"\n'+transform.transform(descriptor))
+    run('descriptor',[descriptor_path])
 
 
     # Execute the actual two spray bodies against bounded synthetic buffers.
@@ -86,12 +82,14 @@ int main(void) {
         spray+=emitter_source[start:transform.close_paren(transform.code_mask(emitter_source),brace)+1]+'\n'
     spray=spray.replace('#include "particle_spray.h"',(root/'include/particle_spray.h').read_text()).replace('#include "particle.h"',(root/'include/particle.h').read_text()).replace('#include "vector.h"',(root/'include/vector.h').read_text())
     spray+=r'''
-#include "ps2asm.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
-int ps2_vu0_run(ps2_cpu *cpu,unsigned address) { abort(); }
+/* ps2asm.h's two names; with port.h's store prototypes (unsigned int) it conflicts on wasm32,
+   where uintptr_t is unsigned long */
+int ps2_asm_problems(void);
+int ps2_vu0_run(void *cpu,unsigned address) { abort(); }
 int D_002694D0[]={0x80402010};
 int D_0027F6C0[]={0,85,170};
 int main(void) {
@@ -122,10 +120,8 @@ int main(void) {
  puts("Real spray emitters: three sections, finite vertices, colors, lifetimes, counts and buffer canaries pass");return 0;
 }
 '''
-    spray_path=out/'spray.c';spray_path.write_text('#include "port.h"\n'+transform.transform(spray,False,'_',None))
-    spray_exe=out/'spray.exe'
-    subprocess.run(flags+[str(spray_path),str(root/'port/runtime/ps2asm.c'),'-o',str(spray_exe)],check=True)
-    subprocess.run([str(spray_exe)],check=True)
+    spray_path=out/'spray.c';spray_path.write_text('#include "port.h"\n'+transform.transform(spray))
+    run('spray',[spray_path,root/'port/runtime/ps2asm.c'])
 
     unit=(root/'src/unsorted/00215B68.c').read_text();start=unit.index('int func_00216E28(');brace=unit.index('{',start)
     prepare_body=unit[start:transform.close_paren(transform.code_mask(unit),brace)+1]
@@ -155,14 +151,12 @@ int main(void) {
 }
 '''
     prepared=prepared.replace('#include "vif_transforms.h"',(root/'include/vif_transforms.h').read_text()).replace('#include "matrix_packets.h"',(root/'include/matrix_packets.h').read_text()).replace('#include "vector.h"',(root/'include/vector.h').read_text())
-    prepare_path=out/'prepare.c';prepare_path.write_text('#include "port.h"\n'+transform.transform(prepared,False,'_',None))
+    prepare_path=out/'prepare.c';prepare_path.write_text('#include "port.h"\n'+transform.transform(prepared))
     apply_source=(root/'src/unsorted/00221888.c').read_text().replace('#include "vector.h"',(root/'include/vector.h').read_text())
-    apply_path=out/'apply.c';apply_path.write_text('#include "port.h"\n'+transform.transform(apply_source,False,'_',None))
-    prepare_exe=out/'prepare.exe'
+    apply_path=out/'apply.c';apply_path.write_text('#include "port.h"\n'+transform.transform(apply_source))
     # Reuse the no-microprogram stub from a separate tiny runtime shim.
     shim=out/'shim.c';shim.write_text('#include "ps2asm.h"\n#include <stdlib.h>\nint ps2_vu0_run(ps2_cpu *p,unsigned a) {abort();}\n')
-    subprocess.run(flags+[str(prepare_path),str(apply_path),str(out/'00223A38.c'),str(shim),str(root/'port/runtime/ps2asm.c'),'-o',str(prepare_exe)],check=True)
-    subprocess.run([str(prepare_exe)],check=True)
+    run('prepare',[prepare_path,apply_path,out/'00223A38.c',shim,root/'port/runtime/ps2asm.c'])
 
 
 if __name__=='__main__':main()

@@ -1,240 +1,144 @@
-"""Build and run the inline asm runtime tests (port/runtime/test_ps2asm.c) as a 32-bit Windows
-program. Needs LLVM (clang-cl) and Visual Studio's x86 libraries; run port/tools/build.py first,
-the test parses every ps2_asm() call site found in build/port/src.
+"""Build and run the runtime tests: the inline asm runtime (port/runtime/test_ps2asm.c), the ABI
+fixtures, the module's hle units and the host's GS, VIF/VU1, queue and SDL pieces, then the other
+port tests (test_rider_time.py, ...). Each program runs where the game runs its code (testprog.py):
+the core's units as guest programs (wasm32 -> wasm2c), the host's on the 64-bit host.
+Run port/tools/build_wasm.py first: the asm test parses every ps2_asm() call site the core's
+transformed sources (build/wasm/src) hold.
 usage: python port/tools/test_runtime.py"""
-import glob, os, re, subprocess, sys
+import glob
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-OUT = os.path.join(ROOT, 'build', 'port', 'runtime')
+import testprog
+
+ROOT = testprog.ROOT
+OUT = ROOT / 'build' / 'port' / 'runtime'
 STR = r'"(?:\\.|[^"\\])*"'
 CALL = re.compile(r'(?:ps2_asm\(|PS2A\(\s*\w+\s*,\s*)((?:%s\s*)+),\s*("[^"]*"),\s*(\d+)' % STR)  # PS2A: transform.py's literal templates
+RT, HLE, GS = ROOT / 'port/runtime', ROOT / 'port/hle', ROOT / 'port/gs'
 
-# A DMA kick must survive all three native C MMIO lvalue forms.
-from transform import dma_stores
-for source in ('*(volatile unsigned int *)0x10009000 = 0x145;',
-               'HW(0x10009000) = 0x145;',
-               '#define D1_CHCR (*(volatile unsigned int *)0x10009000)\nD1_CHCR = 0x145;'):
-    result = dma_stores(source)
-    assert 'ps2_store32(0x10009000, 0x145);' in result, result
-assert dma_stores('if (D1_CHCR == 0x145) wait();') == 'if (D1_CHCR == 0x145) wait();'
 
-os.makedirs(OUT, exist_ok=True)
-from test_float_abi import main as check_float_abi
-check_float_abi()
-from test_scalar_guard import main as check_scalar_guard
-check_scalar_guard()
-from test_quad_abi import main as check_quad_abi
-check_quad_abi()
-from test_scalar_dispatch import main as check_scalar_dispatch
-check_scalar_dispatch()
-from test_format_abi import main as check_format_abi
-check_format_abi()
-from test_shared_scalars import main as check_shared_scalars
-check_shared_scalars()
-from test_particle_packets import main as check_particle_packets
-check_particle_packets()
-from test_scalar_abi import main as check_scalar_abi
-check_scalar_abi()
-from test_particle_float import main as check_particle_float
-check_particle_float()
-from test_ready_ratio import main as check_ready_ratio
-check_ready_ratio()
-from test_tween_float import main as check_tween_float
-check_tween_float()
-from test_terrain_float import main as check_terrain_float
-check_terrain_float()
-from test_slab_float import main as check_slab_float
-check_slab_float()
-from test_proximity_float import main as check_proximity_float
-check_proximity_float()
-from test_npc_distance_float import main as check_npc_distance_float
-check_npc_distance_float()
-from test_rider_step import main as check_rider_step
-check_rider_step()
-from test_blend_float import main as check_blend_float
-check_blend_float()
-from test_virtual_scale import main as check_virtual_scale
-check_virtual_scale()
-from test_recomp import prepare
-recomp_test = prepare(OUT)
-from test_recomp import check_forwarders
-thunk_test = check_forwarders(OUT)
-from test_data import check
-check(OUT)
-from test_abi import prepare as prepare_abi
-abi_tests = prepare_abi(OUT)
-from test_integer_abi import prepare as prepare_integer_abi
-integer_abi_tests = prepare_integer_abi(OUT)
-from test_member_abi import prepare as prepare_member_abi
-member_test = prepare_member_abi(OUT)
-sites = set()
-for f in glob.glob(os.path.join(ROOT, 'build', 'port', 'src', '**', '*.c*'), recursive=True):
-    for m in CALL.finditer(open(f, encoding='utf-8').read()):
-        sites.add((' '.join(m.group(1).split('\n')), m.group(2), int(m.group(3))))
-if not sites:
-    sys.exit('no ps2_asm() calls in build/port/src: run port/tools/build.py first')
-with open(os.path.join(OUT, 'all_templates.inc'), 'w', encoding='utf-8', newline='\n') as f:
-    for t, c, n in sorted(sites):
-        f.write('{%s, %s, %d},\n' % (t, c, n))
+def python_checks():
+    # A DMA kick must survive all three native C MMIO lvalue forms.
+    from transform import dma_stores
+    for source in ('*(volatile unsigned int *)0x10009000 = 0x145;',
+                   'HW(0x10009000) = 0x145;',
+                   '#define D1_CHCR (*(volatile unsigned int *)0x10009000)\nD1_CHCR = 0x145;'):
+        result = dma_stores(source)
+        assert 'ps2_store32(0x10009000, 0x145);' in result, result
+    assert dma_stores('if (D1_CHCR == 0x145) wait();') == 'if (D1_CHCR == 0x145) wait();'
+    from test_float_abi import main as check_float_abi
+    check_float_abi()
+    from test_scalar_guard import main as check_scalar_guard
+    check_scalar_guard()
+    for name in ('quad_abi', 'scalar_dispatch', 'format_abi', 'shared_scalars', 'particle_packets', 'scalar_abi',
+                 'particle_float', 'ready_ratio', 'tween_float', 'terrain_float', 'slab_float', 'proximity_float',
+                 'npc_distance_float', 'rider_step', 'blend_float', 'virtual_scale'):
+        __import__('test_' + name).main()
 
-vswhere = r'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
-vs = subprocess.run([vswhere, '-latest', '-property', 'installationPath'], capture_output=True,
-                    text=True).stdout.strip()
-exe = os.path.join(OUT, 'test_ps2asm.exe')
-rt = os.path.join(ROOT, 'port', 'runtime')
-cmd = os.path.join(OUT, 'test.cmd')
-with open(cmd, 'w') as f:
-    f.write('@set "PATH=%%PATH%%;%s"\n' % os.path.dirname(vswhere))
-    f.write('@call "%s\\VC\\Auxiliary\\Build\\vcvarsall.bat" x86 >nul\n' % vs)
-    # SSE math, no contraction: single-precision results that don't depend on the optimizer
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations -msse2 -mfpmath=sse /clang:-ffp-contract=off '
-            '/I"%s" /I"%s" "%s\\ps2asm.c" "%s\\vu0_micro.c" "%s\\vu0_interp.c" "%s\\test_ps2asm.c" /Fe:"%s"\n'
-            % (rt, OUT, rt, rt, rt, rt, exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % exe)
-    recomp_exe = os.path.join(OUT, 'test_callbacks.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -msse2 -mfpmath=sse /clang:-ffp-contract=off '
-            '/I"%s" "%s" /Fe:"%s"\n' % (rt, recomp_test, recomp_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % recomp_exe)
-    abi_exe = os.path.join(OUT, 'test_abi.exe')
-    thunk_exe = os.path.join(OUT, 'test_thunk.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    alias_asm = os.path.join(OUT, 'code-alias.s')
-    f.write('clang --target=i686-pc-windows-msvc -c "%s" -o "%s.o"\n' % (alias_asm, alias_asm))
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 /I"%s" "%s" "%s.o" /Fe:"%s"\n' % (rt, thunk_test, alias_asm, thunk_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % thunk_exe)
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-non-prototype %s /Fe:"%s"\n'
-            % (' '.join('"%s"' % p for p in abi_tests), abi_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % abi_exe)
-    gs = os.path.join(ROOT, 'port', 'gs')
-    integer_exe = os.path.join(OUT, 'test_integer_abi.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    for source in integer_abi_tests:
-        f.write('clang --target=i686-pc-windows-itanium -c -O2 -malign-double -I"%s" "%s" -o "%s.o"\n'
-                % (os.path.join(ROOT, 'port/include'), source, source))
-        f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang --target=i686-pc-windows-msvc -fuse-ld=lld -O2 -msse2 -mfpmath=sse -ffp-contract=off %s "%s/ps2asm.c" "%s/vu0_interp.c" -o "%s"\n'
-            % (' '.join('"%s.o"' % p for p in integer_abi_tests), rt, rt, integer_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % integer_exe)
-    gs_exe = os.path.join(OUT, 'test_gs.exe')
-    member_exe = os.path.join(OUT, 'test_member_abi.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang --target=i686-pc-windows-itanium -c -O2 -fno-exceptions -I"%s" "%s" -o "%s.o"\n'
-            % (os.path.join(ROOT, 'port/include'), member_test, member_test))
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang --target=i686-pc-windows-msvc -fuse-ld=lld "%s.o" -o "%s"\n' % (member_test, member_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % member_exe)
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations -msse2 -mfpmath=sse /clang:-ffp-contract=off '
-            '"%s\\memory.c" "%s\\gs.c" "%s\\display.c" "%s\\test_gs.c" /Fe:"%s"\n' % (gs, gs, gs, gs, gs_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % gs_exe)
-    capture_exe = os.path.join(OUT, 'test_capture.exe')
-    capture_dir = os.path.join(OUT, 'capture')
-    os.makedirs(capture_dir, exist_ok=True)
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations "%s/memory.c" "%s/gs.c" "%s/display.c" "%s/capture.c" "%s/test_capture.c" /Fe:"%s"\n'
-            % (gs, gs, gs, gs, gs, capture_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s" "%s"\n' % (capture_exe, capture_dir))
-    f.write('@if errorlevel 1 exit /b 1\n"%s" "%s" 6\n' % (capture_exe, capture_dir))
-    vu_exe = os.path.join(OUT, 'test_vu1.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations -msse2 -mfpmath=sse /clang:-ffp-contract=off '
-            '"%s\\vu0_interp.c" "%s\\test_vu1.c" "%s\\memory.c" "%s\\gs.c" /Fe:"%s"\n'
-            % (rt, rt, gs, gs, vu_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % vu_exe)
-    vif_exe = os.path.join(OUT, 'test_vif.exe')
-    hle = os.path.join(ROOT, 'port', 'hle')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations -msse2 -mfpmath=sse /clang:-ffp-contract=off /I"%s" '
-            '"%s\\vu0_interp.c" "%s\\vif.c" "%s\\graphics.c" "%s\\test_vif.c" "%s\\memory.c" "%s\\gs.c" /Fe:"%s"\n'
-            % (rt, rt, hle, hle, hle, gs, gs, vif_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % vif_exe)
 
-    queue_exe = os.path.join(OUT, 'test_graphics_queue.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations /DGRAPHICS_QUEUE_TEST /I"%s" '
-            '"%s/graphics_queue.c" "%s/test_graphics_queue.c" /Fe:"%s"\n' % (rt, hle, hle, queue_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % queue_exe)
-    f.write('@if errorlevel 1 exit /b 1\n"%s" inline\n' % queue_exe)
-    queued_vif_exe = os.path.join(OUT, 'test_queued_vif.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations -msse2 -mfpmath=sse /clang:-ffp-contract=off /DGRAPHICS_QUEUE_TEST /I"%s" '
-            '"%s/vu0_interp.c" "%s/vif.c" "%s/graphics.c" "%s/graphics_queue.c" "%s/test_vif.c" "%s/memory.c" "%s/gs.c" /Fe:"%s"\n'
-            % (rt, rt, hle, hle, hle, hle, gs, gs, queued_vif_exe))
-    f.write('@if errorlevel 1 exit /b 1\n@set DHD_MTVU=1\n"%s"\n@set DHD_MTVU=\n' % queued_vif_exe)
+def templates():
+    """Every ps2_asm() call site of the core's transformed sources, for test_ps2asm.c."""
+    sites = set()
+    for f in glob.glob(str(ROOT / 'build' / 'wasm' / 'src' / '**' / '*.c*'), recursive=True):
+        for m in CALL.finditer(open(f, encoding='utf-8').read()):
+            sites.add((' '.join(m.group(1).split('\n')), m.group(2), int(m.group(3))))
+    if not sites:
+        sys.exit('no ps2_asm() calls in build/wasm/src: run port/tools/build_wasm.py first')
+    with open(OUT / 'all_templates.inc', 'w', encoding='utf-8', newline='\n') as f:
+        for t, c, n in sorted(sites):
+            f.write('{%s, %s, %d},\n' % (t, c, n))
 
-    autopad_exe = os.path.join(OUT, 'test_autopad.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations /I"%s" "%s\\autopad.c" "%s\\test_autopad.c" /Fe:"%s"\n'
-            % (rt, hle, hle, autopad_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % autopad_exe)
 
-    options_exe = os.path.join(OUT, 'test_game_options.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 -Wno-deprecated-declarations /I"%s" "%s\\game_options.c" "%s\\test_game_options.c" /Fe:"%s"\n'
-            % (hle, hle, hle, options_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % options_exe)
+def guest_tests():
+    """The core's code: the asm runtime, the recompiler's ABI, the ABI fixtures and the module's
+    hle units."""
+    from test_recomp import prepare, check_forwarders
+    from test_data import check
+    from test_abi import prepare as prepare_abi
+    from test_integer_abi import prepare as prepare_integer_abi
+    from test_member_abi import prepare as prepare_member_abi
+    recomp_test = prepare(OUT)
+    thunk_test = check_forwarders(OUT)
+    check(OUT)
+    abi_tests = prepare_abi(OUT)
+    integer_abi_tests = prepare_integer_abi(OUT)
+    member_test = prepare_member_abi(OUT)
+    templates()
+    run = lambda name, sources, *args, **kw: testprog.run(testprog.guest(name, sources, **kw), *args)
+    # the hardware registers at 0x10000000 (the FIFO write) are guest memory
+    run('ps2asm', [RT / 'ps2asm.c', RT / 'vu0_micro.c', RT / 'vu0_interp.c', RT / 'test_ps2asm.c'],
+        includes=[OUT], memory=0x10010000)
+    run('callbacks', [recomp_test])
+    # A data name that only forwards to a function is that function's symbol in the core
+    # (data.forwarding_aliases, build_wasm.py's image_stage and rewrite): the same here.
+    aliases = re.findall(r'/alternatename:(\w+)=(\w+)', (OUT / 'code-alias.s').read_text())
+    run('thunk', [thunk_test], defines=['%s=%s' % alias for alias in aliases])
+    # test_abi.prepare checks the audit and the call rewrites as text. Their program (abi_tests) is
+    # not run: fix_abi_calls repairs a call by casting the callee to its definition's type, and
+    # wasm32 turns a direct call through such a cast into a trapping stub (wasm-ld's
+    # signature_mismatch, clang's *_bitcast_invalid). port/abi_calls.json has no sites.
+    del abi_tests
+    run('integer-abi', integer_abi_tests + [RT / 'ps2asm.c', RT / 'vu0_interp.c'])
+    run('member-abi', [member_test])
+    run('autopad', [HLE / 'autopad.c', HLE / 'test_autopad.c'])
+    run('game-options', [HLE / 'game_options.c', HLE / 'test_game_options.c'])
+    run('keyboard', [HLE / 'keyboard.c', HLE / 'test_keyboard.c'])  # layout and steering ramp (finding 059)
+    run('sif', [HLE / 'sif.c', HLE / 'test_sif.c'])
+    run('timer', [HLE / 'timer.c', HLE / 'test_timer.c'])
+    run('sound', [HLE / 'sound.c', HLE / 'test_sound.c'], defines=['SND_NO_HOST'])
 
-    keyboard_exe = os.path.join(OUT, 'test_keyboard.exe')  # keyboard layout and steering ramp (finding 059)
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 /I"%s" "%s\\keyboard.c" "%s\\test_keyboard.c" /Fe:"%s"\n'
-            % (hle, hle, hle, keyboard_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % keyboard_exe)
 
-    # SDL3 starts and enumerates the controllers (none needed); gamepad.c's smoke test
-    import sdl3
-    sdl_lib, sdl_include = sdl3.build('i686-pc-windows-msvc')  # these test programs are 32-bit
-    gamepad_exe = os.path.join(OUT, 'test_gamepad.exe')
-    # the SDL thread (host/sdl_host.c) with the keyboard and the text field it feeds (W11)
-    host = os.path.join(ROOT, 'port', 'host')
-    f.write('clang-cl -m32 /nologo /O2 -w /I"%s" /I"%s" "%s\\gamepad.c" "%s\\keyboard.c" "%s\\text_input.c" "%s\\sdl_host.c" "%s\\test_gamepad.c" "%s" %s /Fe:"%s"\n'
-            % (hle, sdl_include, hle, hle, hle, host, hle, sdl_lib, ' '.join(sdl3.SYSTEM_LIBS), gamepad_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % gamepad_exe)
+def host_tests():
+    """The host's code: the GS, its captures, VU1 and the VIF, the graphics queue and the SDL
+    devices. The GS renderer's own tests (test_gpu, test_depth, test_present) run on the Rust
+    renderer: port/tools/test_gs_wgpu.py."""
+    gs = [GS / 'memory.c', GS / 'gs.c']
+    run = lambda name, sources, *args, env=None, **kw: testprog.run(testprog.host(name, sources, **kw), *args, env=env)
+    run('gs', gs + [GS / 'display.c', GS / 'test_gs.c'], low=True)
+    capture = testprog.host('capture', gs + [GS / 'display.c', GS / 'capture.c', GS / 'test_capture.c'], low=True)
+    capture_dir = OUT / 'capture'
+    capture_dir.mkdir(exist_ok=True)
+    testprog.run(capture, capture_dir)
+    testprog.run(capture, capture_dir, 6)
+    run('vu1', [RT / 'vu0_interp.c', RT / 'test_vu1.c', testprog.HOST_FP] + gs, low=True)
+    vif = [RT / 'vu0_interp.c', HLE / 'vif.c', HLE / 'graphics.c', HLE / 'test_vif.c'] + gs
+    run('vif', vif, low=True)
+    queue = testprog.host('graphics-queue', [HLE / 'graphics_queue.c', HLE / 'test_graphics_queue.c'],
+                          defines=['GRAPHICS_QUEUE_TEST'], sdl=True, low=True)
+    testprog.run(queue)
+    testprog.run(queue, 'inline')
+    run('queued-vif', vif + [HLE / 'graphics_queue.c'], defines=['GRAPHICS_QUEUE_TEST'], sdl=True, low=True,
+        env={'DHD_MTVU': '1'})
+    # SDL3 starts and enumerates the controllers (none needed): gamepad.c's smoke test, with the
+    # SDL thread (host/sdl_host.c), the keyboard and the text field it feeds (W11)
+    run('gamepad', [HLE / 'gamepad.c', HLE / 'keyboard.c', HLE / 'text_input.c', ROOT / 'port/host/sdl_host.c',
+                    HLE / 'test_gamepad.c'], sdl=True, low=True)
 
-    sif_exe = os.path.join(OUT, 'test_sif.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 /I"%s" "%s\\sif.c" "%s\\test_sif.c" /Fe:"%s"\n'
-            % (rt, hle, hle, sif_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % sif_exe)
 
-    timer_exe = os.path.join(OUT, 'test_timer.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 "%s\\timer.c" "%s\\test_timer.c" /Fe:"%s"\n'
-            % (hle, hle, timer_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % timer_exe)
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    python_checks()
+    # The native VU0 microprograms are checked against the interpreter running the retail
+    # microcode, extracted locally (never tracked) to assets/vutext.bin.
+    vutext = ROOT / 'assets' / 'vutext.bin'
+    if vutext.exists() and 'DHD_VUTEXT' not in os.environ:
+        os.environ['DHD_VUTEXT'] = str(vutext)
+    guest_tests()
+    host_tests()
+    scripts = ['test_rider_time', 'test_rider_interaction', 'test_npc_animation', 'test_rider_input', 'test_float',
+               'test_port_headers']
+    if os.environ.get('DHD_PCSX2_VU'):
+        scripts += ['test_vu1_pcsx2', 'test_vu0_pcsx2']
+    for script in scripts:
+        result = subprocess.run([sys.executable, str(ROOT / 'port/tools' / (script + '.py'))]).returncode
+        if result:
+            return result
+    return 0
 
-    sound_exe = os.path.join(OUT, 'test_sound.exe')
-    f.write('@if errorlevel 1 exit /b 1\n')
-    f.write('clang-cl -m32 /nologo /O2 /DSND_NO_HOST /I"%s" "%s\\sound.c" "%s\\test_sound.c" /Fe:"%s"\n'
-            % (hle, hle, hle, sound_exe))
-    f.write('@if errorlevel 1 exit /b 1\n"%s"\n' % sound_exe)
-    # The GS renderer's own tests (test_gpu, test_depth, test_present) run on the Rust renderer
-    # in x64: port/tools/test_gs_wgpu.py.
 
-# The native VU0 microprograms are checked against the interpreter running the retail
-# microcode, extracted locally (never tracked) to assets/vutext.bin.
-vutext = os.path.join(ROOT, 'assets', 'vutext.bin')
-if os.path.exists(vutext) and 'DHD_VUTEXT' not in os.environ:
-    os.environ['DHD_VUTEXT'] = vutext
-result = subprocess.run(['cmd', '/c', cmd]).returncode
-if not result:
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_rider_time.py')]).returncode
-if result == 0:
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_rider_interaction.py')]).returncode
-if result == 0:
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_npc_animation.py')]).returncode
-if result == 0:
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_rider_input.py')]).returncode
-if result == 0:
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_npc_float_return.py')]).returncode
-if not result:
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_float.py')]).returncode
-if not result:
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_port_headers.py')]).returncode
-if not result and os.environ.get('DHD_PCSX2_VU'):
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_vu1_pcsx2.py')]).returncode
-if not result and os.environ.get('DHD_PCSX2_VU'):
-    result = subprocess.run([sys.executable, os.path.join(ROOT, 'port/tools/test_vu0_pcsx2.py')]).returncode
-sys.exit(result)
+if __name__ == '__main__':
+    sys.exit(main())

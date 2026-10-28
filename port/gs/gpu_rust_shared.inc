@@ -4,13 +4,27 @@
    native backend functions both sides have alike.
 
    Included by each side's native .inc, after NativeExact (the provider, Rust or Web: an Exact, then
-   DhdrExact *x; members native, clip_on, clip[4]), NATIVE_GPU_SIDE (its own Native members) and
-   NATIVE_SCALE_MAX (in the browser also NATIVE_INLINE and the gs_native_* renames). The side then
-   defines what differs: op_read (the browser suspends), op_clock, op_draw_skipped,
-   native_replacement_view (texture packs), native_match_window, native_present (the window and
-   pacing, or the canvas at web_present), native_read_display and native_init. */
+   DhdrExact *x; members native, clip_on, clip[4]) and NATIVE_GPU_SIDE, its own Native members if
+   any (in the browser also NATIVE_INLINE and the gs_native_* renames). The side then defines what
+   differs: op_read and native_read_wait (the browser suspends), op_clock, op_draw_skipped,
+   native_replacement_view (texture packs), native_window_height and NATIVE_WINDOW (the window or
+   the canvas), native_present (the window and pacing, or the canvas at web_present) and
+   native_init. */
 
-#include "dhd_render_ext.h"       /* dhdr_native_picture_indexed (-Iport/render/include) */
+#include "dhd_render_ext.h"       /* dhdr_native_picture_indexed, dhdr_device_max_texture (-Iport/render/include) */
+
+/* DHD_SCALE up to 8 (finding 086, S1). native_wanted caps a surface at NATIVE_SURFACE_MAX GS
+   pixels a side, so 8x needs 16384-texel textures: Direct3D 12 guarantees that size
+   (D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION), desktop Vulkan drivers give 16384 or 32768, and the
+   browser's device asks for its adapter's largest (WebGPU guarantees 8192). native_scale_hold
+   lowers the scale to what the device takes. A size it refuses anyway fails in dhdr_native_surface
+   with a log line, keeping the old texture. */
+#define NATIVE_SCALE_MAX 8u
+#define NATIVE_SURFACE_MAX 2048u
+
+#ifndef NATIVE_GPU_SIDE
+#define NATIVE_GPU_SIDE
+#endif
 
 typedef DhdrTexture *NativeView;   /* a replacement: a texture pack's or the sharp font's */
 /* A decoded texture: its Rust texture (gpu; native_core.inc asks for it as texture) and its sharp
@@ -25,6 +39,7 @@ typedef DhdrTexture *NativeView;   /* a replacement: a texture pack's or the sha
     struct NativeSnapshot *snapshot;   /* the picture handed to dhdr_native_picture */ \
     int dual;                          /* asked for dual-source blending */ \
     int present_failed;                /* dhdr_native_present failed: no more presents */ \
+    unsigned scale_limit;              /* the largest scale this device takes (native_scale_hold) */ \
     NATIVE_GPU_SIDE
 
 #include "native_core.inc"
@@ -115,9 +130,18 @@ static int native_surface_resources(Native *n, NativeSurface *s, const unsigned 
     return 1;
 }
 
-/* DHD_SCALE=window: the smallest scale whose picture is as tall as the window (the canvas in the
-   browser). Per side. */
-static unsigned native_match_window(Native *n, const NativeFrame *f);
+/* The height the picture is shown at: the window's (x64) or the canvas's (browser). Per side. */
+static unsigned native_window_height(Native *n);
+
+/* DHD_SCALE=window: the smallest scale whose picture is as tall as the window, up to the limit. */
+static unsigned native_match_window(Native *n, const NativeFrame *f)
+{
+    unsigned height = native_window_height(n);
+    unsigned lines = f->display_surface >= 0 && f->display[6] ? f->display[6] : 448, scale = 1;
+    while (scale < n->scale_limit && scale * lines < height) scale++;
+    fprintf(stderr, "gs native: resolution scale %u (%s %u lines, picture %u)\n", scale, NATIVE_WINDOW, height, lines);
+    return scale;
+}
 
 /* One picture: the field's commands (with these vertices) drawn and scanned out, then
    native_present (x64: presented at once; the browser: shown by the web_present that follows). */
@@ -189,6 +213,26 @@ static int native_present_draw(Native *n, DhdrSurface *surface, unsigned w, unsi
     return drawn;
 }
 
+/* The wait between dhdr_native_read_begin and _finish. Per side (x64: none, the finish blocks; the
+   browser suspends in web_gpu_await). 1 = mapped. */
+static int native_read_wait(void);
+
+/* The displayed picture (display_width x display_height) into pixels; 0 when there is none. */
+static int native_read_display(Native *n, uint32_t *pixels)
+{
+    uint32_t w = 0, h = 0;
+    if (!n->display_width || !dhdr_native_read_begin(n->r, &w, &h)) return 0;
+    int mapped = native_read_wait();
+    if (w == n->display_width && h == n->display_height) return dhdr_native_read_finish(n->r, pixels) && mapped;
+    /* Not the picture native_picture last reported: finish the read elsewhere, report none. */
+    uint32_t *other = malloc((size_t)w * h * 4);
+    if (!other) native_oom("display read");
+    dhdr_native_read_finish(n->r, other);
+    free(other);
+    fprintf(stderr, "gs native: display read %ux%u, expected %ux%u\n", w, h, n->display_width, n->display_height);
+    return 0;
+}
+
 /* DHD_PRESENT_FILTER=point keeps the picture's pixels sharp; linear by default. Then DHD_ASPECT. */
 static void native_present_options(Native *n)
 {
@@ -199,11 +243,31 @@ static void native_present_options(Native *n)
 
 /* ---- creation ---- */
 
+/* The largest scale this device takes (n->scale_limit), and DHD_SCALE held to it: every surface
+   (up to NATIVE_SURFACE_MAX GS pixels a side) fits in the device's largest texture
+   (dhdr_device_max_texture), and the upscaled ones (the frame and Z buffers, about
+   NATIVE_SCALED_BYTES at 1x, growing with the scale squared) in at most half of memory, the
+   dedicated graphics memory (x64: DXGI's DedicatedVideoMemory, as the texture pack's budget; 0 when
+   unknown, as in the browser). Memory never takes it below 4, as before. */
+#define NATIVE_SCALED_BYTES (16ull << 20)
+static void native_scale_hold(Native *n, uint64_t memory)
+{
+    unsigned limit = NATIVE_SCALE_MAX, texture = dhdr_device_max_texture() / NATIVE_SURFACE_MAX;
+    if (texture && texture < limit) limit = texture;
+    while (memory && limit > 4 && (uint64_t)limit * limit * NATIVE_SCALED_BYTES > memory / 2) limit--;
+    n->scale_limit = limit;
+    if (n->scale_setting > limit) {
+        fprintf(stderr, "gs native: resolution scale %u is more than this graphics device takes; %u\n",
+                n->scale_setting, limit);
+        n->scale_setting = limit;
+    }
+}
+
 /* native_init's common half: the Native over exact, the dual-source choice (DHD_WGPU_DUAL_SOURCE=0
-   turns it off), the Rust native renderer, the present options and the replacements' device. NULL
-   when unavailable (g keeps the exact renderer); *start: the time before Rust built its shaders and
-   pipelines. */
-static Native *native_create_rust(NativeExact *exact, double *start)
+   turns it off), the Rust native renderer, the present options, the scale limit (native_scale_hold
+   with memory) and the replacements' device. NULL when unavailable (g keeps the exact renderer);
+   *start: the time before Rust built its shaders and pipelines. */
+static Native *native_create_rust(NativeExact *exact, uint64_t memory, double *start)
 {
     Native *n = native_create(exact);
     if (!n) return NULL;
@@ -222,6 +286,7 @@ static Native *native_create_rust(NativeExact *exact, double *start)
         return NULL;   /* leaks the shared state: once, at start-up */
     }
     native_present_options(n);
+    native_scale_hold(n, memory);
     /* Replacements (x64: a texture pack and the sharp font; the browser: the sharp font): Rust
        samples them with mipmaps, anisotropic when the GS filters, point magnification when it
        doesn't, with clamped or repeating coordinates as the GS has them. */

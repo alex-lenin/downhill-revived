@@ -1,18 +1,19 @@
-"""Sampling CPU profiler for a running Windows x64 or i686 process (no admin, no WPR).
+"""Sampling CPU profiler for a running Windows x64 process (no admin, no WPR).
 
     python port/tools/sample_profile.py --pid N --seconds 30 --out build/prof/x.json
     python port/tools/sample_profile.py --run EXE --env K=V ... --seconds 30 --out ...
 
 Every --interval ms each thread of the process that used CPU cycles since the previous tick
-(QueryThreadCycleTime) is suspended, its instruction pointer read (GetThreadContext; Wow64 for
-i686) and resumed. Addresses are grouped by module; addresses inside the main exe are symbolized
+(QueryThreadCycleTime) is suspended, its instruction pointer read (GetThreadContext) and
+resumed. Addresses are grouped by module; addresses inside the main exe are symbolized
 with llvm-symbolizer (needs a PDB beside the exe: build_host64.py --debug). The report lists
 self samples per function and per thread, and the inlined frames (llvm-symbolizer --inlines)
 are kept so a function inlined into its caller is still visible. Only the process given (or
-started here) is touched; a started process is stopped by PID at the end.
+started here, through owned_process, which ends it and what it started) is touched.
 """
 import argparse
 import collections
+import contextlib
 import ctypes
 import json
 import os
@@ -22,6 +23,9 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import owned_process
+
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 psapi = ctypes.WinDLL('psapi', use_last_error=True)
 winmm = ctypes.WinDLL('winmm')
@@ -30,7 +34,6 @@ TH32CS_SNAPTHREAD = 4
 THREAD_ACCESS = 0x0002 | 0x0008 | 0x0040 | 0x0800  # suspend/resume, get context, query, query limited
 PROCESS_ACCESS = 0x0400 | 0x0010  # query information, vm read
 CONTEXT_AMD64_CONTROL = 0x00100001
-WOW64_CONTEXT_CONTROL = 0x00010001
 
 
 class THREADENTRY32(ctypes.Structure):
@@ -43,57 +46,19 @@ class MODULEINFO(ctypes.Structure):
     _fields_ = [('lpBaseOfDll', ctypes.c_void_p), ('SizeOfImage', wintypes.DWORD), ('EntryPoint', ctypes.c_void_p)]
 
 
-user32 = ctypes.WinDLL('user32')
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-
-def minimize_windows(pid):
-    """Minimise (without activating) every visible top-level window of the process."""
-    def visit(hwnd, _):
-        owner = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-        if owner.value == pid and user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, 7)  # SW_SHOWMINNOACTIVE
-        return True
-    user32.EnumWindows(WNDENUMPROC(visit), 0)
-
-
 k32.OpenThread.restype = wintypes.HANDLE
 k32.OpenProcess.restype = wintypes.HANDLE
 k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 k32.SuspendThread.argtypes = [wintypes.HANDLE]
 k32.ResumeThread.argtypes = [wintypes.HANDLE]
 k32.GetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
-k32.Wow64GetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
 k32.QueryThreadCycleTime.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_ulonglong)]
 k32.GetThreadDescription.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
 k32.CloseHandle.argtypes = [wintypes.HANDLE]
-k32.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
 psapi.EnumProcessModulesEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD,
                                        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
 psapi.GetModuleInformation.argtypes = [wintypes.HANDLE, wintypes.HMODULE, ctypes.POINTER(MODULEINFO), wintypes.DWORD]
 psapi.GetModuleBaseNameW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
-
-
-class PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD), ('th32ProcessID', wintypes.DWORD),
-                ('th32DefaultHeapID', ctypes.c_void_p), ('th32ModuleID', wintypes.DWORD),
-                ('cntThreads', wintypes.DWORD), ('th32ParentProcessID', wintypes.DWORD),
-                ('pcPriClassBase', wintypes.LONG), ('dwFlags', wintypes.DWORD), ('szExeFile', ctypes.c_wchar * 260)]
-
-
-def child_of(pid):
-    """A child process of pid (dhd.exe relaunches itself with its fixed memory reserved), or None."""
-    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
-    entry = PROCESSENTRY32W(); entry.dwSize = ctypes.sizeof(entry)
-    found = None
-    ok = k32.Process32FirstW(snap, ctypes.byref(entry))
-    while ok:
-        if entry.th32ParentProcessID == pid and entry.szExeFile.lower().endswith('.exe')                 and entry.szExeFile.lower() != 'conhost.exe':
-            found = entry.th32ProcessID
-        ok = k32.Process32NextW(snap, ctypes.byref(entry))
-    k32.CloseHandle(snap)
-    return found
 
 
 def threads_of(pid):
@@ -122,11 +87,10 @@ def modules_of(process):
 
 
 class Thread:
-    def __init__(self, tid, wow):
+    def __init__(self, tid):
         self.tid = tid
         self.handle = k32.OpenThread(THREAD_ACCESS, False, tid)
         self.cycles = 0
-        self.wow = wow
         self.name = ''
         self.sp = 0
         if self.handle:
@@ -147,12 +111,6 @@ class Thread:
         if k32.SuspendThread(self.handle) == 0xFFFFFFFF:
             return None
         try:
-            if self.wow:
-                ctypes.memset(self.ctx, 0, 716)
-                ctypes.c_uint32.from_address(self.ctx).value = WOW64_CONTEXT_CONTROL
-                if not k32.Wow64GetThreadContext(self.handle, self.ctx):
-                    return None
-                return ctypes.c_uint32.from_address(self.ctx + 0xB8).value  # Eip
             ctypes.memset(self.ctx, 0, 1232)
             ctypes.c_uint32.from_address(self.ctx + 0x30).value = CONTEXT_AMD64_CONTROL
             if not k32.GetThreadContext(self.handle, self.ctx):
@@ -194,8 +152,6 @@ def return_chain(process, sp, exe_base, exe_size, cache, depth=4):
 
 def sample(pid, seconds, interval, alive, minimize=False, callers=None):
     process = k32.OpenProcess(PROCESS_ACCESS, False, pid)
-    wow = wintypes.BOOL()
-    k32.IsWow64Process(process, ctypes.byref(wow))
     threads = {}
     counts = collections.Counter()  # (thread name or id, pc)
     caller_counts = collections.Counter()  # (callee rva, caller return rva)
@@ -213,10 +169,10 @@ def sample(pid, seconds, interval, alive, minimize=False, callers=None):
             now = time.perf_counter()
             if now - last_scan > 0.5:
                 if minimize:
-                    minimize_windows(pid)
+                    owned_process.minimize_windows([pid])
                 for tid in threads_of(pid):
                     if tid not in threads:
-                        t = Thread(tid, bool(wow.value))
+                        t = Thread(tid)
                         if t.handle:
                             t.busy(); threads[tid] = t
                 last_scan = now
@@ -279,58 +235,40 @@ def main():
                     help='only run (minimised) until exit or --seconds: a timing run without the sampler')
     ap.add_argument('--callers', action='append', default=[],
                     help='ADDR:SIZE (preferred-base VA of a function): attribute its samples to direct callers')
-    ap.add_argument('--child', action='store_true', help='sample the child the started process relaunches (i686)')
     ap.add_argument('--top', type=int, default=60)
     a = ap.parse_args()
-    proc = None
-    if a.run:
-        env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
-        for item in a.env:
-            k, _, v = item.partition('='); env[k] = v
-        a.out.parent.mkdir(parents=True, exist_ok=True)
-        log = open(str(a.out) + '.log', 'wb')
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup.wShowWindow = 7  # SW_SHOWMINNOACTIVE (SDL may still show it; --minimize follows up)
-        proc = subprocess.Popen([str(a.run.resolve())], cwd=str(a.out.parent.resolve()), env=env,
-                                stdout=log, stderr=subprocess.STDOUT, startupinfo=startup)
-        pid = proc.pid
-    else:
-        pid = a.pid
-    exe = (a.exe or a.run).resolve()
-    alive = (lambda: proc.poll() is None) if proc else (lambda: True)
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < a.delay and alive():
-        if a.minimize:
-            minimize_windows(pid)
-            c = child_of(pid)
-            if c:
-                minimize_windows(c)
-        time.sleep(0.2)
-    if a.child:
-        child = child_of(pid)
-        if not child:
-            raise SystemExit('no child process of %d' % pid)
-        pid = child
-        print('sampling child process %d' % pid)
-    if a.no_sample:
-        end = time.perf_counter() + a.seconds
-        while time.perf_counter() < end and alive():
-            if a.minimize:
-                minimize_windows(pid)
-            time.sleep(0.25)
-        if proc and proc.poll() is None:
-            proc.kill(); proc.wait()
-        print('exit', proc.returncode if proc else None)
-        return
-    try:
+    with contextlib.ExitStack() as owned:   # a started process ends with it
+        proc = None
+        if a.run:
+            env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
+            for item in a.env:
+                k, _, v = item.partition('='); env[k] = v
+            a.out.parent.mkdir(parents=True, exist_ok=True)
+            log = owned.enter_context(open(str(a.out) + '.log', 'wb'))
+            proc = owned.enter_context(owned_process.start([str(a.run.resolve())], cwd=str(a.out.parent.resolve()),
+                                                           env=env, stdout=log, stderr=subprocess.STDOUT,
+                                                           minimized=True))
+            pid = proc.pid
+        else:
+            pid = a.pid
+        alive = (lambda: proc.poll() is None) if proc else (lambda: True)
+        # the delay, then with --no-sample the run itself (minimised)
+        for seconds in (a.delay, a.seconds if a.no_sample else 0):
+            end = time.perf_counter() + seconds
+            while time.perf_counter() < end and alive():
+                if a.minimize:
+                    owned_process.minimize_windows([pid])
+                time.sleep(0.2)
+        if a.no_sample:
+            if proc:
+                proc.stop()
+            print('exit', proc.returncode if proc else None)
+            return
         callers = [tuple(int(x, 0) for x in c.split(':')) for c in a.callers]
         counts, mods, ticks = sample(pid, a.seconds, a.interval, alive, a.minimize, callers)
-    finally:
-        if proc and proc.poll() is None:
-            proc.kill(); proc.wait()
+    exe = (a.exe or a.run).resolve()
     exe_mod = next((m for m in mods if m[2].lower() == exe.name.lower()), None)
-    preferred = 0x140000000 if exe_mod and exe_mod[0] > 0xFFFFFFFF else 0x400000
+    preferred = 0x140000000
     in_exe = sorted({pc for (_, pc) in counts if exe_mod and exe_mod[0] <= pc < exe_mod[0] + exe_mod[1]})
     syms = symbolize(exe, [pc - exe_mod[0] + preferred for pc in in_exe], a.llvm) if exe_mod else {}
     self_fn = collections.Counter(); incl = collections.Counter(); per_thread = collections.Counter()

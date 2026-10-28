@@ -1,6 +1,8 @@
 """Compare VU0 micro mode with a pinned, independently compiled PCSX2 interpreter.
 
-Requires clang-cl/x86 libraries. Downloads public GPL reference sources into build/ (the same
+Both run on the 64-bit host (testprog.host): the oracle reads capture files, which a guest test
+program cannot. The game runs VU0 in the core (wasm32); vu0_interp.c is the same C there, its SSE
+calls through SIMDe. Needs LLVM. Downloads public GPL reference sources into build/ (the same
 pin as test_vu1_pcsx2.py, plus VU0microInterp.cpp). Inputs are local DHD_VU0_CAPTURE files
 (registers, VU0 code/data and the VU1 register file); they hold game microcode and stay under
 build/. Each capture is also re-run with seeded data memory to cover more paths.
@@ -14,6 +16,7 @@ import struct
 import subprocess
 import urllib.request
 
+import testprog
 import test_vu1_pcsx2 as vu1
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,12 +45,9 @@ def build():
         if name == 'VU0microInterp.cpp':
             source = source[:source.index('InterpVU0 CpuIntVU0;')]
         (OUT / name).write_text(source, encoding='utf-8')
-    flags = ['clang-cl', '-m32', '/nologo', '/O2', '-Wno-deprecated-declarations',
-             '-msse2', '-mfpmath=sse', '/clang:-ffp-contract=off']
-    subprocess.run(flags + ['/c', str(ROOT / 'port/runtime/vu0_interp.c'), '/Fonative.obj'], cwd=OUT, check=True)
-    subprocess.run(flags + ['/std:c++20', '/I' + str(OUT), '/I' + str(ROOT / 'port/runtime'), '/c',
-                            str(ROOT / 'port/runtime/pcsx2_vu0_oracle.cpp'), '/Fooracle.obj'], cwd=OUT, check=True)
-    subprocess.run(['clang-cl', '-m32', '/nologo', 'oracle.obj', 'native.obj', '/Feoracle.exe'], cwd=OUT, check=True)
+    native = testprog.host_object(ROOT / 'port/runtime/vu0_interp.c', OUT, 'native')
+    testprog.host('oracle', [ROOT / 'port/runtime/pcsx2_vu0_oracle.cpp', native, testprog.HOST_FP], out=OUT,
+                  includes=[OUT])
 
 
 def seeded(capture, seed):
@@ -81,7 +81,7 @@ def main():
     for capture in captures:
         address = struct.unpack_from('<I', capture.read_bytes())[0]
         for path in [capture] + [seeded(capture, s) for s in range(1, args.seeds + 1)]:
-            run = subprocess.run([str(OUT / 'oracle.exe'), str(path)], capture_output=True, text=True, timeout=30)
+            run = subprocess.run([str(OUT / ('oracle' + testprog.EXE)), str(path)], capture_output=True, text=True, timeout=30)
             results.append(dict(case=path.name, entry=address, result=run.returncode, output=run.stdout, error=run.stderr))
             entries.setdefault(address, [0, 0])[run.returncode != 0] += 1
             if run.returncode:

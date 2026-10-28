@@ -1,13 +1,13 @@
 /* Rate invariance checks against elapsed physical time, not implementation
    snapshots. Compiled with the production host clock and math helpers. */
 #include "../include/fps.h"
+#include "../host/host_api.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 int D_0029E3D0=1,D_0029E3D4=60,D_0029E3D8,D_0029E3DC;
 int D_0029E3E0,D_0029E3E8;
@@ -18,14 +18,15 @@ int func_00243CE8(int ignored) { (void)ignored; waits++; return 0; }
 void hle_log(const char *fmt,...) { (void)fmt; }
 static double fake_wall=1;
 double host_wall_seconds(void) { return fake_wall; }
+int host_display_hz(void) { return 0; }  /* DHD_FPS=monitor is not checked here */
 void func_00155E78(void *p,int kind) { (void)p;recoveries++;recovery_kind=kind; }
 int func_0012D300(void *p) { (void)p;return 0; }
 float func_0012DF48(void *p) { (void)p;return (float)braking; }
 int main(int argc,char **argv)
 {
     int n=atoi(argv[1]);
-    assert(VirtualAlloc((void *)0x10000000,65536,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
-    _putenv_s("DHD_FPS",argv[1]);
+    /* the core's guest memory: the registers at 0x10000000, PS2 RAM at 0x08000000 */
+    host_putenv_s("DHD_FPS",argv[1]);  /* the host environment port_fps reads */
     assert(port_fps()==n);
     if(n==60) {
         assert(port_step()==1 && port_decay(.9f)==.9f && port_blend(.1f)==.1f);
@@ -34,9 +35,8 @@ int main(int argc,char **argv)
         puts("60: original arithmetic preserved"); return 0;
     }
     port_clock_reset();
-    assert(VirtualAlloc((void *)0x08000000,0x1000000,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
     *(int *)0x0829DED8=9;*(int *)0x0843F348=2;
-    __declspec(align(16)) unsigned char rider[0x7BD0]={0},bike[0x4C0]={0};
+    unsigned char __attribute__((aligned(16))) rider[0x7BD0]={0},bike[0x4C0]={0};
     if (argc>2 && !strcmp(argv[2],"wall")) {
         port_fps_wall_mode(1);port_clock_reset();D_0029E3D8=0;
         double simulated=0,elapsed=0; int animation=0;

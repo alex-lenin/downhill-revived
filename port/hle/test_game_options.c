@@ -11,10 +11,13 @@ int D_0039E82C[1], D_0039E830[1];
 static char saved[256];
 static int apply_count, difficulty, vibration[8];
 void hle_log(const char *fmt, ...) { (void)fmt; }
-int host_setting_save(const char *key, const char *value) {
-    assert(!strcmp(key,"game_options")); snprintf(saved,sizeof saved,"%s",value); return 1;
+/* the host's settings services, as the module calls them (guest addresses) */
+int host_service_host_setting_save(uint32_t key, uint32_t value) {
+    assert(!strcmp(GUEST(key),"game_options")); snprintf(saved,sizeof saved,"%s",(char *)GUEST(value)); return 1;
 }
-int host_game_options_read(char *value, size_t size) { snprintf(value,size,"%s",saved); return *saved != 0; }
+int host_service_host_game_options_read(uint32_t value, uint32_t size) {
+    snprintf(GUEST(value),size,"%s",saved); return *saved != 0;
+}
 void func_00195C40(void *o) { assert(o == D_004225A0+0x11A60); apply_count++; }
 void func_0016C298(void *p,int d) { assert(p == D_00398C40); difficulty=d; }
 int func_002205A0(int p) { return p*2; }
@@ -36,7 +39,7 @@ int main(void) {
     port_game_options_apply(); assert(!memcmp(before,D_004225A0,sizeof before));
     strcpy(saved,"1 800 808 400 0 1 2 1 1 0 1 0 2 1 1 0 trailing");
     port_game_options_apply(); assert(!memcmp(before,D_004225A0,sizeof before));
-    _putenv_s("DHD_SETTINGS","none");
+    host_putenv_s("DHD_SETTINGS","none");
     strcpy(saved,"1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
     port_game_options_apply(); port_game_options_save();
     assert(!memcmp(before,D_004225A0,sizeof before));

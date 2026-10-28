@@ -22,14 +22,18 @@ void precision(float a) {}
 int no_proto(int a, int *b) { return a + *b; }
 void promoted(float a) {}
 ''',
+        # the reviewed Color case in its real form, which build_wasm.py's SCALAR_ABI rewrites
         'color.cpp': '''
 union Color { unsigned int packed; };
-extern "C" unsigned int func_00161868(Color c,float *v) { return c.packed; }
+unsigned int func_00161868(Color color, float *light)
+{
+    return color.packed;
+}
 ''',
         'caller.c': '''
 typedef float Scalar;
 extern float inner(Scalar, int);
-extern int alias(Scalar, int, Scalar, int *, int) __asm__("_target");
+extern int alias(Scalar, int, Scalar, int *, int) __asm__("target");
 extern void arity();
 extern void precision(double);
 #define CALL_PRECISION precision

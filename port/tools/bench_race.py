@@ -14,10 +14,8 @@ The window is kept in front (Windows slows a background game) and its focused sh
 Reports medians of fields/s, frame times, thread CPU, displayed rate (DHD_INTERP) and audio
 counters; writes OUT/summary.json and one log per run. Game image: DHD_ISO, else state_trace_run's.
 """
-from ctypes import wintypes
 from pathlib import Path
 import argparse
-import ctypes
 import json
 import os
 import re
@@ -28,8 +26,8 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_pcsx2 as compare
+import owned_process
 import race_compare as race
-from sample_profile import minimize_windows
 from state_trace_run import DEFAULT_ISO
 
 LINE = re.compile(rb'bench: fields=(\d+)-(\d+) fields_per_s=([\d.]+) p50_ms=([\d.]+) p99_ms=([\d.]+) '
@@ -38,7 +36,7 @@ LINE = re.compile(rb'bench: fields=(\d+)-(\d+) fields_per_s=([\d.]+) p50_ms=([\d
 # rate and time between presents.
 SHOWN = re.compile(rb'bench interp: displayed_fps=([\d.]+) present_ms p50=([\d.]+) p99=([\d.]+) '
                    rb'worst1pct=([\d.]+) max=([\d.]+)')
-# Audio output over the window (--sound; port/host/sound_out_common.inc): gaps, silence written in
+# Audio output over the window (--sound; port/host/sound_out_sdl.c): gaps, silence written in
 # them, queue.
 SOUND = re.compile(rb'bench snd: underruns=(\d+) silence_ms=([\d.]+) dropped_ms=([\d.]+) skipped_ms=([\d.]+) '
                    rb'played_s=([\d.]+) queue_ms p1=(\d+) p50=(\d+) p99=(\d+) rate_ppm=([-+\d.]+) '
@@ -53,9 +51,6 @@ SCENES = {'race': (dict(DHD_AUTOPAD_FRAMES=compare.frame_script(compare.parse_pa
                         DHD_NAV=race.NAV, DHD_RACE_SYNC='1', DHD_RACE_PAD=race.RACE_PAD, DHD_RACE_SEED='81257'),
                    '6000-7000'),
           'menu': (dict(DHD_NAV='0:triangle|cross'), '400-1000')}
-GAME_NAMES = ('dhd.exe', 'dhd64.exe')  # the packaged game and build_host64.py's output
-
-
 def parse_candidate(text):
     match = re.fullmatch(r'([^=]+)=(.+?)(?::([A-Za-z_]\w*=.*))?', text)
     if not match:
@@ -63,52 +58,6 @@ def parse_candidate(text):
     label, exe, env = match.groups()
     extra = dict(item.split('=', 1) for item in env.split(',')) if env else {}
     return label, Path(exe).resolve(), extra
-
-
-user32 = ctypes.WinDLL('user32')
-kernel32 = ctypes.WinDLL('kernel32')
-user32.GetForegroundWindow.restype = wintypes.HWND
-kernel32.OpenProcess.restype = wintypes.HANDLE
-WINDOW_CALLBACK = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-
-def process_name(pid):
-    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ''
-    try:
-        buffer = ctypes.create_unicode_buffer(1024)
-        size = wintypes.DWORD(len(buffer))
-        return buffer.value if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)) else ''
-    finally:
-        kernel32.CloseHandle(handle)
-
-
-def focus_game(names):
-    """Brings the game's window to the front. Returns whether it has focus, or None before it exists.
-    Only one game runs during a benchmark, so any visible window of a process named in names is it."""
-    found = []
-
-    def each(hwnd, _):
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if user32.IsWindowVisible(hwnd) and Path(process_name(pid.value)).name.lower() in names:
-            found.append(hwnd)
-        return True
-    user32.EnumWindows(WINDOW_CALLBACK(each), 0)
-    if not found:
-        return None
-    foreground = user32.GetForegroundWindow()
-    if foreground in found:
-        return True
-    hwnd = found[0]
-    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-    # A key event lifts Windows' foreground lock for this process; Alt alone does nothing in the game.
-    user32.keybd_event(0x12, 0, 0, 0)
-    user32.keybd_event(0x12, 0, 2, 0)
-    user32.SetForegroundWindow(hwnd)
-    user32.BringWindowToTop(hwnd)
-    return user32.GetForegroundWindow() == hwnd
 
 
 def run_once(exe, extra, scene, mode, args, log_path):
@@ -125,27 +74,19 @@ def run_once(exe, extra, scene, mode, args, log_path):
         env['DHD_HEADLESS'] = '1'
     env.update(extra)
     window = 'none' if args.headless else 'minimized' if args.minimized else 'focus'
-    startup = None
-    if window == 'minimized':
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup.wShowWindow = 7  # SW_SHOWMINNOACTIVE
-    names = set(GAME_NAMES) | {exe.name.lower()}
     start = time.monotonic()
     samples = focused = 0
-    with open(log_path, 'wb') as log:
-        process = subprocess.Popen([str(exe)], cwd=exe.parent, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                   startupinfo=startup,
-                                   creationflags=getattr(subprocess, 'ABOVE_NORMAL_PRIORITY_CLASS', 0))
+    with open(log_path, 'wb') as log, \
+            owned_process.start([str(exe)], cwd=exe.parent, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                minimized=window == 'minimized',
+                                creationflags=getattr(subprocess, 'ABOVE_NORMAL_PRIORITY_CLASS', 0)) as process:
         while process.poll() is None:
             if time.monotonic() - start > args.timeout:
-                process.kill()
-                process.wait(timeout=30)
                 raise RuntimeError(f'{exe} timed out after {args.timeout} s; see {log_path}')
             if window == 'minimized':
-                minimize_windows(process.pid)
+                process.minimize()
             elif window == 'focus':
-                state = focus_game(names)
+                state = process.focus()
                 if state is not None:
                     samples += 1
                     focused += state

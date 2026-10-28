@@ -14,6 +14,8 @@ import csv
 import subprocess
 from pathlib import Path
 
+import testprog
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -25,11 +27,8 @@ def main():
     out = args.dir.resolve()
     if ROOT / 'build' not in out.parents:
         ap.error('the capture must stay under build/')
-    exe = out / 'vu1_seq_dep.exe'
-    subprocess.run(['clang-cl', '-m32', '/nologo', '/O2', '-Wno-deprecated-declarations', '-msse2', '-mno-fma',
-                    '-mfpmath=sse', '/clang:-ffp-contract=off', '/I' + str(ROOT / 'port/runtime'),
-                    str(ROOT / 'port/runtime/vu0_interp.c'), str(ROOT / 'port/runtime/vu1_seq_dep.c'),
-                    '/Fe' + str(exe)], cwd=out, check=True, timeout=600)
+    exe = testprog.host('vu1_seq_dep', [ROOT / 'port/runtime/vu0_interp.c', ROOT / 'port/runtime/vu1_seq_dep.c',
+                                        testprog.HOST_FP], out=out, low=True)
     with (out / 'dep.csv').open('w') as log:
         subprocess.run([str(exe), str(out)] + ([str(args.max)] if args.max else []), stdout=log, check=True,
                        timeout=3600)

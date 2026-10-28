@@ -1,6 +1,6 @@
 """Execute a shared-header virtual call using the retail SN vtable layout."""
 from pathlib import Path
-import subprocess
+import testprog
 import transform
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,15 +35,7 @@ int main(void) {
  return sounds != 3 || queue->Value() != 0x12345678 || queue->Random() != 0x87654321;
 }
 ''')
-    obj = source.with_suffix('.o')
-    subprocess.run(['clang', '--target=i686-pc-windows-itanium', '-c', '-O2',
-                    '-fno-exceptions', '-fno-rtti', '-malign-double',
-                    '-I' + str(ROOT / 'port/include'), '-I' + str(include),
-                    str(source), '-o', str(obj)], check=True)
-    exe = source.with_suffix('.exe')
-    subprocess.run(['clang', '--target=i686-pc-windows-msvc', '-fuse-ld=lld',
-                    str(obj), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest('port-headers', [source], out=OUT, includes=[include]))
     print('Shared-header virtual layout, slots, signed this adjustments pass')
 
 

@@ -1,9 +1,10 @@
-"""Check patched 32-bit Huffman tables across stack poison and compiler choices."""
-import re, subprocess, sys
+"""Check patched 32-bit Huffman tables (wasm32, as in the core) across stack poison and compiler choices."""
+import re, sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'port'))
 import patches
+import testprog
 out=ROOT/'build/port/huft-test'; out.mkdir(parents=True,exist_ok=True)
 s=(ROOT/'src/unsorted/00240270.c').read_text()
 for kind,a,b in patches.PATCHES['unsorted/00240270.c']:
@@ -14,7 +15,6 @@ for kind,a,b in patches.PATCHES['unsorted/00240270.c']:
 struct=s[s.index('typedef struct Huft {'):s.index('extern const unsigned short D_00299440')]
 fn=s[s.index('int func_00240CB8('):s.index('\n\nextern unsigned short D_00299446')]
 harness=r'''
-#include <windows.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -26,7 +26,7 @@ static unsigned char *arena; static unsigned used;
 void *func_00254EB0(unsigned n) { void *p=arena+used; used+=n; if(used>65536) abort(); return p; }
 int func_00240C70(char *p) { return 0; }
 FUNCTION
-__declspec(noinline) void poison(unsigned seed) { volatile unsigned a[4096]; for(unsigned i=0;i<4096;i++) a[i]=seed*0x01010101u; }
+__attribute__((noinline)) void poison(unsigned seed) { volatile unsigned a[4096]; for(unsigned i=0;i<4096;i++) a[i]=seed*0x01010101u; }
 static int check(Huft *t,unsigned bits,unsigned *seen) {
  for(unsigned i=0;i<(1u<<bits);i++) {
   Huft *p=t+i; if(p->padding) return 1;
@@ -35,7 +35,7 @@ static int check(Huft *t,unsigned bits,unsigned *seen) {
  } return 0;
 }
 int main(void) {
- arena=VirtualAlloc((void*)0x08800000,65536,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE); if(arena!=(void*)0x08800000) return 10;
+ arena=(unsigned char *)0x08800000; /* a fixed guest address: the tables' pointers are the same in every build */
  unsigned char expected[65536]; unsigned expected_size=0; uint64_t hash=1469598103934665603ULL;
  for(unsigned test=0;test<2;test++) for(unsigned seed=0;seed<256;seed++) {
   unsigned lens[288],seen[65536]={0},bits=test?2:7,n=test?2:288; Huft *t=0;
@@ -52,10 +52,9 @@ int main(void) {
 '''.replace('STRUCT',struct).replace('FUNCTION',fn)
 source=out/'test.c';source.write_text(harness)
 answers=[]
-for opt,isa in [('1','sse2'),('2','sse2'),('2','sse4.1'),('2','avx2')]:
- exe=out/f'huft-{opt}-{isa}.exe'
- subprocess.run(['clang-cl','-m32','/nologo','/clang:-O'+opt,'-m'+isa,'-mno-fma','/clang:-ffp-contract=off',str(source),'/Fe'+str(exe),'/Fo'+str(out/'test.obj'),'/link','/dynamicbase:no'],check=True,timeout=60)
- result=subprocess.check_output([str(exe)],timeout=20,text=True).strip();answers.append(result)
- print(opt,isa,result,flush=True)
+for label,flags in [('core',[]),('O1',['-O1']),('no-simd',['-mno-simd128'])]:  # the core's -O2 with SIMD, then other choices
+ exe=testprog.guest('huft-'+label,[source],out=out/label,flags=flags,memory=0x08810000)
+ result=testprog.run(exe,timeout=20,quiet=True).stdout.strip();answers.append(result)
+ print(label,result,flush=True)
 assert len(set(answers))==1,answers
-print('Huffman table bytes MATCH: 4 builds, 256 stack patterns, complete and incomplete trees')
+print('Huffman table bytes MATCH: 3 builds, 256 stack patterns, complete and incomplete trees')

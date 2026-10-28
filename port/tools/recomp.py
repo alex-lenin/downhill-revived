@@ -18,7 +18,8 @@ usage: python port/tools/recomp.py NAME...   (normally run by port/tools/build_w
 import glob, hashlib, json, os, re, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pctarget import LABEL_PREFIX as P, TARGET  # noqa: E402
+P = ''  # the module's C symbols carry no prefix (data.LABEL_PREFIX)
+TARGET = 'wasm32-wasip1'  # the core's target (build_wasm.WASM_TARGET): the callers' declarations
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ASM = os.path.join(ROOT, 'asm', 'nonmatchings', 'text')

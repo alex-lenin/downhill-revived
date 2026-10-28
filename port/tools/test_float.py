@@ -1,8 +1,7 @@
 """EE float semantics: recompiled float code, the IR rewrite and the grid conversion patch."""
 from pathlib import Path
-import os
-import subprocess
 import recomp
+import testprog
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,13 +17,8 @@ def grid_conversion():
         text = text.replace(old, new)
     unit = OUT / 'grid.c'
     unit.write_text('#include "port.h"\n' + text)
-    obj = unit.with_suffix('.o')
-    subprocess.run(['clang', '--target=i686-pc-windows-itanium', '-O1', '-c',
-                    '-msse2', '-mfpmath=sse', '-ffp-contract=off',
-                    '-I' + str(ROOT / 'port/include'), str(unit), '-o', str(obj)], check=True)
     driver = OUT / 'grid_driver.c'
     driver.write_text('''#include "ps2float.h"
-#include <xmmintrin.h>
 #include <stdio.h>
 int ps2_cvt_w_s(float a) { return ps2_float_to_int(a); }
 int func_00117A10(void *, float);
@@ -32,7 +26,6 @@ int main(void) {
  float values[3] = {0,0,1};
  float inputs[] = {0,1,3.1f,511,1022,1023,1e37f,-1e37f};
  int expected[] = {1,2,4,512,1023,1023,1023,0};
- _mm_setcsr(_mm_getcsr() & ~(0x680u | 63u));
  for (unsigned i=0;i<8;i++) if (func_00117A10(values,inputs[i]) != expected[i]) return 1;
  values[2]=0;
  if (func_00117A10(values,1e37f)) return 2;
@@ -40,17 +33,13 @@ int main(void) {
  return 0;
 }
 ''')
-    exe = driver.with_suffix('.exe')
-    subprocess.run(['clang', '--target=i686-pc-windows-msvc', '-fuse-ld=lld', '-O2',
-                    '-msse2', '-mfpmath=sse', '-ffp-contract=off',
-                    '-I' + str(ROOT / 'port/runtime'), str(driver), str(obj), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest('grid', [unit, driver], out=OUT / 'grid'))
 
 
 def recompiled_float():
     operations = ['add.s', 'sub.s', 'mul.s', 'div.s', 'madd.s', 'msub.s',
                   'adda.s', 'suba.s', 'mula.s', 'madda.s', 'msuba.s']
-    source = '#include "recomp.h"\n#include <xmmintrin.h>\n#include <stdio.h>\n'
+    source = '#include "recomp.h"\n#include <stdio.h>\n'
     source += 'ps2_cpu ps2;\nfloat ps2_fdiv(float a, float b) { return ps2_float_div(a,b); }\n'
     for i, op in enumerate(operations):
         fn = recomp.Func('float_probe', set(), {})
@@ -75,7 +64,6 @@ static unsigned cases[][4] = {
  {0x7f7fffff,0x40000000,0,0xff7fffff}
 };
 int main(void) {
- _mm_setcsr(_mm_getcsr() & ~(0x680u | 63u));
  for (unsigned i=0;i<11;i++) {
   __builtin_memcpy(&ps2.fpr[1], &cases[i][0], 4);
   __builtin_memcpy(&ps2.fpr[2], &cases[i][1], 4);
@@ -85,17 +73,13 @@ int main(void) {
   __builtin_memcpy(&actual, i<6 ? &ps2.fpr[3] : &ps2.fpu_acc, 4);
   if (actual != cases[i][3]) { printf("probe %u: %08X != %08X\\n", i, actual, cases[i][3]); return 1; }
  }
- puts("Recompiled EE exceptional arithmetic: 11 operations pass with SSE traps enabled");
+ puts("Recompiled EE exceptional arithmetic: 11 operations pass");
  return 0;
 }
 '''
     path = OUT / 'recompiled_float.c'
     path.write_text(source)
-    exe = path.with_suffix('.exe')
-    subprocess.run(['clang', '--target=i686-pc-windows-msvc', '-fuse-ld=lld', '-O2',
-                    '-msse2', '-mfpmath=sse', '-ffp-contract=off',
-                    '-I' + str(ROOT / 'port/runtime'), str(path), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest('recompiled-float', [path], out=OUT / 'recompiled'))
 
 
 def ir_rewrite():

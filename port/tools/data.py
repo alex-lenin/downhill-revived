@@ -8,7 +8,7 @@ mirrors (0x20000000/0x30000000 | address), DMA tag addresses and fixed RAM addre
   .data, .rodata, .gcc_except_table and .sdata, in PS2 address order. .sbss and .bss are zero in
   the RAM block and need no bytes.
 - Every data label (D_..., jtbl_..., ehtbl_..., named ones) becomes an absolute symbol,
-  PS2_RAM_BASE + address, with the target's C prefix (port/tools/pctarget.py). C and C++ units
+  PS2_RAM_BASE + address (wasm32 C symbols carry no prefix: LABEL_PREFIX). C and C++ units
   declare these extern (transform.extern_image_data), so there is one copy, the retail one.
 - .word values: symbols become their absolute or code addresses; switch-table entries (.L...)
   their PS2 address (the case values of recompiled switches, port/tools/recomp.py); exception
@@ -24,7 +24,11 @@ usage: python port/tools/data.py   (normally run by port/tools/build_wasm.py's i
 import ast, bisect, glob, os, re, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pctarget import LABEL_PREFIX as P, PS2_RAM_BASE  # noqa: E402
+P = LABEL_PREFIX = ''  # the module's C symbols carry no prefix (build/audit/w5-wasm-module.md 2.1)
+# The emulated PS2 RAM (32 MB) sits at this guest address, with the uncached mirrors at
+# 0x20000000/0x30000000 + it (port/runtime/memory.c). Below 0x10000000, so a PS2 DMA address
+# (pointer & 0x0FFFFFFF) is still the guest pointer.
+PS2_RAM_BASE = 0x08000000
 from recomp import data_entries  # noqa: E402
 import recomp  # noqa: E402
 
@@ -71,7 +75,13 @@ class ImageNames:
     fold an address into a larger label while a C unit defines it as its own variable)."""
 
     def __init__(self):
-        self.labels = image_symbols()
+        self._labels = None
+
+    @property
+    def labels(self):  # read on first use: importing build_wasm.py needs no asm/ (testprog.py)
+        if self._labels is None:
+            self._labels = image_symbols()
+        return self._labels
 
     def __contains__(self, name):
         if name in self.labels:

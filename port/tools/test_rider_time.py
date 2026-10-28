@@ -1,10 +1,9 @@
 """Exercise the real rider phase setter and idle caller across their native ABI."""
 from pathlib import Path
-import subprocess
 import sys
 import re
 
-import pctarget
+import testprog
 import transform
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,7 +62,7 @@ void ps2_asm(const char *text, const char *constraints, int n, ps2_op *ops) {
     float x, y, z;
     failures += n != 4;
     x = *(float *)ops[1].p; y = *(float *)ops[2].p; z = *(float *)ops[3].p;
-    *(float *)ops[0].p = sqrtf((x*x + y*y) + z*z);
+    *(float *)ops[0].p = __builtin_sqrtf((x*x + y*y) + z*z);  /* libc_shims.c has the libc fabsf */
 }
 static void speed_case(float speed, uint64_t flags, int mode, int ones, int tens) {
     unsigned char object[0x1349] = {0}, race[0x4190] = {0};
@@ -133,7 +132,7 @@ static void reset(float phase) {
     F(0x24) = phase;
 }
 static void check(float target, float rate, float original) {
-    failures += !isfinite(F(0x1C)) || fabsf(F(0x1C) - rate) > 0.000001f;
+    failures += !isfinite(F(0x1C)) || __builtin_fabsf(F(0x1C) - rate) > 0.000001f;
     failures += F(0x20) != F(0x1C) || F(0x2C) != target || F(0x30) != original;
     failures += ctrl[0x18] != 1;
 }
@@ -183,25 +182,9 @@ def main():
     patched = '--unpatched' not in sys.argv
     sources, driver = prepare(ROOT / 'build/port/runtime', patched,
                               '--unpatched-handle' not in sys.argv)
-    objects = []
-    for source in sources:
-        obj = source.with_suffix('.o')
-        subprocess.run(['clang', '--target=' + pctarget.TARGET, '-c', '-O1',
-                        '-fstack-protector-all',
-                        '-msse2', '-mfpmath=sse', '-ffp-contract=off', '-malign-double',
-                        '-I', str(ROOT / 'port/include'), '-I', str(ROOT / 'include'),
-                        str(source), '-o', str(obj)], check=True)
-        objects.append(str(obj))
-    exe = driver.with_suffix('.exe')
-    shim = driver.parent / 'libc_shims.o'
-    subprocess.run(['clang', '--target=' + pctarget.HOST_TARGET, '-c', '-O1',
-                    '-Wno-deprecated-declarations', str(ROOT / 'port/runtime/libc_shims.c'),
-                    '-o', str(shim)], check=True)
-    subprocess.run(['clang', '--target=' + pctarget.HOST_TARGET, '-fuse-ld=lld', '-O1',
-                    '-msse2', '-mfpmath=sse', '-ffp-contract=off', str(driver), *objects,
-                    str(shim), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
-
+    # canaries in every frame (the old DHD_STACK_PROTECT build) catch a buffer overflow at return
+    testprog.run(testprog.guest('rider-time', [*sources, driver, ROOT / 'port/runtime/libc_shims.c'],
+                                out=driver.parent, includes=[ROOT / 'include'], flags=['-fstack-protector-all']))
 
 if __name__ == '__main__':
     main()

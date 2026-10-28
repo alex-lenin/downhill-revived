@@ -23,7 +23,6 @@ from itertools import zip_longest
 from pathlib import Path
 
 import race_compare as rc
-from owned_process import stop_verified
 
 ROOT = Path(__file__).resolve().parents[2]
 TRACES = ('trace.csv', 'trace.csv.steps.csv')
@@ -45,7 +44,7 @@ def run(exe, out, rate, ticks, timeout):
         if process.returncode:
             raise RuntimeError(f'game exited {process.returncode}; see {out / "port.log"}')
     finally:
-        stop_verified(process, out / 'dhd.exe')
+        process.stop()
     with (out / 'trace.csv').open() as f:
         seen = {}
         for row in csv.DictReader(f):

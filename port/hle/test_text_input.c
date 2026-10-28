@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdio.h>
 
+double host_pacing_period(void) { return 1.0 / 60; }  /* host.c's, for keyboard.c's field timing */
+
 int main(void)
 {
     char field[7] = "";

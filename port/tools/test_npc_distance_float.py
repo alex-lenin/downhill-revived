@@ -1,8 +1,7 @@
 """Execute the NPC selector's real distance-adjustment statement."""
 from pathlib import Path
-import subprocess
 import sys
-from pctarget import HOST_TARGET
+import testprog
 ROOT=Path(__file__).resolve().parents[2]
 
 
@@ -19,7 +18,6 @@ def main():
     source.write_text('''#include "ps2float.h"
 #include <assert.h>
 #include <stdio.h>
-#include <xmmintrin.h>
 static float ps2_fsub(float a,float b){return ps2_float_sub(a,b);}
 static float ps2_fmul(float a,float b){return ps2_float_mul(a,b);}
 static float ps2_fadd(float a,float b){return ps2_float_add(a,b);}
@@ -36,18 +34,14 @@ static void check(float distance,float value,float expected){
  speed=value;reads=0;assert(adjust(distance)==expected);assert(reads==1);
 }
 int main(void){
- _mm_setcsr((_mm_getcsr()&~0x680u)&~63u);
  check(10,.5f,15);check(10,1,10);check(10,2,10);check(10,-1,30);
  check(3.4028234663852886e38f,.45f,3.4028234663852886e38f);
  check(-3.4028234663852886e38f,.45f,-3.4028234663852886e38f);
  check(0,-3.4028234663852886e38f,0);
- puts("Real NPC distance adjustment: ordinary, signed, sentinel and zero-product cases pass with SSE traps");return 0;
+ puts("Real NPC distance adjustment: ordinary, signed, sentinel and zero-product cases pass");return 0;
 }
 ''')
-    exe=out/'fixture.exe'
-    subprocess.run(['clang','--target='+HOST_TARGET,'-O1','-w','-msse2','-mfpmath=sse','-fwrapv',
-                    '-ffp-contract=off','-I',str(ROOT/'port/runtime'),str(source),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
+    testprog.run(testprog.guest('npc-distance-float', [source], out=out))
 
 
 if __name__=='__main__':main()

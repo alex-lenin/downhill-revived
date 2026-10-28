@@ -20,6 +20,7 @@
    window size's when windowed), unless DHD_ASPECT names a ratio, which is then used; or W:H.
    This changes EE memory and what the game culls, so the game-state gates run without it. */
 #include "hle.h"
+#include "widescreen_flat.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -264,16 +265,5 @@ void port_hud_text_l(int font, int view, int x, int y, const char *text)
 /* The widescreen picture's shape (width / height), 0 when off. */
 double host_widescreen_aspect(void) { return widescreen ? aspect : 0; }
 
-/* Maximum PATH1 count of a full-screen loading picture in this state, or zero
-   where a small 3D race view must never be mistaken for a card. The goggles
-   transition before a level draws 3,648 primitives; the later tiled card draws
-   144..170. The shop exit (18) already shows the goggles before screen 9.
-   The flyby and title retain the lower limit, since they also draw 3D. */
-int host_widescreen_flat_limit(void)
-{
-    int menu = *(volatile int32_t *)(uintptr_t)(PS2_RAM_BASE + 0x29DED8);
-    int phase = *(volatile int32_t *)(uintptr_t)(PS2_RAM_BASE + 0x43F348);
-    if (menu == 18 || (menu == 9 && phase == 0)) return 4096;
-    if (menu == 0 || (menu == 9 && phase == 5)) return 1000;
-    return 0;
-}
+/* Maximum PATH1 count of a full-screen loading picture in this menu state (widescreen_flat.h). */
+int host_widescreen_flat_limit(void) { return widescreen_flat_limit(); }

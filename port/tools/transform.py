@@ -303,7 +303,7 @@ def rewrite_minmax(text):
 
 def rewrite_long(text):
     """SN EE long is 64 bits and long long is 128, including literal suffixes.
-    Keep the host's long double spelling (both compilers use 64-bit double).
+    Keep long double as spelled (64-bit on the EE, 128-bit in wasm32; no game unit uses it).
     """
     mask = code_mask(text)
     out, last = [], 0
@@ -435,7 +435,6 @@ def port_headers(source, output):
     symbol labels receive the same rewrites as source units.
     """
     from pathlib import Path
-    from pctarget import LABEL_PREFIX
     source, output = Path(source), Path(output)
     for path in source.rglob('*'):
         if not path.is_file(): continue
@@ -443,7 +442,7 @@ def port_headers(source, output):
         target.parent.mkdir(parents=True, exist_ok=True)
         if path.suffix == '.h':
             text = path.read_text(encoding='utf-8', errors='replace')
-            target.write_text(prefix_asm_labels(gcc_virtuals(text), LABEL_PREFIX), encoding='utf-8')
+            target.write_text(gcc_virtuals(text), encoding='utf-8')
         else:
             target.write_bytes(path.read_bytes())
 

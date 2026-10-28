@@ -24,6 +24,8 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw
 
+import owned_process
+
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / 'build/port/compare'
 RATE = Decimal(60000) / Decimal(1001)
@@ -106,25 +108,6 @@ def snapshot_exe(source, directory):
     raise RuntimeError('port executable changed repeatedly during snapshot; retry after linking')
 
 
-def stop(process):
-    if process.poll() is None:
-        if os.name == 'nt':
-            # The reservation launcher can spawn a same-image child. Verify
-            # every executable PID before stopping it; never tree-kill an
-            # unchecked descendant.
-            from owned_process import stop_verified
-            if not isinstance(process.args, (list, tuple)) or not process.args:
-                raise RuntimeError('cannot verify the comparison executable')
-            stop_verified(process, process.args[0])
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
-
-
 def run_port(args, directory, script, events, manifest):
     iso = os.environ.get('DHD_ISO')
     if not iso or not Path(iso).is_file():
@@ -157,20 +140,16 @@ def run_port(args, directory, script, events, manifest):
     deadline = time.monotonic() + args.timeout
     log_path = directory / 'port.log'
     print(f'Running isolated port; {expected} captures; timeout {args.timeout:g}s', flush=True)
-    with log_path.open('wb') as log:
-        process = subprocess.Popen([str(exe)], cwd=exe.parent, env=env,
-                                   stdout=log, stderr=subprocess.STDOUT)
-        try:
-            while process.poll() is None:
-                text = log_path.read_text(errors='replace')
-                if len(re.findall(r'gs: captured .* and \d+ matching native fields', text)) >= expected:
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('port capture deadline exceeded; see port.log')
-                time.sleep(0.25)
-            manifest['port_exit_before_stop'] = process.poll()
-        finally:
-            stop(process)
+    with log_path.open('wb') as log, \
+            owned_process.start([str(exe)], cwd=exe.parent, env=env, stdout=log, stderr=subprocess.STDOUT) as process:
+        while process.poll() is None:
+            text = log_path.read_text(errors='replace')
+            if len(re.findall(r'gs: captured .* and \d+ matching native fields', text)) >= expected:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('port capture deadline exceeded; see port.log')
+            time.sleep(0.25)
+        manifest['port_exit_before_stop'] = process.poll()
     paths = sorted(dumps.glob('*.gs'))[:expected]
     if len(paths) != expected:
         raise RuntimeError(f'port exited after {len(paths)}/{expected} captures; see port.log')
@@ -248,21 +227,18 @@ def replay_pcsx2(args, dump, directory, count):
         config.write(f)
     command = [str(args.pcsx2), '-datapath', str(data), '-batch', '-nogui',
                '-logfile', str(directory / 'emulog.txt'), '--', str(dump)]
-    with (directory / 'stdout.log').open('wb') as log:
-        process = subprocess.Popen(command, cwd=args.pcsx2.parent, stdout=log, stderr=subprocess.STDOUT)
+    with (directory / 'stdout.log').open('wb') as log, \
+            owned_process.start(command, cwd=args.pcsx2.parent, stdout=log, stderr=subprocess.STDOUT) as process:
         deadline = time.monotonic() + args.replay_timeout
-        try:
-            while process.poll() is None:
-                files = list(directory.glob(f'*_f{count-1:05d}_fr*.*'))
-                if files:
-                    # PCSX2 texture dump saves synchronously. Give the last write time to finish.
-                    time.sleep(0.3)
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f'PCSX2 replay timeout: {directory}')
-                time.sleep(0.1)
-        finally:
-            stop(process)
+        while process.poll() is None:
+            files = list(directory.glob(f'*_f{count-1:05d}_fr*.*'))
+            if files:
+                # PCSX2 texture dump saves synchronously. Give the last write time to finish.
+                time.sleep(0.3)
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'PCSX2 replay timeout: {directory}')
+            time.sleep(0.1)
     files = {}
     for path in directory.iterdir():
         match = re.search(r'_f(\d+)_fr([01])_', path.name)

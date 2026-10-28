@@ -98,6 +98,10 @@ __attribute__((export_name("replay_web"))) int replay_web(const uint8_t *capture
     return (int)fields;
 }
 
+/* web_display's register read (port/web/host_graphics.c's, which the replay does not link): the
+   one-worker build's, straight from the GS MMIO page. */
+uint64_t web_gs_mmio(unsigned addr) { return *(volatile uint64_t *)(uintptr_t)(0x12000000u + addr); }
+
 /* The last picture: web_display reads the privileged registers from the PS2's GS MMIO page
    (0x12000000 in the game's memory), so they are put there first. */
 __attribute__((export_name("replay_display"))) uint32_t replay_display(void)

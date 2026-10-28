@@ -1,7 +1,7 @@
 """The Rust renderer's C ABI: the header and src/abi.rs must agree on every target.
 
     python port/tools/test_dhdr_abi.py                              x86_64 and wasm32
-    python port/tools/test_dhdr_abi.py --arch i686,x86_64,wasm32    the plan's referee
+    python port/tools/test_dhdr_abi.py --arch wasm32                one target
     python port/tools/test_dhdr_abi.py --selftest                   planted faults in the header or abi.rs must fail
 
 For each target:
@@ -13,9 +13,6 @@ For each target:
 3. rustc compiles src/abi.rs on its own (it depends on core only) for the same target, with one
    compile-time assertion per C row, so any row Rust lays out or values differently, or lacks,
    fails the build.
-The i686 build does not use the Rust library (decision D2 = c) and the toolchain has no i686
-target; there the C rows must equal the wasm32 C rows (both 32-bit, so equal to what wasm32's
-Rust gives), and the Rust side is checked only when an i686 Rust target is installed.
 Finally every function prototype in the header must equal its `<name>_fn` type in src/abi.rs
 (same parameters, names and types, same return type), and the two lists must be the same.
 
@@ -34,7 +31,7 @@ ABI_RS = ROOT / 'port/render/src/abi.rs'
 PROBE = ROOT / 'port/gs/test_dhdr_abi.c'
 CRATE = ROOT / 'port/render'          # rust-toolchain.toml picks the pinned rustc here
 OUT = ROOT / 'build/port/test-dhdr-abi'
-TRIPLES = {'i686': 'i686-pc-windows-msvc', 'x86_64': 'x86_64-pc-windows-msvc', 'wasm32': 'wasm32-unknown-unknown'}
+TRIPLES = {'x86_64': 'x86_64-pc-windows-msvc', 'wasm32': 'wasm32-unknown-unknown'}
 
 
 def clang():
@@ -105,14 +102,6 @@ def check_padding(arch, rows, problems):
             at = offset + size
         if at != table[s + '#size']:
             problems.append('%s: %s: members end at %d, the struct is %d bytes' % (arch, s, at, table[s + '#size']))
-
-
-def rust_target_installed(triple):
-    code, text = run(['rustc', '--print', 'target-libdir', '--target', triple], cwd=CRATE)
-    if code or not text:
-        return False
-    libdir = Path(text.splitlines()[-1].strip())
-    return libdir.is_dir() and any(libdir.glob('libcore-*.rlib'))
 
 
 def rust_check(arch, rows, abi_rs, out, problems):
@@ -245,10 +234,7 @@ def check(arches, header=HEADER, abi_rs=ABI_RS, out=OUT, quiet=False):
     problems = []
     say = (lambda *a: None) if quiet else print
     rows = {}
-    need = list(arches)
-    if 'i686' in arches and not rust_target_installed(TRIPLES['i686']) and 'wasm32' not in need:
-        need.append('wasm32')
-    for arch in need:
+    for arch in arches:
         rows[arch] = c_rows(arch, include, out, problems)
         if rows[arch] is not None:
             check_padding(arch, rows[arch], problems)
@@ -256,16 +242,6 @@ def check(arches, header=HEADER, abi_rs=ABI_RS, out=OUT, quiet=False):
         if rows.get(arch) is None:
             continue
         n = len(rows[arch])
-        if arch == 'i686' and not rust_target_installed(TRIPLES['i686']):
-            if rows.get('wasm32') is None:
-                problems.append('i686: no wasm32 C rows to compare with')
-                continue
-            diff = [(a, b) for a, b in zip(rows['i686'], rows['wasm32']) if a != b]
-            if diff or len(rows['i686']) != len(rows['wasm32']):
-                problems.append('i686: the C layout differs from wasm32 (both 32-bit): %s' % diff[:20])
-            else:
-                say('i686: %d C rows equal the wasm32 C rows (no i686 Rust target: decision D2 = c)' % n)
-            continue
         if rust_check(arch, rows[arch], abi_rs, out, problems):
             say('%s: %d rows agree (C header and src/abi.rs), no implicit padding' % (arch, n))
     count = check_functions(header.read_text(encoding='utf-8'), abi_rs.read_text(encoding='utf-8'), problems)
@@ -321,7 +297,7 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--arch', default='x86_64,wasm32', help='comma list of i686, x86_64, wasm32')
+    ap.add_argument('--arch', default='x86_64,wasm32', help='comma list of x86_64, wasm32')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:

@@ -36,10 +36,7 @@ PORT = os.path.join(ROOT, 'port')
 sys.path.insert(0, HERE)
 sys.path.insert(0, PORT)  # patches.py
 
-import pctarget  # noqa: E402
 WASM_TARGET = 'wasm32-wasip1'  # the WASI headers need __wasi__ (wasi/version.h); no WASI import is used by the module
-pctarget.TARGET = WASM_TARGET
-pctarget.LABEL_PREFIX = ''  # no prefix for wasm (build/audit/w5-wasm-module.md 2.1); read at import time below
 import data, eefloat, objcache, port_source, recomp, transform  # noqa: E402
 from port_source import apply_patches, align_aggregate_allocas  # noqa: E402
 import vu1_aot  # noqa: E402
@@ -78,13 +75,13 @@ MODULE_UNITS = [
     'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/graphics.c', 'hle/pad.c', 'hle/menu_page.c',
     'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/puppet.c', 'hle/online.c',
     'hle/online_menu.c', 'hle/autopad.c', 'hle/state_trace.c', 'hle/rate_audit.c', 'hle/sound.c', 'hle/game_options.c',
-    'hle/fps.c', 'hle/keyboard.c', 'hle/vif0.c', 'runtime/wasi_adapter.c',
+    'hle/fps.c', 'hle/keyboard.c', 'hle/vif0.c', 'hle/presence.c', 'runtime/wasi_adapter.c',
 ]
 MIRROR_DIRS = ['runtime', 'hle', 'include', 'host', 'gs', 'net']
 
-# The flags of build.py's CLANG list (its source, minus the x86-only ones), for wasm32:
-# -msse2 -mfpmath=sse -malign-double are x86-only and -w is kept (warnings stay off). -O2 is the
-# brief's level for the backend; the front end's -disable-llvm-passes makes its -O irrelevant.
+# The game units' flags (those of the retired 32-bit build, minus its x86-only -msse2
+# -mfpmath=sse -malign-double), for wasm32; -w is kept (warnings stay off). -O2 is the brief's
+# level for the backend; the front end's -disable-llvm-passes makes its -O irrelevant.
 BASE = ['--target=' + WASM_TARGET, '--sysroot=' + WASI, '-isystem', WASI + '/include/wasm32-wasip1', '-c', '-O2', '-msimd128',
         '-ftrivial-auto-var-init=zero', '-ffp-contract=off', '-fwrapv', '-fno-strict-aliasing', '-fno-builtin',
         '-fno-delete-null-pointer-checks', '-ferror-limit=0', '-w',
@@ -348,8 +345,7 @@ def rewrite(text, aliases):
         out += [keep_macros(text[last:a]), repl + '\n' * max(1, text[a:b].count('\n') - repl.count('\n'))]
         last = b
     out.append(keep_macros(text[last:]))
-    # RETAIL(name) names the PS2 function's C symbol: no i686 underscore (hle.h, mirror only)
-    text = ''.join(out).replace('__asm__("_" #name)', '__asm__(#name)')
+    text = ''.join(out)
     text = re.sub(r'([^\n])(#(?:undef|define)\b)', r'\1\n\2', text)  # a directive starts its own line
     return scalar_abi(fall_off_returns(variadic_declarations(text)))
 
@@ -639,7 +635,7 @@ def host_api_names():
 # ---- compile ----------------------------------------------------------------------------------
 
 def compile_src(job):
-    """Game unit: front end to IR, eefloat rewrite, IR back end (build.py's two steps)."""
+    """Game unit: front end to IR, eefloat rewrite, IR back end (two steps)."""
     rel, src, obj, cpp = job[:4]
     extra = job[4] if len(job) > 4 else []
     if src is None:
@@ -1204,7 +1200,7 @@ def main():
                 shutil.copyfile(p, dst)
             mirror.append(dst)
 
-    # 3. game units (transform with an empty prefix, as build.py)
+    # 3. game units (transform with an empty prefix)
     def transform_unit(path):
         rel = os.path.relpath(path, SRC_ROOT).replace(os.sep, '/')
         cpp = not path.endswith('.c')

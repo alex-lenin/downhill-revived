@@ -1,9 +1,8 @@
 """Execute the actual proximity update when its distance output is a sentinel."""
 from pathlib import Path
 import re
-import subprocess
 import sys
-from pctarget import HOST_TARGET
+import testprog
 ROOT=Path(__file__).resolve().parents[2]
 
 
@@ -22,7 +21,6 @@ def main():
     source.write_text('''#include "ps2float.h"
 #include <assert.h>
 #include <stdio.h>
-#include <xmmintrin.h>
 static float ps2_fmul(float a,float b){return ps2_float_mul(a,b);}
 static int port_fps_high(void){return 0;}  /* the 60 path */
 static int port_whole_step(void){return 1;}
@@ -50,21 +48,16 @@ void func_00203E10(Handle *p,float value){}
 void func_00202E38(Handle *p,int a,int b,float value){}
 int main(void){
  Obj obj={0};Model model={0};obj.type=9;obj.model=&model;
- _mm_setcsr((_mm_getcsr()&~0x680u)&~63u);
  distance=3.4028234663852886e38f;calls=0;found=0;func_0011EDA8(&obj);
  assert(obj.x250==distance && obj.x38==0 && actions==0);
  distance=12;calls=0;found=1;func_0011EDA8(&obj);
  assert(obj.x250==144 && obj.x38==1 && actions==1);
  distance=3e20f;calls=0;found=1;func_0011EDA8(&obj);
  assert(obj.x250==3.4028234663852886e38f && actions==1);
- puts("Real proximity update: missing-rider sentinel, ordinary distance and square overflow pass with SSE traps");return 0;
+ puts("Real proximity update: missing-rider sentinel, ordinary distance and square overflow pass");return 0;
 }
 ''')
-    exe=out/'fixture.exe'
-    subprocess.run(['clang','--target='+HOST_TARGET,'-O1','-w','-msse2','-mfpmath=sse','-fwrapv',
-                    '-ffp-contract=off','-I',str(ROOT/'port/runtime'),'-I',str(ROOT/'include'),
-                    str(source),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
+    testprog.run(testprog.guest('proximity-float', [source], out=out, includes=[ROOT / 'include']))
 
 
 if __name__=='__main__':main()

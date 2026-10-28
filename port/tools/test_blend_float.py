@@ -1,7 +1,7 @@
 """Execute the real rider blend initializer with empty and overflowing tracks."""
 from pathlib import Path
-import subprocess
 import sys
+import testprog
 import transform
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,13 +19,8 @@ def main():
         end = transform.close_paren(transform.code_mask(text), start) + 1
         text = text[:start] + body + text[end:]
     unit = OUT / 'blend.c'; unit.write_text('#include "port.h"\n' + transform.transform(text))
-    obj = unit.with_suffix('.o')
-    subprocess.run(['clang', '--target=i686-pc-windows-itanium', '-O1', '-c', '-w',
-                    '-msse2', '-mfpmath=sse', '-ffp-contract=off',
-                    '-I' + str(ROOT / 'port/include'), str(unit), '-o', str(obj)], check=True)
     driver = OUT / 'driver.c'
     driver.write_text(r'''#include "ps2float.h"
-#include <xmmintrin.h>
 #include <stdio.h>
 #include <string.h>
 struct Handle { int x0,x4,x8,xC; };
@@ -59,7 +54,6 @@ int main(void) {
    struct Entry e={0};e.xC=1;e.x14=cases[c][2];e.x1C=cases[c][3];e.x48=cases[c][4];
    D_00272888[i]=D_00273D60[i]=e;
   }
-  _mm_setcsr((_mm_getcsr()|0x8040)&~(0x680|63));
   func_001E75D8(&owner);
   for(unsigned i=0;i<43;i++) {
    failures+=D_00272888[i].x4C!=expected[c][0];
@@ -73,10 +67,7 @@ int main(void) {
  return failures!=0;
 }
 ''')
-    exe = driver.with_suffix('.exe')
-    subprocess.run(['clang', '--target=i686-pc-windows-msvc', '-fuse-ld=lld', '-O1',
-                    '-I' + str(ROOT / 'port/runtime'), str(driver), str(obj), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest('blend-float', [unit, driver], out=OUT))
 
 
 if __name__ == '__main__': main()

@@ -1,7 +1,11 @@
-"""Prove the explicit inflate status against i686's original EAX behavior.
+"""The inflate block status (func_00241E70) as the PS2 returns it, from the patched game function.
 
-Uses the actual game function and port patch with synthetic block decoders,
-without game data. The unfixed wasm is a negative control.
+The decompiled body is void; its callers read $v0. The retail code (asm func_00241E70.s) returns
+the block decoder's $v0 for block types 0, 1 and 2 (the jal is its last call) and, for the
+invalid type 3, the 2 its last compare loaded into $v0 (the delay slot at 00241F50): gzip's
+"bad block type". The patched unit must give exactly that; the unpatched body through wasm (its
+in-TU bitcast returns the argument) is the negative control. Synthetic block decoders, no game
+data. Scratch stays on F:.
 """
 from pathlib import Path
 import re
@@ -25,9 +29,7 @@ NOINLINE int func_002417E0(void) { ++calls; return 30; }
 NOINLINE unsigned char func_00242058(void) { return 0; }
 '''
 ENTRY = r'''
-#ifdef __wasm__
 __attribute__((export_name("run_case")))
-#endif
 u32 run_case(u32 type) {
     int done=0;
     D_0029DCD4=(type<<1)|1; D_0029DCD0=3;
@@ -36,23 +38,17 @@ u32 run_case(u32 type) {
 '''
 DRIVER = r'''
 #include <stdio.h>
-#ifdef NATIVE
-unsigned run_case(unsigned);
-#define RUN(k) run_case(k)
-#else
 #include "probe.h"
 #include "wasm-rt-impl.h"
 static w2c_probe p;
-#define RUN(k) w2c_probe_run_case(&p,k)
-#endif
 int main(void) {
-#ifndef NATIVE
     wasm_rt_init(); wasm2c_probe_instantiate(&p);
-#endif
-    for (unsigned k=0;k<4;k++) printf("%u %08x\n",k,RUN(k));
+    for (unsigned k=0;k<4;k++) printf("%u %08x\n",k,w2c_probe_run_case(&p,k));
     return 0;
 }
 '''
+# the decoders' statuses for types 0-2, and the retail $v0 (2) for the invalid type 3
+EXPECTED = {0: [10], 1: [20], 2: [30], 3: [2]}
 
 
 def function(text):
@@ -70,11 +66,6 @@ def main():
         if kind=='text' and ('func_00241E70' in a or '    if (t == 0)' in a):
             assert fixed.count(a)==1
             fixed=fixed.replace(a,b)
-    driver=OUT/'driver.c'; driver.write_text(DRIVER)
-    old=OUT/'original.c'; old.write_text(HEADER+function(original)+ENTRY)
-    reference=harness.native('x86',[old,driver],OUT/'i686.exe',defines=['NATIVE'])
-    expected={0:[10],1:[20],2:[30],3:[3]}
-    assert reference==expected,reference
     results={}
     for name,text in [('original',original),('fixed',fixed)]:
         out=OUT/name; out.mkdir(exist_ok=True)
@@ -82,13 +73,10 @@ def main():
         wasm=out/'probe.wasm'
         run([harness.WASI/'bin/clang.exe','--target=wasm32','-O2','-nostdlib',
              '-Wno-incompatible-function-pointer-types','-Wl,--no-entry',src,'-o',wasm])
-        run([harness.WABT/'bin/wasm2c.exe',wasm,'-n','probe','-o',out/'probe.c'])
-        results[name]=harness.native('x64',[driver,out/'probe.c',harness.RT/'wasm-rt-impl.c',
-                                           harness.RT/'wasm-rt-mem-impl.c'],out/'run.exe',
-                                    extra=['-I'+str(out),'-I'+str(harness.WABT/'include'),'-I'+str(harness.RT)])
-    assert results['original']!=reference,results
-    assert results['fixed']==reference,results
-    print('PASS: original i686 statuses 10/20/30/3; unfixed wasm differs; explicit returns match all four')
+        results[name]=harness.through_wasm2c(wasm,name+'-run',DRIVER)
+    assert results['original']!=EXPECTED,results
+    assert results['fixed']==EXPECTED,results
+    print('PASS: retail statuses 10/20/30 and 2 (invalid type); unfixed wasm differs; the patched returns match all four')
 
 
 if __name__=='__main__':

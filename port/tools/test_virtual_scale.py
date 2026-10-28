@@ -2,9 +2,8 @@
 from pathlib import Path
 from unittest.mock import patch
 import json
-import subprocess
 import recomp
-from pctarget import HOST_TARGET
+import testprog
 
 
 def main():
@@ -18,15 +17,10 @@ def main():
     with patch.object(recomp, 'OUT', str(out)):
         sig = recomp.signatures([name])[name]
     assert sig['ret'] == 'float' and sig['args'] == ['i32'], sig
-    flags = ['--target='+HOST_TARGET, '-O1', '-w', '-msse2', '-mfpmath=sse',
-             '-I', str(root / 'port/runtime')]
     for negative in (False, True):
         test_sig = dict(sig, ret='i32') if negative else sig
         with patch.object(recomp, 'OUT', str(out)):
             recomp.write(name, {name}, {name: test_sig})
-        target = out / (name+'.c')
-        obj = out / 'target.o'
-        subprocess.run(['clang', *flags, '-c', str(target), '-o', str(obj)], check=True)
         driver = out / 'driver.c'
         driver.write_text(r'''
 #include "recomp.h"
@@ -39,24 +33,22 @@ extern float func_00261E48(uint32_t);
 typedef struct { short delta,index; void *function; } Slot;
 static Slot table[6];
 int main(void) {
- unsigned env[7], failures=0;
+ unsigned failures=0;
  table[5].function=(void *)func_00261E48;
- __asm__ volatile("fninit");
  for(unsigned i=0;i<16;i++) {
   volatile float result=((float (*)(void *))table[5].function)((void *)0x12340000);
   failures += result != 1.0f;
  }
- __asm__ volatile("fnstenv %0\n\tfldenv %0" : "=m"(env) : : "memory");
- unsigned bad = (env[1]&0x41) != 0 || (env[2]&65535) != 65535;
- __asm__ volatile("fninit");
- printf("virtual scale: wrong=%u SW=%04X TAG=%04X\n",failures,env[1]&65535,env[2]&65535);
- return NEGATIVE ? !(bad && failures==16) : (bad || failures);
+ printf("virtual scale: wrong=%u\n",failures);
+ return failures != 0;
 }
-'''.replace('NEGATIVE', str(int(negative))))
-        exe = out / ('wrong.exe' if negative else 'correct.exe')
-        subprocess.run(['clang', *flags, str(driver), str(obj), '-o', str(exe)], check=True)
-        subprocess.run([str(exe)], check=True)
-    print('Virtual scale getter: real wrapper, stale cache, vtable result and x87 negative/positive cases pass')
+''')
+        # The wrapper with the stale int return has another wasm type than the float vtable call:
+        # the call traps (exit 134), as the core's would without a matching declaration.
+        exe = testprog.guest('virtual-scale-' + ('wrong' if negative else 'correct'),
+                             [out / (name + '.c'), driver], out=out / ('wrong' if negative else 'correct'))
+        testprog.run(exe, expect=134 if negative else 0, quiet=negative)
+    print('Virtual scale getter: real wrapper, stale cache, vtable result; the stale int return traps')
 
 
 if __name__ == '__main__':

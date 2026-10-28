@@ -213,7 +213,8 @@ int main(void) {
     failures += func_0018EB50(object) != 0;
     for (j = 0x490; j < 0x4a0; j++) failures += object[j] != 0;
     failures += object[0x48f] != 0xab || object[0x4a0] != 0xab;
-    failures += sizeof(long) != 8 || sizeof(long long) != 16 || sizeof(long double) != 8;
+    /* long double: no game unit uses it (the EE's is 64-bit, wasm32's 128-bit) */
+    failures += sizeof(long) != 8 || sizeof(long long) != 16;
     failures += sizeof(1L) != 8 || sizeof(1LL) != 16 || sizeof(1ULL) != 16;
     failures += sizeof(layout) != 32 || (char *)&layout.b - (char *)&layout != 16;
     failures += (unsigned_wide >> 127) != 1 || (wide >> 96) != 0x504f4e4d;
@@ -232,6 +233,6 @@ int main(void) {
             if directive in source:
                 source = source.replace(directive, (root / "include" / header).read_text())
         path = out / name
-        path.write_text('#include "port.h"\n' + transform.transform(source, label_prefix='_'))
+        path.write_text('#include "port.h"\n' + transform.transform(source))
         paths.append(str(path))
     return paths

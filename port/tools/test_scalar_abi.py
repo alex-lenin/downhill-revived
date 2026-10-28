@@ -1,7 +1,7 @@
 """Execute a recompiled call to a native GCC mode(DI) division helper."""
 from pathlib import Path
 import json
-import subprocess
+import testprog
 from unittest.mock import patch
 
 import recomp
@@ -52,10 +52,7 @@ int main(void) {
 }
 '''
     path = OUT / 'test.c'; path.write_text(source)
-    exe = path.with_suffix('.exe')
-    subprocess.run(['clang', '--target=i686-pc-windows-msvc', '-fuse-ld=lld', '-O1',
-                    '-I' + str(ROOT / 'port/runtime'), str(path), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    testprog.run(testprog.guest('scalar-abi', [path], out=OUT))
 
 
 if __name__ == '__main__': main()
