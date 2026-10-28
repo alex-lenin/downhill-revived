@@ -9,19 +9,26 @@ each time it starts.
 What you need
 - Windows 10 or 11 (64-bit), a graphics card with Direct3D 12 or Vulkan. Without one the game
   draws with Windows' software renderer (WARP), slowly.
+  Or a Mac with Apple Silicon (M1 or later) on macOS 11 or later, or Linux on a 64-bit PC with
+  Vulkan and WebKitGTK 4.1 for the launcher (libwebkit2gtk-4.1-0, already there with GNOME).
+  The Mac and Linux builds are experimental: they may have problems the Windows build doesn't.
+  Please report them with your dhd.log.
 - Your own dump of the Downhill Domination USA disc (SCUS-97177) as an .iso file. Other regions
   and modified images are refused.
 
 How to play
 1. Unzip this folder anywhere you can write to (not Program Files).
+   macOS: unzip and move Downhill Revived to Applications. The first time it is blocked (it is
+   not from an identified developer): open System Settings > Privacy & Security, click Open
+   Anyway next to Downhill Revived, and confirm. Your settings, saves and log are in
+   ~/Library/Application Support/Downhill Revived.
+   Linux: unzip anywhere you can write to and run DownhillRevived.
 2. Run DownhillRevived.exe, the launcher (dhd.exe opens it too). It keeps the game up to date
    and holds the settings, your rider name for online races, the patch notes and a link to the
    Discord server. Press PLAY.
-3. The first time, the game asks for your disc image: choose your .iso. It is checked and
-   remembered in dhd.ini (the game writes this file then); you are only asked again if the file
-   moves or changes. The launcher's Settings > Game can change it later.
-To start the game without the launcher, turn off Settings > Game > Open the launcher first (or
-put "launcher = off" in dhd.ini); dhd.exe then starts the game straight away.
+3. The first time, the launcher asks for your disc image (Choose disc): choose your .iso. It is
+   checked and remembered in dhd.ini; you are only asked again if the file moves or changes.
+   The launcher's Settings > Game can change it later.
 
 Controls
 A controller works out of the box: Xbox pads, DualSense, DualShock 4, Switch Pro, 8BitDo and most
@@ -62,7 +69,8 @@ the PS2 does. A texture pack that replaces the font wins over both.
 Texture packs (upscale mods)
 Texture replacement packs made for PCSX2 work unchanged (PNG files named by PCSX2's texture
 hash). Packs are made by their authors and are not part of this game; get one yourself. Either
-- put the pack's files in a folder textures\SCUS-97177\replacements beside dhd.exe, or
+- put the pack's files in a folder textures\SCUS-97177\replacements beside dhd.ini (the
+  folder of your settings and saves; on Windows that is normally the game's folder), or
 - name the pack's folder in dhd.ini (its full path), e.g. the one PCSX2 uses:
     texture_pack = <Documents>\PCSX2\textures\SCUS-97177\replacements
 OPTIONS > PC SETTINGS > Texture Pack turns it off or on (at the next start); in dhd.ini that is
@@ -74,14 +82,13 @@ Files the game writes beside dhd.exe
 - dhd.ini       your settings, one "key = value" per line.
 - saves\card1\  memory card 1: your saves. Copy this folder to back them up.
 - dhd.log       messages from the last run. Attach it when you report a problem.
-- dhd.exe.old   the previous version, for a moment after an update; the next start deletes it.
 
 Updates
-At start the game looks for a newer version. If there is one it asks: "Update now" downloads
-it, checks it, puts it in place and starts the game again; "Later" starts this version. Without
-a network the game just starts. An update replaces dhd.exe and the other files of the release
-(the text files, dxcompiler.dll) only: dhd.ini and saves\ are never touched. You can also update by hand: copy the files of a newer version over
-your folder (a release holds no dhd.ini and no saves, so yours are kept).
+The launcher looks for a newer version when it opens and shows Update in its footer. Update
+downloads it, checks it and puts it in place. Without a network you can still play. An update
+replaces the files of the release only: dhd.ini and saves\ are never touched. You can also update
+by hand: copy the files of a newer version over your folder (a release holds no dhd.ini and no
+saves, so yours are kept).
 In dhd.ini:
     auto_update = ask    ask before updating (the default); on: update without asking;
                          off: never look
@@ -93,7 +100,7 @@ Choose ONLINE in the main menu: create a public or private race, or join one fro
 with its code. It works out of the box, on the project's official server
 (wss://dhd.skuza.app). Every player needs the same USA disc image,
 and the newest version of the game: an older one is told "A new version is out. Update to play
-online." and offered Update Now.
+online." and offered Update Now, which closes the game and lets the launcher update it.
 Running your own server is optional: put its address on the "server =" line of dhd.ini, e.g.
     server = wss://races.example.org
 A server of your own can keep an older version playing (its MIN_VERSION setting); then point

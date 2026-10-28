@@ -277,7 +277,7 @@ LLVM / clang (https://llvm.org), Apache-2.0 WITH LLVM-exception
 
 Microsoft C runtime and Windows SDK import libraries
   dhd.exe links the static Microsoft C runtime and uses Windows system libraries (Direct3D 12,
-  DXGI, WinHTTP, the Windows Imaging Component for PNG files, and for the controllers XInput,
+  DXGI, the Windows Imaging Component for PNG files, and for the controllers XInput,
   DirectInput, Windows.Gaming.Input, SetupAPI and HID), all part of Windows.
 
 The game itself

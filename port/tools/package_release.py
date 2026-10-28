@@ -1,28 +1,41 @@
-"""The public release: build/release/DownhillRevived-<version>-win.zip (and the same files unzipped
-in build/release/DownhillRevived-<version>/), built from the 64-bit game on the Rust renderer.
+"""The public release for one platform, built from the 64-bit game on the Rust renderer:
+build/release/DownhillRevived-<version>-<platform>.zip (and the same files unzipped beside it), and
+latest.json. macOS and Linux are experimental (EXPERIMENTAL): their zips are named
+DownhillRevived-<version>-mac-experimental.zip and -linux-experimental.zip, and latest.json's
+"platforms" entries name them, so their launchers update from them (update.rs).
 
     python port/tools/build_wasm.py                      # the game core, build/wasm/dhd_core.wasm
     python port/tools/package_release.py                 # dhd.exe from it, checked, zipped
     python port/tools/package_release.py --wasm PATH     # from another dhd_core.wasm
     python port/tools/package_release.py --exe PATH      # a ready build_host64.py dhd64.exe (link.rsp beside it)
     python port/tools/package_release.py --launcher PATH # a ready build_launcher.py DownhillRevived.exe
+    python port/tools/package_release.py --platform mac --game PATH [--launcher PATH]
+    python port/tools/package_release.py --merge OTHER/latest.json   # add another machine's platform
 
-dhd.exe is build_host64.py's dhd64.exe (wasm2c, clang-cl, lld-link; the Rust renderer,
+--platform is win, mac (Apple Silicon) or linux (x64); the default is the host's. The launcher is
+built for the host only (build_launcher.py), so each platform is packaged on its own machine (a
+mac or linux layout can be looked at from Windows with --launcher and --game). mac and linux take
+the game as --game PATH (build_host64's targets for them); --exe is the same option.
+
+Windows (-win.zip). dhd.exe is build_host64.py's dhd64.exe (wasm2c, clang-cl, lld-link; the Rust renderer,
 port/render, linked in as dhd_render.lib) under build/release-work/, with an x64 SDL3 static
 library (sdl3.py's by default, or --sdl-lib/--sdl-include). In the package it is named dhd.exe:
 the name every earlier release used, so the updater of a 32-bit release (0.3.1 and before) puts it
 in place of the old one (finding 088, CL3).
 
 The version is port/include/version.h's DHD_VERSION, the one the exe was built with (--version,
-if given, must be the same). Beside the zip goes latest.json, the update manifest the game's
-updater reads (port/hle/update.c, finding 054): {"version", "url" (the zip as a GitHub release
-asset of tag v<version>, or --base-url + the zip's name), "sha256" (the zip's), "size", "page"}.
-Publish both as assets of the GitHub release tagged v<version>.
+if given, must be the same). Beside the zip goes latest.json, the update manifest the launcher
+reads (port/launcher/src-tauri/src/update.rs, finding 054): {"version", "url", "sha256", "size"
+(the Windows zip's: what 0.6.x launchers read), "page", "platforms": {"win"|"mac"|"linux": {"url"
+(the zip as a GitHub release asset of tag v<version>, or --base-url + the zip's name), "sha256"
+(the zip's), "size"}}}. Each run adds its platform to a latest.json of the same version already
+there (--merge adds the entries of another machine's). Publish the zips and latest.json, with every
+platform in it, as assets of the GitHub release tagged v<version>.
 
-The zip holds one folder, DownhillRevived-<version>, with:
+The Windows zip holds one folder, DownhillRevived-<version>, with:
   DownhillRevived.exe      the launcher (port/launcher, finding 093; built by build_launcher.py): settings,
                            rider name, updates, Discord; it starts dhd.exe, and dhd.exe started straight
-                           opens it (port/hle/update.c). It imports only Windows' own DLLs (checked)
+                           opens it (port/hle/launcher_link.c). It imports only Windows' own DLLs (checked)
   dhd.exe                  the 64-bit game; it imports only Windows' own DLLs (checked)
   README.txt               how to play (port/release/README.txt)
   LICENSE.txt              the GPL-3.0 text (LICENSE)
@@ -57,12 +70,32 @@ A third-party binary (third_party in main) is checked by its SHA-256 instead: it
 its publisher released (pinned in its fetch script), so it can hold neither game data nor a path or
 server of ours. The byte scans would only find coincidences in it (dxcompiler.dll holds the words
 0..14, as a run of the ELF's .data does, and the text "\\temp").
+
+macOS (-mac-experimental.zip): Downhill Revived.app, with Contents/Info.plist (bundle id and name from
+tauri.conf.json, the version, LSMinimumSystemVersion 11.0, NSHighResolutionCapable),
+Contents/MacOS/DownhillRevived (the launcher, the bundle's executable) and Contents/MacOS/dhd (the
+game, a helper started by it), Contents/Resources/icon.icns (the launcher's icon) and the three text
+files. On a Mac the bundle is signed ad hoc (codesign --force --deep -s -; no Apple developer
+account: players allow it once under Privacy & Security). Elsewhere it isn't, and latest.json is
+left alone: such a zip only shows the layout. Linux (-linux-experimental.zip): the Windows layout's folder with
+DownhillRevived, dhd and the text files. A zip on both, so the launcher has one extractor; the
+executables keep their 0755 mode (unix entries).
+
+The checks are the same on every platform: the version, absolute paths, server names and the
+retail-bytes scan in every file, the crates' licences (for the platform's target). The Windows DLL
+imports become the libraries a Mach-O or ELF binary needs (otool -L or llvm-objdump; readelf or
+llvm-readobj), each on an allow-list: the system's own (/usr/lib, /System/Library) on macOS, the C
+runtime (and the launcher's WebKitGTK stack) on Linux, where neither binary may need a symbol
+version newer than glibc 2.35 has (LINUX_SYMBOLS: built on Ubuntu 22.04). The Rust renderer library's checks
+(rust_lib_problems) read the Windows link.rsp; on mac and linux they are skipped with a note, and
+--rust-lib names the library whose bytes the retail scan may find in the game.
 """
 import argparse
 import functools
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import struct
@@ -101,9 +134,11 @@ ABSOLUTE = re.compile(rb'(?<![A-Za-z0-9])[A-Za-z]:[\\/][\x20-\x7e]{2,}')
 OFFICIAL_HOST = b'dhd.skuza.app'
 # any workers.dev host (other_hosts allows only the official one)
 WORKERS_HOST = re.compile(rb'[A-Za-z0-9.-]*workers\.dev', re.I)
-# user folders, and the builder's own account name and checkout folders
+# user folders, and the builder's own account name and checkout folders. A build as root (WSL's
+# default) looks for root's home instead: "root" is a word every program holds (roots, has_root).
 FORBIDDEN = [b'\\Users\\', b'/Users/'] + [
-    s.encode() for s in {os.environ.get('USERNAME', ''), os.environ.get('USER', '')} if len(s) > 2] + [
+    (b'/root/' if s == 'root' else s.encode())
+    for s in {os.environ.get('USERNAME', ''), os.environ.get('USER', '')} if len(s) > 2] + [
     p.encode() for folder in (ROOT, ROOT.parent) if len(folder.parts) > 1
     for p in (str(folder), str(folder).replace('\\', '/'), str(folder)[2:], str(folder)[2:].replace('\\', '/'))]
 # SDL_windows.c's list of USB vibration device paths: SDL's own text, not a builder's folder.
@@ -119,6 +154,55 @@ SYSTEM_DLL = re.compile(r'^(kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut3
 LAUNCHER_DLL = re.compile(r'^(comctl32|secur32|shlwapi)\.dll$', re.I)
 RUST_TRIPLE = 'x86_64-pc-windows-msvc'   # the Rust renderer's native target
 RUST_LIB = 'dhd_render.lib'              # build_host64.py links it (rustgs.py builds it)
+# The libraries a macOS binary may need: the system's own.
+MAC_LIB = re.compile(r'^(/usr/lib/|/System/Library/)')
+# Linux: the C runtime; the launcher also WebKitGTK and the GTK stack it is drawn with (the
+# distribution's packages, README.txt).
+LINUX_LIB = re.compile(r'^(libc|libm|libdl|libpthread|librt|libgcc_s|ld-linux-x86-64)\.so\.\d+$')
+LINUX_LAUNCHER_LIB = re.compile(r'^lib(webkit2gtk-4\.1|javascriptcoregtk-4\.1|gtk-3|gdk-3|gdk_pixbuf-2\.0|cairo|'
+                                r'cairo-gobject|pango-1\.0|pangocairo-1\.0|harfbuzz|soup-3\.0|glib-2\.0|gobject-2\.0|'
+                                r'gio-2\.0|atk-1\.0|xdo)\.so\.\d+$')
+# The oldest Linux the package starts on: glibc 2.35 (Ubuntu 22.04, Debian 12, Fedora 36). A binary
+# linked on a newer system binds the newer symbol versions its headers name (C23's __isoc23_* and
+# strlcpy: 2.38; pidfd_spawnp: 2.39; acosf and six other float functions: 2.43), which an older
+# loader refuses at start, so release builds are linked on Ubuntu 22.04 (docs/BUILDING.md) and every
+# version a binary needs is checked: GLIBC up to LINUX_GLIBC; libgcc_s's unwinder (GCC_) up to
+# GCC_4.2.0, in every distribution since 2007; nothing else (no libstdc++: GLIBCXX, CXXABI).
+LINUX_GLIBC = (2, 35)
+LINUX_SYMBOLS = {'GLIBC': LINUX_GLIBC, 'GCC': (4, 2, 0)}
+
+
+# The platforms whose builds are experimental (0.7.0: macOS and Linux): "-experimental" after the
+# platform in the zip's name. latest.json's key stays the platform's (update.rs PLATFORM).
+EXPERIMENTAL = ('mac', 'linux')
+
+
+class Platform:
+    """What differs between the platforms' packages."""
+    def __init__(self, key, triple, exe_suffix, kind, name):
+        self.key, self.triple, self.kind, self.name = key, triple, kind, name
+        self.launcher, self.game = 'DownhillRevived' + exe_suffix, 'dhd' + exe_suffix
+        self.zip_tag = key + ('-experimental' if key in EXPERIMENTAL else '')   # in the zip's name
+
+
+PLATFORMS = {
+    'win': Platform('win', RUST_TRIPLE, '.exe', 'PE x64', 'Windows'),
+    'mac': Platform('mac', 'aarch64-apple-darwin', '', 'Mach-O arm64', 'macOS'),
+    'linux': Platform('linux', 'x86_64-unknown-linux-gnu', '', 'ELF x86-64', 'Linux'),
+}
+
+
+def binary_kind(data):
+    """'PE x64', 'Mach-O arm64', 'ELF x86-64', or None."""
+    if data[:2] == b'MZ' and len(data) > 0x40:
+        pe = int.from_bytes(data[0x3C:0x40], 'little')
+        if data[pe:pe + 4] == b'PE\0\0' and data[pe + 4:pe + 6] == b'\x64\x86':  # IMAGE_FILE_MACHINE_AMD64
+            return 'PE x64'
+    if data[:4] == b'\xcf\xfa\xed\xfe' and int.from_bytes(data[4:8], 'little') == 0x0100000C:  # CPU_TYPE_ARM64
+        return 'Mach-O arm64'
+    if data[:5] == b'\x7fELF\x02' and int.from_bytes(data[18:20], 'little') == 62:  # ELFCLASS64, EM_X86_64
+        return 'ELF x86-64'
+    return None
 
 
 def utf16_strings(data):
@@ -149,19 +233,45 @@ def other_hosts(text):
     return sorted({m.group(0).lower() for m in WORKERS_HOST.finditer(text)} - {OFFICIAL_HOST})
 
 
+def code_ranges(data):
+    """(offset, size) of the executable's code sections: PE, Mach-O 64 or ELF64."""
+    kind = binary_kind(data)
+    if kind == 'PE x64':
+        pe = struct.unpack_from('<I', data, 0x3C)[0]
+        count, optional = struct.unpack_from('<H', data, pe + 6)[0], struct.unpack_from('<H', data, pe + 20)[0]
+        for k in range(count):
+            header = pe + 24 + optional + 40 * k
+            size, offset = struct.unpack_from('<II', data, header + 16)
+            if struct.unpack_from('<I', data, header + 36)[0] & 0x20000000:  # IMAGE_SCN_MEM_EXECUTE
+                yield offset, size
+    elif kind == 'Mach-O arm64':
+        count, at = struct.unpack_from('<I', data, 16)[0], 32
+        for _ in range(count):
+            cmd, cmd_size = struct.unpack_from('<II', data, at)
+            if cmd == 0x19:  # LC_SEGMENT_64, then its section_64 headers
+                for k in range(struct.unpack_from('<I', data, at + 64)[0]):
+                    section = at + 72 + 80 * k
+                    size, offset = struct.unpack_from('<QI', data, section + 40)
+                    if struct.unpack_from('<I', data, section + 64)[0] & 0x80000400:  # S_ATTR_*_INSTRUCTIONS
+                        yield offset, size
+            at += cmd_size
+    elif kind == 'ELF x86-64':
+        table, entry, count = struct.unpack_from('<Q', data, 0x28)[0], *struct.unpack_from('<HH', data, 0x3A)
+        for k in range(count):
+            kind_, flags, _, offset, size = struct.unpack_from('<IQQQQ', data, table + entry * k + 4)
+            if flags & 0x4 and kind_ != 8:  # SHF_EXECINSTR, not SHT_NOBITS
+                yield offset, size
+    else:
+        raise ValueError('not a PE, Mach-O or ELF executable')
+
+
 def without_code(data):
-    """data with the bytes of the PE's executable sections zeroed. The compiler puts every string in a
+    """data with the bytes of the executable's code sections zeroed. The compiler puts every string in a
     data section, never in code; in code a 4-byte immediate after an opcode can spell a drive path by
     chance (push 0x407c2f3a is 'h:/|@'), depending only on where the linker placed things."""
     out = bytearray(data)
-    pe = struct.unpack_from('<I', data, 0x3C)[0]
-    assert data[:2] == b'MZ' and data[pe:pe + 4] == b'PE\0\0', 'dhd.exe is not a PE file'
-    count, optional = struct.unpack_from('<H', data, pe + 6)[0], struct.unpack_from('<H', data, pe + 20)[0]
-    for k in range(count):
-        header = pe + 24 + optional + 40 * k
-        size, offset = struct.unpack_from('<II', data, header + 16)
-        if struct.unpack_from('<I', data, header + 36)[0] & 0x20000000:  # IMAGE_SCN_MEM_EXECUTE
-            out[offset:offset + size] = bytes(size)
+    for offset, size in code_ranges(data):
+        out[offset:offset + size] = bytes(size)
     return bytes(out)
 
 
@@ -250,13 +360,55 @@ def linked_rust_lib(exe):
     return gs[0]
 
 
+def tool_output(commands, path):
+    """The output of the first of commands (each a list, the file appended) found on PATH."""
+    for cmd in commands:
+        if shutil.which(cmd[0]):
+            out = subprocess.run(cmd + [str(path)], capture_output=True, text=True, encoding='utf-8', errors='replace')
+            if out.returncode:
+                sys.exit('%s failed on %s: %s' % (cmd[0], path, out.stderr[-2000:]))
+            return out.stdout
+    sys.exit('none of %s is on PATH (LLVM, or the system\'s own tools)' % ', '.join(c[0] for c in commands))
+
+
 def imported_dlls(exe):
     """The DLL names in the executable's import table (llvm-readobj, LLVM on PATH)."""
-    out = subprocess.run(['llvm-readobj', '--coff-imports', str(exe)], capture_output=True, text=True,
-                         encoding='utf-8', errors='replace')
-    if out.returncode:
-        sys.exit('llvm-readobj failed on %s: %s' % (exe, out.stderr[-2000:]))
-    return sorted(set(m.group(1) for m in re.finditer(r'Name:\s*(\S+\.dll)', out.stdout, re.I)))
+    out = tool_output([['llvm-readobj', '--coff-imports']], exe)
+    return sorted(set(m.group(1) for m in re.finditer(r'Name:\s*(\S+\.dll)', out, re.I)))
+
+
+def needed_libraries(path, kind):
+    """The shared libraries a Mach-O (its load commands) or ELF (its NEEDED entries) binary needs."""
+    if kind == 'Mach-O arm64':
+        out = tool_output([['otool', '-L'], ['llvm-objdump', '--macho', '--dylibs-used']], path)
+        return sorted(set(line.split()[0] for line in out.splitlines()[1:] if line[:1].isspace() and line.strip()))
+    out = tool_output([['llvm-readobj', '--needed-libs'], ['readelf', '-d']], path)
+    return sorted(set(re.findall(r'(?<![\w.+-])((?:lib|ld-)[\w.+-]*\.so(?:\.\d+)*)', out)))
+
+
+def foreign_libraries(path, data, platform, launcher=False):
+    """What path needs beyond the platform's allow-list (SYSTEM_DLL, MAC_LIB, LINUX_LIB)."""
+    if platform.key == 'win':
+        return [d for d in imported_dlls(path) if not SYSTEM_DLL.match(d) and not (launcher and LAUNCHER_DLL.match(d))]
+    allowed = [MAC_LIB] if platform.key == 'mac' else [LINUX_LIB] + [LINUX_LAUNCHER_LIB] * launcher
+    return [d for d in needed_libraries(path, binary_kind(data)) if not any(a.match(d) for a in allowed)]
+
+
+def symbol_versions(path):
+    """The symbol versions an ELF binary needs from its libraries (.gnu.version_r): {'GLIBC': {(2, 34), ...}, ...}."""
+    out = tool_output([['llvm-readelf', '-V'], ['readelf', '-V']], path)
+    found = {}
+    for name, number in re.findall(r'Name:\s*([A-Z]+)_([0-9][0-9.]*)\b', out):
+        found.setdefault(name, set()).add(tuple(int(n) for n in number.split('.')))
+    return found
+
+
+def too_new_symbols(path):
+    """The symbol versions a Linux binary needs beyond LINUX_SYMBOLS (none for a package that starts on
+    every system with LINUX_GLIBC)."""
+    return ['%s_%s' % (name, '.'.join(map(str, v)))
+            for name, versions in sorted(symbol_versions(path).items()) for v in sorted(versions)
+            if name not in LINUX_SYMBOLS or v > LINUX_SYMBOLS[name]]
 
 
 # ---- the Rust crates' licences ----
@@ -265,7 +417,10 @@ def imported_dlls(exe):
 # the value names the crate's licence file (its name holds the word), when it has several.
 LICENCES = {'MIT': 'mit', 'Zlib': 'zlib', 'ISC': 'isc', 'BSD-2-Clause': 'bsd', 'BSD-3-Clause': 'bsd',
             'Apache-2.0': 'apache', 'Unicode-3.0': 'unicode', 'CC0-1.0': 'cc0',
-            'MPL-2.0': 'mpl'}  # MPL-2.0: the launcher's HTML parser crates (Tauri's), unmodified
+            'MPL-2.0': 'mpl',  # MPL-2.0: the launcher's HTML parser crates (Tauri's), unmodified
+            # webpki-roots' data (Mozilla's root certificates, port/render/net): a permissive data licence
+            # whose one condition is that its text travels with the data (it does, below)
+            'CDLA-Permissive-2.0': 'cdla'}
 LICENCE_FILE = re.compile(r'^(licen[cs]e|copying|copyright|notice|unlicense)', re.I)
 MIT_TEMPLATE = """Copyright (c) %s
 
@@ -285,29 +440,34 @@ OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."""
 
 
-def linked_crates(folder=RENDER, root_name='dhd_render', features=('native',)):
+def linked_crates(folder=RENDER, root_name='dhd_render', features=('native',), triple=RUST_TRIPLE):
     """The crates linked into a crate of ours (dhd_render.lib; the launcher): cargo metadata (offline,
-    --locked: Cargo.lock's versions) with its features for the x64 Windows target, walked from it through
+    --locked: Cargo.lock's versions) with its features for the platform's target, walked from it through
     normal dependencies. Proc-macro crates run only inside the compiler: neither they nor what only
-    they use reach the binary."""
-    cmd = ['cargo', 'metadata', '--offline', '--locked', '--format-version', '1', '--filter-platform', RUST_TRIPLE]
+    they use reach the binary. Path crates (no registry source: dhd_net, port/render/net) are this
+    project's own, under its licence."""
+    cmd = ['cargo', 'metadata', '--offline', '--locked', '--format-version', '1', '--filter-platform', triple]
     if features:
         cmd += ['--features', ','.join(features)]
-    r = subprocess.run(cmd, cwd=str(folder), capture_output=True, text=True, encoding='utf-8', errors='replace')
+    # off Windows without the repository's sccache wrapper (.cargo/config.toml), a Windows program
+    env = dict(os.environ, **({} if os.name == 'nt' else {'RUSTC_WRAPPER': ''}))
+    r = subprocess.run(cmd, cwd=str(folder), env=env, capture_output=True, text=True, encoding='utf-8', errors='replace')
     if r.returncode:
         sys.exit('cargo metadata failed in %s:\n%s' % (folder, r.stderr[-2000:]))
     meta = json.loads(r.stdout)
     packages = {p['id']: p for p in meta['packages']}
     nodes = {n['id']: n for n in meta['resolve']['nodes']}
     root = next(i for i, p in packages.items() if p['name'] == root_name)
-    seen, todo = set(), [root]
+    seen, todo, ours = set(), [root], set()
     while todo:
         i = todo.pop()
         if i in seen or any('proc-macro' in t['kind'] for t in packages[i]['targets']):
             continue
         seen.add(i)
+        if packages[i].get('source') is None:  # ours: the root and its path crates
+            ours.add(i)
         todo += [d['pkg'] for d in nodes[i]['deps'] if any(k['kind'] is None for k in d['dep_kinds'])]
-    seen.discard(root)
+    seen -= ours
     return sorted((packages[i] for i in seen), key=lambda p: (p['name'], p['version']))
 
 
@@ -331,8 +491,9 @@ def crate_licence(package):
         named = [f for f in files if LICENCES[chosen] in f.name.lower()]
         plain = [f for f in files if not re.search(r'mit|apache|zlib|bsd|isc|unicode|cc0', f.name, re.I)
                  and not f.name.lower().startswith(('notice', 'copyright'))]
-        source = named[0] if named else plain[0] if plain and len(choices) == 1 else None
-        text = source.read_text(encoding='utf-8', errors='replace').strip() if source else None
+        # a single licence with plain files: all of them (ring's LICENSE points to its two others)
+        sources = named[:1] if named else plain if plain and len(choices) == 1 else []
+        text = '\n\n'.join(f.read_text(encoding='utf-8', errors='replace').strip() for f in sources) or None
         if text is None and chosen == 'MIT':
             text = MIT_TEMPLATE % ', '.join(re.sub(r'\s*<[^>]*>', '', a) for a in package.get('authors') or
                                             ['the %s developers' % package['name']])
@@ -350,11 +511,12 @@ def indent(text):
     return '\n'.join(('  ' + line).rstrip() for line in text.replace('\r\n', '\n').split('\n'))
 
 
-def rust_notices():
-    """The notices of the Rust crates linked into dhd.exe and DownhillRevived.exe (linked_crates), as
-    text: a list, then each licence text once with the crates it covers, then the Apache License 2.0
-    text (also the WABT runtime's, THIRD-PARTY-NOTICES.txt)."""
-    both = {(p['name'], p['version']): p for p in linked_crates() + linked_crates(LAUNCHER_CRATE, 'dhd_launcher', ())}
+def rust_notices(platform=PLATFORMS['win']):
+    """The notices of the Rust crates linked into the platform's game and launcher (linked_crates, for its
+    target), as text: a list, then each licence text once with the crates it covers, then the Apache
+    License 2.0 text (also the WABT runtime's, THIRD-PARTY-NOTICES.txt)."""
+    both = {(p['name'], p['version']): p for p in linked_crates(triple=platform.triple) +
+            linked_crates(LAUNCHER_CRATE, 'dhd_launcher', (), platform.triple)}
     crates = [both[k] for k in sorted(both)]
     rows, texts, apache, mpl_without = [], {}, None, []
     for p in crates:
@@ -381,10 +543,12 @@ def rust_notices():
         if mpl is None:
             sys.exit('no MPL-2.0 text for %s; not packaged' % ', '.join(mpl_without))
         mpl[2].extend(mpl_without)
-    out = ['Rust crates linked into dhd.exe and DownhillRevived.exe',
-           '=======================================================',
+    title = 'Rust crates linked into %s and %s' % (platform.game, platform.launcher)
+    out = [title,
+           '=' * len(title),
            '',
-           'The graphics renderer (port/render) and the launcher (port/launcher), parts of this project',
+           'The graphics renderer (port/render, with the network client port/render/net) and the launcher',
+           '(port/launcher), parts of this project',
            '(GPL-3.0-or-later), are written in Rust and linked with these crates (versions from',
            'port/render/Cargo.lock and port/launcher/src-tauri/Cargo.lock). A crate offered under several',
            'licences is used under the first of MIT, Zlib, ISC, BSD, Apache-2.0. The crates under MPL-2.0 are',
@@ -427,23 +591,118 @@ def build_exe(wasm, sdl_lib, sdl_include, jobs):
     return WORK / 'dhd64.exe'
 
 
+def lf(data):
+    if isinstance(data, Path):
+        data = data.read_bytes()
+    return data.replace(b'\r\n', b'\n')
+
+
+def launcher_conf():
+    return json.loads((LAUNCHER_CRATE / 'tauri.conf.json').read_text(encoding='utf-8'))
+
+
+def mac_info_plist(version):
+    """Contents/Info.plist of the app bundle: the launcher's name and bundle id (tauri.conf.json)."""
+    conf = launcher_conf()
+    return plistlib.dumps({
+        'CFBundleDevelopmentRegion': 'en',
+        'CFBundleDisplayName': conf['productName'],
+        'CFBundleExecutable': PLATFORMS['mac'].launcher,
+        'CFBundleIconFile': 'icon.icns',
+        'CFBundleIdentifier': conf['identifier'],
+        'CFBundleInfoDictionaryVersion': '6.0',
+        'CFBundleName': conf['productName'],
+        'CFBundlePackageType': 'APPL',
+        'CFBundleShortVersionString': version,
+        'CFBundleVersion': version,
+        'LSApplicationCategoryType': 'public.app-category.games',
+        'LSMinimumSystemVersion': '11.0',  # the first macOS on Apple Silicon
+        'NSHighResolutionCapable': True,
+    }, sort_keys=True)
+
+
+def layout(platform, version, launcher, game, notices):
+    """{path in the zip: content}, in the zip's order, and the paths of the game and the launcher."""
+    text = crlf if platform.key == 'win' else lf
+    texts = {
+        'README.txt': text(RELEASE / 'README.txt'),
+        'LICENSE.txt': text(ROOT / 'LICENSE'),
+        'THIRD-PARTY-NOTICES.txt': text((RELEASE / 'THIRD-PARTY-NOTICES.txt').read_bytes().rstrip() + b'\n\n'
+                                        + notices.encode('utf-8')),
+    }
+    if platform.key == 'mac':
+        contents = launcher_conf()['productName'] + '.app/Contents/'
+        files = {contents + 'Info.plist': mac_info_plist(version),
+                 contents + 'MacOS/' + platform.launcher: launcher,
+                 contents + 'MacOS/' + platform.game: game,
+                 contents + 'Resources/icon.icns': (LAUNCHER_CRATE / 'icons' / 'icon.icns').read_bytes()}
+        files.update({contents + 'Resources/' + n: t for n, t in texts.items()})
+        return files, contents + 'MacOS/' + platform.game, contents + 'MacOS/' + platform.launcher
+    folder = 'DownhillRevived-%s/' % version
+    files = {folder + platform.launcher: launcher, folder + platform.game: game}
+    files.update({folder + n: t for n, t in texts.items()})
+    if platform.key == 'win':
+        files[folder + 'dxcompiler.dll'] = dxc.dll('x64').read_bytes()
+    return files, folder + platform.game, folder + platform.launcher
+
+
+def sign_app(app):
+    """Ad-hoc signature of the app bundle (codesign, on a Mac only); whether it was signed."""
+    if sys.platform != 'darwin':
+        print('note: %s is NOT signed (codesign runs on a Mac): this zip only shows the layout, and '
+              'latest.json is left alone' % app.name)
+        return False
+    subprocess.run(['xattr', '-cr', str(app)], check=True)  # codesign refuses Finder info and the like
+    for cmd in (['codesign', '--force', '--deep', '-s', '-', str(app)],
+                ['codesign', '--verify', '--deep', '--strict', str(app)]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit('%s failed:\n%s' % (' '.join(cmd[:2]), r.stderr[-2000:]))
+    print('signed ad hoc: %s' % app)
+    return True
+
+
+def write_manifest(path, version, entries, page):
+    """latest.json with entries ({platform: {url, sha256, size}}) added to those of a latest.json of the
+    same version already there. The top level's url, sha256 and size are the Windows zip's: what the
+    0.6.x launchers read (update.rs)."""
+    old = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    platforms = dict(old.get('platforms', {})) if old.get('version') == version else {}
+    platforms.update(entries)
+    manifest = {'name': 'Downhill Revived', 'version': version}
+    manifest.update(platforms.get('win', {}))
+    manifest['page'] = page
+    manifest['platforms'] = dict(sorted(platforms.items()))
+    path.write_text(json.dumps(manifest, indent=1) + '\n', encoding='utf-8')
+    return sorted(platforms)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--platform', choices=sorted(PLATFORMS), default=build_launcher.host_platform(),
+                    help='win, mac (arm64) or linux (x64); default: this machine\'s')
     source = ap.add_mutually_exclusive_group()
     source.add_argument('--wasm', type=Path, default=ROOT / 'build' / 'wasm' / 'dhd_core.wasm',
-                        help='the dhd_core.wasm to build dhd.exe from (default build/wasm/dhd_core.wasm)')
-    source.add_argument('--exe', type=Path, help="a ready build_host64.py dhd64.exe (its link.rsp beside it)")
-    ap.add_argument('--launcher', type=Path, help='a ready build_launcher.py DownhillRevived.exe (default: build it)')
+                        help='the dhd_core.wasm to build dhd.exe from (default build/wasm/dhd_core.wasm; Windows)')
+    source.add_argument('--game', '--exe', dest='game', type=Path,
+                        help="the ready game: build_host64.py's dhd64.exe (its link.rsp beside it), or the mac/linux "
+                             "build's dhd")
+    ap.add_argument('--launcher', type=Path, help='a ready build_launcher.py launcher (default: build it)')
+    ap.add_argument('--rust-lib', type=Path, help='mac/linux: the Rust renderer library linked into --game, whose '
+                    'bytes the retail scan may find in it')
     ap.add_argument('--sdl-lib', type=Path, help='x64 SDL3 static library (default: sdl3.py\'s x64 build)')
     ap.add_argument('--sdl-include', type=Path, help='its include directory (with --sdl-lib)')
     ap.add_argument('--jobs', type=int, default=2)
     ap.add_argument('--version', help="must equal port/include/version.h's DHD_VERSION (the default)")
-    ap.add_argument('--out', type=Path, help='default build/release/DownhillRevived-<version>-win.zip')
+    ap.add_argument('--out', type=Path, help='default build/release/DownhillRevived-<version>-<platform>.zip')
     ap.add_argument('--base-url', help="latest.json's zip address is this + the zip's name (default: the GitHub "
                     "release asset of tag v<version>), for a self-hosted update source")
+    ap.add_argument('--merge', type=Path, nargs='+', metavar='LATEST_JSON',
+                    help="only add these latest.json files' platforms (same version) to the one beside --out")
     ap.add_argument('--settings', type=Path, help="a dhd.ini whose server line must not be in the package")
     ap.add_argument('--elf', type=Path, default=ROOT / 'iso' / 'SCUS_971.77', help='your retail ELF, for the game-data scan')
     a = ap.parse_args()
+    platform = PLATFORMS[a.platform]
     version = header_version()
     if a.version and a.version != version:
         sys.exit('--version %s, but port/include/version.h says %s (the exe reports that one); bump the header '
@@ -452,21 +711,33 @@ def main():
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', a.version):
         sys.exit('version %r: MAJOR.MINOR.PATCH digits only (the updater and the server compare them)' % a.version)
     name = 'DownhillRevived-%s' % a.version
-    out = (a.out or ROOT / 'build' / 'release' / (name + '-win.zip')).resolve()
-    if ROOT / 'build' not in out.parents or out.drive.upper() == 'C:':
+    out = (a.out or ROOT / 'build' / 'release' / ('%s-%s.zip' % (name, platform.zip_tag))).resolve()
+    if (ROOT / 'build').resolve() not in out.parents or out.drive.upper() == 'C:':
         sys.exit('the zip goes under build/ (never tracked, never on C:)')
+    manifest_path = out.with_name('latest.json')
+    page = '%s/tag/v%s' % (RELEASES, a.version)
+    if a.merge:
+        for other in a.merge:
+            m = json.loads(other.read_text(encoding='utf-8'))
+            if m.get('version') != a.version or not m.get('platforms'):
+                sys.exit('%s: version %s with platforms needed (it has %s)' % (other, a.version, m.get('version')))
+            done = write_manifest(manifest_path, a.version, m['platforms'], page)
+        print('%s: version %s, %s' % (manifest_path, a.version, ', '.join(done)))
+        return 0
     changes = source_changes()
     if changes:
         sys.exit('port/ or src/ has uncommitted changes; a release is built from committed source:\n  '
                  + '\n  '.join(changes[:20]))
     if not a.elf.exists():
         sys.exit('%s: the retail ELF is needed to check that no game data is packaged' % a.elf)
-    notices = rust_notices()  # before the build: a crate with an unusable licence stops it early
+    notices = rust_notices(platform)  # before the build: a crate with an unusable licence stops it early
 
-    if a.exe:
-        exe = a.exe.resolve()
+    if a.game:
+        exe = a.game.resolve()
         if not exe.exists():
             sys.exit('%s: no such file' % exe)
+    elif platform.key != 'win':
+        sys.exit('the %s game is built by build_host64\'s %s target: pass it as --game PATH' % (platform.name, platform.key))
     else:
         wasm = a.wasm.resolve()
         if not wasm.exists():
@@ -481,86 +752,126 @@ def main():
             sdl_lib, sdl_include = sdl3.build(sdl3.X64_TARGET)
         exe = build_exe(wasm, Path(sdl_lib).resolve(), Path(sdl_include).resolve(), a.jobs)
     data = exe.read_bytes()
-    pe = int.from_bytes(data[0x3C:0x40], 'little') if data[:2] == b'MZ' else -1
-    if pe < 0 or data[pe:pe + 4] != b'PE\0\0' or data[pe + 4:pe + 6] != b'\x64\x86':  # IMAGE_FILE_MACHINE_AMD64
-        sys.exit('%s is not an x64 (AMD64) executable' % exe)
-    rust_lib = linked_rust_lib(exe)
+    if binary_kind(data) != platform.kind:
+        sys.exit('%s is not a %s executable (%s)' % (exe, platform.kind, binary_kind(data) or 'unknown'))
+    if platform.key == 'win':
+        rust_libs = [linked_rust_lib(exe)]
+    else:
+        rust_libs = [a.rust_lib.resolve()] if a.rust_lib else []
+        print('note: the Rust library\'s own checks (rust_lib_problems) read the Windows link.rsp: skipped for %s'
+              % platform.name)
     if b'dhd-port %s ' % a.version.encode() not in data:
         sys.exit('%s was not built with version %s (port/include/version.h); build it again' % (exe, a.version))
     problems = exe_problems(exe, server_strings(a.settings))
     if problems:
-        sys.exit('dhd.exe is not fit to publish:\n  ' + '\n  '.join(problems[:30]))
-    dlls = imported_dlls(exe)
-    foreign = [d for d in dlls if not SYSTEM_DLL.match(d)]
-    if foreign:
-        sys.exit('dhd.exe imports DLLs that are not Windows\' own: %s' % ', '.join(foreign))
-    launcher = a.launcher.resolve() if a.launcher else build_launcher.build()
+        sys.exit('%s is not fit to publish:\n  ' % platform.game + '\n  '.join(problems[:30]))
+    libraries = foreign_libraries(exe, data, platform)
+    if libraries:
+        sys.exit('%s needs libraries that are not %s\'s own: %s' % (platform.game, platform.name, ', '.join(libraries)))
+    if platform.key == 'linux' and too_new_symbols(exe):
+        sys.exit('%s needs symbols newer than glibc %s has: %s (link it on Ubuntu 22.04)'
+                 % (platform.game, '.'.join(map(str, LINUX_GLIBC)), ', '.join(too_new_symbols(exe))))
+    launcher = a.launcher.resolve() if a.launcher else build_launcher.build(platform.key)
     if not launcher.exists():
         sys.exit('%s: no such file' % launcher)
+    launcher_data = launcher.read_bytes()
     found = build_launcher.problems(launcher)
-    foreign = [d for d in imported_dlls(launcher) if not SYSTEM_DLL.match(d) and not LAUNCHER_DLL.match(d)]
-    if found or foreign:
-        sys.exit('%s is not fit to publish:\n  %s' % (launcher, '\n  '.join(
-            found + ['imports %s, not Windows\' own' % d for d in foreign])))
+    if binary_kind(launcher_data) != platform.kind:
+        found.append('not a %s executable' % platform.kind)
+    else:
+        found += ['needs %s, not %s\'s own' % (d, platform.name)
+                  for d in foreign_libraries(launcher, launcher_data, platform, launcher=True)]
+        if platform.key == 'linux':
+            found += ['needs %s, newer than glibc %s has' % (v, '.'.join(map(str, LINUX_GLIBC)))
+                      for v in too_new_symbols(launcher)]
+    if found:
+        sys.exit('%s is not fit to publish:\n  %s' % (launcher, '\n  '.join(found)))
 
-    files = {
-        'DownhillRevived.exe': launcher.read_bytes(),
-        'dhd.exe': data,
-        'README.txt': crlf(RELEASE / 'README.txt'),
-        'LICENSE.txt': crlf(ROOT / 'LICENSE'),
-        'THIRD-PARTY-NOTICES.txt': crlf((RELEASE / 'THIRD-PARTY-NOTICES.txt').read_bytes().rstrip() + b'\n\n'
-                                        + notices.encode('utf-8')),
-        'dxcompiler.dll': dxc.dll('x64').read_bytes(),
-    }
+    files, game_path, launcher_path = layout(platform, a.version, launcher_data, data, notices)
+    executables = {game_path, launcher_path}
+    # Static libraries linked in: their bytes may match the ELF by chance (game_data_runs).
+    linked = {game_path: rust_libs, launcher_path: build_launcher.native_libraries(launcher)}
     # Third-party binaries: the publisher's exact bytes (see the module's doc).
-    third_party = {'dxcompiler.dll': dxc.DLL_SHA256['x64']}
+    third_party = {p: dxc.DLL_SHA256['x64'] for p in files if p.endswith('/dxcompiler.dll')}
     elf = a.elf.read_bytes()
-    for file_name, content in files.items():
+    for path, content in files.items():
+        file_name = path.rsplit('/', 1)[-1]
         if GAME_DATA.search(file_name):
             sys.exit('%s looks like game data; not packaged' % file_name)
-        if file_name in third_party:
-            if hashlib.sha256(content).hexdigest() != third_party[file_name]:
+        if path in third_party:
+            if hashlib.sha256(content).hexdigest() != third_party[path]:
                 sys.exit('%s is not the pinned third-party file; not packaged' % file_name)
             continue
-        runs = game_data_runs(content, elf, [rust_lib] if file_name == 'dhd.exe' else [])
+        runs = game_data_runs(content, elf, linked.get(path, []))
         if runs:
             sys.exit('%s holds game data (runs of the retail ELF):\n  %s' % (file_name, '\n  '.join(
                 '+0x%X: %d bytes = %s' % (at, n, scan_retail.elf_place(elf, e)) for at, e, n in runs[:20])))
         # the text files may show the official server and example.org addresses, nothing else. In the
         # launcher the Rust string constants sit back to back ("wss://dhd.skuza.appwss://ws://"); no host
-        # holds a scheme, so each scheme starts a new address.
+        # holds a scheme, so each scheme starts a new address. A bare "ws://" constant may also run into
+        # the next strings (Linux: "ws://lobbiesminVersion..."): a server address has a dot or a port,
+        # or is localhost, so a run of letters without either is not one. The official address may run
+        # into the next constant the same way ("wss://dhd.skuza.appnamedhd": dhd_settings' keys): its
+        # host followed by letters with no dot or port is still the official one.
         split = re.sub(rb'(?=(?:wss?|https?)://)', b'\0', content)
-        hosts = set(h.lower().rstrip(b'.') for h in re.findall(rb'wss?://([A-Za-z0-9.:-]+)', split)) - {
-            b'races.example.org', OFFICIAL_HOST}
-        if file_name != 'dhd.exe' and (hosts or other_hosts(content) or any(
+        hosts = set(h.lower().rstrip(b'.') for h in re.findall(rb'wss?://([A-Za-z0-9.:-]+)', split))
+        hosts = {OFFICIAL_HOST if h.startswith(OFFICIAL_HOST) and re.fullmatch(rb'[a-z0-9]*', h[len(OFFICIAL_HOST):])
+                 else h for h in hosts} - {b'races.example.org', OFFICIAL_HOST}
+        hosts = {h for h in hosts if b'.' in h or b':' in h or h.startswith(b'localhost')}
+        if path != game_path and (hosts or other_hosts(content) or any(
                 s.lower() in content.lower() for s in FORBIDDEN + sorted(server_strings(a.settings)))):
             sys.exit('%s names a server or a local path; not packaged' % file_name)
 
-    folder = out.with_name(name)  # the same files unzipped, to try before publishing
-    if folder.exists():
-        shutil.rmtree(folder)
-    folder.mkdir(parents=True)
+    # The same files unzipped, to try before publishing: Windows' in build/release/<name>/ as always.
+    stage = out.parent if platform.key == 'win' else out.with_suffix('')
+    for top in sorted({p.split('/')[0] for p in files}):
+        if (stage / top).exists():
+            shutil.rmtree(stage / top)
+    for path, content in files.items():
+        (stage / path).parent.mkdir(parents=True, exist_ok=True)
+        (stage / path).write_bytes(content)
+        if path in executables and os.name != 'nt':
+            (stage / path).chmod(0o755)
+    signed = True
+    entries = list(files)
+    if platform.key == 'mac':
+        app = stage / entries[0].split('/')[0]
+        signed = sign_app(app)
+        entries += sorted(p.relative_to(stage).as_posix() for p in app.rglob('*')
+                          if p.is_file() and p.relative_to(stage).as_posix() not in files)  # the signature
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for file_name, content in files.items():
-            (folder / file_name).write_bytes(content)
-            info_entry = zipfile.ZipInfo('%s/%s' % (name, file_name), date_time=(2026, 1, 1, 0, 0, 0))
+        for path in entries:
+            info_entry = zipfile.ZipInfo(path, date_time=(2026, 1, 1, 0, 0, 0))
             info_entry.compress_type = zipfile.ZIP_DEFLATED
-            info_entry.external_attr = 0o644 << 16
-            z.writestr(info_entry, content)
+            if platform.key == 'win':
+                info_entry.create_system = 0  # as made on Windows, from any machine
+                info_entry.external_attr = 0o644 << 16
+            else:  # unix entries: unzip and the launcher's updater keep the mode
+                info_entry.create_system = 3
+                info_entry.external_attr = (0o100755 if path in executables else 0o100644) << 16
+            z.writestr(info_entry, (stage / path).read_bytes())
     zip_hash = hashlib.sha256(out.read_bytes()).hexdigest()
-    # The updater's manifest (port/hle/update.c): published beside the zip as a release asset.
+    # The launcher's update manifest (update.rs): published beside the zip as a release asset.
     zip_url = (a.base_url.rstrip('/') + '/' + out.name if a.base_url
                else '%s/download/v%s/%s' % (RELEASES, a.version, out.name))
-    manifest_path = out.with_name('latest.json')
-    manifest_path.write_text(json.dumps({
-        'name': 'Downhill Revived', 'version': a.version, 'url': zip_url, 'sha256': zip_hash,
-        'size': out.stat().st_size, 'page': '%s/tag/v%s' % (RELEASES, a.version)}, indent=1) + '\n', encoding='utf-8')
     commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=str(ROOT), capture_output=True, text=True).stdout.strip()
     print('%s (%d KB)' % (out, out.stat().st_size // 1024))
-    print('  zip sha256 %s; unzipped in %s' % (zip_hash, folder))
-    print('  %s: version %s, %s' % (manifest_path, a.version, zip_url))
-    print('  dhd.exe (x64, Rust renderer %s) sha256 %s, source %s' % (rust_lib, hashlib.sha256(data).hexdigest(), commit[:9]))
-    print('  imports (all Windows DLLs): %s' % ', '.join(dlls))
+    print('  zip sha256 %s; unzipped in %s' % (zip_hash, stage / entries[0].split('/')[0]))
+    if signed:
+        done = write_manifest(manifest_path, a.version, {platform.key: {
+            'url': zip_url, 'sha256': zip_hash, 'size': out.stat().st_size}}, page)
+        print('  %s: version %s, %s; platforms %s' % (manifest_path, a.version, zip_url, ', '.join(done)))
+    print('  %s (%s, Rust renderer %s) sha256 %s, source %s' % (
+        platform.game, platform.kind, ', '.join(map(str, rust_libs)) or 'not named', hashlib.sha256(data).hexdigest(),
+        commit[:9]))
+    if platform.key == 'win':
+        print('  imports (all Windows DLLs): %s' % ', '.join(imported_dlls(exe)))
+    else:
+        print('  libraries (all %s\'s own): %s' % (platform.name, ', '.join(needed_libraries(exe, platform.kind))))
+    if platform.key == 'linux':
+        for label, path in ((platform.game, exe), (platform.launcher, launcher)):
+            print('  %s needs %s' % (label, ', '.join('%s_%s' % (n, '.'.join(map(str, max(v))))
+                                                     for n, v in sorted(symbol_versions(path).items()))))
     return 0
 
 

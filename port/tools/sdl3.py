@@ -8,17 +8,19 @@ and builds a static library with CMake and Ninja for 64-bit Windows (x86_64-pc-w
 clang, the static C runtime that dhd64.exe uses).
 The window (video, Direct3D 11 surface only: no OpenGL, Vulkan or SDL renderer) and the audio
 output (WASAPI) are built too (finding 083 / W11). No GPU or camera subsystems.
-linux_build() is the same source built for Linux x64 (build_host64_linux.py, WSL only):
-the window (X11 and Wayland where their dev packages are present) and audio
-(PulseAudio/PipeWire and ALSA where present), same SDL version and subsystem selection.
+posix_build() is the same source built on Linux x64 (or WSL) and macOS arm64 (build_host64.py's
+linux-x64 and macos-arm64 targets): the window (X11 and Wayland where their dev packages are
+present; Cocoa and Metal views on macOS) and audio (PulseAudio/PipeWire and ALSA where present;
+Core Audio), same SDL version and subsystem selection.
 android_build() (--android) is libSDL3.so for Android arm64 with the NDK, plus SDL's file dialog,
-and the release's Java sources (build_host64_android.py, port/android/build_apk.py; finding 091).
+and the release's Java sources (build_host64.py --target android-arm64, port/android/build_apk.py; finding 091).
 SDL is zlib-licensed (port/release/THIRD-PARTY-NOTICES.txt).
 
 The download is kept in build/downloads, so a rebuild needs no network. Needs CMake on PATH (or in its default place), LLVM's clang and the
 ninja Python package (requirements.txt)."""
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -140,34 +142,43 @@ SYSTEM_LIBS = ['setupapi.lib', 'winmm.lib', 'imm32.lib', 'version.lib', 'ole32.l
                'dwmapi.lib', 'shcore.lib']
 
 
-LINUX_DIRNAME = '%s-linux-x86_64' % VERSION  # build/port/sdl3/<version>-linux-x86_64
-
-
-def linux_build():
-    """The Linux x64 static library, its include directory and the system libraries it needs.
+def posix_build():
+    """The static library for this Linux x64 or macOS arm64 machine, its include directory and the
+    system libraries (and on macOS frameworks) it needs.
 
     Same SDL version, same subsystem selection (OPTIONS: the window, audio and controllers;
-    no GPU/renderer/camera). CMake auto-detects the backends whose dev packages are installed
-    (X11, Wayland, PulseAudio/PipeWire, ALSA); the build fails closed if neither X11 nor
-    Wayland is found, so a windowless SDL3 never ships silently. The library installs under
-    its build dir (build/port/sdl3/<version>-linux-x86_64/install); the system libraries come
-    from the installed sdl3.pc (`pkg-config --static --libs`). WSL/Linux only. Output stays
-    under build/."""
+    no GPU/renderer/camera). On Linux CMake finds the backends whose dev packages are installed
+    (X11, Wayland, PulseAudio/PipeWire, ALSA), and the build fails closed if neither X11 nor
+    Wayland is found, so a windowless SDL3 never ships silently; on macOS the window is Cocoa's
+    (with Metal views) and the sound Core Audio. The library installs under its build dir
+    (build/port/sdl3/<version>-<os>-<arch>/install); the system libraries come from the installed
+    sdl3.pc (its Libs and Libs.private, read here: no pkg-config needed). Output stays under build/."""
     import json as _json
+    import platform as _platform
     if sys.platform == 'win32':
-        sys.exit('SDL3: --linux needs WSL or Linux (run python3 port/tools/sdl3.py --linux there)')
-    base = OUT / LINUX_DIRNAME
+        sys.exit('SDL3: the POSIX build runs on Linux (or WSL) or macOS (python3 port/tools/sdl3.py --posix there)')
+    system = 'macos' if sys.platform == 'darwin' else 'linux'
+    base = OUT / ('%s-%s-%s' % (VERSION, system, _platform.machine()))
     prefix = base / 'install'
     lib = prefix / 'lib' / 'libSDL3.a'
     include = prefix / 'include'
     stamp = base / 'built.txt'
     libs_file = base / 'link_libs.json'
-    recipe = repr(sorted(OPTIONS.items())) + 'linux-x86_64'
+    options = {k: v for k, v in OPTIONS.items()
+               if k not in ('SDL_INSTALL', 'SDL_DISABLE_INSTALL', 'SDL_DISABLE_UNINSTALL', 'HAVE_DINPUT_H', 'HAVE_GAMEINPUT_H')}
+    options.update(SDL_INSTALL='ON', SDL_DISABLE_INSTALL='OFF', SDL_DISABLE_UNINSTALL='OFF')
+    if system == 'macos':
+        options['CMAKE_OSX_DEPLOYMENT_TARGET'] = '11.0'  # the first macOS on Apple silicon (Info.plist's too)
+    # SDL's assertions name their source files (__FILE__), and package_release refuses a builder's
+    # folder in the game: gcc 11 (Ubuntu 22.04, the Linux release's base) kept SDL_gpu.c's full path.
+    # Its sources are named from SDL's own folder instead.
+    options['CMAKE_C_FLAGS'] = '-ffile-prefix-map=%s=SDL3-%s' % (base / 'src' / ('SDL3-%s' % VERSION), VERSION)
+    recipe = repr(sorted(options.items())) + '%s-%s' % (system, _platform.machine())
     if lib.exists() and stamp.exists() and libs_file.exists() and stamp.read_text() == recipe:
         return lib, include, _json.loads(libs_file.read_text())
-    for name in ('cmake', 'ninja', 'pkg-config'):
+    for name in ('cmake', 'ninja'):
         if not shutil.which(name):
-            sys.exit('SDL3: %s not found on PATH (apt: cmake, ninja-build, pkg-config)' % name)
+            sys.exit('SDL3: %s not found on PATH (apt: cmake, ninja-build; macOS: cmake and ninja)' % name)
     tarball = fetch()
     src_parent = base / 'src'
     if src_parent.exists():
@@ -184,35 +195,42 @@ def linux_build():
     cmd = ['cmake', '-S', str(src), '-B', str(bld), '-G', 'Ninja',
            '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_INSTALL_PREFIX=' + str(prefix),
            '-DCMAKE_INSTALL_LIBDIR=lib']
-    cmd += ['-D%s=%s' % kv for kv in sorted(OPTIONS.items())
-            if kv[0] not in ('SDL_INSTALL', 'SDL_DISABLE_INSTALL', 'SDL_DISABLE_UNINSTALL',
-                             'HAVE_DINPUT_H', 'HAVE_GAMEINPUT_H')]
-    cmd += ['-DSDL_INSTALL=ON', '-DSDL_DISABLE_INSTALL=OFF', '-DSDL_DISABLE_UNINSTALL=OFF']
-    for step in (cmd, ['cmake', '--build', str(bld)], ['cmake', '--install', str(bld)]):
+    cmd += ['-D%s=%s' % kv for kv in sorted(options.items())]
+    jobs = os.environ.get('DHD_SDL_JOBS', '4')  # an 8 GB Mac builds with 4
+    for step in (cmd, ['cmake', '--build', str(bld), '-j', jobs], ['cmake', '--install', str(bld)]):
         p = subprocess.run(step, capture_output=True, text=True)
         if p.returncode:
-            sys.exit('SDL3 Linux build failed:\n' + (p.stdout + p.stderr)[-4000:])
+            sys.exit('SDL3 %s build failed:\n' % system + (p.stdout + p.stderr)[-4000:])
     if not lib.exists():
         sys.exit('SDL3: %s missing after the build' % lib)
-    video = [line for line in (bld / 'CMakeCache.txt').read_text().splitlines()
-             if line.startswith(('SDL_X11:', 'SDL_WAYLAND:'))]
-    env = dict(os.environ, PKG_CONFIG_PATH=str(prefix / 'lib' / 'pkgconfig'))
-    p = subprocess.run(['pkg-config', '--static', '--libs', 'sdl3'], capture_output=True, text=True, env=env)
-    if p.returncode:
-        sys.exit('SDL3: sdl3.pc missing after install:\n' + (p.stdout + p.stderr)[-2000:])
-    libs = [word for word in p.stdout.split() if word != '-lSDL3' and 'SDL3' not in word]
-    # The backends' own libraries need not appear above: SDL3 dlopens them
-    # (configure logs `dynamic libX11 -> ...`), so the window-backend gate reads
-    # the configure result, not the link line. (nm confirms the compiled archive
-    # defines X11_bootstrap, Wayland_bootstrap and the audio bootstraps.)
-    if not any(line.endswith('=ON') for line in video):
+    cache = (bld / 'CMakeCache.txt').read_text()
+    backends = ('SDL_COCOA:',) if system == 'macos' else ('SDL_X11:', 'SDL_WAYLAND:')
+    video = [line for line in cache.splitlines() if line.startswith(backends)]
+    # The Linux backends' own libraries need not appear below: SDL3 dlopens them (configure logs
+    # `dynamic libX11 -> ...`), so the window-backend gate reads the configure result, not the link
+    # line. macOS links its frameworks.
+    if system == 'linux' and not any(line.endswith('=ON') for line in video):
         sys.exit('SDL3: no window backend (X11/Wayland dev packages missing?):\n  ' + '\n  '.join(video))
+    pc = (prefix / 'lib' / 'pkgconfig' / 'sdl3.pc').read_text()
+    fields = dict(re.findall(r'^([A-Za-z_.]+)\s*[:=]\s*(.*)$', pc, re.M))
+    expand = lambda s: re.sub(r'\$\{(\w+)\}', lambda m: expand(fields.get(m.group(1), '')), s)
+    words = (expand(fields.get('Libs', '')) + ' ' + expand(fields.get('Libs.private', ''))).split()
+    libs, k = [], 0
+    while k < len(words):  # "-framework X" stays one entry: the link line keeps the pair together
+        word = words[k]
+        if word in ('-framework', '-weak_framework') and k + 1 < len(words):
+            libs.append(word + ' ' + words[k + 1])
+            k += 2
+            continue
+        if not word.startswith('-L') and 'SDL3' not in word and word not in libs:
+            libs.append(word)
+        k += 1
     libs_file.write_text(_json.dumps(libs) + '\n')
     stamp.write_text(recipe)
     return lib, include, libs
 
 
-ANDROID_API = 30  # Android 11 (memfd_create, the Mi 11i's first release); build_host64_android.py's too
+ANDROID_API = 30  # Android 11 (memfd_create, the Mi 11i's first release); build_host64.py's android-arm64 target too
 ANDROID_DIRNAME = '%s-android-arm64' % VERSION  # build/port/sdl3/<version>-android-arm64
 
 
@@ -283,8 +301,8 @@ def android_build():
 if __name__ == '__main__':
     if sys.argv[1:] == ['--android']:
         print(*android_build(), sep='\n')
-    elif sys.argv[1:] == ['--linux']:
-        lib, include, libs = linux_build()
+    elif sys.argv[1:] == ['--posix']:
+        lib, include, libs = posix_build()
         print('%s\n%s\n%s' % (lib, include, ' '.join(libs)))
     else:
         print(*build())
