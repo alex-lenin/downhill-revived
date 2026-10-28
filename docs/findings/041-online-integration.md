@@ -32,7 +32,7 @@ lobby, launcher, package, split-screen data fix, `DHD_WATCH` and the stack-struc
 | `DHD_NET_SERVER` | The relay (from `online-settings.txt`; never in a tracked file). |
 | `DHD_NET_CREATE=1` / `DHD_NET_JOIN=CODE` | Host a room / join one. |
 | `DHD_NET_NAME`, `DHD_NET_RIDER`, `DHD_NET_TRACK`, `DHD_NET_PLAYERS`, `DHD_NET_PUBLIC`, `DHD_NET_ROOM_NAME` | Lobby choices. `DHD_NET_PLAYERS=n`: the host starts when n are in and ready; otherwise on START/Enter. |
-| `DHD_NET_ISO_SHA256` | The ISO hash the server compares (the launcher computes it). |
+| `DHD_NET_ISO_SHA256` | The disc hash the server compares, set by tools; the game and the launcher compute it themselves (since 2026-10-28 the game files hash, finding 098). |
 | `DHD_NET_SCRIPTED=1` | Tests: this PC's slot comes from `DHD_RACE_PAD<slot>` instead of the controller. |
 | `DHD_VIEW=0..3` / `all` | Full-screen view of that player in 3-4 player races. Online the default is this PC's player. |
 | `DHD_HASH_LOG=FILE`, `DHD_HASH_DUMP=field` | Hash every 60 fields; dump the hashed memory at one field. |
@@ -140,6 +140,10 @@ pass on.
 USA disc (SCUS-97177, redump disc 30393, 2,530,869,248 bytes): MD5
 `3654a6f4438c899be4a1f5236cfdcd74`, SHA-1 `a2739ce3b632c1513d2a96cf3982b5effcca5a3c`, SHA-256
 `0fe2b77713d3440cc3030741ea0b18f49e3feaa09671a30a421e0d4888a7eb86`.
+
+Since 2026-10-28 online compares its game files hash instead, so a good dump that differs only
+outside the files is taken too: `c8c17bcae383daf9f2feadc7f6d7476c43d659ab8d66127a299b01311f2a3476`
+(finding 098, "The game files check").
 
 ## Sources
 

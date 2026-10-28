@@ -119,10 +119,39 @@ folders it uses (MSVC 14.51, SDK 10.0.26100.0) at its top.
 ### Android (arm64 APK)
 
 `python port/android/build_apk.py --wasm build/wasm/dhd_core.wasm` builds `libmain.so` with
-`port/tools/build_host64_android.py` and a debug-signed APK, `build/android/downhill-revived-<version>-debug.apk`.
+`port/tools/build_host64.py --target android-arm64` and a debug-signed APK, `build/android/downhill-revived-<version>-debug.apk`.
 It needs the Android SDK (`ANDROID_HOME`, platform android-35), an NDK (r29 tested), a JDK 17+
 (`JAVA_HOME`), the Rust target `aarch64-linux-android`, and `GRADLE_USER_HOME` and
 `ANDROID_USER_HOME` set (Gradle and the debug key). No Android Studio. Details and status: finding 091.
+
+### macOS (Apple silicon) and Linux (x64)
+
+Each is built on its own machine with the same script, `build_host64.py --target macos-arm64` or
+`--target linux-x64`, then packaged there with `package_release.py --platform mac|linux --game
+build/host64-<macos|linux>/dhd64 --elf PATH/SCUS_971.77` (it builds the launcher with
+`build_launcher.py`; the Mac zip's app is signed ad hoc).
+
+- macOS: Xcode's command-line tools (Apple clang, ld), Python 3.12, CMake and Ninja, rustup
+  (its toolchain file installs Rust 1.97.1), Node.js for the launcher. A Mac without WABT takes the
+  C that `wasm2c dhd_core.wasm -n core --num-outputs=8` wrote on another machine, with `--wabt`
+  naming a folder that holds WABT's `include/` and `share/`; `--simde` (or `SIMDE_DIR`) names SIMDe.
+  `DHD_VUTEXT` names `vutext.bin` when the checkout has no `assets/`. An 8 GB Mac builds with 4
+  jobs (the target's default). The first `cargo` run needs the network once
+  (`CARGO_NET_OFFLINE=false cargo fetch --locked` in `port/render`).
+- Linux (or WSL): clang, lld, CMake, Ninja, and the X11, Wayland and PipeWire/PulseAudio/ALSA
+  development packages SDL3 finds; WABT in `/opt/wabt`. The Rust library is built by `rustgs.py` on
+  the machine, or in WSL without cargo by the Windows side through WSL's interop. The launcher needs
+  WebKitGTK 4.1's development files.
+- Linux release builds are made on Ubuntu 22.04 (a WSL distribution of its own works: LLVM 21
+  from apt.llvm.org, rustup, Node.js 24, WABT built from source, a Python 3.12 or later), so the
+  game and the launcher run on glibc 2.35 and later. `package_release.py --platform linux` refuses
+  a binary that needs a newer symbol version (`LINUX_SYMBOLS`): one linked on a newer system binds
+  the versions of that system's headers. The first `cargo` run needs the network once, as on macOS
+  (`CARGO_NET_OFFLINE=false RUSTC_WRAPPER= cargo fetch --locked` in `port/render` and
+  `port/launcher/src-tauri`).
+
+Off Windows the object cache is used only when `DHD_OBJCACHE_DIR` names a folder; rustgs's target
+dirs go to `DHD_CARGO_DIR`, else `~/.cache/dhd-cargo`.
 
 ### SDL3 (window, sound, controllers)
 

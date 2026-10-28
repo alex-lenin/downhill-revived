@@ -44,7 +44,7 @@ A refusal is one text frame followed by a close:
 | `bad_message` | 4000 | Unparseable JSON, unknown type, invalid `hello`, anything before `hello`. |
 | `protocol_mismatch` | 4001 | `hello.protocol` is not the server's `PROTOCOL`. |
 | `version_mismatch` | 4002 | `hello.version` differs from the host's. |
-| `iso_mismatch` | 4003 | `hello.isoSha256` differs from the host's. |
+| `iso_mismatch` | 4003 | `hello.isoSha256` (the disc image's game files hash, finding 098) differs from the host's. |
 | `room_full` | 4004 | No free slot. |
 | `room_started` | 4005 | The race is running; late joins are not supported. |
 | `room_not_found` | 4006 | No room has this code (or it was closed). |

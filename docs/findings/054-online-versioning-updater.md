@@ -1,5 +1,8 @@
 # 054 — Online start gates, the version gate and the auto-updater (round 40, 0.2.0)
 
+The game's own updater (`port/hle/update.c`) was removed on 2026-10-27: the launcher
+(`port/launcher`, finding 093) is the updater on every platform, with the same rules.
+
 Three pieces for 0.2.0's online track:
 - every rider on its own start gate online, the same on every PC;
 - one version number and a server that turns away old releases;

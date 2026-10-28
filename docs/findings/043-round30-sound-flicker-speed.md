@@ -28,6 +28,15 @@ the stretcher at window boundaries where both give the same signal. `DHD_SND_STR
 Real-time paced race, 3 interleaved runs, audio on: legacy 521 gaps (median 901 ms of silence);
 paced without stretch 15 gaps (70 ms); paced with stretch 1 gap (0 ms).
 
+Later (2026-10-27): the same output runs on every platform through SDL3's audio stream
+(`port/host/sound_out_sdl.c`, WASAPI under it on Windows); the WASAPI file and the legacy loop
+(`DHD_SND_LEGACY`) are gone. The stream's get-callback does the thread's work once per device
+period, which is asked for at 10 ms (`SDL_AUDIO_DEVICE_SAMPLE_FRAMES` 480, WASAPI's event period);
+the queue it measures is the stream plus one period, WASAPI's padding. A 20-s minimized title run
+on Windows (bench window fields 600-1500) gave the same numbers as the WASAPI build: no underruns,
+queue p1/p50/p99 62/71/79 ms (WASAPI 62/70/78), game tick max 17 ms. The boot's load stall gaps
+in both.
+
 ## Exact-frame hold
 
 When the Z probe comes within 32 rows of the exact band the native renderer draws whole fields

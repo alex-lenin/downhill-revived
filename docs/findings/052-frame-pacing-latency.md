@@ -65,6 +65,36 @@ race because frame work peaks near 15 ms (mean ~9.7, p99 13.7). Windowed (not bo
 composed at the desktop rate and judders (display-change sd 3.6 ms); borderless is the mode to
 use with G-SYNC.
 
+## The queue before the presenter (2026-10-28, `desk/integrate3`)
+
+With deferred vsync (finding 090 HO1) up to two fields wait for the GS, and the hitch at the start
+(a 115 ms gap before the second picture) left three pictures queued before the presenter. The rule
+above followed the presenter only when it was one picture behind, and the presenter shows one late
+picture a period after the last, so the queue never emptied: each picture was presented 52 ms
+after its due, the work samples were all longer than a field (work = a whole field, no
+just-in-time start), and pad to present was 69-83 ms (`DHD_PACING_STATS`; round 2's build the same).
+A Mac worker measured 45-73 ms from a press to the menu reacting.
+
+`host_pacing_wait` now also follows a presenter two or more pictures behind, while it is presenting
+(a minimised window presents nothing): the picture handed now is shown `behind` periods after the
+presenter's last one, and the grid starts there, once, so the queue empties. Measured on Windows
+(RTX 3070, 143 Hz desktop, windowed 896x672, native 2x, V-Sync; the title screen; a probe that is
+not committed: a key down from SDL's thread every 0.7 s at a random phase, the first pad read that
+holds it, the present of the picture whose pad read did):
+
+| build | key to pad read | pad read to present | key to present |
+|---|---|---|---|
+| before | 7.5 ms | 82.6 ms (82.3-82.9) | 90.1 ms |
+| before, `DHD_LATENCY=0` | 8.1 ms | 17.4 ms | 25.6 ms |
+| before, `DHD_VSYNC=0` | 10.0 ms | 12.9 ms | 22.9 ms |
+| after | 8.3 ms | 3.0 ms (2.4-4.6) | 11.4 ms |
+
+The present spacing is unchanged (16.68 ms, sd 0.01 before and after, no gap off by 2 ms in 2,500
+pictures); pictures are presented at their due (median lateness 52.1 -> 0.0 ms) and the work
+estimate is real again (2.6 ms on the title). In a race (DHD_NAV, no `pad_refresh`) pad to present
+is 13-16 ms. The game's own frames between reading a press and drawing its effect come on top,
+the same on every platform, and so does the display (DWM composes a windowed game).
+
 ## Gate
 
 `port/tools/gate_native_renderer.py` on b00c9174 (and on cb8e185b before it): both arms match

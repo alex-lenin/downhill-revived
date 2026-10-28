@@ -83,9 +83,10 @@ window (`sdl_host.c`), SDL sound, the Rust renderer front end (`gpu_rust.c`), `f
   the previous handler and returns, so debuggerd still writes its tombstone.
 - **Backtraces**: bionic's `backtrace()` needs API 33; `port/host/backtrace_posix.h` builds it from
   `_Unwind_Backtrace` + `dladdr` (library + offset) below that.
-- **Threads/timers** (`port/gs/native_thread.h`): a POSIX branch (pthread mutex/cond, detached
-  threads, `clock_nanosleep` timers, `__atomic` stores); `gpu_rust.c` and `font_sharp.c` include
-  `win32_compat.h` off Windows.
+- **Threads/locks** (`port/gs/native_thread.h`): one SDL3 implementation on every platform
+  (`SDL_Mutex`/`SDL_Condition`, detached `SDL_Thread`, `SDL_DelayNS` then a spin for the frame
+  wait); the queues, movie decoder, texture packs and net client use SDL3 and C11 atomics directly.
+  `win32_compat.h` is gone (2026-10-27).
 
 ### Renderer (Rust, Vulkan)
 

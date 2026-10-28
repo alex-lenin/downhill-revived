@@ -3,7 +3,8 @@
 A PC port of Downhill Domination.
 
 Downhill Revived is a native 64-bit Windows port of *Downhill Domination* (PlayStation 2, Incognito
-Entertainment / SCEA, 2003). It is built on a matching decompilation: C/C++ source that
+Entertainment / SCEA, 2003), with experimental builds for Macs with Apple silicon and for 64-bit
+Linux. It is built on a matching decompilation: C/C++ source that
 compiles back to the original game program byte for byte. The port takes that source, builds it
 for the PC and replaces the PS2 hardware with native code. It adds a modern renderer, PC display
 options, the game's movies, memory card saves, texture packs, online races, a launcher and
@@ -20,7 +21,8 @@ News, help and races: the [Discord server](https://discord.gg/XrSeTyzfr2).
   the translated code only; at every start it reads the game's data (strings, tables, vector
   unit microcode) from your disc image, after checking it is the unchanged original.
 - To play you need your own copy of the game: the **USA disc (SCUS-97177)**, dumped by you to an
-  `.iso` file. Other regions and modified images are not supported.
+  `.iso` file. Other regions and modified images are not supported (why:
+  [docs/findings/100-other-releases.md](docs/findings/100-other-releases.md)).
 - The project takes no donations and sells nothing.
 
 ## Features
@@ -30,6 +32,9 @@ What works today:
 - **A launcher**, `DownhillRevived.exe`: it opens before the game and holds the settings, your
   rider name for online races, the disc image, updates, the release notes, the public races on
   the server and a link to the [Discord server](https://discord.gg/XrSeTyzfr2). It works with a controller too.
+- **Discord Rich Presence**: your Discord profile can show the menus, the race with its track and
+  your place, the career or the online room (never a private room's code). Off in the launcher:
+  Online > Discord status.
 - **Native renderer** on Direct3D 12 or Vulkan, written in Rust on [wgpu](https://wgpu.rs). The
   original PS2 graphics hardware is reproduced on the GPU. An exact emulation path stays in the
   code as the reference it is tested against.
@@ -93,6 +98,11 @@ Known gaps:
 2. Run `DownhillRevived.exe` (`dhd.exe` opens it too) and press PLAY.
 3. The first time, choose your disc image: your `.iso` of the USA disc. It is checked and
    remembered in `dhd.ini`; you won't be asked again unless the file moves or changes.
+
+Mac and Linux (experimental): download `DownhillRevived-<version>-mac-experimental.zip` or
+`-linux-experimental.zip` instead. On a Mac, move Downhill Revived to Applications and allow it
+once under System Settings > Privacy & Security (Open Anyway); on Linux, unzip it anywhere you
+can write to and run `DownhillRevived`. The `README.txt` in the zip has the details.
 
 To start the game without the launcher, turn off Settings > Game > Open the launcher first in the
 launcher (or put `launcher = off` in `dhd.ini`); `dhd.exe` then starts the game straight away.
@@ -202,6 +212,9 @@ Each key has a `DHD_*` environment variable (`scale` is `DHD_SCALE`, `server` is
 - A graphics card with Direct3D 12 or Vulkan. Without one the game draws with Windows' software
   renderer (WARP), slowly.
 - A reasonably modern CPU: the PS2's vector units are run on the CPU.
+- Or, experimental: a Mac with Apple silicon (M1 or later) on macOS 11 or later; or 64-bit Linux
+  with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, Linux Mint 21 and later), a Vulkan
+  driver and WebKitGTK 4.1 for the launcher.
 
 ## Building from source
 

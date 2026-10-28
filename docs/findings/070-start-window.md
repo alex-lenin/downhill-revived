@@ -1,5 +1,8 @@
 # 070: the start window and the shader cache
 
+The start window was removed on 2026-10-27: the launcher (finding 093) is the start screen on every
+platform. The shader cache part stands.
+
 Players saw nothing for many seconds after a double-click and thought the game was stuck.
 
 ## Where the time went
