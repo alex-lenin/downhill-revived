@@ -24,58 +24,42 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "settings_table.h"  /* the settings' choices: generated from port/render/settings */
+
 void gs_window_apply(void);           /* port/gs/present.c */
 void gs_present_options_apply(void);
 int texpack_available(void);          /* port/gs/texpack.c */
 
-enum { ROWS = 13 };
+enum { ROWS = 13, MAX_CHOICES = 16 };
 
-typedef struct { const char *text, *value; } Choice;
+/* A row: its label and dhd.ini key; the setting's variable, built-in value and choices come from
+   setting_table (dhd_settings), the list from choices_build. */
 typedef struct {
-    const char *label, *key, *env, *fallback;
-    const Choice *choices;
-    int count, live;
+    const char *label, *key;
+    int live;
+    const char *env, *builtin;
+    SettingChoice choices[MAX_CHOICES];
+    int count;
     int selected, running, opened;    /* choice indexes; -1: a value not in the list */
 } Row;
 
-/* Resolution: 1x up to what the renderer draws (DHD_SCALE_MAX, which the Rust native renderer sets:
-   8, or less on a card with little memory; 4 on the others), then Window (choices_build). */
-static const Choice scales[] = {{"1x", "1"}, {"2x", "2"}, {"3x", "3"}, {"4x", "4"}, {"5x", "5"}, {"6x", "6"},
-                                {"7x", "7"}, {"8x", "8"}};
-static Choice scale_list[sizeof scales / sizeof *scales + 1];
-static const Choice displays[] = {{"Window", "windowed"}, {"Borderless", "borderless"}, {"Fullscreen", "fullscreen"}};
-static const Choice sizes[] = {{"896x672", "896x672"}, {"1280x960", "1280x960"}, {"1440x1080", "1440x1080"},
-                               {"1280x720", "1280x720"}, {"1920x1080", "1920x1080"}};
-/* Window Size: sizes and the monitor's own (DHD_MONITOR_MODE, present.c) when it isn't one of them. */
-static Choice size_list[sizeof sizes / sizeof *sizes + 1];
-static char monitor_size[24];
-/* Wide: widescreen's shape (the monitor's, port/hle/widescreen.c); 4:3 with widescreen off. */
-static const Choice shapes[] = {{"4:3", "4:3"}, {"Wide", "wide"}, {"16:9", "16:9"}, {"Stretch", "stretch"}, {"Pixels", "pixels"}};
-static const Choice filters[] = {{"Smooth", "linear"}, {"Sharp", "point"}};
-static const Choice switches[] = {{"OFF", "0"}, {"ON", "1"}};
-static const Choice toggles[] = {{"OFF", "off"}, {"ON", "on"}};
-static const Choice fonts[] = {{"Original", "original"}, {"Sharp", "sharp"}};
-/* Frame Rate: the rates up to port_fps_max (240; the browser sets DHD_FPS_MAX 144), then Monitor. */
-static const Choice rates[] = {{"60", "60"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"240", "240"}};
-static Choice rate_list[sizeof rates / sizeof *rates + 1];
-
-#define CHOICES(c) c, (int)(sizeof c / sizeof *c)
 enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT, RATE, VSYNC, UNLOCK };
 static Row rows[ROWS] = {
-    {"Resolution:", "scale", "DHD_SCALE", "2", CHOICES(scales), 0},
-    {"Display:", "window", "DHD_WINDOW", "windowed", CHOICES(displays), 1},
-    {"Window Size:", NULL, "DHD_WINDOW_WIDTH", "896x672", CHOICES(sizes), 1},  /* width and height */
-    {"Picture:", "DHD_ASPECT", "DHD_ASPECT", "4:3", CHOICES(shapes), 1},
-    {"Scaling:", "DHD_PRESENT_FILTER", "DHD_PRESENT_FILTER", "linear", CHOICES(filters), 1},
-    {"Widescreen:", "widescreen", "DHD_WIDESCREEN", "0", CHOICES(switches), 0},
-    {"Skip Movies:", "skip_movies", "DHD_SKIP_MOVIES", "0", CHOICES(switches), 1},  /* the startup movies */
-    {"Vibration:", "vibration", "DHD_VIBRATION", "1", CHOICES(switches), 1},
-    {"Texture Pack:", "textures", "DHD_TEXTURES", "on", CHOICES(toggles), 0},  /* port/gs/texpack.c */
-    {"Font:", "font", "DHD_FONT", "sharp", CHOICES(fonts), 0},  /* port/gs/font_sharp.c */
-    {"Frame Rate:", "fps", "DHD_FPS", "60", CHOICES(rates), 0},
-    {"V-Sync:", "vsync", "DHD_VSYNC", "0", CHOICES(switches), 0},  /* no tearing (port/gs/gpu_rust.c) */
-    {"Unlock All:", "unlock_all", "DHD_UNLOCK_ALL", "0", CHOICES(switches), 1},  /* port_unlock_all */
+    {"Resolution:", "scale", 0},
+    {"Display:", "window", 1},
+    {"Window Size:", "size", 1},  /* width and height */
+    {"Picture:", "DHD_ASPECT", 1},
+    {"Scaling:", "DHD_PRESENT_FILTER", 1},
+    {"Widescreen:", "widescreen", 0},
+    {"Skip Movies:", "skip_movies", 1},  /* the startup movies */
+    {"Vibration:", "vibration", 1},
+    {"Texture Pack:", "textures", 0},  /* port/gs/texpack.c */
+    {"Font:", "font", 0},  /* port/gs/font_sharp.c */
+    {"Frame Rate:", "fps", 0},
+    {"V-Sync:", "vsync", 0},  /* no tearing (port/gs/gpu_rust.c) */
+    {"Unlock All:", "unlock_all", 1},  /* port_unlock_all */
 };
+static char monitor_size[24];
 
 /* Unlock All (dhd.ini "unlock_all", DHD_UNLOCK_ALL): the game's unlock checks answer as if
    everything were unlocked, while it is on: tracks, riders and pro riders, sponsor rows, the
@@ -90,30 +74,39 @@ int port_unlock_all(void)
 
 static int loaded;
 
-/* The lists that depend on this PC: the scales the renderer draws, the monitor's size. */
+/* Each row's list: the setting's choices, but Resolution up to what the renderer draws
+   (DHD_SCALE_MAX, which the Rust native renderer sets: 8, or less on a card with little memory; 4
+   on the others) and Frame Rate up to port_fps_max (240; the browser sets DHD_FPS_MAX 144), each
+   then Window or Monitor; Window Size with the monitor's own size (DHD_MONITOR_MODE, present.c) in
+   place of "monitor" when it isn't one of them. */
 static void choices_build(void)
 {
-    const char *most = host_getenv("DHD_SCALE_MAX");
-    int scale_count = most && atoi(most) > 4 ? atoi(most) : 4, size_count = 0;
-    if (scale_count > (int)(sizeof scales / sizeof *scales)) scale_count = (int)(sizeof scales / sizeof *scales);
-    memcpy(scale_list, scales, (size_t)scale_count * sizeof *scales);
-    scale_list[scale_count].text = "Window"; scale_list[scale_count].value = "window";
-    rows[RESOLUTION].choices = scale_list; rows[RESOLUTION].count = scale_count + 1;
-    for (; size_count < (int)(sizeof sizes / sizeof *sizes); size_count++) size_list[size_count] = sizes[size_count];
-    const char *mode = host_getenv("DHD_MONITOR_MODE");
-    int w = 0, h = 0;
-    if (mode && sscanf(mode, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
-        snprintf(monitor_size, sizeof monitor_size, "%dx%d", w, h);
-        int known = 0;
-        for (int i = 0; i < size_count; i++) known |= !strcmp(sizes[i].value, monitor_size);
-        if (!known) { size_list[size_count].text = size_list[size_count].value = monitor_size; size_count++; }
+    const char *most = host_getenv("DHD_SCALE_MAX"), *mode = host_getenv("DHD_MONITOR_MODE");
+    int max_scale = most && atoi(most) > 4 ? atoi(most) : 4, w = 0, h = 0;
+    if (mode && sscanf(mode, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) snprintf(monitor_size, sizeof monitor_size, "%dx%d", w, h);
+    for (int i = 0; i < ROWS; i++) {
+        Row *r = &rows[i];
+        const SettingInfo *info = NULL;
+        for (unsigned j = 0; j < sizeof setting_table / sizeof *setting_table && !info; j++)
+            if (!strcmp(setting_table[j].key, r->key)) info = &setting_table[j];
+        if (!info) continue;
+        r->env = i == SIZE ? "DHD_WINDOW_WIDTH" : info->env;
+        r->builtin = info->builtin;
+        r->count = 0;
+        for (int j = 0; j < info->count && r->count < MAX_CHOICES; j++) {
+            SettingChoice c = info->choices[j];
+            int number = atoi(c.value);
+            if (i == RESOLUTION && number > max_scale) continue;
+            if (i == RATE && number > port_fps_max()) continue;
+            if (i == SIZE && !strcmp(c.value, "monitor")) continue;
+            r->choices[r->count++] = c;
+        }
+        if (i == SIZE && *monitor_size) {
+            int known = 0;
+            for (int j = 0; j < r->count; j++) known |= !strcmp(r->choices[j].value, monitor_size);
+            if (!known && r->count < MAX_CHOICES) r->choices[r->count++] = (SettingChoice){monitor_size, monitor_size};
+        }
     }
-    rows[SIZE].choices = size_list; rows[SIZE].count = size_count;
-    int rate_count = 0;
-    for (int i = 0; i < (int)(sizeof rates / sizeof *rates); i++)
-        if (atoi(rates[i].value) <= port_fps_max()) rate_list[rate_count++] = rates[i];
-    rate_list[rate_count].text = "Monitor"; rate_list[rate_count].value = "monitor";
-    rows[RATE].choices = rate_list; rows[RATE].count = rate_count + 1;
 }
 static char footer[64];
 static const char *restart_footer = "* Applies when the game starts again";
@@ -144,7 +137,8 @@ static void choose_rows(void)
 
 static Row *row_at(int index) { return index >= 0 && index < shown_count ? &rows[shown[index]] : NULL; }
 
-/* The value the program runs with now: the variable (set from dhd.ini or the environment). */
+/* The value the program runs with now: the variable (set from dhd.ini, in a choice's own spelling,
+   or the environment), else the game's built-in one. */
 static void current(const Row *r, char *out, size_t size)
 {
     if (r == &rows[SIZE]) {
@@ -153,14 +147,7 @@ static void current(const Row *r, char *out, size_t size)
         return;
     }
     const char *v = host_getenv(r->env);
-    snprintf(out, size, "%s", v && *v ? v : r->fallback);
-    if (r == &rows[WIDESCREEN] || r == &rows[MOVIES] || r == &rows[VIBRATION] || r == &rows[VSYNC] || r == &rows[UNLOCK])
-        snprintf(out, size, "%d", atoi(out) != 0);
-    if (r == &rows[TEXTURES])
-        snprintf(out, size, "%s", v && (!dhd_stricmp(v, "off") || !strcmp(v, "0") || !dhd_stricmp(v, "false") || !dhd_stricmp(v, "no"))
-                 ? "off" : "on");
-    if (r == &rows[FONT])  /* as font_sharp_on reads it */
-        snprintf(out, size, "%s", v && (!dhd_stricmp(v, "original") || !dhd_stricmp(v, "off") || !strcmp(v, "0")) ? "original" : "sharp");
+    snprintf(out, size, "%s", v && *v ? v : r->builtin);
 }
 
 static int find(const Row *r, const char *value)
@@ -186,7 +173,7 @@ static void format(Row *r)
     for (int i = 0; i < shown_count; i++)
         if (&rows[shown[i]] == r) index = i;
     if (index < 0) return;
-    if (r->selected >= 0) snprintf(value, sizeof value, "%s", r->choices[r->selected].text);
+    if (r->selected >= 0) snprintf(value, sizeof value, "%s", r->choices[r->selected].label);
     else current(r, value, sizeof value);
     if (r->selected != r->running) strncat(value, " *", sizeof value - strlen(value) - 1);
     menu_page_value_set(&page, index, r->label, value, !locked(r));
@@ -195,17 +182,12 @@ static void format(Row *r)
 /* Saves the row's choice and, for a live row, applies it. */
 static void commit(Row *r, int apply)
 {
-    const Choice *c = &r->choices[r->selected];
-    if (r == &rows[SIZE]) {
+    const SettingChoice *c = &r->choices[r->selected];
+    host_service_host_setting_save(GADDR(r->key), GADDR(c->value));  /* "size": width and height */
+    if (apply && r == &rows[SIZE]) {
         char w[16], h[16];
-        sscanf(c->value, "%15[0-9]x%15[0-9]", w, h);
-        host_service_host_setting_save(GADDR("width"), GADDR(w));
-        host_service_host_setting_save(GADDR("height"), GADDR(h));
-        if (apply) { host_putenv_s("DHD_WINDOW_WIDTH", w); host_putenv_s("DHD_WINDOW_HEIGHT", h); }
-    } else {
-        host_service_host_setting_save(GADDR(r->key), GADDR(c->value));
-        if (apply) host_putenv_s(r->env, c->value);
-    }
+        if (sscanf(c->value, "%15[0-9]x%15[0-9]", w, h) == 2) { host_putenv_s("DHD_WINDOW_WIDTH", w); host_putenv_s("DHD_WINDOW_HEIGHT", h); }
+    } else if (apply) host_putenv_s(r->env, c->value);
     if (apply) hle_env_changed();
     if (!apply) return;
     r->running = r->selected;

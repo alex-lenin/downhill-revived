@@ -14,6 +14,9 @@ modules (build/web/vu.wasm, graphics.wasm) and the Rust renderer get a shared me
 core's side of the queue, and the Rust glue renews its memory views on a grown shared memory. worker.js picks the mode from the
 core module's memory. check_web_layout.py's rule M2 then wants every memory shared (gqueue.wasm
 present), and none in a one-worker build.
+dhd.ini's rules (www/settings.js) are the crate dhd_settings (port/render/settings), built on its own
+by `rustgs.py build --target wasm32-unknown-unknown --crate dhd_settings` into build/web/dhd_settings.wasm
+(its own memory, none of the game's: check_web_layout.py's rule P1; finding 102), then wasm-opt -Oz.
 Input stays untouched; all derived modules, metadata and scratch stay in build/web.
 No proprietary input or generated module belongs in a commit.
 """
@@ -44,6 +47,12 @@ def main():
     # first: a Rust failure stops the build before the long core pass
     from build_renderer import build as build_renderer,SERVED,RENDERER
     renderer=build_renderer(a.renderer_profile,not a.no_opt,OUT)
+    settings=OUT/'dhd_settings.wasm'
+    run(sys.executable,ROOT/'port/tools/rustgs.py','build','--target','wasm32-unknown-unknown','--crate','dhd_settings','--profile',a.renderer_profile)
+    if not a.no_opt:
+        tmp=OUT/'dhd_settings-optimized.wasm'
+        run(BINARYEN,settings,'-Oz','--all-features','--disable-compact-imports','-o',tmp)
+        settings.write_bytes(tmp.read_bytes());tmp.unlink()
     run(sys.executable,ROOT/'port/web/postlink.py',source,OUT/'core-web-raw.wasm',*(['--debug-memory'] if a.debug_memory else []),*(['--legacy-memory'] if a.legacy_memory else []),*(['--no-inline-memory'] if a.no_inline_memory else []))
     run(sys.executable,ROOT/'port/web/build_graphics.py',*(['--debug-memory'] if a.debug_memory else []),*(['--legacy-memory'] if a.legacy_memory else []),*(['--exact-float'] if a.exact_float else []),*(['--threads'] if a.threads else []))
     if not a.threads:(OUT/'gqueue.wasm').unlink(missing_ok=True)  # a stale one would make check_web_layout treat the build as threaded
@@ -65,7 +74,7 @@ def main():
             dst.write_bytes(tmp.read_bytes())
         elif src!=dst:dst.write_bytes(src.read_bytes())
     generate(OUT/'dhd_core.wasm',OUT/'imports.json')
-    files=[source,OUT/'dhd_core.wasm',OUT/'graphics.wasm']+([OUT/'gqueue.wasm',OUT/'vu.wasm'] if a.threads else [])+[RENDERER/n for n in SERVED]
+    files=[source,OUT/'dhd_core.wasm',OUT/'graphics.wasm']+([OUT/'gqueue.wasm',OUT/'vu.wasm'] if a.threads else [])+[RENDERER/n for n in SERVED]+[settings]
     manifest={'input':str(source),'optimized':not a.no_opt,'renderer':'rust','threads':a.threads,
               'sha256':{str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files},'renderer_sizes':renderer['sizes']}
     (OUT/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')

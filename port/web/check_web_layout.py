@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Layout check for the browser build's three wasm modules, which share one linear memory.
+"""Layout check for the browser build's wasm modules: the game's, which share one linear memory, and
+the settings module, which must keep its own.
 
   dhd_core.wasm                 the game reactor; defines the memory (exported as "memory")
   graphics.wasm                 GS/VIF/VU1 module; imports env.memory
@@ -8,8 +9,10 @@
   vu.wasm                       a threaded build's VIF1/VU1 module (its VU worker, finding 090
                                 SP4); imports env.memory; only in a threaded build, and there
                                 required
+  dhd_settings.wasm             dhd.ini's crate for the page and the game worker (port/web/www/
+                                settings.js, finding 102): its own memory, apart from the game's
 
-All three must be there (the JS renderer and its renderer-less builds are gone: cleanup CL5,
+All of them must be there (the JS renderer and its renderer-less builds are gone: cleanup CL5,
 finding 088; --require-renderer is accepted for old callers).
 
 Usage:
@@ -35,6 +38,8 @@ Rules:
   R4  renderer exports __data_end and __heap_base; data ends <= __data_end <= __heap_base <= window top
   R5  renderer has no start function (its init is explicit, from the worker)
   D2  reserved ranges of different modules never overlap (data, stacks, renderer bss window)
+  P1  the settings module imports nothing, defines one memory, exported as "memory", neither shared
+      nor memory64, and has no start function: it never touches the game's memory
 
 RESERVATION TABLE (the rules above read these values)
 """
@@ -68,6 +73,7 @@ THREADED_ONLY = {'vu'}   # roles a threaded build (gqueue.wasm present) has, and
 STACK_BYTES = {role: size for role, _, _, size in ROLES}
 MEMORY_MODULE = {role: mod for role, _, mod, _ in ROLES}
 FILES = {role: name for role, name, _, _ in ROLES}
+SETTINGS_FILE = 'dhd_settings.wasm'   # outside ROLES: not on the shared memory (rule P1)
 
 
 class WasmError(Exception):
@@ -410,6 +416,23 @@ def check(mods, threads=False):
     return v, lines
 
 
+def check_settings(m):
+    """P1 for the settings module; violations as check's."""
+    v = []
+    if m.imports:
+        v.append(('P1', 'settings', 'imports %s; it may import nothing' % ', '.join('%s.%s' % (a, b) for a, b, _ in m.imports)))
+    if len(m.memories) != 1:
+        v.append(('P1', 'settings', 'defines %d memories; it must define exactly one, its own' % len(m.memories)))
+    for flags, _, _ in m.memories:
+        if flags & ~1:
+            v.append(('P1', 'settings', 'memory flags 0x%x: shared or memory64' % flags))
+    if m.exports.get('memory', (None,))[0] != 2:
+        v.append(('P1', 'settings', 'does not export its memory as "memory" (settings.js reads its results there)'))
+    if m.start is not None:
+        v.append(('P1', 'settings', 'declares a start function (index %d)' % m.start))
+    return v
+
+
 # ---- loading and CLI ------------------------------------------------------------------------
 
 def load(build_dir):
@@ -424,6 +447,10 @@ def load(build_dir):
         if not path.exists():
             raise WasmError('missing %s' % path)
         mods[role] = parse(role, path)
+    path = Path(build_dir) / SETTINGS_FILE
+    if not path.exists():
+        raise WasmError('missing %s' % path)
+    mods['settings'] = parse('settings', path)
     return mods
 
 
@@ -434,7 +461,11 @@ def run(build_dir):
         print('ERROR %s' % e)
         return 2
     threads = (Path(build_dir) / 'gqueue.wasm').exists()
+    settings = mods.pop('settings')
     violations, lines = check(mods, threads)
+    violations += check_settings(settings)
+    lines.append('%-9s %s: its own memory (%s), %d import(s)' % (
+        'settings', SETTINGS_FILE, ', '.join('%d pages' % mn for _, mn, _ in settings.memories) or 'none', len(settings.imports)))
     if threads:
         lines.append('threaded build (gqueue.wasm): every memory must be shared')
     for line in lines:
@@ -444,7 +475,7 @@ def run(build_dir):
     if violations:
         print('web layout: FAIL (%d violation(s))' % len(violations))
         return 1
-    print('web layout: OK (%s)' % ', '.join(sorted(mods)))
+    print('web layout: OK (%s)' % ', '.join(sorted([*mods, 'settings'])))
     return 0
 
 
@@ -506,6 +537,12 @@ def _module(*secs):
     return b'\x00asm\x01\x00\x00\x00' + b''.join(secs)
 
 
+def _settings(import_memory=False):
+    if import_memory:   # a settings module on the game's memory
+        return _module(_sec(2, _vec([_name('env') + _name('memory') + b'' + _lim(28864, 32768)])))
+    return _module(_sec(5, _vec([_lim(17)])), _sec(7, _vec([_name('memory') + b'' + _leb(0)])))
+
+
 def _core(sp=0x70DF8890):
     return _module(
         _sec(5, _vec([_lim(28896, 32768)])),
@@ -539,8 +576,9 @@ def _renderer(sp=0x60000000, data=((0x50001000, 16),), data_end=0x50001010, heap
 
 
 FIXTURES = {
-    # name: (renderer kwargs, graphics kwargs, expected rule ids; empty = must pass)
+    # name: (renderer kwargs, graphics kwargs, expected rule ids; empty = must pass[, settings kwargs])
     'good': (dict(), dict(), ()),
+    'settings_shared': (dict(), dict(), ('P1',), dict(import_memory=True)),
     # wasm-ld default: stack at the bottom of the window, data above it (stack-first)
     'stack_first': (dict(sp=0x50100000, data=((0x50100000, 16),), data_end=0x50100010), dict(), ('R3',)),
     # stack and data in the low reserved range [0,1M)
@@ -554,12 +592,13 @@ FIXTURES = {
 
 def write_fixtures(out):
     out = Path(out)
-    for name, (ren, gfx, _) in FIXTURES.items():
+    for name, (ren, gfx, _, *settings) in FIXTURES.items():
         d = out / name
         (d / 'renderer').mkdir(parents=True, exist_ok=True)
         (d / 'dhd_core.wasm').write_bytes(_core())
         (d / 'graphics.wasm').write_bytes(_graphics(**gfx))
         (d / 'renderer' / 'dhd_render_bg.wasm').write_bytes(_renderer(**ren))
+        (d / SETTINGS_FILE).write_bytes(_settings(**(settings[0] if settings else {})))
     return sorted(FIXTURES)
 
 
@@ -568,9 +607,11 @@ def selftest(out):
     import io
     write_fixtures(out)
     failures = []
-    for name, (_, _, expect) in FIXTURES.items():
+    for name, (_, _, expect, *_) in FIXTURES.items():
         mods = load(Path(out) / name)
+        settings = mods.pop('settings')
         violations, _ = check(mods)
+        violations += check_settings(settings)
         rules = {rule for rule, _, _ in violations}
         with contextlib.redirect_stdout(io.StringIO()):
             code = run(Path(out) / name)
@@ -589,7 +630,7 @@ def selftest(out):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description='Check the layout of the web build modules sharing one memory.')
-    ap.add_argument('build_dir', nargs='?', type=Path, help='directory holding dhd_core.wasm, graphics.wasm, renderer/')
+    ap.add_argument('build_dir', nargs='?', type=Path, help='directory holding dhd_core.wasm, graphics.wasm, renderer/, dhd_settings.wasm')
     ap.add_argument('--require-renderer', action='store_true', help='accepted for old callers: the Rust renderer is always required')
     ap.add_argument('--selftest', action='store_true', help='build the synthetic fixtures and check their verdicts')
     ap.add_argument('--write-fixtures', type=Path, metavar='DIR', help='write the synthetic fixtures under DIR')

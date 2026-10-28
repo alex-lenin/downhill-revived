@@ -1,0 +1,17 @@
+# dhd.ini, the player's settings: one implementation for the game, the launcher and (next) the
+# browser.
+# A member of the renderer's workspace, inside its folder so cargo names its sources by relative
+# paths (no build folder in the library). Linked into dhd_render's static library (its `native`
+# feature: the game has one Rust static library) and a path dependency of port/launcher. No
+# dependencies: the standard library only.
+[package]
+name = "dhd_settings"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+description = "dhd.ini: the settings' keys, defaults, choices, parsing and line-keeping saves"
+publish = false
+
+[lib]
+path = "src/lib.rs"

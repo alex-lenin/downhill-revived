@@ -8,82 +8,61 @@ const listen = T.event.listen;
 const appWindow = T.window.getCurrentWindow();
 const $ = (id) => document.getElementById(id);
 
-// The player defaults the game applies where dhd.ini doesn't say (port/hle/host.c, pc_settings.c).
-const DEFAULTS = {
-  scale: '2', window: 'borderless', size: 'monitor', widescreen: '1', DHD_ASPECT: 'wide', skip_movies: '1', vsync: '1',
-  fps: '60', textures: 'on', font: 'sharp', vibration: '1', DHD_PRESENT_FILTER: 'linear',
-  auto_update: 'ask', launcher: 'on', name: '', server: '', iso: '', unlock_all: '0',
-};
-const NAME_LETTERS = /[^A-Z0-9 -]/g;
-
-// The settings pages: the rows of OPTIONS > PC SETTINGS plus the dhd.ini lines players change. A row
-// with `when` is greyed out, with `offHint`, while that doesn't hold.
+// The settings pages: the rows of OPTIONS > PC SETTINGS plus the dhd.ini lines players change. Each
+// setting's choices (value and label) and default are the game's (dhd_settings, port/render/settings,
+// through settings_schema); a switch's are off then on. A row with `when` is greyed out, with
+// `offHint`, while that doesn't hold. A hint may be a function (drawn with the schema).
 const TABS = [
   ['Graphics', [
-    { key: 'scale', label: 'Resolution', hint: 'How sharp the 3D picture is drawn. 1x is the PS2\'s own.', type: 'select',
-      options: [['1', '1x (PS2)'], ['2', '2x'], ['3', '3x'], ['4', '4x'], ['5', '5x'], ['6', '6x'], ['7', '7x'], ['8', '8x'], ['window', 'Match window']] },
-    { key: 'DHD_ASPECT', label: 'Aspect', hint: 'Wide fits your monitor\'s shape; 16:9 is always 16:9', type: 'seg',
-      options: [['4:3', '4:3'], ['wide', 'Wide'], ['16:9', '16:9'], ['stretch', 'Stretch'], ['pixels', 'Pixels']] },
-    { key: 'DHD_PRESENT_FILTER', label: 'Scaling', type: 'seg', options: [['linear', 'Smooth'], ['point', 'Sharp']] },
-    { key: 'fps', label: 'Frame rate', hint: 'Offline races. Online races always run at 60.', type: 'select',
-      options: [['60', '60 fps'], ['120', '120 fps'], ['144', '144 fps'], ['165', '165 fps'], ['240', '240 fps'], ['monitor', 'Monitor']] },
-    { key: 'vsync', label: 'V-Sync', hint: 'No tearing', type: 'switch', on: '1', off: '0' },
-    { key: 'textures', label: 'Texture pack', hint: 'Uses the installed PCSX2 texture pack', type: 'switch', on: 'on', off: 'off',
+    { key: 'scale', label: 'Resolution', hint: 'How sharp the 3D picture is drawn. 1x is the PS2\'s own.', type: 'select' },
+    { key: 'DHD_ASPECT', label: 'Aspect', hint: 'Wide fits your monitor\'s shape; 16:9 is always 16:9', type: 'seg' },
+    { key: 'DHD_PRESENT_FILTER', label: 'Scaling', type: 'seg' },
+    { key: 'fps', label: 'Frame rate', hint: 'Offline races. Online races always run at 60.', type: 'select' },
+    { key: 'vsync', label: 'V-Sync', hint: 'No tearing', type: 'switch' },
+    { key: 'textures', label: 'Texture pack', hint: 'Uses the installed PCSX2 texture pack', type: 'switch',
       when: () => state.texturePack, offHint: 'No pack found. README.txt says where one goes.' },
-    { key: 'font', label: 'Font', type: 'seg', options: [['sharp', 'Sharp'], ['original', 'Original']] },
+    { key: 'font', label: 'Font', type: 'seg' },
   ]],
   ['Display', [
-    { key: 'window', label: 'Display', type: 'seg', options: [['windowed', 'Window'], ['borderless', 'Borderless'], ['fullscreen', 'Fullscreen']] },
+    { key: 'window', label: 'Display', type: 'seg' },
     { key: 'size', label: 'Window size', hint: 'The game window\'s size', type: 'select',
-      when: () => get('window') === 'windowed', offHint: 'Only for Display: Window',
-      options: [['monitor', 'Monitor size'], ['896x672', '896 × 672'], ['1280x960', '1280 × 960'], ['1440x1080', '1440 × 1080'],
-                ['1280x720', '1280 × 720'], ['1920x1080', '1920 × 1080'], ['2560x1440', '2560 × 1440']] },
-    { key: 'widescreen', label: 'Widescreen', hint: 'A wider view, with the HUD and menus kept in shape', type: 'switch', on: '1', off: '0' },
+      when: () => get('window') === 'windowed', offHint: 'Only for Display: Window' },
+    { key: 'widescreen', label: 'Widescreen', hint: 'A wider view, with the HUD and menus kept in shape', type: 'switch' },
   ]],
   ['Game', [
     { key: 'iso', label: 'Disc image', type: 'disc' },
-    { key: 'skip_movies', label: 'Skip intro movies', type: 'switch', on: '1', off: '0' },
-    { key: 'vibration', label: 'Vibration', type: 'switch', on: '1', off: '0' },
-    { key: 'unlock_all', label: 'Unlock All', hint: 'Every track, rider, bike and shop item; your save is not changed', type: 'switch', on: '1', off: '0' },
-    { key: 'auto_update', label: 'Updates', hint: 'Online races need the newest version', type: 'seg',
-      options: [['ask', 'Ask'], ['on', 'Automatic'], ['off', 'Off']] },
-    { key: 'launcher', label: 'Open the launcher first', hint: 'Off: dhd.exe starts the game straight away', type: 'switch', on: 'on', off: 'off' },
+    { key: 'skip_movies', label: 'Skip intro movies', type: 'switch' },
+    { key: 'vibration', label: 'Vibration', type: 'switch' },
+    { key: 'unlock_all', label: 'Unlock All', hint: 'Every track, rider, bike and shop item; your save is not changed', type: 'switch' },
+    { key: 'auto_update', label: 'Updates', hint: 'Online races need the newest version', type: 'seg' },
   ]],
   ['Online', [
-    { key: 'name', label: 'Rider name', hint: 'Shown over your rider in online races. Up to 12 letters, digits, spaces or dashes.', type: 'name' },
+    { key: 'name', label: 'Rider name', hint: () => `Shown over your rider in online races. ${state.schema.name.rule.hint}`, type: 'name' },
     { key: 'server', label: 'Race server', hint: 'Leave empty for the official server', type: 'text', placeholder: 'wss://dhd.skuza.app' },
+    { key: 'discord', label: 'Discord status', hint: 'Shows what you are playing on your Discord profile while Discord runs', type: 'switch' },
   ]],
 ];
 const GAME_TAB = 2;
+const ONLINE_TAB = 3;
+const OFFLINE_ONLY = "Offline only: this disc image's game files are different from the USA disc's (SCUS-97177): a bad or modified dump. Make a new dump or choose another image.";
 
 const state = {
-  version: '', settings: {}, gameFound: true, running: false, tab: 0, update: null, check: 'idle', checkError: '',
+  version: '', settings: {}, schema: {}, gameFound: true, running: false, tab: 0, update: null, check: 'idle', checkError: '',
   discProblem: null, texturePack: false,
+  online: null,       // the disc's online check: { path, checking, done, total }, { path, usa } or { path, error }
   server: null,       // null: not asked yet; 'down'; or { races, riders, min_version }
   error: null,        // { text, fix: { label, icon, onclick } }: stays in the footer until dismissed
   confirmClose: false,
 };
 let flashTimer = 0;
 
-function get(key) {
-  if (key === 'size') {
-    const w = state.settings.width, h = state.settings.height;
-    return w && h && w !== 'monitor' ? `${w}x${h}` : 'monitor';
-  }
-  const v = state.settings[key.toLowerCase()];
-  return v !== undefined && v !== '' ? v : DEFAULTS[key] ?? '';
-}
+// A setting's value (the snapshot's: dhd.ini's, else the default), its choices as [value, label].
+const get = (key) => state.settings[key] ?? '';
+const choices = (key) => state.schema[key]?.choices ?? [];
 
 async function write(key, value) {
-  if (key === 'size') {
-    const [w, h] = value === 'monitor' ? ['monitor', 'monitor'] : value.split('x');
-    await invoke('save_setting', { key: 'width', value: w });
-    await invoke('save_setting', { key: 'height', value: h });
-    state.settings.width = w; state.settings.height = h;
-  } else {
-    await invoke('save_setting', { key, value });
-    state.settings[key.toLowerCase()] = value;
-  }
+  await invoke('save_setting', { key, value });  // "size" is width and height (dhd_settings)
+  state.settings[key] = value !== '' ? value : state.schema[key]?.default ?? '';
 }
 
 async function save(key, value, label) {
@@ -159,7 +138,7 @@ function renderHome() {
   if (first) {
     $('first-title').textContent = state.discProblem ? 'Choose your disc again' : 'One step to the start gate';
     const step = $('first-step');
-    step.textContent = state.discProblem || 'Any folder; the file stays where it is';
+    step.replaceChildren(...withLink(state.discProblem || 'Any folder; the file stays where it is'));
     step.classList.toggle('bad', !!state.discProblem);
   } else {
     const r = state.update?.release;
@@ -181,7 +160,38 @@ function renderHome() {
   $('fact-disc').hidden = first || !iso;
   $('fact-disc').title = iso;
   $('fact-disc-name').textContent = baseName(iso);
+  renderOnline();
   renderServer();
+}
+
+// A disc problem's "More: https://..." (the other releases, finding 100) as a link.
+function withLink(text) {
+  const m = text.match(/^(.*?)\s*More: (https:\S+)$/s);
+  if (!m) return [text];
+  const open = (e) => { e.stopPropagation(); invoke('open_link', { url: m[2] }).catch((err) => fail(String(err))); };
+  return [`${m[1]} `, el('button', { class: 'link inline', onclick: open }, 'More about other releases')];
+}
+
+// What the online check says, for the Play page and the Online tab: nothing for the USA disc's files.
+function onlineNote() {
+  const o = state.online;
+  if (!o || o.path !== get('iso') || needsDisc()) return null;
+  if (o.checking) {
+    if (!o.total) return null; // answered from iso-check.txt before any progress
+    const pct = Math.min(100, Math.floor((o.done / o.total) * 100));
+    return el('div', { class: 'note' }, el('span', { class: 'dot busy' }),
+      el('div', {}, `Checking the disc image for online races… ${pct}%`, el('div', { class: 'bar' }, el('i', { style: `width:${pct}%` }))));
+  }
+  if (o.error) return el('div', { class: 'note' }, icon('i-alert'), el('div', {}, o.error));
+  if (o.usa === false) return el('div', { class: 'note' }, icon('i-alert'), el('div', {}, OFFLINE_ONLY));
+  return null;
+}
+
+function renderOnline() {
+  const note = onlineNote();
+  $('online-note').hidden = !note;
+  $('online-note').replaceChildren(...(note ? [note] : []));
+  if (state.tab === ONLINE_TAB && !$('page-settings').hidden) renderRows();
 }
 
 function renderServer() {
@@ -213,27 +223,28 @@ function control(row, off) {
   switch (row.type) {
     case 'seg':
       return el('div', { class: 'seg', role: 'radiogroup', 'aria-label': row.label },
-        row.options.map(([v, t]) => el('button', {
+        choices(row.key).map(([v, t]) => el('button', {
           class: v === value ? 'on' : '', role: 'radio', 'aria-checked': String(v === value), tabindex: tab,
           onclick: () => save(row.key, v, label(t)).then(renderRows),
         }, t)));
     case 'select': {
       const s = el('select', { 'aria-label': row.label, disabled: off, onchange: (e) => {
-        const opt = row.options.find(([v]) => v === e.target.value);
+        const opt = choices(row.key).find(([v]) => v === e.target.value);
         save(row.key, e.target.value, label(opt[1]));
-      } }, row.options.map(([v, t]) => el('option', { value: v, selected: v === value }, t)));
+      } }, choices(row.key).map(([v, t]) => el('option', { value: v, selected: v === value }, t)));
       return el('div', { class: 'select' }, s, icon('i-down'));
     }
     case 'switch': {
-      const on = !off && value === row.on;
+      const [[offValue], [onValue]] = choices(row.key);
+      const on = !off && value === onValue;
       return el('button', { class: 'sw', role: 'switch', 'aria-checked': String(on), 'aria-label': row.label, disabled: off,
-        onclick: () => save(row.key, on ? row.off : row.on, label(on ? 'off' : 'on')).then(renderRows) });
+        onclick: () => save(row.key, on ? offValue : onValue, label(on ? 'off' : 'on')).then(renderRows) });
     }
     case 'text':
       return el('input', { class: 'text-in', value, placeholder: row.placeholder, spellcheck: 'false', 'aria-label': row.label,
         onchange: (e) => save(row.key, e.target.value.trim(), label(e.target.value.trim() || 'official')) });
     case 'name':
-      return el('input', { class: 'text-in upper', value, maxlength: '12', spellcheck: 'false', 'aria-label': row.label,
+      return el('input', { class: 'text-in upper', value, maxlength: String(state.schema.name.rule.max), spellcheck: 'false', 'aria-label': row.label,
         oninput: (e) => { e.target.value = cleanName(e.target.value); },
         onchange: (e) => setName(e.target.value) });
     case 'disc':
@@ -260,7 +271,7 @@ function renderTabs() {
 function renderRows() {
   const rows = TABS[state.tab][1].map((row) => {
     const off = row.when ? !row.when() : false;
-    let hint = off ? row.offHint : row.hint;
+    let hint = off ? row.offHint : typeof row.hint === 'function' ? row.hint() : row.hint;
     let title = null;
     let bad = false;
     if (row.type === 'disc') {
@@ -269,17 +280,19 @@ function renderRows() {
       bad = !!state.discProblem;
     }
     return el('div', { class: off ? 'row off' : 'row' },
-      el('div', { class: 'l' }, row.label, hint ? el('small', { title, class: bad ? 'bad' : null }, hint) : null),
+      el('div', { class: 'l' }, row.label, hint ? el('small', { title, class: bad ? 'bad' : null }, withLink(hint)) : null),
       control(row, off));
   });
-  keepFocus($('rows'), () => $('rows').replaceChildren(...rows));
+  const note = state.tab === ONLINE_TAB ? onlineNote() : null;
+  keepFocus($('rows'), () => $('rows').replaceChildren(...(note ? [note] : []), ...rows));
 }
 
 // Back to the game's player defaults; the disc image and the rider name stay.
 async function resetTab() {
   const [name, rows] = TABS[state.tab];
   try {
-    for (const row of rows) if (row.type !== 'disc' && row.type !== 'name') await write(row.key, DEFAULTS[row.key]);
+    // a text row is emptied (its default, the official server, stays the game's to name)
+    for (const row of rows) if (row.type !== 'disc' && row.type !== 'name') await write(row.key, row.type === 'text' ? '' : state.schema[row.key].default);
     flash(`${name} is back to the defaults`);
   } catch (e) {
     fail(String(e));
@@ -299,16 +312,41 @@ async function chooseDisc() {
     state.settings.iso = path;
     state.discProblem = null;
     state.error = null;
+    state.online = null;
     renderAll();
     flash('Disc image checked and saved');
+    checkDisc();
   } catch (e) {
     fail(String(e));
   }
 }
 
+// Online races need the USA disc's game files (finding 098): the disc image's files are hashed once
+// (a few seconds on an SSD, about half a minute on a hard disk), then remembered in iso-check.txt
+// for the game too.
+async function checkDisc() {
+  const path = get('iso');
+  if (!path || state.discProblem) return;
+  state.online = { path, checking: true };
+  try {
+    const r = await invoke('check_disc');
+    if (r.path !== get('iso')) return;
+    state.online = { path: r.path, usa: r.usa };
+  } catch (e) {
+    if (String(e).startsWith('replaced') || state.online?.path !== path) return;
+    state.online = { path, error: String(e) };
+  }
+  renderOnline();
+}
+
 // ---------- rider name ----------
 
-function cleanName(s) { return s.toUpperCase().replace(NAME_LETTERS, '').slice(0, 12); }
+// The rider name's rule is dhd_settings' (settings_schema's rule for name): what a field keeps while
+// the player types; rider_name gives the name saved.
+function cleanName(s) {
+  const { letters, max } = state.schema.name.rule;
+  return [...s.replace(/[a-z]/g, (c) => c.toUpperCase())].filter((c) => letters.includes(c)).join('').slice(0, max);
+}
 
 function renderRider() {
   const name = get('name');
@@ -319,8 +357,8 @@ function renderRider() {
 }
 
 async function setName(raw) {
-  const name = cleanName(raw).trim();
-  if (!name) return;
+  const name = await invoke('rider_name', { text: raw });
+  if (!name || name === get('name')) return;
   await save('name', name, `Rider name: ${name}`);
   renderRider();
 }
@@ -436,7 +474,7 @@ function renderFooter() {
     return setSecondary('Close game', () => { state.confirmClose = true; renderFooter(); });
   }
   if (!state.gameFound) {
-    status('bad', 'i-alert', 'dhd.exe isn\'t in this folder. Unzip the whole release together.');
+    status('bad', 'i-alert', 'The game isn\'t in this folder. Unzip the whole release together.');
     setSecondary([icon('i-folder'), 'Open folder'], () => invoke('open_folder').catch((e) => fail(String(e))), true);
     return setPrimary({ ...playNow, disabled: true });
   }
@@ -452,6 +490,10 @@ function renderFooter() {
         break;
       case 'off':
         status('', null, 'Version ', v, '. Update checks are off.');
+        setPrimary(playNow);
+        break;
+      case 'unavailable':
+        status('', null, 'Version ', v, '. No update package is published for this platform yet.');
         setPrimary(playNow);
         break;
       case 'failed':
@@ -481,7 +523,7 @@ function renderFooter() {
   }
   if (state.error) {
     const { text, fix } = state.error;
-    status('bad', 'i-alert', text);
+    status('bad', 'i-alert', ...withLink(text));
     setSecondary(fix && [icon(fix.icon), fix.label], fix?.onclick, true);
     $('dismiss').hidden = false;
   }
@@ -512,7 +554,7 @@ async function checkUpdate() {
     state.update = await invoke('check_update');
     renderNotes();
     renderHome();
-    state.check = state.update.newer ? 'available' : 'current';
+    state.check = !state.update.release ? 'unavailable' : state.update.newer ? 'available' : 'current';
     renderFooter();
     if (state.update.newer && get('auto_update') === 'on') installUpdate();
   } catch (e) {
@@ -562,6 +604,8 @@ async function play() {
 
 async function start() {
   const snap = await invoke('snapshot');
+  state.schema = Object.fromEntries((await invoke('settings_schema')).map((s) => [s.key, s]));
+  $('rider-input').maxLength = state.schema.name.rule.max;
   state.version = snap.version;
   state.settings = snap.settings;
   state.gameFound = snap.game_found;
@@ -594,7 +638,7 @@ async function start() {
     if (e.key === 'Enter' || e.key === 'Escape') input.blur();
   });
   input.addEventListener('blur', () => {
-    if (cleanName(input.value).trim() && cleanName(input.value).trim() !== get('name')) setName(input.value);
+    setName(input.value);
     editName(false);
   });
 
@@ -604,6 +648,12 @@ async function start() {
   document.addEventListener('contextmenu', (e) => { if (!e.target.closest('input, .md')) e.preventDefault(); });
 
   await listen('update-progress', (e) => renderProgress(e.payload.done, e.payload.total));
+  await listen('disc-progress', (e) => {
+    const { path, done, total } = e.payload;
+    if (!state.online?.checking || state.online.path !== path) return;
+    state.online = { path, checking: true, done, total };
+    renderOnline();
+  });
   await listen('game-exited', (e) => {
     state.running = false;
     state.confirmClose = false;
@@ -617,6 +667,7 @@ async function start() {
   $('primary').focus();
   checkUpdate();
   checkServer();
+  checkDisc();
 }
 
 start();

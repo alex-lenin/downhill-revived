@@ -1,7 +1,7 @@
 // The page: picks the ISO, hands the canvas to the game worker, and feeds it keys, gamepads, the
 // mouse (or touch) and sound through SharedArrayBuffers (the worker never returns to its event loop mid-field, so
 // messages would wait). Needs a cross-origin isolated page: serve.mjs sends COOP/COEP.
-import { readIni, lookup, enabled, BROWSER_DEFAULTS } from './settings.js';
+import { startSettings } from './settings.js';
 const $ = id => document.getElementById(id);
 const status = $('status'), log = $('log'), canvas = $('screen');
 const params = new URLSearchParams(location.search);
@@ -105,13 +105,13 @@ function refreshHz() {
 }
 
 // The canvas's shape (PC SETTINGS > Widescreen, from the stored settings): 16:9 with widescreen
-// (the picture's "wide", host_monitor_aspect's 16:9), else the PS2's 4:3. Unset: BROWSER_DEFAULTS.
+// (the picture's "wide", host_monitor_aspect's 16:9), else the PS2's 4:3: DHD_WIDESCREEN as the game
+// will have it (?env., else the stored settings', else the player's default; settings.js).
 // Also at page load, so the frame around the picture has its shape before Start.
 async function shape(env) {
-  const name = env.DHD_SETTINGS ?? 'dhd.ini';
-  const ini = enabled(name) ? await readIni(name).catch(() => '') : '';
-  const wide = (parseInt(env.DHD_WIDESCREEN ?? lookup(ini, 'widescreen') ??
-    (enabled(name) ? BROWSER_DEFAULTS.DHD_WIDESCREEN : '0')) || 0) !== 0;
+  const start = await startSettings(env).catch(() => null);
+  start?.db?.close();
+  const wide = (parseInt(env.DHD_WIDESCREEN ?? start?.vars.DHD_WIDESCREEN ?? '0') || 0) !== 0;
   document.documentElement.style.setProperty('--ar', wide ? '16 / 9' : '4 / 3');  // index.html's stage
   return wide;
 }
