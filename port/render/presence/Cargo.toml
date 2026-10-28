@@ -1,0 +1,27 @@
+# Discord Rich Presence (finding 106).
+# A member of the renderer's workspace, inside its folder so cargo names its sources by relative
+# paths (no build folder in the library).
+#
+# Discord's local IPC (a named pipe on Windows, a Unix socket on macOS and Linux) through the
+# discord-rich-presence crate (MIT): no Discord SDK, nothing downloaded. Linked into dhd_render's
+# static library (its `native` feature): the game has one Rust static library. Built only through
+# port/tools/rustgs.py (--locked --offline, its version gate, check_rust_lib.py).
+[package]
+name = "dhd_presence"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+description = "Discord Rich Presence: what the player is doing, on their Discord profile, over Discord's local IPC"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+discord-rich-presence = { version = "=1.1.0", default-features = false }
+dhd_settings = { path = "../settings" }
+
+
+[dev-dependencies]
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }

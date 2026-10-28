@@ -122,6 +122,7 @@ void pad_vsync(void)
     int port, slot;
     menu_mouse_field();  /* the mouse in the menus: the presses it makes this field */
     pads_begin_field();
+    presence_field();
     for (port = 0; port < 2; port++)
         for (slot = 0; slot < 4; slot++) {
             Pad *p = &pads[port][slot];

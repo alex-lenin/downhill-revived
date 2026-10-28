@@ -20,7 +20,9 @@ fn filter(level: u32) -> ::log::LevelFilter {
 
 impl ::log::Log for HostLogger {
     fn enabled(&self, m: &::log::Metadata) -> bool {
-        m.level() <= filter(LEVEL.load(Ordering::Relaxed))
+        // discord-rich-presence's own lines (one per try while Discord isn't running) stay out:
+        // dhd_presence logs what the player needs, once
+        m.level() <= filter(LEVEL.load(Ordering::Relaxed)) && !m.target().starts_with("discord_rich_presence")
     }
     fn log(&self, r: &::log::Record) {
         if self.enabled(r.metadata()) {
