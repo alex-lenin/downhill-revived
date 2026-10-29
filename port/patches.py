@@ -430,6 +430,38 @@ PATCHES['unsorted/0017A678.cpp'] = PATCHES.get('unsorted/0017A678.cpp', []) + [
 # and CITYTDH their 1-player ones, as at 2 players). Here 3-4 players get the save's tracks, as
 # 1-2 players do. PC SETTINGS > Unlock All (port_unlock_all, pc_settings.c) adds every track the
 # game's unlock cheat gives (all but 21 DUAL and 23 MOSH) without writing the save.
+# At 3 players the game draws four views (D_0029E450), but the level registers its objects for
+# views 0-2 only (func_001589A8 -> func_0023D0B0, which takes each view's x4 slot from the pool
+# func_00208FB8 on first use): the fourth view has no x4. The freeride tracks' race build
+# (func_0011C6F0) then stores D_0029E448 through every view's x4 and their field callback writes
+# x4 + 0xB8 (func_00195F90): on the EE into low RAM, in the 64-bit build into its null guard
+# (issue #12: every freeride track crashed at 3 players). A view without x4 takes its slot here as
+# func_0023D0B0 would; views that had one, every case the PS2 ran without the fault, are unchanged.
+PATCHES['unsorted/0023D1A0.c'] = [
+    ('text', 'extern int D_0029E448;', 'extern int D_0029E448;\nextern int *func_00208FB8(void);'),
+    ('text', '    *entry->x4 = D_0029E448;', '    if (!entry->x4) entry->x4 = func_00208FB8();\n    *entry->x4 = D_0029E448;')]
+# The same field callbacks (one per track family) pass each view's rider's x793C to func_0021D758;
+# the fourth view at 3 players has no rider, so the EE read a word of low RAM and handed it on. The
+# call is skipped for a view without a rider.
+for unit, rider in (('0011C918.c', 'body->x793C'), ('00128DD8.c', 'body->x793C'), ('00181B88.c', 'rider->x793c'),
+                    ('00195F90.c', 'rider->x793c'), ('0016C720.c', 'rider->x793C')):
+    owner = rider.split('->')[0]
+    PATCHES['unsorted/' + unit] = PATCHES.get('unsorted/' + unit, []) + [
+        ('text', f'func_0021D758({rider}, ', f'if ({owner}) func_0021D758({rider}, ')]
+# Glacier's callbacks can sample an empty fourth view before its x4 is allocated.
+# No rider needs its motion; skip that view before sampling it.
+PATCHES['unsorted/0016B400.c'] = [
+    ('text', '        pos.q=func_0023CF78(i)->q;', '        if (!rider) continue;\n        pos.q=func_0023CF78(i)->q;')]
+PATCHES['unsorted/0016C720.c'] += [
+    ('text', '        player++;\n        pos = *func_0023CF78(i);',
+     '        player++;\n        if (!rider) continue;\n        pos = *func_0023CF78(i);')]
+# BC2's paired trackside controller stays in state 0 unless both actors bind
+# (0016CE68). At 3+ players 00192F68 disables the actor pool, but the manager
+# still schedules these inactive controllers. Their unbound parts have x0=1
+# from 001224F0, so updating them requests a reset through a null owner.
+# Leave inactive controllers dormant, as we already do for completed state 14.
+PATCHES['unsorted/0016D0E0.c'] = [
+    ('text', '    if (o->x0 == 14)', '    if (o->x0 == 0 || o->x0 == 14)')]
 PATCHES['unsorted/00193F38.c'] = [
     ('text', 'extern int D_004B2828[];', 'extern int port_unlock_all(void);'),
     ('body', 'func_00193F38', '{\n    return *(int *)(obj + 0x12114) | (port_unlock_all() ? 0x35FFFFF : 0);\n}')]

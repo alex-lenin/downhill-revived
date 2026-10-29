@@ -419,3 +419,65 @@ Use `build/` for dumps (game data). All runs: `DHD_RENDER=native`, `DHD_RACE_SEE
 - Pedroj-64/DownHill-Port-PC `docs/p2s-savestates.md` (PAL rider stride 0x7BD0 and type byte
   +0x7A5C, 1 human / 3 AI), via the project's research notes; confirmed here on US code.
 - The game's manual (multitap on port 1 for 3-4 players).
+
+## Issue #12: freeride tracks at 3 players (2026-10-29)
+
+At 3 players the game draws four views (`D_0029E450`), but the level registers its objects for
+views 0-2 only (`func_001589A8` -> `func_0023D0B0`), so the fourth view has no `x4` slot and its
+rider slot is empty. The PS2 never offered these tracks at 3-4 players (the 5-track mask of issue
+#1), so nothing there hit it. The freeride tracks' race build (`func_0011C6F0`) stores through every
+view's `x4`, and the per-field callbacks of five track families (`0011C918`, `00128DD8`,
+`00181B88`, `00195F90`, `0016C720`) write `x4 + 0xB8` and read the view rider's `x793C`: on the EE
+low RAM, in the 64-bit build its null guard. Port patches (`port/patches.py`): `func_0023D1A0` takes
+a missing slot from the pool (`func_00208FB8`, as `func_0023D0B0` does), and the five callbacks skip
+`func_0021D758` for a view without a rider. Checked with scripted races on Italy freeride (track 0):
+3 players crashed before the fix at the race build (write of guest 0) and ran after it (the fourth
+view shows the track camera); 2 and 4 players still run.
+
+### Glacier's empty-view motion callbacks (2026-10-29)
+
+A three-player Glacier freeride run with `DHD_RACE_SETUP=5` faulted during the countdown at guest address `0xB8` in `func_00167A00`: the fourth view has no rider or motion target. Glacier's `func_0016C720` samples that target before the later allocation in `func_0023D1A0`; `func_0016B400` has the same ordering. The port skips those callbacks' empty-rider iteration before sampling. Iterations with riders are unchanged. A first attempt to allocate only in `0016B400` still faulted; after guarding both callbacks, the same minimized harness reached GO, captured at g+300 and remained in race past clock 3952. The test used the setup override, so it does not cover track-menu selection.
+
+
+### BC2's inactive paired actors (2026-10-29)
+
+BC2 (track 19) has another cause besides the empty fourth view: `func_00192F68`
+disables trackside actor allocation at **both** three and four players. The paired
+controller manager still registers BC2's path controllers (`0016C8A0`), but
+`0016CE68` leaves their state at 0 unless both actor nodes bind. The null-owner
+initialization (`0016CDE8` -> `001224F0`) leaves each part's reset flag at 1.
+`0016D0E0` updated these inactive controllers anyway, so `0016D5C0` requested
+`0016D648` -> `00127098` -> `00126B20`, which dereferenced a missing actor's
+vtable. A fresh unguarded diagnostic run reproduced RVA `0x32a9c3`: the first
+controller (`D_003A6A10 + 0x50`, mapped guest `0x083A6A60`) had state 0,
+both actor pointers 0 and both reset flags 1 immediately before the fault.
+A two-player diagnostic control reached GO and g+300 without that inactive log.
+
+The port now leaves state-0 controllers dormant in `0016D0E0`, alongside the
+existing completed-state-14 early return. This avoids updating absent actors
+instead of hiding two individual bad resets; active controllers are unchanged.
+An earlier candidate, guards on the two part resets in `0016D648`, was dropped for
+this; it also reached GO, and a load stall seen once with it did not come back.
+Diagnosis used the local matching
+sources, a temporary port-only logging patch and `host64_rva.py`; no external code
+was needed. Diagnostic logging is absent from the final build.
+
+Final minimized sweep: all nine class-2 Freeride tracks from `00182290`, each at
+three and four local players, using rider indexes `0,1,2` / `0,1,2,3`
+(guest IDs `20,40,60` / `20,40,60,80`). Each PASS independently checks GO,
+`shot-g+300+0.bmp` written, a live race heartbeat beyond clock 3600 and at least
+61 wall seconds after observing GO (actual minimum 62.3 s). Track selection uses
+`DHD_RACE_SETUP`; this tests level/race behavior, not selecting each menu entry.
+Strict wasm link and offset scan pass; the win-x64 host build passes.
+
+| Track (level) | 3 players | 4 players |
+|---|---|---|
+| 0 (ALP2) | PASS, clock 3989 | PASS, clock 3719 |
+| 1 (MOAB2) | PASS, clock 4971 | PASS, clock 4603 |
+| 2 (JUNGLE2) | PASS, clock 4359 | PASS, clock 3761 |
+| 3 (PERU2) | PASS, clock 3817 | PASS, clock 4938 |
+| 5 (GLAC2P) | PASS, clock 5395 | PASS, clock 4267 |
+| 11 (AUBERST2) | PASS, clock 4030 | PASS, clock 4394 |
+| 12 (FUJI2) | PASS, clock 5164 | PASS, clock 5088 |
+| 19 (BC2) | PASS, clock 3768 | PASS, clock 3724 |
+| 20 (CITY2) | PASS, clock 4896 | PASS, clock 5170 |
