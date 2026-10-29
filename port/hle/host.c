@@ -789,6 +789,7 @@ static void console_open(const char *path)
         opened = 1;
     }
     setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);  /* send log output to the copier promptly, even on forced termination */
     SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
     SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout)));
     if (opened) log_start();

@@ -1098,6 +1098,7 @@ static int others_here(void)
    screen (race phase back to the countdown, or to the flight over a new track), on every PC. The
    race's own online state starts again; the room, the players and their rides stay. The new start
    is agreed again (start_together), and the puppets drop what they had (hle_puppet_rematch). */
+static int rematch_trace, rematch_menu, rematch_phase;
 static void rematch_reset(int track)
 {
     fprintf(stderr, "online: the next race in room %s: track %d (at %.1f s)\n", on.code, track, host_wall_seconds());
@@ -1115,6 +1116,8 @@ static void rematch_reset(int track)
     on.rematch_want = on.rematch_fields = on.restart_accepted = 0;
     on.rematch_at = 0;
     on.setup.track = track;
+    rematch_trace = 1;
+    rematch_menu = rematch_phase = -1;
     kernel_pace_shared(0);
     hle_puppet_rematch();
 }
@@ -1128,6 +1131,11 @@ void hle_online_restart(void)
     if (on.rematch_want == 2) {
         RaceSetup s = {on.rematch_track, {-1, -1, -1, -1}};
         write_setup(&s);  /* the level list has just written its own cursor's track */
+    }
+    /* Test only: exercise a specific destination after the host selects NEW LEVEL. */
+    if (on.local_slot == on.host_slot && getenv("DHD_NET_TEST_NEXT_TRACK")) {
+        RaceSetup s = {atoi(getenv("DHD_NET_TEST_NEXT_TRACK")), {-1, -1, -1, -1}};
+        write_setup(&s);
     }
     on.restart_accepted = 1;
     on.rematch_want = on.rematch_fields = 0;
@@ -1260,6 +1268,7 @@ static int connected;
 static void race_over(void)
 {
     fprintf(stderr, "online: the race is over; back to offline play\n");
+    rematch_trace = 0;
     host_service_net_leave();
     hle_puppet_offline();
     port_online_relock();
@@ -1312,7 +1321,13 @@ void pads_begin_field(void)
         exchange_rides();
         on.setup_done = 1;
     }
+    if (rematch_trace && (rematch_menu != EE32(MENU) || rematch_phase != EE32(PHASE))) {
+        rematch_menu = EE32(MENU), rematch_phase = EE32(PHASE);
+        fprintf(stderr, "online: rematch transition menu %d phase %d at %.1f s\n",
+                rematch_menu, rematch_phase, host_wall_seconds());
+    }
     if (!on.started && on.setup_done && EE32(MENU) == LOAD_MENU && EE32(PHASE) == 1) {
+        rematch_trace = 0;
         start_together();
         on.started = 1;
     }

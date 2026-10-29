@@ -111,6 +111,38 @@ whenever not online). No game RAM layout or retail code changed.
   countdown came 1.5-1.9 s after loading on both PCs.
 - The level list moves with RIGHT (cursor 0 -> 1 is ALPINE -> track 6); DOWN does nothing there.
 
+### Reopened report: track 16 to track 2
+
+The two 0.7.1 logs end just after rematch initialization, before either reports loading.
+The host controller disconnected and reconnected during the first race. Both machines built the
+new grid, including slots 8 and 9. This does not identify where execution stopped afterwards.
+`kernel_pace_shared(0)` runs at reset; the high-rate wall clock caps accumulated debt outside
+phases 1-4. The AI count is recomputed at race initialization, and the online rider count reads
+the resulting setup. Neither observation establishes a fault.
+
+The Windows log thread writes each pipe chunk immediately; stderr is unbuffered. Forced
+termination can still lose bytes in the pipe or copier, and stdout could remain buffered. The
+launcher log now makes stdout unbuffered as well. After a rematch, online logs menu and phase
+changes once each until the countdown begins, so a later report can narrow the interval.
+
+Local relay tests (minimized clients, forced finish at 40 s): an idle-input 60/120 run went
+from track 16 to track 6 and reached both second countdowns in about 21 s after reset; this used
+eight then six riders, not the reported transition. A scripted 60/60 run from track 0 to 6
+also reached both countdowns in about 20 s. Both ran the pre-instrumentation game module.
+
+An instrumented 60/120 run with idle player pads and `DHD_NET_TEST_NEXT_TRACK=2` went from
+track 16 with eight riders to track 2 with ten. Both logged menu 9 phase 5 immediately after
+reset, phase 1 about 25 s later, countdown about 27 s after reset, and second-race clock lines.
+The test override changes the destination at restart acceptance after the host's scripted menu
+choice, so it does not test selecting JUNGLE on the level list. It is retained for repeatable
+tests. The module passed strict link and offset checks and the native build passed. These runs
+do not reproduce the reported failure; there is no confirmed gameplay fix or root cause yet.
+The next useful evidence is the new transition log from an affected machine, especially whether
+it reaches phase 5 and then phase 1, and how long it remains in each.
+
+The same 16 -> 2 run with the players' other settings also reached both countdowns in about 27 s:
+the guest with movies on, the host with Unlock All off and the guest with it on, and both together.
+
 ## Open
 
 - High-rate physics equivalence is still open (finding 067: a full-pedal race finished in
