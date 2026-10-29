@@ -445,7 +445,7 @@ static void choose_riders(const NetLobby *lobby)
     for (int j = 0; j < on.nslots; j++) {
         int want = lobby->racer[j].rider - 1, k = 0;
         snprintf(on.name[j], sizeof on.name[j], "%s", lobby->racer[j].name);
-        if (selected_ride && want >= 0 && want < 16) {
+        if ((selected_ride || getenv("DHD_NET_SCRIPTED")) && want >= 0 && want < 16) {
             on.pick[j] = want;
             fprintf(stderr, "online: player %d %s rides %s (preview choice)\n", j, on.name[j], rider_name[want]);
             continue;
@@ -643,6 +643,22 @@ static void receive_frames(void)
 
 /* ---- the riders: who wears what ---- */
 
+/* A rider's bike online (issue #18): the room skips the shop, which would write it, so the setup
+   holds a stale one, and a pro rider on it rides a mix of two bikes. The five pros get theirs from
+   the game's own single-race rule (func_001B7C08, three words); the others the stock bike, 17 4 0,
+   as func_001B99B8 gives them. */
+extern void func_001B7C08(void *obj, int rider, int slot);
+static void default_bike(int rider, int32_t bike[3])
+{
+    if (rider == 0xE0 || rider == 0x100 || rider == 0x140 || rider == 0x180 || rider == 0x1A0) {
+        int32_t scratch[0x300 / 4] = {0};
+        func_001B7C08(scratch, rider, 0);
+        for (int k = 0; k < 3; k++) bike[k] = scratch[0x14C / 4 + k];
+    } else {
+        bike[0] = 0x11; bike[1] = 4; bike[2] = 0;
+    }
+}
+
 /* On the load screen, before the race build: the setup block as this PC's menus left it, with
    the lobby's track and this player's rider; then every PC tells the others what its player
    rides, and waits for theirs (at most 30 s). */
@@ -694,14 +710,12 @@ int hle_online_race_riders(void)
 /* After func_001B74E8 chose the AI riders (patched into func_001B7198): the AI slots that are
    puppets of the other players wear what those players ride, and the host's AI riders are the
    same on every PC (the remaining ones of the ten, in the game's order from +0x368). A ride not
-   received falls back to the lobby pick on the host's bike. */
+   received falls back to the lobby pick with its default bike. */
 void hle_online_riders(void *game)
 {
     if (!online_mode() || !on.released) return;
     uint8_t *g = game;
-    int used[16] = {0}, next = 0, host_bike[3];
-    for (int k = 0; k < 3; k++)
-        host_bike[k] = on.ride[on.host_slot].have ? on.ride[on.host_slot].bike[k] : EE32(SETUP + 0x11C + 4 * k);
+    int used[16] = {0}, next = 0;
     for (int j = 0; j < on.nslots; j++) used[on.ride[j].have ? (on.ride[j].rider / 32 - 1) & 15 : on.pick[j]] = 1;
     while (next < 10 && regular[next] != *(int32_t *)(g + 0x368) / 32 - 1) next++;
     next %= 10;
@@ -712,12 +726,14 @@ void hle_online_riders(void *game)
         if (global < on.nslots) {
             const Ride *r = &on.ride[global];
             id = r->have ? r->rider : 0x20 * (on.pick[global] + 1);
-            for (int w = 0; w < 3; w++) outfit[w] = r->have ? r->outfit[w] : 0, bike[w] = r->have ? r->bike[w] : host_bike[w];
+            for (int w = 0; w < 3; w++) outfit[w] = r->have ? r->outfit[w] : 0;
+            if (r->have) for (int w = 0; w < 3; w++) bike[w] = r->bike[w];
+            else default_bike(id, bike);
         } else {
             for (int tries = 0; tries < 10 && used[regular[next]]; tries++) next = (next + 1) % 10;
             id = 0x20 * (regular[next] + 1);
             used[regular[next]] = 1;
-            for (int w = 0; w < 3; w++) bike[w] = host_bike[w];
+            default_bike(id, bike);
         }
         outfit[0] = id / 32 - 1;
         *(int32_t *)(g + 0x32C + 4 * k) = id;
@@ -726,8 +742,9 @@ void hle_online_riders(void *game)
             *(int32_t *)(g + 0x14C + 12 * k + 4 * w) = bike[w];
         }
         *(int32_t *)(g + 0x264 + 4 * k) = func_001FA7C0(bike[0]);
-        /* +0x2A8 is per rider (0 the human, 4 the computer's, -1 not racing): a puppet on the
-           human's rider leaves it the human's */
+        /* +0x2A8 is per rider: the slot riding it, -1 if none. The AI choice (func_001B74E8) and
+           the rider screens only ask whether it is free, so a puppet on the human's rider leaves
+           the human's entry */
         int32_t *kind = (int32_t *)(g + 0x2A8 + 4 * ((id / 32 - 1) & 15));
         if (*kind == -1) *kind = 4;
         fprintf(stderr, "online: slot %d (%s %d) rides %s, bike %d %d %d\n", slot, global < on.nslots ? "player" : "AI",
@@ -1286,6 +1303,11 @@ void pads_begin_field(void)
             /* the outfit's first word is the rider (as write_setup and hle_online_riders have it): the
                selection can leave the rider screen's first rider there, who would then ride */
             EE32(SETUP + 0x1B8) = selected_rider / 32 - 1;
+        }
+        {
+            int32_t bike[3];
+            default_bike(EE32(SETUP + 0x290), bike);
+            for (int k = 0; k < 3; k++) EE32(SETUP + 0x11C + 4 * k) = bike[k];
         }
         exchange_rides();
         on.setup_done = 1;
