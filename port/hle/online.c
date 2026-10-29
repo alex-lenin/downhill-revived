@@ -432,25 +432,31 @@ static int pressed_start(void)
     return edge;
 }
 
-/* Every player rides the rider they picked in the lobby; when two picked the same, the later one
-   (lobby order) gets the next free one. The same on every PC. */
+/* Every player rides the rider they picked in the lobby, two or more on the same one too (issue
+   #17); a player without a pick, or with one not of the ten, gets a default the others don't ride.
+   The same on every PC. */
 static void choose_riders(const NetLobby *lobby)
 {
     int taken[16] = {0};
     for (int j = 0; j < on.nslots; j++) {
+        int want = lobby->racer[j].rider - 1;
+        if (want >= 0 && want < 16) taken[want] = 1;
+    }
+    for (int j = 0; j < on.nslots; j++) {
         int want = lobby->racer[j].rider - 1, k = 0;
+        snprintf(on.name[j], sizeof on.name[j], "%s", lobby->racer[j].name);
         if (selected_ride && want >= 0 && want < 16) {
             on.pick[j] = want;
-            snprintf(on.name[j], sizeof on.name[j], "%s", lobby->racer[j].name);
             fprintf(stderr, "online: player %d %s rides %s (preview choice)\n", j, on.name[j], rider_name[want]);
             continue;
         }
         while (k < 10 && regular[k] != want) k++;
-        if (k == 10) k = j % 10;  /* none or not one of the ten: a default */
-        for (int tries = 0; tries < 10 && taken[regular[k]]; tries++) k = (k + 1) % 10;
+        if (k == 10) {  /* none or not one of the ten: a default */
+            k = j % 10;
+            for (int tries = 0; tries < 10 && taken[regular[k]]; tries++) k = (k + 1) % 10;
+            taken[regular[k]] = 1;
+        }
         on.pick[j] = regular[k];
-        taken[regular[k]] = 1;
-        snprintf(on.name[j], sizeof on.name[j], "%s", lobby->racer[j].name);
         fprintf(stderr, "online: player %d %s rides %s\n", j, on.name[j], rider_name[on.pick[j]]);
     }
 }
@@ -720,7 +726,10 @@ void hle_online_riders(void *game)
             *(int32_t *)(g + 0x14C + 12 * k + 4 * w) = bike[w];
         }
         *(int32_t *)(g + 0x264 + 4 * k) = func_001FA7C0(bike[0]);
-        *(int32_t *)(g + 0x2A8 + 4 * ((id / 32 - 1) & 15)) = 4;
+        /* +0x2A8 is per rider (0 the human, 4 the computer's, -1 not racing): a puppet on the
+           human's rider leaves it the human's */
+        int32_t *kind = (int32_t *)(g + 0x2A8 + 4 * ((id / 32 - 1) & 15));
+        if (*kind == -1) *kind = 4;
         fprintf(stderr, "online: slot %d (%s %d) rides %s, bike %d %d %d\n", slot, global < on.nslots ? "player" : "AI",
                 global, rider_name[(id / 32 - 1) & 15], bike[0], bike[1], bike[2]);
     }

@@ -313,3 +313,53 @@ pen/colour restoration. Two live clients on the local relay used Rider Alpha and
 follow the moving remote riders; the race HUD and pause menu retain their text styling. Only the
 test instances' PIDs were stopped. Matching sources, game data and screenshots are not added to this
 change. 
+
+## Issue 17: shared online riders (2026-10-29)
+
+The room checked every other member for a matching rider, so both the earlier
+member (including the host) and the later member lost Ready. This supersedes
+section 2's earlier-member restriction: online players may choose the same rider.
+`online_menu.c` removes the conflict, forced unready, cursor diversion and footer;
+track/options changes still invalidate readiness and host-only controls retain
+their existing host checks.
+
+Source trace: `src/unsorted/001B7198.cpp`'s `func_001B74E8` reads the
+setup +0x2A8 table to avoid occupied riders when choosing opponents;
+`func_001B7A40` writes an opponent's id to +0x32C and marks its rider type 4.
+The picker in `001EB1D8.cpp` writes that table by rider index as well.
+This is one classification per rider, not storage for each racing instance.
+`func_001B9220` requests NGP assets separately per human/opponent slot;
+`func_001B8D10` does the RTX/TEX passes per slot, and `func_001B94B8`
+looks up the slot's outfit record. These paths suggest duplicate assets can be
+instantiated separately without expanding the per-rider table.
+
+`hle_online_riders` now keeps the local human's entry when a puppet shares
+that rider (otherwise 4 would overwrite it; readers only test it for -1); each slot still receives its
+own id, outfit and bike. AI choices continue to exclude human rider identities.
+`choose_riders` honors valid explicit lobby picks in the scripted path too, so
+the harness really exercises duplicates rather than silently choosing a different
+rider (launcher picks keep the ten-rider rule, duplicates allowed). Unspecified picks
+retain the fallback. Outfits remain the players' picks:
+changing them automatically would hide the identical-asset case being tested.
+No matching source or retail data was changed. Research used the local matching
+source and port implementation; no external code was adapted.
+
+Validation: `python port/tools/build_wasm.py` passed (3,815 game units, 35 port
+units, strict link, clean offset scan); `python port/tools/build_host64.py
+build/wasm/dhd_core.wasm` passed (132 imports, 37 Windows host objects).
+`online_race.py --minimized --a DHD_NET_RIDER=4 --b DHD_NET_RIDER=4`
+ran once for its default 420-second budget against localhost:8791. Both logs
+confirm Host and Guest ride Kalolo, including each remote slot; identical outfits
+and bikes loaded. Both reached GO and sustained snapshot exchange through race
+clock ~25,230; the host received two hits and AI finish events arrived on both
+clients. Inspected the host g+300 and guest g+900 harness captures: normal rider
+and bike rendering, no evident texture corruption. The harness exited 0, but
+reported `not every game got the results`: the scripted humans did not finish
+within the budget. This validates loading and sustained racing with duplicates,
+not human finish/results handling or every rider/outfit combination. Duplicates
+remain enabled because this run exposed no duplicate-related engine failure;
+there is no evidence here requiring deep engine changes. The room change was
+compiled and reviewed logically, not driven through a new menu harness.
+
+Later check: two games through the room flow, both on the same rider; the host could still
+READY and START, and both loaded the race.
