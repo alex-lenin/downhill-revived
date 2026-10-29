@@ -293,6 +293,7 @@ void host_service_mouse_state(uint32_t out);
 void host_service_text_input_begin(void);
 void host_service_text_input_end(void);
 int host_service_text_input_edit(uint32_t a0, int a1, uint32_t a2);
+int host_service_clipboard_set(uint32_t text);  /* 1 when the text is on the clipboard */
 void host_service_movie_start(uint32_t name, uint32_t lsn, uint32_t size, int audio, int found);
 int host_service_movie_update(int keep);
 

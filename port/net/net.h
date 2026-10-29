@@ -23,6 +23,7 @@ typedef struct {
     char name[100];            /* UTF-8, up to 24 characters */
     int ready, rider, bike;
     int rtt_ms;                /* the server's measure, -1 unknown */
+    int choosing;              /* on the rider screen */
 } NetMember;
 
 typedef struct {
@@ -53,6 +54,9 @@ typedef struct {
     int offline;               /* the connection dropped mid-race */
     /* the last error */
     char error_code[32], error[200];
+    /* Everyone is ready: the race starts by itself in this many ms (the server's countdown),
+       -1 when none runs. Worked out as the copy is made (net_get_lobby). */
+    int countdown_ms;
 } NetLobby;
 
 /* Host settings; fields at -1 (room_name NULL) are left as they are. */
@@ -76,7 +80,8 @@ void net_leave(void);
 /* Public lobbies (blocking HTTP GET); returns how many, -1 on error. */
 int net_list_lobbies(NetLobbyInfo *out, int max);
 void net_set_room(const NetRoomSettings *s);       /* host */
-void net_pick(int member, int rider, int bike);    /* member -1: this PC */
+/* member -1: this PC. rider -1 (this PC): choosing a rider now, unready until the next pick. */
+void net_pick(int member, int rider, int bike);
 void net_set_ready(int ready);
 void net_kick(int member);                         /* host */
 void net_start_race(void);                         /* host; everyone must be ready */

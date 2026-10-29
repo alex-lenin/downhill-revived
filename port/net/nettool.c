@@ -3,7 +3,8 @@
    stays in it for --seconds, counting the others' frames; then it prints a RESULT line and leaves.
 
    usage: nettool [--server URL] [--name NAME] [--seconds S] [--version V --iso SHA256]
-                  [--replay FILE --rider N] host [--players N] [--code-file PATH] | join CODE | list
+                  [--replay FILE --rider N] [--pick N] [--ready-after S]
+                  host [--players N] [--code-file PATH] | join CODE | list
    The server is --server or DHD_NET_SERVER (ws://127.0.0.1:8787 for wrangler dev). With the
    game's --version and --iso hash it can join a room of real games (finding 041). */
 #include <windows.h>
@@ -106,6 +107,8 @@ int main(int argc, char **argv)
     const char *version = "dhd-port nettool 1", *iso = "0000000000000000000000000000000000000000000000000000000000000000";
     const char *replay_file = NULL;
     int rider = 4, seconds = 600, received = 0;
+    int pick = -1;            /* --pick N: the lobby's rider number (1..16); 0 stays choosing */
+    double ready_after = 0;   /* --ready-after S: Ready after S seconds; below 0 never */
     int i, slot;
     uint8_t frame[NET_FRAME_MAX];
     double until;
@@ -121,12 +124,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--replay") && i + 1 < argc) replay_file = argv[++i];
         else if (!strcmp(argv[i], "--rider") && i + 1 < argc) rider = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pick") && i + 1 < argc) pick = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ready-after") && i + 1 < argc) ready_after = atof(argv[++i]);
         else if (!mode) mode = argv[i];
         else code = argv[i];
     }
     if (!mode || (!strcmp(mode, "join") && !code)) {
         printf("usage: nettool [--server URL] [--name NAME] [--seconds S] [--version V --iso SHA256]\n"
-               "               [--replay FILE --rider N] host [--players N] [--code-file PATH] | join CODE | list\n");
+               "               [--replay FILE --rider N] [--pick N] [--ready-after S] host [--players N] [--code-file PATH] | join CODE | list\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -153,14 +158,16 @@ int main(int argc, char **argv)
         fprintf(fp, "%s\n", l.code);
         fclose(fp);
     }
-    net_pick(-1, replay_file ? rider + 1 : l.member_id % 8, 1);
-    net_set_ready(1);
+    if (pick == 0) net_pick(-1, -1, 0);  /* on the rider screen, as far as the room knows */
+    else net_pick(-1, pick > 0 ? pick : replay_file ? rider + 1 : l.member_id % 8, 1);
+    if (ready_after > 0) Sleep((DWORD)(ready_after * 1000));
+    if (ready_after >= 0 && pick != 0) net_set_ready(1);
     if (l.is_host) {
         wait_for(all_ready, 60, "the players");
         Sleep(300);
         net_start_race();
     }
-    wait_for(racing, 60, "the start");
+    wait_for(racing, seconds, "the start");
     net_get_lobby(&l);
     slot = l.local_slot;
     printf("RACE slot %d of %d, ping %d ms, seed %u\n", slot, l.nslots, l.ping_ms, l.race_seed);

@@ -274,7 +274,7 @@ static void region_callback(uintptr_t lo, uintptr_t hi, int host) {
             'host_service_movie_start': (0,), 'host_service_text_input_edit': (2,),
             'host_service_net_init': (0,1,2,3), 'host_service_net_join_room': (0,),
             'host_service_gs_capture_request': (0,),
-            'host_service_disc_check_start': (0,1),
+            'host_service_disc_check_start': (0,1), 'host_service_clipboard_set': (0,),
         }
         for i in strings.get(name, ()):
             code.append(f'    (void)host64_bridge_string(a{i});')

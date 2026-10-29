@@ -161,6 +161,105 @@ describe("lobby", () => {
   });
 });
 
+describe("race room", () => {
+  const room = (f: unknown) => typeof f === "string" && JSON.parse(f).type === "room";
+  const snap = async (c: Client, pred: (r: any) => boolean) => JSON.parse((await c.next((f) => room(f) && pred(JSON.parse(f as string)))) as string);
+  const countdown = { features: ["countdown"] };
+
+  it("unreadies everyone when the track or options change, not when the room goes public", async () => {
+    const { host, code } = await Client.host("H");
+    const a = await Client.join(code, "A");
+    host.sendJson({ type: "ready", ready: true });
+    a.sendJson({ type: "ready", ready: true });
+    await snap(host, (r) => r.members.length === 2 && r.members.every((m: any) => m.ready));
+    host.sendJson({ type: "settings", public: true });
+    expect((await snap(host, (r) => r.public)).members.every((m: any) => m.ready)).toBe(true);
+    host.sendJson({ type: "settings", track: 3 });
+    expect((await snap(host, (r) => r.settings.track === 3)).members.some((m: any) => m.ready)).toBe(false);
+    a.sendJson({ type: "ready", ready: true });
+    await snap(host, (r) => r.members[1]?.ready);
+    host.sendJson({ type: "settings", laps: 1 });
+    expect((await snap(host, (r) => r.settings.laps === 1)).members[1].ready).toBe(false);
+  });
+
+  it("lets two players ride the same rider, both ready (issue #17)", async () => {
+    const { host, code } = await Client.host("H");
+    const a = await Client.join(code, "A");
+    host.sendJson({ type: "pick", rider: 5 });
+    host.sendJson({ type: "ready", ready: true });
+    await snap(host, (r) => r.members.length === 2 && r.members[0].ready);  // sockets aren't ordered with each other
+    a.sendJson({ type: "pick", rider: 5 });
+    a.sendJson({ type: "ready", ready: true });
+    const r = await snap(host, (r) => r.members[1]?.ready);
+    expect(r.members.map((m: any) => [m.rider, m.ready])).toEqual([[5, true], [5, true]]);
+  });
+
+  it("shows who is choosing a rider and keeps them unready", async () => {
+    const { host, code } = await Client.host("H");
+    const a = await Client.join(code, "A");
+    a.sendJson({ type: "ready", ready: true });
+    await snap(host, (r) => r.members[1]?.ready);
+    a.sendJson({ type: "pick", choosing: true });
+    expect((await snap(host, (r) => r.members[1].choosing)).members[1].ready).toBe(false);
+    a.sendJson({ type: "ready", ready: true });
+    expect((await a.json("error")).code).toBe("not_ready");
+    a.sendJson({ type: "pick", rider: 9, choosing: false });
+    a.sendJson({ type: "ready", ready: true });
+    const r = await snap(host, (r) => r.members[1]?.ready);
+    expect(r.members[1]).toMatchObject({ rider: 9, choosing: false });
+  });
+
+  it("counts down once everyone is ready and starts the race by itself", async () => {
+    const host = await Client.connect("/v1/rooms/new");
+    host.hello("H", countdown);
+    const { code } = await host.json("welcome");
+    const a = await Client.connect(`/v1/rooms/${code}`);
+    a.hello("A", countdown);
+    await a.json("welcome");
+    host.sendJson({ type: "ready", ready: true });
+    a.sendJson({ type: "ready", ready: true });
+    const r = await snap(host, (r) => r.countdownEndsAt !== null);
+    expect(r.countdownEndsAt - r.serverTime).toBeGreaterThan(0);
+    expect(r.countdownEndsAt - r.serverTime).toBeLessThanOrEqual(300);
+    await new Promise((done) => setTimeout(done, 350));
+    await runDurableObjectAlarm(env.ROOM.get(env.ROOM.idFromName(code)));
+    const [sh, sa] = await Promise.all([host.json("start"), a.json("start")]);
+    expect([sh.yourSlot, sa.yourSlot]).toEqual([0, 1]);
+  });
+
+  it("stops the countdown when someone unreadies, and Start still starts at once", async () => {
+    const host = await Client.connect("/v1/rooms/new");
+    host.hello("H", countdown);
+    const { code } = await host.json("welcome");
+    const a = await Client.connect(`/v1/rooms/${code}`);
+    a.hello("A", countdown);
+    await a.json("welcome");
+    host.sendJson({ type: "ready", ready: true });
+    a.sendJson({ type: "ready", ready: true });
+    await snap(host, (r) => r.countdownEndsAt !== null);
+    a.sendJson({ type: "ready", ready: false });
+    await snap(host, (r) => r.countdownEndsAt === null && !r.members[1].ready);
+    await new Promise((done) => setTimeout(done, 350));
+    await runDurableObjectAlarm(env.ROOM.get(env.ROOM.idFromName(code)));
+    expect((await snap(host, () => true)).started).toBe(false);
+    a.sendJson({ type: "ready", ready: true });
+    await snap(host, (r) => r.countdownEndsAt !== null);
+    host.sendJson({ type: "start" });
+    await Promise.all([host.json("start"), a.json("start")]);
+  });
+
+  it("runs no countdown while anyone's client doesn't show one", async () => {
+    const host = await Client.connect("/v1/rooms/new");
+    host.hello("H", countdown);
+    const { code } = await host.json("welcome");
+    const old = await Client.join(code, "Old");
+    host.sendJson({ type: "ready", ready: true });
+    old.sendJson({ type: "ready", ready: true });
+    const r = await snap(host, (r) => r.members.length === 2 && r.members.every((m: any) => m.ready));
+    expect(r.countdownEndsAt).toBeNull();
+  });
+});
+
 describe("public lobby list", () => {
   it("lists public rooms that have not started and have room", async () => {
     const { host, code } = await Client.host("Lister");

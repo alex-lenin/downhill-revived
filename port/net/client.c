@@ -84,8 +84,10 @@ void client_connected(NetClient *c, const NetTransport *tr)
     c->last_rx = c->next_ping = net_now_ms();
     json_escape(name, sizeof name, c->name);
     /* clientVersion: this release (port/include/version.h), for the server's version gate */
+    /* features: this client shows the race room's countdown (the server runs one only when
+       everyone's does) */
     say(c, "{\"type\":\"hello\",\"protocol\":%d,\"version\":\"%s\",\"clientVersion\":\"%s\",\"isoSha256\":\"%s\","
-        "\"name\":\"%s\"}", NET_PROTOCOL, c->version, DHD_VERSION, c->iso, name);
+        "\"name\":\"%s\",\"features\":[\"countdown\"]}", NET_PROTOCOL, c->version, DHD_VERSION, c->iso, name);
     if (c->lobby.state != NET_RECONNECTING)
         c->lobby.state = NET_CONNECTING;
     changed(c);
@@ -111,6 +113,10 @@ static void read_room(NetClient *c, const char *t)
     if (json_int(t, "settings.laps", &v))
         l->laps = (int)v;
     l->seed = json_int(t, "settings.seed", &v) ? v : -1;
+    {
+        double ends;
+        c->countdown_ends = json_number(t, "countdownEndsAt", &ends) ? ends : 0;
+    }
     n = json_count(t, "members");
     l->nmembers = n < 0 ? 0 : n > NET_MAX_SLOTS ? NET_MAX_SLOTS : n;
     for (i = 0; i < l->nmembers; i++) {
@@ -129,6 +135,7 @@ static void read_room(NetClient *c, const char *t)
             m->bike = (int)v;
         if (json_int(t, FIELD("rttMs"), &v))
             m->rtt_ms = (int)v;
+        json_bool(t, FIELD("choosing"), &m->choosing);
 #undef FIELD
     }
 }
@@ -231,7 +238,9 @@ void client_on_text(NetClient *c, const char *text, size_t n)
             c->clock_offset = server_time - net_now_ms();
         c->lobby.state = NET_LOBBY;
         c->lobby.error_code[0] = c->lobby.error[0] = 0;
-        if (c->picked)  /* after a reconnect: what we had chosen */
+        if (c->choosing)  /* after a reconnect: still on the rider screen */
+            say(c, "{\"type\":\"pick\",\"choosing\":true}");
+        else if (c->picked)  /* what we had chosen */
             say(c, "{\"type\":\"pick\",\"rider\":%d,\"bike\":%d}", c->rider, c->bike);
         if (c->ready)
             say(c, "{\"type\":\"ready\",\"ready\":true}");
@@ -240,6 +249,7 @@ void client_on_text(NetClient *c, const char *text, size_t n)
         read_room(c, text);
         changed(c);
     } else if (!strcmp(type, "start")) {
+        c->countdown_ends = 0;
         read_start(c, text);
         changed(c);
     } else if (!strcmp(type, "left") && json_int(text, "slot", &v) && v >= 0 && v < NET_MAX_SLOTS) {
@@ -357,9 +367,12 @@ void client_set_room(NetClient *c, const NetRoomSettings *s)
 void client_pick(NetClient *c, int member, int rider, int bike)
 {
     SDL_LockMutex(c->lock);
-    if (member < 0 || member == c->lobby.member_id) {
-        c->picked = 1, c->rider = rider, c->bike = bike;
-        say(c, "{\"type\":\"pick\",\"rider\":%d,\"bike\":%d}", rider, bike);
+    if ((member < 0 || member == c->lobby.member_id) && rider < 0) {
+        c->choosing = 1, c->ready = 0;
+        say(c, "{\"type\":\"pick\",\"choosing\":true}");
+    } else if (member < 0 || member == c->lobby.member_id) {
+        c->picked = 1, c->rider = rider, c->bike = bike, c->choosing = 0;
+        say(c, "{\"type\":\"pick\",\"rider\":%d,\"bike\":%d,\"choosing\":false}", rider, bike);
     } else
         say(c, "{\"type\":\"pick\",\"member\":%d,\"rider\":%d,\"bike\":%d}", member, rider, bike);
     SDL_UnlockMutex(c->lock);
@@ -407,6 +420,11 @@ void client_lobby(NetClient *c, NetLobby *out)
 {
     SDL_LockMutex(c->lock);
     *out = c->lobby;
+    out->countdown_ms = -1;
+    if (c->countdown_ends > 0 && out->state == NET_LOBBY) {
+        double left = c->countdown_ends - (net_now_ms() + c->clock_offset);
+        out->countdown_ms = left > 0 ? (int)left : 0;
+    }
     SDL_UnlockMutex(c->lock);
 }
 

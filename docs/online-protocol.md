@@ -78,13 +78,14 @@ use the same `error` frame **without** a close; the client just shows `message`.
 ```jsonc
 // First message, required. name: 1-24 characters.
 {"type":"hello","protocol":1,"version":"dhd-port 0.2.0 1a2b3c4d5e6f7a8b","clientVersion":"0.2.0",
- "isoSha256":"<64 lowercase hex>","name":"Rider"}
+ "isoSha256":"<64 lowercase hex>","name":"Rider","features":["countdown"]}  // features: optional
 
 // Host only. Every field optional; omitted fields keep their value.
 {"type":"settings","track":3,"laps":2,"seed":12345,"public":true,"maxPlayers":4,"roomName":"Friday race"}
 
 // Rider and bike for a member. Anyone may set their own; the host may set anyone's.
 {"type":"pick","member":2,"rider":5,"bike":1}     // "member" omitted = yourself
+{"type":"pick","choosing":true}                     // on the rider screen (unreadies); false when back
 
 {"type":"ready","ready":true}
 {"type":"kick","member":3}                          // host only
@@ -100,6 +101,8 @@ use the same `error` frame **without** a close; the client just shows `message`.
 - `maxPlayers`: 2..8, default 4. It can't go below the current member count.
 - `public`: listed in `/v1/lobbies` while not started and not full. Default `false`
   (private, join code only).
+- `features`: what the client understands beyond version 1. `"countdown"`: the room may start
+  the race by itself (below).
 
 ### Server → client
 
@@ -111,8 +114,9 @@ use the same `error` frame **without** a close; the client just shows `message`.
 {"type":"room","code":"K7QX2M","hostId":0,"roomName":"Friday race","public":true,"maxPlayers":4,
  "started":false,"version":"dhd-port 0.4.0",
  "settings":{"track":3,"laps":2,"seed":null},
- "members":[{"id":0,"name":"Ann","ready":true,"rider":5,"bike":1,"rttMs":38},
-            {"id":2,"name":"Bo","ready":false,"rider":0,"bike":0,"rttMs":null}]}
+ "members":[{"id":0,"name":"Ann","ready":true,"rider":5,"bike":1,"rttMs":38,"choosing":false},
+            {"id":2,"name":"Bo","ready":false,"rider":0,"bike":0,"rttMs":null,"choosing":true}],
+ "countdownEndsAt":null,"serverTime":1734000000000}
 
 // Server-timestamped ping, every 2 s while in the lobby. Echo "s" back unchanged in a "pong".
 {"type":"ping","s":1734000000123}
@@ -185,6 +189,21 @@ A racer leaves by closing the socket (or sends `{"type":"leave"}` first, which o
 `reason`). The server broadcasts `left`; every frame the racer sent before reached the others
 first (same socket, ordered). The host's game hands the rider to its AI and sends it as its
 own from then on.
+
+### Race room rules (finding 115)
+
+The server keeps what everyone has to agree on:
+- **Ready is for what you saw.** A changed `track` or `laps` unreadies everyone (`public` and
+  `roomName` don't).
+- **Riders can be shared.** Two or more members may pick the same rider and all be ready
+  (issue #17).
+- **Choosing** (`pick` with `"choosing":true`): the member is on the rider screen; it is
+  unreadied and `ready` answers `not_ready` until a pick with `"choosing":false`.
+- **Countdown.** When at least two members are in the room, all ready, none choosing,
+  and every one said `"countdown"` in `hello`, the server sets `countdownEndsAt` (server ms,
+  `COUNTDOWN_MS` = 5 s on) and starts the race itself then, as `start` would. Any change that
+  breaks the rule clears it. `start` still starts at once. Clients show the time left with
+  `serverTime` as the clock offset. Older clients never get a countdown: the host starts.
 
 ## Lobby list
 

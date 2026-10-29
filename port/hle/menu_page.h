@@ -49,6 +49,13 @@ struct MenuPage {
     int armed;                 /* the buttons were all released since the page opened */
     unsigned char kind[MENU_PAGE_ROWS];     /* MENU_ROW_* of each row */
     char text[MENU_PAGE_ROWS][MENU_PAGE_TEXT];  /* the value rows' text */
+    /* A page that lays itself out (the race room): it has no rows and draws in update with the
+       menu_draw_* calls below. mouse: once a field when the mouse did something, the pointer in
+       the view's coordinates; a right click still presses Triangle. */
+    void (*mouse)(MenuPage *, int x, int y, int moved, int left, int wheel);
+    void (*draw)(MenuPage *);  /* every frame after the game's update (which starts the popups'
+                                  frame afresh): the menu_draw_* calls */
+    int title_y;               /* above 0: the title's y, instead of above the rows */
 } __attribute__((aligned(16)));  /* the game stores a u128 at +0x490 with aligned SSE moves */
 
 void menu_page_run(MenuPage *p);       /* modally, until it closes */
@@ -66,5 +73,27 @@ void menu_page_set_cursor(MenuPage *p, int row);
 int menu_page_rows(const MenuPage *p);
 void menu_page_enable(MenuPage *p, int row, int enabled);  /* a row's flag, without building again */
 void menu_page_sound(int next);        /* S_NEXT / S_PREVIOUS, as the value rows play them */
+
+/* ---- drawing, for a page that lays itself out (in its draw) ----
+   In the popup's view, x across 0..640 and y down 0..224 as the rows are (menu_draw_size),
+   each call queued at once, in order: what is drawn later is on top, and text is on top of
+   every box. The game's own pieces: the popups' translucent panel with its black top and bottom
+   edges (func_00190E48), the cursor's bar (func_0018F9C0, one a frame), and its font in the
+   rows' styles (the menu's UiStyles, below), sized and coloured. */
+typedef struct { int size[4]; int rgba[4]; } MenuStyle;  /* a UiStyle: glyph size and spacing, colour */
+enum { MENU_STYLE_ROW, MENU_STYLE_SELECTED, MENU_STYLE_OFF };
+enum { MENU_LEFT, MENU_CENTRE, MENU_RIGHT };
+#define GLYPH_SQUARE "\xA0"
+#define GLYPH_CIRCLE "\xAB"
+MenuStyle menu_page_style(const MenuPage *p, int which);
+MenuStyle menu_style(MenuStyle s, int percent, int r, int g, int b);  /* sized; colour r < 0: kept */
+void menu_draw_size(int *width, int *height);  /* the popup view's size */
+void menu_draw_begin(void);            /* each frame, before the first box */
+void menu_draw_box(int x, int y, int w, int h, int level);  /* level 90: the popups' own */
+void menu_draw_rect(int x, int y, int w, int h, int r, int g, int b, int a);  /* a < 128: blended */
+void menu_draw_bar(int x, int y, int w, int h);  /* the cursor's bar */
+void menu_draw_text(int align, int x, int y, const char *text, const MenuStyle *s);
+int menu_text_width(const char *text, const MenuStyle *s);
+void menu_play(const char *sound);     /* a front-end sound by name: "S_SELECT", "S_BACK"... */
 
 #endif

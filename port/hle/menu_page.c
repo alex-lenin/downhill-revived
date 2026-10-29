@@ -124,9 +124,11 @@ static void slot_update(void *menu)  /* slot 5, as func_0015E750: the page, then
         menu_page_set_cursor(p, p->rebuild_row);
     }
     if (p->update) p->update(p, menu_page_cursor(p));
+    if (p->title_y > 0) MENU(p, X_TITLE, Item).y = (short)p->title_y;
     set_text(&MENU(p, X_TITLE, Item), 1, p->title);
     footer(p);
     func_0018DC20(menu);
+    if (p->draw) p->draw(p);
 }
 
 static void slot_accept(void *menu, int index)  /* slot 7, Cross */
@@ -241,6 +243,130 @@ void menu_page_set_cursor(MenuPage *p, int row)
         if (((Item *)((char *)p->menu + X_ITEMS))[i].enabled) { MENU(p, X_CURSOR, int) = i; return; }
     }
     MENU(p, X_CURSOR, int) = row;
+}
+
+/* ---- drawing, for a page that lays itself out (menu_page.h) ---- */
+
+typedef unsigned int u128 __attribute__((mode(TI)));
+void func_00190E48(void *popups, void *packet, int x, int y, int w, int h);  /* the panel's packet */
+void func_00190DB0(void *popups, int level);   /* its shade: 90 the popups' own */
+void func_002103D8(void *lists, int view, void *packet);  /* onto the view's display list, by reference */
+void func_002105A0(void *lists, void *qword, int r, int g, int b, int a);  /* RGBAQ */
+void func_00210578(void *lists, void *qword, int x, int y);  /* XYZ2 (widescreen.c maps x) */
+void func_0018F9C0(int unused, int x, int y, int w, int h);  /* the cursor's bar */
+void func_0023D618(int view, int *x, int *y);
+void func_0020F9A8(int font, int view, int x, int y, const char *text);
+void func_0020F9F0(int font, int view, int x, int y, const char *text);
+void func_0020FA98(int font, int view, int x, int y, const char *text);
+void func_0020F518(int font, int r, int g, int b, int a);
+void func_001C57A8(void *bank, u128 name);     /* a sound of the bank by name */
+extern char D_00513B00[];                      /* the views' display lists */
+extern char D_004B2A90[];                      /* the front end's sound bank */
+
+/* The display lists keep a reference to each packet until the frame is drawn, so every box and
+   rectangle of a frame has its own; the game draws a frame's lists before the next update. The
+   DMA reads them from EE RAM, which this unit's statics are not in: they come from the game's
+   heap (func_001FD430, its operator new) the first time, and stay for the run.
+   A packet's DMA tag counts its own qword (as func_00190E48 writes it), so the DMA sends one
+   qword past the end: each packet is zeroed first, and that spare goes to the GIF as an empty
+   tag (in the game's own buffers it is zero too). A box is 14 qwords, a rectangle 6. */
+enum { DRAW_BOXES = 32, BOX_QWORDS = 16, DRAW_RECTS = 96, RECT_QWORDS = 8 };
+void *func_001FD430(unsigned int size);
+static uint64_t (*box_packets)[BOX_QWORDS * 2], (*rect_packets)[RECT_QWORDS * 2];
+static int boxes_used, rects_used;
+
+static int draw_view(void) { return *(int *)(D_003F52D0 + M_VIEW); }
+
+MenuStyle menu_page_style(const MenuPage *p, int which)
+{
+    static const int fields[] = {X_STYLE, X_STYLE_ON, X_STYLE + 8};
+    MenuStyle s;
+    const int *style = MENU(p, fields[which], const int *);
+    if (style) memcpy(&s, style, sizeof s);
+    else memset(&s, 0, sizeof s);
+    return s;
+}
+
+MenuStyle menu_style(MenuStyle s, int percent, int r, int g, int b)
+{
+    for (int i = 0; i < 4; i++) s.size[i] = s.size[i] * percent / 100;
+    if (r >= 0) s.rgba[0] = r, s.rgba[1] = g, s.rgba[2] = b;
+    return s;
+}
+
+void menu_draw_size(int *width, int *height) { func_0023D650(draw_view(), width, height); }
+
+void menu_draw_begin(void)
+{
+    if (!box_packets) {
+        size_t boxes = sizeof *box_packets * DRAW_BOXES, rects = sizeof *rect_packets * DRAW_RECTS;
+        uintptr_t at = ((uintptr_t)func_001FD430((unsigned)(boxes + rects + 15)) + 15) & ~(uintptr_t)15;
+        box_packets = (void *)at, rect_packets = (void *)(at + boxes);
+    }
+    boxes_used = rects_used = 0;
+}
+
+void menu_draw_box(int x, int y, int w, int h, int level)
+{
+    if (!box_packets || boxes_used >= DRAW_BOXES) return;
+    void *packet = box_packets[boxes_used++];
+    memset(packet, 0, sizeof *box_packets);
+    func_00190E48(D_003F52D0, packet, x, y, w, h);
+    func_00190DB0(D_003F52D0, level);
+    func_002103D8(D_00513B00, draw_view(), packet);
+}
+
+/* As func_0018F9C0 draws the cursor's bar: one sprite, its colour at both corners. */
+void menu_draw_rect(int x, int y, int w, int h, int r, int g, int b, int a)
+{
+    if (!rect_packets || rects_used >= DRAW_RECTS || w <= 0 || h <= 0) return;
+    uint64_t *start = rect_packets[rects_used++], *q = start + 2;
+    memset(start, 0, sizeof *rect_packets);
+    int view = draw_view(), cx, cy, vw, vh;
+    func_0023D618(view, &cx, &cy);
+    func_0023D650(view, &vw, &vh);
+    int left = cx - (vw >> 1) + x, top = cy - (vh >> 1) + y;
+    /* GIF tag: one loop of RGBAQ, XYZ2, RGBAQ, XYZ2; PRIM a sprite, alpha-blended (0x46) when a < 128 */
+    q[0] = a < 128 ? 0x4023400000008001ull : 0x4003400000008001ull, q[1] = 0x5151, q += 2;
+    func_002105A0(D_00513B00, q, r, g, b, a), q += 2;
+    func_00210578(D_00513B00, q, left, top), q += 2;
+    func_002105A0(D_00513B00, q, r, g, b, a), q += 2;
+    func_00210578(D_00513B00, q, left + w, top + h), q += 2;
+    start[0] = (uint64_t)(((q - start) / 2) | 0x60000000), start[1] = 0;
+    func_002103D8(D_00513B00, view, start);
+}
+
+void menu_draw_bar(int x, int y, int w, int h) { func_0018F9C0(0, x, y, w, h); }
+
+void menu_draw_text(int align, int x, int y, const char *text, const MenuStyle *s)
+{
+    func_0020FB80(0, s->size[0], s->size[1], s->size[2], s->size[3]);
+    func_0020F518(0, s->rgba[0], s->rgba[1], s->rgba[2], s->rgba[3]);
+    int view = draw_view();
+    if (align == MENU_LEFT) func_0020F9A8(0, view, x, y, text);
+    else if (align == MENU_RIGHT) func_0020FA98(0, view, x, y, text);
+    else func_0020F9F0(0, view, x, y, text);
+}
+
+int menu_text_width(const char *text, const MenuStyle *s)
+{
+    char saved[0x20];
+    memcpy(saved, D_004F3570, sizeof saved);
+    func_0020FB80(0, s->size[0], s->size[1], s->size[2], s->size[3]);
+    *(int *)(D_004F3570 + 0x1C) = 0;
+    int width = func_0020F860(0, text) >> 4;
+    memcpy(D_004F3570, saved, sizeof saved);
+    return width;
+}
+
+void menu_play(const char *sound)
+{
+    unsigned char name[16] = {0};
+    size_t n = strlen(sound);
+    memcpy(name, sound, n < 16 ? n : 16);
+    u128 v;
+    memcpy(&v, name, sizeof v);  /* the bank's names are their bytes, little-endian */
+    func_001C57A8(D_004B2A90, v);
 }
 
 /* ---- the mouse (finding 092) ----
@@ -367,8 +493,14 @@ static int row_enabled(void *menu, int row)
 /* The open popup and the mouse's news this field: hover, clicks, wheel. */
 static void popup_mouse(void *menu, int view, int moved, int left, int right, int wheel)
 {
-    int left_arrow, row = row_at(menu, view, &left_arrow);
     MenuPage *p = page_of(menu);
+    if (p && p->mouse) {  /* a page that lays itself out hit-tests its own pieces */
+        int mx, my;
+        if (pointer(view, &mx, &my) && (moved || left || wheel)) p->mouse(p, mx, my, moved, left, wheel);
+        if (right) press(PAD_TRIANGLE);
+        return;
+    }
+    int left_arrow, row = row_at(menu, view, &left_arrow);
     int value_row = p && row >= 0 && row < MENU_PAGE_ROWS && p->kind[row] == MENU_ROW_VALUE;
     if (moved && row >= 0 && row_enabled(menu, row) && AT(menu, X_CURSOR, int) != row)
         AT(menu, X_CURSOR, int) = row;

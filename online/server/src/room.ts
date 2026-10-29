@@ -4,7 +4,9 @@ import { DurableObject } from "cloudflare:workers";
 import { LISTING_REFRESH_MS, type LobbyEntry } from "./lobbies";
 import {
   CLOSE_CODES,
+  COUNTDOWN_MS,
   DEFAULT_MAX_PLAYERS,
+  FEATURE_COUNTDOWN,
   FRAME_PING,
   FRAME_PONG,
   FRAME_STATE,
@@ -38,6 +40,10 @@ interface Member {
   ready: boolean;
   rider: number;
   bike: number;
+  /** On the rider screen: not ready until they come back with a rider. */
+  choosing?: boolean;
+  /** The hello listed the "countdown" feature (COUNTDOWN_MS). */
+  countdown?: boolean;
 }
 
 interface Race {
@@ -65,6 +71,9 @@ interface RoomState {
   track: number;
   laps: number;
   seed: number | null;
+  /** Everyone is ready: the race starts by itself at this server time (COUNTDOWN_MS); null when
+      no countdown runs. */
+  countdownEndsAt?: number | null;
   /** In join order, so members[0] has been here longest. */
   members: Member[];
   race: Race | null;
@@ -202,6 +211,7 @@ export class Room extends DurableObject<Env> {
         return this.onPick(ws, st, me, isHost, m);
       case "ready":
         if (st.race) return this.error(ws, "room_started", "The race is running.");
+        if (m.ready === true && me.choosing) return this.error(ws, "not_ready", "Choose your rider first.");
         me.ready = m.ready === true;
         return this.changed();
       case "kick": {
@@ -220,6 +230,7 @@ export class Room extends DurableObject<Env> {
         if (!isHost) return this.error(ws, "not_host", "Only the host can end the race.");
         if (!st.race) return;
         st.race = null;
+        st.countdownEndsAt = null;
         for (const x of st.members) x.ready = false;
         this.rebuildRace();
         this.broadcast({ type: "ended" });
@@ -262,6 +273,11 @@ export class Room extends DurableObject<Env> {
       if (pending) await this.ctx.storage.setAlarm(now + PING_INTERVAL_MS);
       return;
     }
+    // The countdown's end. Alarms fire at or after their time; a little early still counts.
+    if (st.countdownEndsAt != null && now >= st.countdownEndsAt - 20 && !st.race) {
+      if (this.countdownReady(st)) await this.startRace(st, "");
+      else st.countdownEndsAt = null;
+    }
     if (st.members.length === 0) {
       if (pending === 0 && now - st.createdAt > UNUSED_ROOM_MS) return this.destroy();
     } else if (!st.race) {
@@ -270,7 +286,13 @@ export class Room extends DurableObject<Env> {
       this.broadcastRoom();
       if (now - this.listedAt > LISTING_REFRESH_MS) this.updateListing(true);
     }
-    await this.ctx.storage.setAlarm(now + PING_INTERVAL_MS);
+    await this.ctx.storage.setAlarm(this.nextAlarm(st, now));
+  }
+
+  /** The next ping, or the countdown's end if that is sooner. */
+  private nextAlarm(st: RoomState, now: number): number {
+    const ping = now + PING_INTERVAL_MS;
+    return st.countdownEndsAt != null && !st.race ? Math.min(ping, Math.max(now, st.countdownEndsAt)) : ping;
   }
 
   // ---- Race relay (hot path: no awaits, no allocation beyond the frame) ----
@@ -380,7 +402,15 @@ export class Room extends DurableObject<Env> {
       st.roomName = `${name}'s room`;
     }
 
-    const member: Member = { id: st.nextMemberId++, name, ready: false, rider: 0, bike: 0 };
+    const features = Array.isArray(m.features) ? m.features : [];
+    const member: Member = {
+      id: st.nextMemberId++,
+      name,
+      ready: false,
+      rider: 0,
+      bike: 0,
+      countdown: features.includes(FEATURE_COUNTDOWN),
+    };
     st.members.push(member);
     if (asHost) st.hostId = member.id;
     info.memberId = member.id;
@@ -427,6 +457,9 @@ export class Room extends DurableObject<Env> {
       if (!Number.isInteger(mp) || (mp as number) < 2 || (mp as number) > MAX_MEMBERS) return bad("maxPlayers");
       if ((mp as number) < st.members.length) return bad("maxPlayers (below the player count)");
     }
+    // A new track or new options make a different race: everyone readies again for it.
+    if ((m.track !== undefined && m.track !== st.track) || (m.laps !== undefined && m.laps !== st.laps))
+      for (const x of st.members) x.ready = false;
     if (m.track !== undefined) st.track = m.track as number;
     if (m.laps !== undefined) st.laps = m.laps as number;
     if (m.seed !== undefined) st.seed = m.seed as number | null;
@@ -443,8 +476,12 @@ export class Room extends DurableObject<Env> {
     if (target !== me && !isHost) return this.error(ws, "not_host", "Only the host can pick for others.");
     if (m.rider !== undefined && !isByte(m.rider)) return this.error(ws, "bad_value", "Invalid rider.");
     if (m.bike !== undefined && !isByte(m.bike)) return this.error(ws, "bad_value", "Invalid bike.");
+    if (m.choosing !== undefined && typeof m.choosing !== "boolean")
+      return this.error(ws, "bad_value", "Invalid choosing.");
     if (m.rider !== undefined) target.rider = m.rider as number;
     if (m.bike !== undefined) target.bike = m.bike as number;
+    if (m.choosing !== undefined) target.choosing = m.choosing as boolean;
+    if (target.choosing) target.ready = false;
     await this.changed();
   }
 
@@ -453,6 +490,37 @@ export class Room extends DurableObject<Env> {
     const waiting = st.members.filter((x) => !x.ready);
     if (waiting.length)
       return this.error(ws, "not_ready", `Not ready: ${waiting.map((x) => x.name).join(", ")}.`);
+    const hostInfo = ws.deserializeAttachment() as SocketInfo | null;
+    await this.startRace(st, hostInfo?.country ?? "");
+  }
+
+  /** Everyone can race now, and every client shows the countdown. */
+  private countdownReady(st: RoomState): boolean {
+    return (
+      !st.race &&
+      st.members.length >= 2 &&
+      st.members.every((x) => x.ready && !x.choosing && x.countdown)
+    );
+  }
+
+  private countdownMs(): number {
+    const v = Number((this.env as unknown as Record<string, unknown>).COUNTDOWN_MS);
+    return Number.isFinite(v) && v >= 0 ? v : COUNTDOWN_MS;
+  }
+
+  /** Starts or stops the countdown after a change; true when it started now. */
+  private updateCountdown(st: RoomState): boolean {
+    if (!this.countdownReady(st)) {
+      st.countdownEndsAt = null;
+      return false;
+    }
+    if (st.countdownEndsAt != null) return false;
+    st.countdownEndsAt = Date.now() + this.countdownMs();
+    return true;
+  }
+
+  private async startRace(st: RoomState, country: string): Promise<void> {
+    st.countdownEndsAt = null;
 
     // Host first, then join order.
     const racers = [...st.members].sort((a, b) => Number(b.id === st.hostId) - Number(a.id === st.hostId));
@@ -468,8 +536,7 @@ export class Room extends DurableObject<Env> {
     this.rebuildRace();
     await this.save();
     const race = st.race;
-    const hostInfo = ws.deserializeAttachment() as SocketInfo | null;
-    this.stat(["race", "", hostInfo?.country ?? ""], [racers.length, race.track, race.laps]);
+    this.stat(["race", "", country], [racers.length, race.track, race.laps]);
     const players = racers.map((x, slot) => ({ slot, memberId: x.id, name: x.name, rider: x.rider, bike: x.bike }));
     racers.forEach((x, slot) => {
       const s = this.sockets.get(x.id);
@@ -541,6 +608,11 @@ export class Room extends DurableObject<Env> {
   }
 
   private async changed(): Promise<void> {
+    const st = this.state;
+    if (st && this.updateCountdown(st)) {
+      const at = await this.ctx.storage.getAlarm();
+      if (at === null || at > st.countdownEndsAt!) await this.ctx.storage.setAlarm(st.countdownEndsAt!);
+    }
     await this.save();
     this.broadcastRoom();
     this.updateListing();
@@ -561,7 +633,17 @@ export class Room extends DurableObject<Env> {
       started: st.race !== null,
       version: st.version,
       settings: { track: st.track, laps: st.laps, seed: st.seed },
-      members: st.members.map((x) => ({ ...x, rttMs: this.rttOf(x.id) })),
+      countdownEndsAt: st.countdownEndsAt ?? null,
+      serverTime: Date.now(),
+      members: st.members.map((x) => ({
+        id: x.id,
+        name: x.name,
+        ready: x.ready,
+        rider: x.rider,
+        bike: x.bike,
+        rttMs: this.rttOf(x.id),
+        choosing: x.choosing ?? false,
+      })),
     };
   }
 

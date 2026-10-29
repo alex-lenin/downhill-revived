@@ -7,7 +7,8 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
       // The tests run with the version gate raised past 0.1.0 (wrangler.jsonc may still allow it):
       // the helpers' hello is release 0.2.0, and a hello without clientVersion (0.1.0) is refused.
-      miniflare: { bindings: { MIN_VERSION: "0.2.0" } },
+      // The race room's countdown is short here (src/protocol.ts COUNTDOWN_MS).
+      miniflare: { bindings: { MIN_VERSION: "0.2.0", COUNTDOWN_MS: "300" } },
     }),
   ],
 });

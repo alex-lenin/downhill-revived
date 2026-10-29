@@ -25,7 +25,8 @@ typedef struct {
     NetLobby lobby;
     int racing;
     /* what to repeat after a lobby reconnect */
-    int picked, rider, bike, ready;
+    int picked, rider, bike, ready, choosing;
+    double countdown_ends;  /* the server's countdown end, server ms; 0 none */
     /* pings and the server clock */
     double next_ping, last_rx, clock_offset;  /* offset: server ms - local ms */
     int have_offset;

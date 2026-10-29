@@ -97,3 +97,13 @@ int text_input_edit(char *buffer, int capacity, const char *allowed)
 void host_service_text_input_begin(void) { text_input_begin(); }
 void host_service_text_input_end(void) { text_input_end(); }
 int host_service_text_input_edit(uint32_t a0, int a1, uint32_t a2) { return text_input_edit((char *)GUEST(a0), a1, (const char *)GUEST(a2)); }
+/* The race room's join code, for a chat elsewhere. */
+int host_service_clipboard_set(uint32_t text)
+{
+#if defined(_WIN32) || defined(DHD_HAVE_SDL)
+    return SDL_SetClipboardText((const char *)GUEST(text));
+#else
+    (void)text;
+    return 0;
+#endif
+}
