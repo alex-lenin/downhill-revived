@@ -461,6 +461,17 @@ static void choose_riders(const NetLobby *lobby)
     }
 }
 
+/* Round-trips to the relay for the log: this PC's own measure, then the server's for each
+   player (-1 not measured yet). */
+static void log_pings(const NetLobby *l)
+{
+    char line[640];
+    int n = snprintf(line, sizeof line, "online: ping %d ms; players:", l->ping_ms);
+    for (int i = 0; i < l->nmembers && n < (int)sizeof line - 120; i++)
+        n += snprintf(line + n, sizeof line - n, "%s %s %d ms", i ? "," : "", l->member[i].name, l->member[i].rtt_ms);
+    fprintf(stderr, "%s\n", line);
+}
+
 /* The barrier: at boot every PC waits in the lobby until the host starts the race. */
 static void barrier(void)
 {
@@ -549,6 +560,7 @@ static void barrier(void)
     hle_puppet_online(on.local_slot, on.nslots, on.host_slot);
     fprintf(stderr, "online: race starts: player %d of %d, track %d, seed %s%s\n", on.local_slot, on.nslots,
             on.setup.track, seed, on.no_bots ? ", no computer riders" : "");
+    log_pings(&lobby);
 }
 
 static void send_event(const void *payload, int n)
@@ -1004,6 +1016,8 @@ static void state_sync(void)
         fprintf(stderr, "online: race clock %d (%d fps), %u snapshots sent, %u received, hits taken %d, %u ms late, %u "
                 "extra fields, lag (ms):%s\n", clock, port_fps(), on.sent, on.received, hle_puppet_hits_taken(),
                 kernel_pace_late_ms, kernel_pace_extra_fields, lag);
+        static double last_ping;
+        if (last_title - last_ping >= 10) last_ping = last_title, log_pings(&lobby);
     }
 }
 
