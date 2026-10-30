@@ -744,10 +744,10 @@ static void log_start(const char *path)
 }
 #endif
 
-/* The log's first line: the release and the build, "Downhill Revived 0.6.4 (dhd-port 0.6.4
-   1a2b3c4d5e6f7a8b)", the same build name the online lobby shows (online.c build_version: the
-   start of the program file's SHA-256), so a player's log says which game wrote it. The second:
-   the system (OS, CPU, threads, RAM), so a bug report needs nobody to look them up. */
+/* The log's first line keeps the native executable's SHA-256 prefix for diagnostics.
+   Lobby compatibility uses the shared source identity instead (online_version.c, finding 115),
+   so Windows and macOS logs can name different executables while their clients can race.
+   The second line records the system (OS, CPU, threads and RAM) for bug reports. */
 static void log_version(void)
 {
     char path[HOST_PATH_MAX], build[17] = "unknown";

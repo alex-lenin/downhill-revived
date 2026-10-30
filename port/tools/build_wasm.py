@@ -74,7 +74,7 @@ MODULE_UNITS = [
     'runtime/sha256.c', 'hle/kernel.c', 'hle/timer.c', 'hle/boot.c', 'hle/sif.c', 'hle/cdvd.c', 'hle/game_data.c',
     'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/graphics.c', 'hle/pad.c', 'hle/menu_page.c',
     'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/puppet.c', 'hle/online.c',
-    'hle/online_menu.c', 'hle/autopad.c', 'hle/state_trace.c', 'hle/rate_audit.c', 'hle/sound.c', 'hle/game_options.c',
+    'hle/online_menu.c', 'hle/online_version.c', 'hle/autopad.c', 'hle/state_trace.c', 'hle/rate_audit.c', 'hle/sound.c', 'hle/game_options.c',
     'hle/fps.c', 'hle/keyboard.c', 'hle/vif0.c', 'hle/presence.c', 'runtime/wasi_adapter.c',
 ]
 MIRROR_DIRS = ['runtime', 'hle', 'include', 'host', 'gs', 'net']
@@ -1199,6 +1199,11 @@ def main():
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copyfile(p, dst)
             mirror.append(dst)
+
+    # Same source tree on every platform, including local edits; never hash the host executable.
+    from online_identity import write_header
+    identity = write_header(os.path.join(PORT_OUT, 'include', 'online_build.h'), ROOT)
+    print('online compatibility: src1-' + identity, flush=True)
 
     # 3. game units (transform with an empty prefix)
     def transform_unit(path):

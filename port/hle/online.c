@@ -27,8 +27,6 @@
 #include "hle.h"
 #include "../gs/present.h"
 #include "../net/net.h"
-#include "../include/version.h"
-#include "../runtime/sha256.h"
 #include "../include/fps.h"
 
 #include <stdarg.h>
@@ -357,29 +355,6 @@ static void fail(const char *why)
     exit(1);
 }
 
-/* The build's identity for the lobby: players must run the same executable. The release
-   (version.h) is in it so the server's "the host runs ..." message names it; the hello also
-   sends the release alone (clientVersion) for the version gate. */
-static void build_version(char *out, size_t size)
-{
-    char path[HOST_PATH_MAX];
-    Sha256 hash;
-    uint8_t digest[32], buf[65536];
-    int64_t n;
-    snprintf(out, size, "dhd-port " DHD_VERSION " unknown");
-    host_exe_path(path, sizeof path);
-    HostFile f = host_file_open(path, HOST_FILE_READ);
-    if (!f) return;
-    sha256_init(&hash);
-    while ((n = host_file_read(f, buf, sizeof buf)) > 0) sha256_update(&hash, buf, (size_t)n);
-    sha256_final(&hash, digest);
-    snprintf(out, size, "dhd-port " DHD_VERSION " %02x%02x%02x%02x%02x%02x%02x%02x", digest[0], digest[1], digest[2],
-             digest[3], digest[4], digest[5], digest[6], digest[7]);
-    host_file_close(f);
-}
-
-void hle_online_version(char *out, size_t size) { build_version(out, size); }
-
 unsigned hle_env_epoch;  /* hle.h's hle_env */
 static void set_env(const char *name, const char *value)
 {
@@ -413,7 +388,7 @@ static void connect_lobby(void)
     const char *render = getenv("DHD_RENDER");
     if (!render || strcmp(render, "native")) fail("online races use the native renderer (DHD_RENDER=native).");
     if (!iso || strlen(iso) != 64) fail("the disc image's hash is missing (DHD_NET_ISO_SHA256: 64 hex digits).");
-    build_version(version, sizeof version);
+    hle_online_version(version, sizeof version);
     host_service_net_init(GADDR(server), GADDR(name && *name ? name : "Rider"), GADDR(version), GADDR(iso));
     if (join && *join) {
         if (host_service_net_join_room(GADDR(join)) < 0) fail("that join code can't be one (6 letters and digits).");

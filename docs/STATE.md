@@ -299,6 +299,13 @@ is not in the repo: extract it from your own disc (`7z e "<USA iso>" SCUS_971.77
 sha256 adfda7b7…f0cf0c).
 
 ## Online play
+2026-10-28 (finding 115): lobby compatibility now uses
+the release plus a generated source fingerprint instead of the native executable's hash.
+Identical sources (including local edits, with LF/CRLF normalised) can share rooms across OSes;
+different sources, old executable-hash clients and different discs still fail the existing checks.
+Eight identity/integration regressions and all 28 server tests pass; server typechecking passes.
+A real cross-platform race remains to be checked after rebuilding the clients.
+
 Shipped since 0.1.0; the original plan is `docs/ONLINE-PLAN.md` (historical). The round log is in
 findings 039-047, 053-054, 065 and 072 and in this file's history.
 - Server: `online/server/` (Cloudflare Workers + Durable Objects) at `wss://dhd.skuza.app`, the

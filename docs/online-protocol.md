@@ -75,6 +75,14 @@ use the same `error` frame **without** a close; the client just shows `message`.
 
 ### Client → server
 
+The corrected clients use `hello.version = "dhd-port <release> src1-<source fingerprint>"`.
+The 32 hex digits are a SHA-256 prefix over sorted relative source paths and LF-normalised
+contents (`port/tools/online_identity.py`, finding 115). Native executable bytes, absolute
+checkout paths and timestamps are excluded: the same sources can join across operating systems.
+Local code changes produce another identity even without a commit. The server still compares
+the whole string exactly, independently of `clientVersion` and `isoSha256`. Earlier clients
+with an executable-hash identity cannot join these rooms; every player must rebuild the client.
+
 ```jsonc
 // First message, required. name: 1-24 characters.
 {"type":"hello","protocol":1,"version":"dhd-port 0.2.0 1a2b3c4d5e6f7a8b","clientVersion":"0.2.0",

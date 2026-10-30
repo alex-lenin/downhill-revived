@@ -4,6 +4,39 @@ import { describe, expect, it } from "vitest";
 import { Client, ISO, startedRace } from "./helpers";
 
 describe("lobby", () => {
+  it.each([["Windows", "macOS"], ["macOS", "Windows"]])(
+    "accepts a shared source identity with a %s host and %s guest",
+    async (hostPlatform, guestPlatform) => {
+      // Native executable hashes differ; clients now send the same source identity instead.
+      const version = "dhd-port 0.7.1 src1-" + "a".repeat(32);
+      const host = await Client.connect("/v1/rooms/new");
+      host.hello(hostPlatform, { version });
+      const { code } = await host.json("welcome");
+      host.sendJson({ type: "settings", public: true });
+      await host.next((f) => typeof f === "string" && JSON.parse(f).type === "room" && JSON.parse(f).public === true);
+      const list = await (await exports.default.fetch("https://dhd.test/v1/lobbies")).json<any>();
+      expect(list.lobbies.find((l: any) => l.code === code)?.version).toBe(version);
+
+      const guest = await Client.connect(`/v1/rooms/${code}`);
+      guest.hello(guestPlatform, { version });
+      expect(await guest.json("welcome")).toMatchObject({ code, host: false });
+
+      for (const incompatible of ["dhd-port 0.7.1 src1-" + "b".repeat(32),
+                                  "dhd-port 0.7.1 0123456789abcdef"]) {
+        const other = await Client.connect(`/v1/rooms/${code}`);
+        other.hello("Other", { version: incompatible });
+        expect((await other.json("error")).code).toBe("version_mismatch");
+        expect(await other.closed()).toBe(4002);
+      }
+      const wrongDisc = await Client.connect(`/v1/rooms/${code}`);
+      wrongDisc.hello("Wrong disc", { version, isoSha256: "b".repeat(64) });
+      expect((await wrongDisc.json("error")).code).toBe("iso_mismatch");
+      expect(await wrongDisc.closed()).toBe(4003);
+      host.ws.close();
+      guest.ws.close();
+    },
+  );
+
   it("creates a room with a join code and lets others join", async () => {
     const { host, code } = await Client.host("Ann");
     expect(code).toMatch(/^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$/);
