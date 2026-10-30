@@ -671,9 +671,9 @@ void gs_mouse_event(const void *event)
     MOUSE_UNLOCK();
 }
 
-/* SDL thread, every pass of its loop: a new title (gs_window_title); the cursor shows for 3 s
-   after the mouse was used, never while a race is ridden (the game's controls in riding mode,
-   D_0029E290). */
+/* SDL thread, every pass of its loop: a new title (gs_window_title); text input while a text
+   field is open; the cursor shows for 3 s after the mouse was used, never while a race is ridden
+   (the game's controls in riding mode, D_0029E290). */
 void gs_window_tick(void)
 {
     static int shown = -1;
@@ -685,6 +685,17 @@ void gs_window_tick(void)
         title.changed = 0;
         SDL_UnlockSpinlock(&title.lock);
         SDL_SetWindowTitle(sdl_window, text);
+    }
+    /* SDL3 sends typed text (SDL_EVENT_TEXT_INPUT, sdl_host.c) only to a window that takes it:
+       while one of the game's text fields is open (text_input_begin/end, the game thread: the
+       rider name, the join code), from here, as SDL wants its video calls on this thread. */
+    static int typing;
+    if (text_input_active() != typing) {
+        typing = !typing;
+        if (typing) SDL_StartTextInput(sdl_window);
+        else SDL_StopTextInput(sdl_window);
+        fprintf(stderr, "text input: %s (SDL %s)\n", typing ? "on" : "off",
+                SDL_TextInputActive(sdl_window) ? "sends typed text" : "sends no text");
     }
     int riding = *(volatile int32_t *)GUEST(0x0829E290) != 0;
     MOUSE_LOCK();
