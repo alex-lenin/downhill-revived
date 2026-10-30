@@ -20,6 +20,7 @@
 // its graphics threads (a graphics wait, or a call that returns GS state). The VU worker runs that
 // queue and passes the GS's part on to the GS worker. Each vsync queues the picture; graphics.js
 // shows it and leaves its numbers for the status line here.
+import { createNet } from './net.js';
 import { createVfs } from './vfs.js';
 import { thunks } from './thunks.js';
 import { createSettings, BROWSER_PC_SETTINGS, RENDERER_LIVE } from './settings.js';
@@ -302,6 +303,7 @@ async function start(m) {
       if (due > now + 1) await new Promise(r => setTimeout(r, due - now)); else await yieldTask();
     }),
   };
+  Object.assign(impl, createNet({span, str}));
   const noops = `host_sleep_ms host_wait_wall host_dpi_aware host_callbacks_drain host_frame_registers host_frame_video host_capture_name
 host_pacing_wait host_pacing_handoff host_pacing_input host_callback_heartbeat
 host_sound_open host_sound_reset host_sound_tick host_sound_log_stack snd_host_bench
@@ -312,7 +314,7 @@ host_service_gs_window_apply host_service_gs_present_options_apply host_service_
 host_service_text_input_begin host_service_text_input_end host_service_host_backtrace host_service_presence
 host_service_net_get_lobby host_service_clipboard_set`.split(/\s+/);
   for (const n of noops) impl[n] ??= () => {};
-  for (const n of ['host_service_net_racing', 'host_service_net_seconds', 'host_service_net_server_ms', 'host_heartbeat_eip', 'host_service_launcher_open']) impl[n] = () => 0;
+  for (const n of ['host_heartbeat_eip', 'host_service_launcher_open']) impl[n] = () => 0;
 
   const graphicsExports = new Set(WebAssembly.Module.exports(graphicsModule).map(e => e.name));
   const linkedExports = threaded ? new Set(WebAssembly.Module.exports(queueModule).map(e => e.name)) : graphicsExports;

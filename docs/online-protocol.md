@@ -225,6 +225,9 @@ show only rooms whose `version` matches their own.
   player's riders).
 - A room with no members is deleted.
 - No reconnect in version 1: a dropped racer is handed to AI for the rest of the race.
+- A server restart (a deploy) drops every socket with no close event. A lobby client says
+  hello again under the same name and gets its member back (id, host, rider, Ready); members
+  not back within the hello timeout leave as disconnects.
 
 ## Retail preview flow (finding 065)
 
@@ -235,3 +238,183 @@ when all present members are ready, with at least two members. Choosing again
 clears readiness; a changed track requires guests to ready again. Exact executable
 identity in `hello.version` refuses mixed builds. Raise MIN_VERSION to the release
 that includes this UI at release time; no deployment is part of this change.
+
+## Session rooms (0.7.4)
+
+A creator opts in with `"features":["countdown","session"]` in hello.
+The creator's feature selects the rules for the room's whole lifetime.
+Version and ISO matching still apply. Protocol remains 1.
+A creator without session keeps all the old rules, including immediate host Start,
+no racing joins, and hiding racing or full rooms from the public list.
+Binary STATE and EVENT formats do not change. The server runs no game logic.
+
+### Settings and phases
+
+The host sends `settings` with any of the old fields and these optional fields:
+
+| Field | Values | Default |
+| --- | --- | --- |
+| finishWindow | 0, 30, 60, 120 seconds | 60 |
+| nextRace | "auto", "host" | auto if public, host if private |
+| then | "same", "next", "random" | next |
+| rotation | Array of 0–64 byte track ids | empty |
+
+The nextRace default follows public until nextRace is explicitly set.
+The client sends the game's track list in rotation once. An empty rotation keeps
+the track. Next walks forward, wrapping; a current track absent from the list
+selects its first entry. Random excludes the current track whenever another
+track exists. Track ids may repeat; clients should send a unique list.
+
+The snapshot's phase is open, intermission, starting, or racing.
+Open means no race yet, host control, or an expired AUTO timer with nobody ready.
+Intermission is a 30 second AUTO timer. Starting is the five second countdown.
+Racing means a race is running, even for a member waiting in the room.
+
+Ready means "put me in the next race." Two or more members all ready and none
+choosing start a countdown. One member alone cannot do this.
+Shared rider picks remain allowed (issue #17, finding 115).
+The host sends `{"type":"start"}` to count down with the ready members, including
+a solo ready member. At least one must be ready and not choosing.
+Start during a countdown keeps its original grid and deadline.
+
+The countdown locks the grid. Later Ready waits for the following race.
+Unready or choosing drops a member from the grid. They can ready again for the
+following race. If the grid empties, the countdown cancels. lastEvent becomes
+start_cancelled. An AUTO room returns to a new 30 second intermission; a host
+room returns to open. A new countdown clears lastEvent.
+At the deadline, only entrants receive start and slots, with an entering host
+first, then join order. The existing startAt lead for loading still follows the
+countdown. Members outside the grid receive room snapshots and no binary relay.
+Joins are accepted in every phase up to maxPlayers, counting all members.
+
+### Finishes and return
+
+An entrant sends `{"type":"finish","ticks":N,"place":P}` when its own human rider
+crosses the line. N is an unsigned 32-bit race clock at 60 ticks a second.
+P is 1–255, the full-field place computed locally, including computer riders.
+Only the first finish from that entrant counts. Computer finishes send nothing.
+
+The first human finish sets finishEndsAt to now plus the running finishWindow.
+With finishWindow zero the deadline remains null. Later finishes do not move it.
+At the deadline all unfinished entrants become DNF time_up and leave the relay.
+Finished entrants retain their finish and leave the relay too.
+
+A client sends `{"type":"back"}` when leaving the race scene for the room.
+An unfinished entrant becomes DNF gave_up. A finisher keeps its finish.
+Its relay stops. Remaining racers receive `left` with its slot, memberId and
+reason finished or gave_up. Timeouts use time_up; disconnects use left.
+The client retains the connection and can pick and ready while others race.
+Disconnecting or leaving removes membership and records DNF left if unfinished.
+
+The race closes once no unfinished active entrant remains: all entrants have
+finished, returned, timed out, or disconnected.
+The server sends `{"type":"ended","reason":"done"}`, then room.
+A host sends `{"type":"end"}` to void the running race.
+The server sends ended with reason void, keeps the previous lastRace and does
+not rotate. These messages do not disconnect anyone.
+
+Completed lastRace entrants sort by ticks, then DNFs in grid order.
+Their places use reported places, raised to at least the preceding place plus
+one. DNFs follow finishers and get successive places.
+LastRace stays until another race completes. Its id increments on completion.
+Every entrant becomes unready when the race closes. Waiting members keep ready.
+A completed race applies the running then rule to the rotation and selects the
+next track. A void keeps the selected track.
+The running nextRace copy then selects AUTO intermission or host open.
+
+At nextRaceAt, a ready member starts a locked five second countdown.
+If nobody is ready the room goes open with waitingForRider true.
+The next Ready starts a new 30 second intermission, even with only one ready.
+All-ready cannot bypass this intermission.
+
+### Changes and migration
+
+Track or laps changes unready members outside the running race.
+A track change during intermission gives at least 15 seconds before nextRaceAt.
+The host can change settings during a race after finishing or returning.
+FinishWindow, nextRace and then are copied when the grid locks. Changes during
+countdown or racing alter the next race's settings. rulesPending compares these
+settings with the running copy. The running finish deadline and rotation action
+use that copy. Rotation itself is the room's current track list.
+Host migration always selects the longest-present member. A race continues
+after host migration. Only an empty room is destroyed.
+
+### Room snapshot and public list
+
+Session room snapshots keep all old fields and add:
+
+| Field | Meaning |
+| --- | --- |
+| phase | open, intermission, starting, racing |
+| raceStartedAt | startAt of running race, otherwise null |
+| finishEndsAt | running finish deadline, otherwise null |
+| nextRaceAt | intermission deadline, otherwise null |
+| countdownEndsAt | existing countdown deadline, otherwise null |
+| serverTime | server epoch milliseconds at snapshot |
+| waitingForRider | expired AUTO timer waiting for first Ready |
+| lastEvent | start_cancelled, or null |
+| rules | finishWindow, nextRace, then for the next race |
+| rotation | configured track array |
+| rulesPending | current rules differ from the locked copy |
+| lastRace | null, or {id, track, entrants} |
+
+Each member adds inRace (still attached to this race scene/relay).
+Members with a current race entry add raceState: racing, finished, or dnf;
+place; finishTicks for finishers; dnfReason for DNFs.
+Members waiting outside the race omit raceState and result fields.
+An entrant may be finished while inRace is true until back or race closure.
+LastRace entrants carry id (member id), name, rider, place and either ticks or
+dnfReason. Disconnected entrants remain in lastRace.
+All deadlines are server epoch milliseconds; absent deadlines are null.
+Text frames fit 4096 UTF-8 bytes for eight members, including prior results.
+Session member and room names replace C0 controls and unpaired UTF-16 surrogates with U+FFFD to
+bound JSON escaping. Old rooms retain their existing name handling.
+
+GET /v1/lobbies includes public session rooms while racing and when full.
+Their entries add phase, raceStartedAt, finishEndsAt, nextRaceAt and full.
+Players counts all members. MaxPlayers is the membership limit.
+Entries sort by players descending. Old rooms retain their visibility rules.
+Screens filter by their own version before showing entries.
+
+### Game-facing C API
+
+NetLobby, NetMember, NetResult and NetLobbyInfo in port/net/net.h form a shared
+core/host ABI. Keep every layout in sync. The browser's generated net_layout.js
+comes from `python port/tools/gen_net_layout.py`; `--check` checks the layouts
+with clang for wasm32, Windows x64, Linux x64 and macOS arm64.
+
+NetLobby adds phase[16], last_event[32], race_started_at, finish_ends_at,
+next_race_at, countdown_ends_at, server_time (double); waiting_for_rider,
+rules_pending, finish_window, next_race, then, rotation_count, rotation[64],
+last_race_id, last_race_track, nresults and result[8].
+The times are server epoch ms; zero means absent. Compare them directly with
+host_service_net_server_ms(). The existing countdown_ms remains available.
+Next_race is 0 auto or 1 host. Then is 0 same, 1 next or 2 random.
+
+NetMember adds in_race, race_state[12], dnf_reason[16], finish_ticks (signed
+64-bit; -1 absent), and place (zero absent).
+NetResult has id, rider, place, name[100], dnf_reason[16] and ticks (-1 for DNF).
+NetLobbyInfo adds phase[16], race_started_at, finish_ends_at, next_race_at and full.
+NET_RACING means this client received start. Waiting and returned clients remain
+NET_LOBBY even when the room's phase is racing.
+
+The game calls these imports on every platform, including the browser:
+
+- host_service_net_finish(uint32_t ticks, int place)
+- host_service_net_back(void)
+- host_service_net_rules(int finish_window, int next_race, int then)
+- host_service_net_rotation(uint32_t guest_address, int count), at most 64 bytes
+- host_service_net_end_race(void), host void
+- host_service_net_server_ms(void), returns double
+- host_service_net_get_lobby(uint32_t guest_address), copies NetLobby
+
+Native net_finish, net_back, net_rules and net_rotation serialize the messages.
+Rules and rotation use settings. Existing pick, ready and start imports still apply.
+The browser implements the same messages with its WebSocket and shared ABI.
+
+Nettool accepts --races N for N completed room races (including a race joined
+while running), --ready-after S in every open/intermission (-1 never),
+--finish-after S (finish then back), or --give-up-after S (back without finish).
+Neither action means never finish. --seconds bounds the entire session.
+It logs each phase transition as PHASE followed by the phase and local race count.
+A late join waits for its first grid. Existing recording replay mode remains.

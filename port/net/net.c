@@ -153,6 +153,11 @@ int net_list_lobbies(NetLobbyInfo *out, int max)
         l->track = json_int(body, FIELD("track"), &v) ? (int)v : 0;
         l->players = json_int(body, FIELD("players"), &v) ? (int)v : 0;
         l->max_players = json_int(body, FIELD("maxPlayers"), &v) ? (int)v : 0;
+        json_string(body, FIELD("phase"), l->phase, sizeof l->phase);
+        json_bool(body, FIELD("full"), &l->full);
+        json_number(body, FIELD("raceStartedAt"), &l->race_started_at);
+        json_number(body, FIELD("finishEndsAt"), &l->finish_ends_at);
+        json_number(body, FIELD("nextRaceAt"), &l->next_race_at);
 #undef FIELD
     }
     return n;
@@ -164,6 +169,10 @@ void net_set_ready(int ready) { client_ready(&client, ready); }
 void net_kick(int member) { client_kick(&client, member); }
 void net_start_race(void) { client_start(&client); }
 void net_end_race(void) { client_end(&client); }
+void net_finish(unsigned ticks, int place) { client_finish(&client, ticks, place); }
+void net_back(void) { client_back(&client); }
+void net_rules(int finish_window, int next_race, int then) { client_rules(&client, finish_window, next_race, then); }
+void net_rotation(const unsigned char *ids, int count) { client_rotation(&client, ids, count); }
 
 void net_get_lobby(NetLobby *out)
 {
@@ -218,6 +227,11 @@ int host_service_net_join_room(uint32_t a0) { return net_join_room((const char *
 void host_service_net_leave(void) { net_leave(); }
 void host_service_net_get_lobby(uint32_t a0) { net_get_lobby((NetLobby *)GUEST(a0)); }
 void host_service_net_pick(int a0, int a1, int a2) { net_pick(a0, a1, a2); }
+void host_service_net_finish(uint32_t ticks, int place) { net_finish(ticks, place); }
+void host_service_net_back(void) { net_back(); }
+void host_service_net_rules(int finish_window, int next_race, int then) { net_rules(finish_window, next_race, then); }
+void host_service_net_rotation(uint32_t address, int count) { if (count >= 0 && count <= 64) net_rotation((const unsigned char *)GUEST(address), count); }
+void host_service_net_end_race(void) { net_end_race(); }
 void host_service_net_set_ready(int a0) { net_set_ready(a0); }
 void host_service_net_start_race(void) { net_start_race(); }
 int host_service_net_racing(void) { return net_racing(); }

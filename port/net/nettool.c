@@ -3,7 +3,7 @@
    stays in it for --seconds, counting the others' frames; then it prints a RESULT line and leaves.
 
    usage: nettool [--server URL] [--name NAME] [--seconds S] [--version V --iso SHA256]
-                  [--replay FILE --rider N] [--pick N] [--ready-after S]
+                  [--replay FILE --rider N] [--pick N] [--ready-after S] [--races N] [--finish-after S | --give-up-after S]
                   host [--players N] [--code-file PATH] | join CODE | list
    The server is --server or DHD_NET_SERVER (ws://127.0.0.1:8787 for wrangler dev). With the
    game's --version and --iso hash it can join a room of real games (finding 041). */
@@ -109,7 +109,8 @@ int main(int argc, char **argv)
     int rider = 4, seconds = 600, received = 0;
     int pick = -1;            /* --pick N: the lobby's rider number (1..16); 0 stays choosing */
     double ready_after = 0;   /* --ready-after S: Ready after S seconds; below 0 never */
-    int i, slot;
+    int i, slot, races = 0;
+    double finish_after = -1, back_after = -1;
     uint8_t frame[NET_FRAME_MAX];
     double until;
     NetLobby l;
@@ -126,12 +127,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pick") && i + 1 < argc) pick = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ready-after") && i + 1 < argc) ready_after = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--races") && i + 1 < argc) races = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--finish-after") && i + 1 < argc) finish_after = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--give-up-after") && i + 1 < argc) back_after = atof(argv[++i]);
         else if (!mode) mode = argv[i];
         else code = argv[i];
     }
     if (!mode || (!strcmp(mode, "join") && !code)) {
         printf("usage: nettool [--server URL] [--name NAME] [--seconds S] [--version V --iso SHA256]\n"
-               "               [--replay FILE --rider N] [--pick N] [--ready-after S] host [--players N] [--code-file PATH] | join CODE | list\n");
+               "               [--replay FILE --rider N] [--pick N] [--ready-after S] [--races N] [--finish-after S | --give-up-after S] host [--players N] [--code-file PATH] | join CODE | list\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -160,6 +164,45 @@ int main(int argc, char **argv)
     }
     if (pick == 0) net_pick(-1, -1, 0);  /* on the rider screen, as far as the room knows */
     else net_pick(-1, pick > 0 ? pick : replay_file ? rider + 1 : l.member_id % 8, 1);
+    if (races > 0) {
+        char phase[16] = "";
+        double phase_at = net_seconds(), race_at = 0;
+        int acted = 0, readied = 0, started_count = 0, was_racing = 0;
+        until = net_seconds() + seconds;
+        if (l.is_host) net_rules(60, 0, 1);
+        while (net_seconds() < until) {
+            double now = net_seconds();
+            net_get_lobby(&l);
+            if (l.state == NET_FAILED) break;
+            if (strcmp(phase, l.phase)) {
+                snprintf(phase, sizeof phase, "%s", l.phase);
+                printf("PHASE %s race %d\n", phase, started_count);
+                phase_at = now;
+                if (!strcmp(phase, "intermission") || !strcmp(phase, "open")) readied = 0;
+            }
+            if (l.state == NET_RACING && !was_racing) {
+                started_count++; race_at = l.start_at > now ? l.start_at : now; acted = 0; readied = 0;
+                printf("RACE %d slot %d\n", started_count, l.local_slot);
+            }
+            was_racing = l.state == NET_RACING;
+            if (l.state == NET_RACING && !acted &&
+                ((finish_after >= 0 && now - race_at >= finish_after) ||
+                 (back_after >= 0 && now - race_at >= back_after))) {
+                if (finish_after >= 0) net_finish((unsigned)((now - race_at) * 60), l.local_slot + 1);
+                net_back(); acted = 1;
+            }
+            if (l.state != NET_RACING && l.last_race_id >= races) break;
+            if (l.state == NET_LOBBY && (!strcmp(phase, "open") || !strcmp(phase, "intermission")) && !readied && ready_after >= 0 && pick != 0 &&
+                (l.last_race_id > 0 || l.nmembers >= players_wanted) && now - phase_at >= ready_after) {
+                net_set_ready(1); readied = 1;
+            }
+            while (net_receive_frame(frame, sizeof frame) > 0) received++;
+            Sleep(10);
+        }
+        printf("RESULT {\"races\":%d,\"received\":%d}\n", started_count, received);
+        net_leave();
+        return l.last_race_id < races;
+    }
     if (ready_after > 0) Sleep((DWORD)(ready_after * 1000));
     if (ready_after >= 0 && pick != 0) net_set_ready(1);
     if (l.is_host) {

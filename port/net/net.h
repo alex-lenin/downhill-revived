@@ -18,12 +18,17 @@ enum { NET_MAX_SLOTS = 8 };  /* a room holds 8 */
 
 enum { NET_IDLE, NET_CONNECTING, NET_LOBBY, NET_RACING, NET_RECONNECTING, NET_FAILED };
 
+/* Shared core/host ABI: fixed-width ints and doubles, no pointers. Append fields only. */
 typedef struct {
     int id;                    /* member id: fixed for the connection */
     char name[100];            /* UTF-8, up to 24 characters */
     int ready, rider, bike;
     int rtt_ms;                /* the server's measure, -1 unknown */
     int choosing;              /* on the rider screen */
+    int in_race;
+    char race_state[12], dnf_reason[16];
+    long long finish_ticks;     /* -1 when absent */
+    int place;
 } NetMember;
 
 typedef struct {
@@ -32,6 +37,12 @@ typedef struct {
     int rider, bike;
     int left;                  /* gone: the host's AI drives the rider */
 } NetRacer;
+
+typedef struct {
+    int id, rider, place;
+    char name[100], dnf_reason[16];
+    long long ticks;            /* -1 for DNF */
+} NetResult;
 
 typedef struct {
     int state;                 /* NET_IDLE... */
@@ -57,6 +68,15 @@ typedef struct {
     /* Everyone is ready: the race starts by itself in this many ms (the server's countdown),
        -1 when none runs. Worked out as the copy is made (net_get_lobby). */
     int countdown_ms;
+    char phase[16], last_event[32];
+    /* Server epoch ms; zero means absent. Compare with net_server_ms(). */
+    double race_started_at, finish_ends_at, next_race_at, countdown_ends_at, server_time;
+    int waiting_for_rider, rules_pending;
+    int finish_window, next_race, then; /* next: 0 auto/1 host; then: 0 same/1 next/2 random */
+    int rotation_count;
+    unsigned char rotation[64];
+    int last_race_id, last_race_track, nresults;
+    NetResult result[NET_MAX_SLOTS];
 } NetLobby;
 
 /* Host settings; fields at -1 (room_name NULL) are left as they are. */
@@ -69,6 +89,9 @@ typedef struct {
 typedef struct {
     char code[8], room_name[100], version[64], host_name[100];
     int track, players, max_players;
+    char phase[16];
+    double race_started_at, finish_ends_at, next_race_at;
+    int full;
 } NetLobbyInfo;
 
 /* base_url: "wss://host" or "ws://127.0.0.1:8787". version: the build's version string (the
@@ -84,8 +107,13 @@ void net_set_room(const NetRoomSettings *s);       /* host */
 void net_pick(int member, int rider, int bike);
 void net_set_ready(int ready);
 void net_kick(int member);                         /* host */
-void net_start_race(void);                         /* host; everyone must be ready */
+void net_start_race(void);                         /* host; session: ready entrants */
 void net_end_race(void);                           /* host: back to the lobby */
+/* Session room calls. next_race: 0 auto, 1 host; then: 0 same, 1 next, 2 random. */
+void net_finish(unsigned ticks, int place);
+void net_back(void);
+void net_rules(int finish_window, int next_race, int then);
+void net_rotation(const unsigned char *ids, int count);
 void net_get_lobby(NetLobby *out);                 /* a copy, for the UI */
 double net_seconds(void);                          /* the clock start_at uses */
 /* The server's clock (ms since the Unix epoch), estimated from the lobby pings' round-trips: the
