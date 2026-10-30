@@ -785,5 +785,12 @@ PATCHES['unsorted/0019EA38.c'] = PATCHES.get('unsorted/0019EA38.c', []) + [
      'func_00176E40(manager->x150,0); }\n hle_online_restart_ready();\n}'),
 ]
 
+# WaitForRender's spin enters the kernel and sends a queued render chain the VIF1 interrupt
+# would have sent (port/hle/dma.c, hle_render_wait; issue 22).
+PATCHES['unsorted/001B4618.c'] = PATCHES.get('unsorted/001B4618.c', []) + [
+    ('text', 'do {} while(D_0029E1C8 | D_0029E1CC | D_0029E1E4);',
+     'do { extern void hle_render_wait(void); hle_render_wait(); } while(D_0029E1C8 | D_0029E1CC | D_0029E1E4);'),
+]
+
 # wasm32: size_t is unsigned long there and unsigned int on i686 (the same type as the game's).
 PATCHES['unsorted/00235488.cpp'] = [('text', 'operator new[](unsigned int size)', 'operator new[](__SIZE_TYPE__ size)')]

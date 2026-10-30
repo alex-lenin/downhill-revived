@@ -155,6 +155,33 @@ int sceGsSyncPath(int mode, int timeout)
     return 0;
 }
 
+/* One pass of WaitForRender's spin (func_001B4618, port/patches.py), which waits for the flags
+   D_0029E1C8, D_0029E1CC and D_0029E1E4 to clear: a frame's render chain is queued and not yet
+   sent. On the PS2 the VIF1 interrupt's handler (func_0021EAA0) sends it (func_0021E9A8 starts
+   the chain and clears the flags) when the transfer before it ends. Here transfers end at once
+   and that handler never runs: the game enables channel 1 only when a frame finds VIF1 still
+   busy (func_00217D88's bc0t, always idle here, port/tools/recomp.py). So a frame that queues
+   its chain and sends nothing leaves the spin waiting forever: the game freezes, its exit too.
+   That fits issue 22's log; which frame did it there is not known (the load bar's render,
+   func_00218720, can: it sets D_0029E1CC but sends only with D_0029E1C8 set). Each pass enters
+   the kernel (vsync, window messages) and, with VIF1 idle, does what the interrupt would. */
+extern void func_0021E9A8(void);
+
+void hle_render_wait(void)
+{
+    static unsigned sent;
+    kernel_poll();
+    const volatile int32_t *c8 = PS2_PTR(0x0029E1C8), *cc = PS2_PTR(0x0029E1CC), *e4 = PS2_PTR(0x0029E1E4);
+    if (((Channel *)(uintptr_t)channel_base[DMA_VIF1])->chcr & CHCR_STR || !(*c8 | *cc | *e4))
+        return;
+    unsigned ten = 10;
+    while (ten < sent + 1 && ten < 1000000000u) ten *= 10;
+    if (++sent <= 5 || sent == ten)  /* the first few, then each power of ten: whether normal play needs it */
+        hle_log("render wait: VIF1 idle with a chain queued (flags %X %X %X), sent it (%u so far)\n",
+                (unsigned)*c8, (unsigned)*cc, (unsigned)*e4, sent);
+    func_0021E9A8();
+}
+
 /* Installed by kernel_init. The MMIO store has already reached the mapped page. */
 void dma_mmio_write(uintptr_t address, uint64_t value, unsigned size)
 {

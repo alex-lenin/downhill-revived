@@ -505,6 +505,73 @@ static int SDLCALL watchdog(void *seconds)
 }
 #endif
 
+/* The freeze log, always on: once a second a thread looks whether the game's fields go on
+   (kernel_vsync_count, which each vsync publishes; loads and the flyover still count fields),
+   from its first change on (the window and the GPU are set up at field 1). After 5 s without one it logs once where the game is: the menu and phase, WaitForRender's flags
+   (port/hle/dma.c, hle_render_wait), the registers the game last published and, on Windows, the
+   game thread's code addresses as RVAs for port/tools/host64_rva.py. A Mac or Linux game thread
+   is not stopped (that needs a signal handler on it); the rest is logged. One line when the
+   fields go on again. */
+static uint32_t freeze_word(uint32_t ee)
+{
+    const void *p = GUEST(0x08000000u + ee);
+    return host_readable(p, 4) ? *(volatile const uint32_t *)p : 0xFFFFFFFFu;
+}
+
+static int SDLCALL freeze_watch(void *unused)
+{
+    extern uint64_t kernel_vsync_count;
+    uint64_t last = 0;
+    unsigned still = 0;
+    int armed = 0;
+    (void)unused;
+    for (;;) {
+        SDL_Delay(1000);
+        uint64_t field = *(volatile uint64_t *)&kernel_vsync_count;
+        if (field != last || !armed) {
+            armed |= last && field != last;
+            if (still >= 5)
+                fprintf(stderr, "freeze: the game goes on at field %llu after about %u s\n",
+                        (unsigned long long)field, still);
+            last = field, still = 0;
+            continue;
+        }
+        if (++still != 5) continue;
+        fprintf(stderr, "freeze: no field for 5 s at field %llu: menu %d phase %d, render flags %X %X %X\n",
+                (unsigned long long)field, (int)freeze_word(0x29DED8), (int)freeze_word(0x43F348),
+                freeze_word(0x29E1C8), freeze_word(0x29E1CC), freeze_word(0x29E1E4));
+#ifdef _WIN32
+        Snapshot s;
+        CONTEXT c = {.ContextFlags = CONTEXT_FULL};
+        BOOL ok = FALSE;
+        if (game_thread && SuspendThread(game_thread) != (DWORD)-1) {
+            ok = GetThreadContext(game_thread, &c);
+            if (ok) snapshot(&s, &c);
+            ResumeThread(game_thread);
+        }
+        if (ok) {
+            extern char __ImageBase[];
+            uintptr_t base = (uintptr_t)__ImageBase;
+            print_snapshot(&s);
+            uintptr_t lo = 0, hi = 0;
+            host_code_range(&lo, &hi);
+            fprintf(stderr, "  image base %016llX: ", (unsigned long long)base);
+            if (c.Rip >= lo && c.Rip < hi) fprintf(stderr, "rip rva 0x%llx, ", (unsigned long long)(c.Rip - base));
+            else fprintf(stderr, "rip outside the exe, ");
+            fprintf(stderr, "on the stack");
+            for (unsigned i = 0; i < s.count; i++)
+                fprintf(stderr, " rva 0x%llx", (unsigned long long)(s.returns[i] - base));
+            fprintf(stderr, "\n");
+        } else
+#endif
+            fprintf(stderr, "  ps2: sp %08X ra %08X a0 %08X a1 %08X v0 %08X\n", published_registers[0],
+                    published_registers[1], published_registers[2], published_registers[3],
+                    published_registers[4]);
+        fflush(stderr);
+    }
+    return 0;
+}
+
 /* The port's own OS threads by name (game, vu, gs, native, sound): the bench reports each one's
    CPU time. */
 enum { NAMED_THREADS = 16 };
@@ -627,14 +694,10 @@ void host_init(void)
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     const char *dump = getenv("DHD_DUMP");
     host_thread_name("game");
-    if (getenv("DHD_WATCH") || state_trace_watch_spec()) {
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &game_thread, 0, FALSE,
-                        DUPLICATE_SAME_ACCESS);
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &game_thread, 0, FALSE,
+                    DUPLICATE_SAME_ACCESS);  /* the watches, DHD_DUMP and the freeze log */
+    if (getenv("DHD_WATCH") || state_trace_watch_spec())
         AddVectoredExceptionHandler(1, watch_hit);
-    }
-    if (dump)
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &game_thread, 0, FALSE,
-                        DUPLICATE_SAME_ACCESS);
 #else
     struct sigaction sa, dump_sa;
     const char *dump = getenv("DHD_DUMP");
@@ -665,6 +728,7 @@ void host_init(void)
     if (getenv("DHD_WATCH") || state_trace_watch_spec())
         SDL_WaitThread(SDL_CreateThread(watch_arm, "watch", NULL), NULL);
     if (dump) SDL_DetachThread(SDL_CreateThread(watchdog, "watchdog", (void *)(uintptr_t)atoi(dump)));
+    SDL_DetachThread(SDL_CreateThread(freeze_watch, "freeze watch", NULL));
 }
 
 #ifndef _WIN32
