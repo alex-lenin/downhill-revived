@@ -1520,6 +1520,16 @@ static void room_update(MenuPage *p)
     room_news();
     room_countdown_sounds();
     room_input(p, &r);
+    /* tests (DHD_NET_SCRIPTED with DHD_NET_TEST_READY): ready again for the next race, as a player
+       who presses READY in the room after each one, so a scripted run races on (at most 1 a second) */
+    static int test_ready = -1;
+    static double test_ready_at;
+    if (test_ready < 0) test_ready = getenv("DHD_NET_TEST_READY") && getenv("DHD_NET_SCRIPTED");
+    if (test_ready && in && selected && !r.own_ready && !r.riding && !leave_ask && !room_closed &&
+        host_seconds() - test_ready_at > 1) {
+        test_ready_at = host_seconds();
+        host_service_net_set_ready(1);
+    }
     if (!room_closed) room_texts(p);
 }
 
