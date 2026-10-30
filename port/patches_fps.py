@@ -82,6 +82,19 @@ def add(patches):
         edit(unit,expression,'((!port_fps_high() || port_whole_step()) && ('+expression+'))')
     edit('00112360','o->x0->x797C != D_002AF2C0.x501B4',
          '(port_fps_high() && !port_whole_step()) || o->x0->x797C != D_002AF2C0.x501B4')
+    # The track's creatures (func_00125E38, type 6: ids 0x1018-0x1022) pick their mode once a
+    # field. When the player has finished and stopped (speed < 0.1), one more than 12.2 units
+    # from the rider (xD8 > 150, squared) turns to walk to a point 3 units ahead of it (mode 2),
+    # and mode 2 ends at once (mode 1) within 10 units of that point. A creature that came from
+    # ahead stops between the two, so every pick is two mode changes, each a 250 ms animation
+    # blend started on top of the one still running (func_00126B20 -> func_00202E38). Retail
+    # picks 60 times a second, about 30 blends deep; at 240 every update picked, about 120 deep,
+    # and evaluating the chain (00204CE0 -> 00204F38 -> 00205D10 per level) ran out of call stack
+    # 2 s after the finish (online, where the race then waits for the others). Picks stay on
+    # whole fields: the chain is as deep as in retail.
+    edit('00125E38', '        rider = D_0043EEC0[0];\n        if (rider != 0',
+         '        rider = D_0043EEC0[0];\n        if (port_fps_high() && !port_whole_step()) {\n'
+         '        } else if (rider != 0')
     # Failed trick selections can be retried immediately: the cooldown is
     # zero until a choice succeeds. Polling that RNG on fractional updates
     # raises the probability of starting a trick and shifts later AI rolls.

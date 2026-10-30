@@ -143,6 +143,25 @@ it reaches phase 5 and then phase 1, and how long it remains in each.
 The same 16 -> 2 run with the players' other settings also reached both countdowns in about 27 s:
 the guest with movies on, the host with Unlock All off and the guest with it on, and both together.
 
+## Crash 2 s after the finish at 240 (0.7.3 test)
+
+A 240 fps guest (Mac host at 60) crossed the line and, 2.3 s later, before the results, stopped
+with `host64 trap: Call stack exhausted (EE fiber 1, wasm depth 0)`: the stack cycled through
+00204F38 -> 00204CE0 -> 00205D10, the evaluation of an animation's blend chain, one level per
+blend, about 125 deep (wasm2c's limit is 512 calls). The chain was not cyclic: it was a
+creature's (func_00125E38, type 6, ids 0x1018-0x1022). Once the player has finished and stopped,
+those creatures walk to a point 3 units ahead of the rider; one that arrives from ahead ends
+between the two thresholds (more than 12.2 units from the rider, within 10 of the point) and
+switches mode 2 and back to 1 at every pick, each switch a 250 ms blend on top of the last
+(func_00126B20). Retail picks once a field: about 30 deep. Above 60 every update picked: 120 deep
+at 240. Offline the 8 s to the results usually hid it; online the race waits for the others.
+The picks now run on whole fields (`port/patches_fps.py`), so the chain is as deep as in retail.
+
+Repro (local, two games, real server; debug build only, not committed): the guest finishes as a
+creature comes in range and is held still, with that creature's 150 lowered to 40 so it always
+stops in the switching band. Without the fix at 240: the same trap, 101 deep after about 1 s.
+With it at 240: 32 deep, no trap, results on both. At 60: 34 deep.
+
 ## Open
 
 - High-rate physics equivalence is still open (finding 067: a full-pedal race finished in
