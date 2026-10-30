@@ -122,6 +122,7 @@ static struct {
     /* online */
     int online, local, nslots, host;
     int gone[NET_SLOTS];     /* lobby slots that left */
+    int kept[NET_SLOTS];     /* of those, the ones that had finished: their riders stay puppets */
     int hits_taken;
     uint8_t events[MAX_EVENTS][32];
     int event_size[MAX_EVENTS], nevents;
@@ -356,8 +357,13 @@ static int human_slot(int lobby) { return lobby == pp.local ? 0 : lobby < pp.loc
 static int lobby_of(int slot) { return slot == 0 ? pp.local : slot <= pp.local ? slot - 1 : slot; }
 static int to_local(int global) { return global < pp.nslots ? human_slot(global) : global; }
 static int to_global(int slot) { return slot < pp.nslots ? lobby_of(slot) : slot; }
-/* The PC that runs a rider: a human's own while connected, else the host (which also runs the AI). */
-static int owner_of(int slot) { return slot < pp.nslots && !pp.gone[lobby_of(slot)] ? lobby_of(slot) : pp.host; }
+/* The PC that runs a rider: a human's own while connected, else the host (which also runs the AI);
+   none (-1) for a player who left after finishing, until the next race (hle_puppet_drop). */
+static int owner_of(int slot)
+{
+    if (slot >= pp.nslots || !pp.gone[lobby_of(slot)]) return slot < pp.nslots ? lobby_of(slot) : pp.host;
+    return pp.kept[lobby_of(slot)] ? -1 : pp.host;
+}
 static int owned(int slot) { return owner_of(slot) == pp.local; }
 
 void hle_puppet_online(int local, int nslots, int host)
@@ -378,6 +384,10 @@ void hle_puppet_rematch(void)
     for (int i = 1; i < NRIDERS; i++) {
         Puppet *p = &pp.p[i];
         p->count = 0, p->have_offset = 0, p->offset = 0, p->remote_crash = 0, p->sent_any = 0;
+        if (i < pp.nslots && pp.kept[lobby_of(i)]) {  /* a new race: the host's AI rides it now */
+            pp.kept[lobby_of(i)] = 0;
+            p->on = !owned(i);
+        }
     }
     pp.hits_taken = 0, pp.nevents = 0;
 }
@@ -390,18 +400,25 @@ void hle_puppet_offline(void)
     for (int i = 1; i < NRIDERS; i++)
         if (i != pp.play_slot) memset(&pp.p[i], 0, sizeof pp.p[i]);
     memset(pp.gone, 0, sizeof pp.gone);
+    memset(pp.kept, 0, sizeof pp.kept);
     pp.hits_taken = 0, pp.nevents = 0;
     fprintf(stderr, "puppet: offline\n");
 }
 
 /* A player left (lobby slot); host: who runs the AI now (the lowest still connected). The riders
    this PC now owns stop being puppets: their own AI and physics take over where they are, and
-   from here on this PC sends their snapshots. */
-void hle_puppet_drop(int lobby, int host)
+   from here on this PC sends their snapshots. A player who had already finished (finished: the
+   race has their time) is not handed to the AI, which would race their rider on past the line:
+   it stays a puppet on every PC, on its last snapshot, run by no PC until the next race. */
+void hle_puppet_drop(int lobby, int host, int finished)
 {
     if (!pp.online || lobby < 0 || lobby >= NET_SLOTS) return;
     pp.gone[lobby] = 1;
+    pp.kept[lobby] = finished;
     pp.host = host;
+    if (finished && lobby != pp.local)
+        fprintf(stderr, "puppet: tick %d slot %d (player %d) had finished: it stays where its player left it\n",
+                RACE_CLOCK, human_slot(lobby), lobby);
     for (int i = 1; i < NRIDERS; i++) {
         Puppet *p = &pp.p[i];
         if (p->on && owned(i)) {
@@ -537,12 +554,13 @@ void hle_puppet_receive(int sender, const uint8_t *in, int n)
 }
 
 /* func_0012E940 (rider self hit by other). A hit by a puppet is decided on its PC; a hit by a
-   rider this PC runs on a puppet becomes an EVENT for the PC that runs the puppet. */
+   rider this PC runs on a puppet becomes an EVENT for the PC that runs the puppet (none for a
+   finished rider whose player left). */
 int hle_puppet_hit(uint8_t *self, int kind, void *direction, uint8_t *other)
 {
     if (pp.allow || (!puppet(self) && !puppet(other))) return 0;
     int victim = slot_of(self), attacker = slot_of(other);
-    if (pp.online && !puppet(other) && pp.nevents < MAX_EVENTS) {
+    if (pp.online && !puppet(other) && owner_of(victim) >= 0 && pp.nevents < MAX_EVENTS) {
         uint8_t *e = pp.events[pp.nevents], *o = e;
         *o++ = EVENT_VERSION;
         *o++ = EVENT_HIT;

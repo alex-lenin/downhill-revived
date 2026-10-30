@@ -258,7 +258,7 @@ static void log_hash(uint64_t field)
 
 void hle_puppet_online(int local, int nslots, int host);
 void hle_puppet_offline(void);
-void hle_puppet_drop(int lobby, int host);
+void hle_puppet_drop(int lobby, int host, int finished);
 int hle_puppet_pack(int slot, uint8_t *out, int max);
 void hle_puppet_receive(int sender, const uint8_t *in, int n);
 int hle_puppet_take_event(uint8_t *out, int max);
@@ -978,7 +978,8 @@ static void finish_step(void)
 /* ---- disconnects ---- */
 
 /* A player who left: their rider goes on as the host's AI (the lowest lobby slot still here is
-   the host; it runs the AI riders). If this PC lost the connection, it runs every rider itself. */
+   the host; it runs the AI riders), unless they had finished: then it stays where it is, finished
+   (hle_puppet_drop). If this PC lost the connection, it runs every rider itself. */
 static void check_left(void)
 {
     NetLobby lobby;
@@ -996,7 +997,7 @@ static void check_left(void)
         }
         fprintf(stderr, "online: player %d (%s) left at race tick %d; host now player %d\n", j, on.name[j], RACE_CLOCK,
                 host);
-        hle_puppet_drop(j, host);
+        hle_puppet_drop(j, host, on.finish[j] >= 0);
     }
 }
 

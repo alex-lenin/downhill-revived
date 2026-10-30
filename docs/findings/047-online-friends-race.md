@@ -55,7 +55,11 @@ new messages are all EVENT frames (type 6) the server already passes on.
     Every PC then releases the end (4 s) and shows the order in the window title.
 11. **Leaving**: every 15 fields each PC checks the lobby; a player who left is marked gone,
     the host moves to the lowest remaining player, and the riders the leaver ran (their own;
-    the AI if the host left) become the new host's AI riders (`hle_puppet_drop`).
+    the AI if the host left) become the new host's AI riders (`hle_puppet_drop`). Since 0.7.3 a
+    player who had already finished is the exception: the AI raced their rider on past the line
+    (seen when a 240 fps guest crashed after its finish). Their rider stays a puppet on its last
+    snapshot on every PC, run and sent by none, keeps its time in the results, and goes to the
+    host's AI only in the next race.
 
 EVENT payloads: byte 0 version 2, byte 1 type: 1 HIT, 2 LOADED, 3 SETUP, 4 START, 5 GO,
 6 FINISH, 7 RESULTS. The relay stamps the sender's lobby slot.
