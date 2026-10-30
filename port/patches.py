@@ -354,11 +354,16 @@ PATCHES = {
         ('text', '    func_001B74E8(game);\n', '    func_001B74E8(game);\n    hle_online_riders(game);\n'),
         # Online: the AI count for the room (computer riders on or off, port/hle/online.c)
         ('text', '    return D_004B25A0.xB174 == 0 ? result : 0;\n', '    return hle_online_ai_count(D_004B25A0.xB174 == 0 ? result : 0);\n')],
-    # Online: the other players' names over their riders (port/hle/online.c hle_online_names)
+    # Online: the other players' names over their riders (port/hle/online.c hle_online_names); a
+    # cheat code does nothing in a room with cheats off, and each code goes in the log
+    # (hle_cheat_code, finding 117)
     'unsorted/0012C9E0.c': [
         ('text', 'extern void func_0012CF68(void *, int);',
-         'extern void func_0012CF68(void *, int);\nextern void hle_online_names(void *, int);'),
-        ('text', '    func_0012CF68(obj, saved);\n', '    func_0012CF68(obj, saved);\n    hle_online_names(obj, saved);\n')],
+         'extern void func_0012CF68(void *, int);\nextern void hle_online_names(void *, int);\n'
+         'extern void hle_cheat_code(void *);\nextern void hle_cheat_code_done(void *);'),
+        ('text', '    int saved = obj->x7988;\n', '    int saved = obj->x7988;\n    hle_cheat_code(obj);\n'),
+        ('text', '    func_0012CF68(obj, saved);\n',
+         '    hle_cheat_code_done(obj);\n    func_0012CF68(obj, saved);\n    hle_online_names(obj, saved);\n')],
     'unsorted/0019F9B0.c': [
         ('text', 'extern void func_001614D8(void *, int);', 'extern void func_001614D8(void *, int);\nextern int hle_online_race_end(int);'),
         ('text', '        } else {\n            func_001B45F8(D_004B1F40, 1, time * 60);\n            if (!D_0043FA34[0]',

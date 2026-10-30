@@ -329,6 +329,7 @@ static struct {
     double first_finish;        /* host_wall_seconds of the first human finish */
     int end_held, end_done;     /* the race-end countdown, held for the results */
     int no_bots;                /* the room's computer riders off (its "laps" option 1) */
+    int cheats;                 /* the room's cheat codes on (option 2; off: hle_cheat_code) */
     /* the host's next race after the results (EVENT_REMATCH): 1 TRY AGAIN, 2 NEW LEVEL on
        rematch_track; rematch_fields: 1/60 s fields (not frames) since this PC began choosing it */
     int rematch_want, rematch_track, rematch_fields;
@@ -488,8 +489,9 @@ static void barrier(void)
             if (!ready_sent) fprintf(stderr, "online: room %s%s\n", lobby.code, lobby.is_host ? " (host)" : "");
             if (lobby.is_host && !settings_sent) {
                 const char *track = getenv("DHD_NET_TRACK"), *room = getenv("DHD_NET_ROOM_NAME");
-                NetRoomSettings s = {track && *track ? atoi(track) : 0, -1, getenv("DHD_NET_PUBLIC") != NULL, 4, -1,
-                                     room && *room ? room : NULL};
+                /* DHD_NET_CHEATS=1 (tests): the room's cheats on (options bit 2) */
+                NetRoomSettings s = {track && *track ? atoi(track) : 0, getenv("DHD_NET_CHEATS") ? 2 : -1,
+                                     getenv("DHD_NET_PUBLIC") != NULL, 4, -1, room && *room ? room : NULL};
                 host_service_net_set_room(GADDR(&s));
                 settings_sent = 1;
             }
@@ -547,6 +549,7 @@ static void barrier(void)
     choose_riders(&lobby);
     on.setup.track = lobby.race_track;
     on.no_bots = lobby.race_laps & 1;
+    on.cheats = (lobby.race_laps & 2) != 0;
     on.setup.rider[0] = on.pick[on.local_slot];
     for (int i = 1; i < 4; i++) on.setup.rider[i] = -1;
     for (int i = 0; i < NRIDERS; i++) on.finish[i] = -1;
@@ -556,8 +559,8 @@ static void barrier(void)
     snprintf(seed, sizeof seed, "%u", lobby.race_seed ? lobby.race_seed : 1u);
     set_env("DHD_RACE_SEED", seed);  /* hle_race_seed: never 0, which falls back to the RTC */
     hle_puppet_online(on.local_slot, on.nslots, on.host_slot);
-    fprintf(stderr, "online: race starts: player %d of %d, track %d, seed %s%s\n", on.local_slot, on.nslots,
-            on.setup.track, seed, on.no_bots ? ", no computer riders" : "");
+    fprintf(stderr, "online: race starts: player %d of %d, track %d, seed %s%s, cheats %s\n", on.local_slot, on.nslots,
+            on.setup.track, seed, on.no_bots ? ", no computer riders" : "", on.cheats ? "on" : "off");
     log_pings(&lobby);
 }
 
@@ -1139,6 +1142,77 @@ void hle_online_names(void *rider, int view)
     for (int i = 0; drawn && i < 4; i++) func_0020F420(0, i);
 }
 
+/* ---- cheat codes (finding 117) ----
+   func_001E6F58, the human rider's pad reader at rider +0x1420, matches the last presses against
+   the code table (D_00272448) and leaves the code's number (1-26) at rider +0x1E3C for one frame;
+   in the race (phases 2-4) func_0012C9E0 applies it, codes 2-26 only once code 1 ("Codes") has
+   turned code entry on (rider +0x1E3A, func_001E7460). Their effects are the bytes at rider
+   +0x7BA8..+0x7BB6, which func_0012C450 clears at each race's load but for +0x7BB2 (Always
+   Stoked), +0x7BB4 and +0x7BB5, and Extra Smack Time's global copy D_0043EF2C. With the room's
+   cheats off (online_menu.c ROOM_CHEATS) a code does nothing online, and the race starts with
+   none of them on. Offline, and in a room with cheats on, the game's own rules. */
+enum { CHEAT_CODE = 0x1E3C, CHEAT_ENTRY = 0x1E3A, CHEAT_FLAGS = 0x7BA8, CHEAT_FLAG_COUNT = 15,
+       CHEAT_NAMES = 0x272818, SMACK_TIME = 0x43EF2C };
+enum { SPEED_FREAK = 0x7BAA, INFINITE_BOTTLES = 0x7BAD };
+static int cheat_entered;  /* this frame's code, logged after func_0012C9E0 applied it */
+
+static int cheats_blocked(void) { return online_mode() && on.released && !on.cheats; }
+
+static const char *cheat_name(int code)
+{
+    return code > 0 && code < 27 ? *(const char **)EE_PTR(CHEAT_NAMES + 4 * code) : "?";
+}
+
+static void cheat_flags(const uint8_t *rider, char *out, int size)
+{
+    int n = 0;
+    out[0] = 0;
+    for (int i = 0; i < CHEAT_FLAG_COUNT && n < size - 8; i++)
+        if (rider[CHEAT_FLAGS + i]) n += snprintf(out + n, size - n, " +%X", CHEAT_FLAGS + i);
+    if (!n) snprintf(out, size, " none");
+}
+
+/* Patched into func_0012C9E0 before it reads the code. */
+void hle_cheat_code(void *rider)
+{
+    int32_t *code = (int32_t *)((uint8_t *)rider + CHEAT_CODE);
+    cheat_entered = *code;
+    if (!*code || !cheats_blocked()) return;
+    hle_log("cheats: code %d (%s) blocked: the room's cheats are off\n", *code, cheat_name(*code));
+    *code = cheat_entered = 0;
+}
+
+/* After func_0012C9E0: what the code left on. */
+void hle_cheat_code_done(void *rider)
+{
+    if (!cheat_entered) return;
+    const uint8_t *r = rider;
+    char flags[96];
+    cheat_flags(r, flags, sizeof flags);
+    hle_log("cheats: code %d (%s)%s, code entry %s; on:%s\n", cheat_entered, cheat_name(cheat_entered),
+            online_mode() ? " online, the room's cheats on" : "", r[CHEAT_ENTRY] ? "on" : "off", flags);
+    cheat_entered = 0;
+}
+
+/* GO online: with the room's cheats off, whatever was on (from offline play before) goes off,
+   the way typing its code again would turn it off. */
+static void cheats_start(void)
+{
+    uint8_t *r = RIDER(0);
+    char flags[96];
+    if (on.cheats) {
+        hle_log("cheats: the room's cheats are on\n");
+        return;
+    }
+    cheat_flags(r, flags, sizeof flags);
+    if (r[SPEED_FREAK]) *(float *)(r + 0x4214) = 1.0f;
+    if (r[INFINITE_BOTTLES]) *(int32_t *)(r + 0x7ADC) = 3;
+    memset(r + CHEAT_FLAGS, 0, CHEAT_FLAG_COUNT);
+    uint8_t *smack = EE_PTR(SMACK_TIME);
+    hle_log("cheats: the room's cheats are off; cleared:%s%s\n", flags, *smack ? " and Extra Smack Time's copy" : "");
+    *smack = 0;
+}
+
 /* ---- the next race in the same room ---- */
 
 /* Someone else still in the race, so the host's next race is theirs too. */
@@ -1411,7 +1485,7 @@ void pads_begin_field(void)
                 rematch_menu, rematch_phase, host_wall_seconds());
     }
     if (!on.started && on.setup_done && EE32(MENU) == LOAD_MENU && EE32(PHASE) == 1) {
-        if (start_step()) rematch_trace = 0, on.started = 1;
+        if (start_step()) rematch_trace = 0, on.started = 1, cheats_start();
     }
     if (on.started) state_sync();
     /* the host's new level, in the setup block once this PC is in its menus (not mid-race) */

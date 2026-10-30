@@ -40,8 +40,9 @@ enum { NAME_MAX = SETTING_NAME_MAX, CODE_LENGTH = 6, ROW_TEXT = 96, MAX_ROWS = 1
 enum { HOME, LIST, NAME, CODE, ROOM };
 /* The room's rows */
 /* The room's options, carried in the server's "laps" setting (Downhill Domination has no laps):
-   every PC builds the same race from them (online.c hle_online_ai_count). */
-enum { ROOM_NO_BOTS = 1 };
+   every PC builds the same race from them (online.c hle_online_ai_count, hle_cheat_code). Cheat
+   codes are off unless the host turns them on (finding 117). */
+enum { ROOM_NO_BOTS = 1, ROOM_CHEATS = 2 };
 static const char *const rider_names[16] = {
     "COSMO", "MAI", "AJAX", "JONNIE", "KALOLO", "T-BAG", "ERIC CARTER", "TARA LLANES", "DRUD",
     "BRIAN LOPES", "RAKEL", "MISSY GIOVE", "RICHIE SCHLEY", "JEN", "WOODY", "KINETICLOPS"};
@@ -413,6 +414,7 @@ static void enter_room(int create, const char *code)
     reset_selection();
     choosing = 0;
     public_room = create == 2;
+    if (create) room_options &= ~ROOM_CHEATS;  /* a new room starts with cheats off */
     room_settings_sent = !create;  /* a guest who becomes host keeps the room as it is */
     room_ready_sent = 0;
     connecting = 1;
@@ -565,7 +567,7 @@ static void leave_room(MenuPage *p)
    ready its countdown starts the race by itself (countdown_ms); Start starts it at once. Two or
    more players may ride the same rider (issue #17). */
 
-enum { RF_TRACK, RF_BOTS, RF_PUBLIC, RF_RIDER, RF_READY, RF_START, RF_LEAVE, RF_COUNT };
+enum { RF_TRACK, RF_BOTS, RF_CHEATS, RF_PUBLIC, RF_RIDER, RF_READY, RF_START, RF_LEAVE, RF_COUNT };
 enum { TOASTS = 3, TRACK_COLUMNS = 4 };
 /* The layout, in the popup view's 640 x 224 (menu_draw_size) */
 enum { L_X = 48, L_W = 166, TOP = 40, CARD_X = 224, CARD_W = 368, CARD_Y = 52, CARD_H = 24, CARD_GAP = 3,
@@ -625,7 +627,7 @@ static RoomNow room_now(void)
 static int focusable(int f, const RoomNow *r)
 {
     switch (f) {
-    case RF_TRACK: case RF_BOTS: case RF_PUBLIC: return r->host && r->in;
+    case RF_TRACK: case RF_BOTS: case RF_CHEATS: case RF_PUBLIC: return r->host && r->in;
     case RF_RIDER: return r->in;
     case RF_READY: return r->in;
     case RF_START: return r->can_start;
@@ -655,7 +657,10 @@ static void change_setting(int f, int by)
         send_settings(tracks[room_track].index, -1, -1);
     } else if (f == RF_BOTS)
         send_settings(-1, room_options = room.laps ^ ROOM_NO_BOTS, -1);
-    else if (f == RF_PUBLIC)
+    else if (f == RF_CHEATS) {
+        send_settings(-1, room_options = room.laps ^ ROOM_CHEATS, -1);
+        hle_log("online menu: the room's cheats %s\n", room_options & ROOM_CHEATS ? "on" : "off");
+    } else if (f == RF_PUBLIC)
         send_settings(-1, -1, public_room = !room.is_public);
     menu_page_sound(by > 0);
 }
@@ -724,7 +729,7 @@ static void activate(MenuPage *p, int f, const RoomNow *r)
     }
     switch (f) {
     case RF_TRACK: open_track_list(r); break;
-    case RF_BOTS: case RF_PUBLIC: change_setting(f, 1); break;
+    case RF_BOTS: case RF_CHEATS: case RF_PUBLIC: change_setting(f, 1); break;
     case RF_RIDER: choose_rider(); break;
     case RF_READY: toggle_ready(r); break;
     case RF_START: host_service_net_start_race(); menu_play("S_ENTER_GAME"); break;
@@ -828,7 +833,7 @@ static void room_mouse(MenuPage *p, int x, int y, int moved, int left, int wheel
             menu_page_sound(1);
         }
         if (left) {
-            if (f == RF_BOTS || f == RF_PUBLIC) change_setting(f, 1);
+            if (f == RF_BOTS || f == RF_CHEATS || f == RF_PUBLIC) change_setting(f, 1);
             else activate(p, f, &r);
         }
     }
@@ -932,15 +937,16 @@ static void draw_left(const RoomNow *r)
     if (on) bar(L_X + 6, TOP + 17, L_W - 12, 14);
     put(MENU_CENTRE, cx, TOP + 18, line, fit(line, on ? st_on : st_row, 125, L_W - 16));
     hit(&hits[RF_TRACK], L_X, TOP + 14, L_W, 20);
-    draw_setting(RF_BOTS, TOP + 42, "COMPUTER RIDERS", l->laps & ROOM_NO_BOTS ? "OFF" : "ON", r);
-    draw_setting(RF_PUBLIC, TOP + 56, "ROOM", l->is_public ? "PUBLIC" : "PRIVATE", r);
-    rect(L_X + 8, TOP + 72, L_W - 16, 1, (const int[]){0, 0, 0}, 128);
+    draw_setting(RF_BOTS, TOP + 39, "COMPUTER RIDERS", l->laps & ROOM_NO_BOTS ? "OFF" : "ON", r);
+    draw_setting(RF_CHEATS, TOP + 52, "CHEATS", l->laps & ROOM_CHEATS ? "ON" : "OFF", r);
+    draw_setting(RF_PUBLIC, TOP + 65, "ROOM", l->is_public ? "PUBLIC" : "PRIVATE", r);
+    rect(L_X + 8, TOP + 78, L_W - 16, 1, (const int[]){0, 0, 0}, 128);
     /* the join code; Circle (or a click) copies it */
     int copied = copied_at > 0 && host_seconds() - copied_at < 1.5;
-    put(MENU_CENTRE, cx, TOP + 79, copied ? (copied_ok ? "COPIED" : "COPY FAILED") : "JOIN CODE",
+    put(MENU_CENTRE, cx, TOP + 82, copied ? (copied_ok ? "COPIED" : "COPY FAILED") : "JOIN CODE",
          !copied ? menu_style(st_off, 80, -1, 0, 0) : copied_ok ? tint(st_row, 80, green) : tint(st_row, 80, red));
-    put(MENU_CENTRE, cx, TOP + 91, l->code[0] ? l->code : "------", menu_style(st_on, 150, -1, 0, 0));
-    hit(&code_hit, L_X, TOP + 76, L_W, 34);
+    put(MENU_CENTRE, cx, TOP + 93, l->code[0] ? l->code : "------", menu_style(st_on, 150, -1, 0, 0));
+    hit(&code_hit, L_X, TOP + 80, L_W, 34);
 }
 
 static void draw_bars(int x, int y, int rtt)
@@ -1221,7 +1227,13 @@ static void room_update(MenuPage *p)
         menu_page_close(p);
         return;
     }
-    if (in) room_options = l->laps, public_room = l->is_public;
+    if (in) {
+        static int seen_cheats = -1;  /* every PC logs the room's cheats as it sees them */
+        if (seen_cheats != (l->laps & ROOM_CHEATS))
+            hle_log("online menu: room %s: cheats %s\n", l->code, l->laps & ROOM_CHEATS ? "ON" : "OFF");
+        seen_cheats = l->laps & ROOM_CHEATS;
+        room_options = l->laps, public_room = l->is_public;
+    }
     /* an older server leaves these to the client */
     if (r.own_ready && (ready_track != l->track || ready_options != l->laps)) host_service_net_set_ready(0);
     room_news();
