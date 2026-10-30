@@ -131,7 +131,18 @@ uint64_t host_cycles(void)
 #endif
 }
 
-void host_putenv(const char *text) { putenv((char *)text); }
+/* "NAME=value", as Windows' _putenv: a copy (putenv would keep the caller's buffer, often on the
+   module's stack: online.c's set_env, so DHD_NAV read garbage and the online race never started),
+   and "NAME=" unsets it. */
+void host_putenv(const char *text)
+{
+    const char *eq = strchr(text, '=');
+    char name[256];
+    if (!eq || eq == text || (size_t)(eq - text) >= sizeof name) return;
+    memcpy(name, text, (size_t)(eq - text));
+    name[eq - text] = 0;
+    host_putenv_s(name, eq + 1);
+}
 
 void host_putenv_s(const char *name, const char *value)
 {
