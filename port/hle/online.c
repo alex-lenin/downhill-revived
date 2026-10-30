@@ -28,7 +28,6 @@
 #include "../gs/present.h"
 #include "../net/net.h"
 #include "../include/version.h"
-#include "../runtime/sha256.h"
 #include "../include/fps.h"
 
 #include <ctype.h>
@@ -362,25 +361,19 @@ static void fail(const char *why)
     exit(1);
 }
 
-/* The build's identity for the lobby: players must run the same executable. The release
-   (version.h) is in it so the server's "the host runs ..." message names it; the hello also
-   sends the release alone (clientVersion) for the version gate. */
+/* The module's own hash: build_wasm.py writes the first 8 bytes of the finished module's SHA-256
+   (in hex, taken with these 16 bytes as they are here) over them. Every platform runs the same
+   module (wasm2c's C of it), so a Windows, Mac, Linux and Android build of one core agree; an
+   exe's hash differs per platform. Not const: the bytes must stay in the module's data. */
+char hle_core_id[17] = "@@DHD_CORE_ID@@@";
+
+/* The build's identity for the lobby: players must run the same game (the module: the game's
+   code, the patches and the online code). The release (version.h) is in it so the server's
+   "the host runs ..." message names it; the hello also sends the release alone (clientVersion)
+   for the version gate. */
 static void build_version(char *out, size_t size)
 {
-    char path[HOST_PATH_MAX];
-    Sha256 hash;
-    uint8_t digest[32], buf[65536];
-    int64_t n;
-    snprintf(out, size, "dhd-port " DHD_VERSION " unknown");
-    host_exe_path(path, sizeof path);
-    HostFile f = host_file_open(path, HOST_FILE_READ);
-    if (!f) return;
-    sha256_init(&hash);
-    while ((n = host_file_read(f, buf, sizeof buf)) > 0) sha256_update(&hash, buf, (size_t)n);
-    sha256_final(&hash, digest);
-    snprintf(out, size, "dhd-port " DHD_VERSION " %02x%02x%02x%02x%02x%02x%02x%02x", digest[0], digest[1], digest[2],
-             digest[3], digest[4], digest[5], digest[6], digest[7]);
-    host_file_close(f);
+    snprintf(out, size, "dhd-port " DHD_VERSION " %.16s", hle_core_id);
 }
 
 void hle_online_version(char *out, size_t size) { build_version(out, size); }

@@ -27,7 +27,7 @@ usage: python port/tools/build_wasm.py [-j 8]
 Needs LLVM's clang, wasm-ld, llvm-nm, llvm-objcopy, llvm-cxxfilt on PATH (clang also assembles the
 data image as a COFF object, for its checks only), WABT's wasm-objdump, the wasi-sdk sysroot
 (WASI_SYSROOT) and SIMDe (SIMDE_DIR). The native hosts run wasm2c themselves (build_host64.py)."""
-import argparse, collections, glob, json, os, re, shutil, subprocess, sys, time
+import argparse, collections, glob, hashlib, json, os, re, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1343,6 +1343,15 @@ def main():
     # 4 GiB past p here: commit edf2dc201), or that points at no guest memory, fails the build
     if __import__('wasm_offset_scan').run(WASM, report=os.path.join(OUT, 'offset_scan.json')):
         sys.exit('wasm offset scan: fix the source (port/patches.py) or allow the hit in wasm_offset_scan.ALLOW')
+    # the module's identity for online rooms (online.c's hle_core_id): its hash written into it last,
+    # so a build of this module on any platform carries the same one
+    image = open(WASM, 'rb').read()
+    mark = b'@@DHD_CORE_ID@@@'
+    if image.count(mark) != 1:
+        sys.exit('the module holds %d copies of online.c\'s core id mark (one expected)' % image.count(mark))
+    core_id = hashlib.sha256(image).hexdigest()[:16].encode()
+    open(WASM, 'wb').write(image.replace(mark, core_id))
+    print('core id: %s' % core_id.decode(), flush=True)
 
     # the module's imports, grouped by owner
     imports = []

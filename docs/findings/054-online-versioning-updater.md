@@ -59,7 +59,10 @@ Test: see section 5.
 - `port/include/version.h`: `#define DHD_VERSION "0.2.0"`, the only place the release number
   is written.
   - The online version string becomes `dhd-port 0.2.0 <exe hash>` (`port/hle/online.c`); rooms
-    still need the same exe.
+    still need the same exe. Since 0.7.3 it is `dhd-port <version> <module hash>`: the exe hash
+    differs per platform, so a Mac guest was refused in a Windows host's room. `build_wasm.py`
+    writes the finished module's SHA-256 (first 8 bytes, hex) over `hle_core_id`'s mark, and
+    every platform runs wasm2c's C of that module.
   - The hello sends `"clientVersion":"0.2.0"` (`port/net/client.c`).
   - The updater compares against it.
   - `port/tools/package_release.py` takes the version from it (`--version` must agree). It
