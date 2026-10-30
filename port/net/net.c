@@ -193,6 +193,14 @@ double net_server_ms(void)
     return net_now_ms() + client.clock_offset;
 }
 
+/* This PC's ping while in a room, else -1 (the FPS & Ping counter, port/gs/gpu_rust.c): a few
+   fields, read as net_racing reads its flag, not a copy of the lobby for every picture. */
+int net_ping_ms(void)
+{
+    const NetLobby *l = &client.lobby;
+    return inited && (l->state == NET_LOBBY || l->state == NET_RACING) && !l->offline && l->code[0] ? l->ping_ms : -1;
+}
+
 int net_racing(void)
 {
     return inited && client.racing;

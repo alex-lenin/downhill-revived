@@ -4,9 +4,9 @@
    - left/right change the row under the cursor; Cross (SELECT) keeps the changes and closes,
      Triangle (BACK) puts the values the page opened with back and closes, as AUDIO / OTHER does.
    Every change is saved to dhd.ini at once (host_setting_save keeps the other lines). Display,
-   window size, picture shape, scaling, skip movies (the startup movies), vibration and unlock all
-   apply at once; resolution, widescreen, the texture pack, the font, the frame rate and V-Sync at
-   the next start ("*" and the footer say so). A setting the environment
+   window size, picture shape, scaling, skip movies (the startup movies), vibration, unlock all
+   and FPS & Ping apply at once; resolution, widescreen, the texture pack, the font, the frame
+   rate and V-Sync at the next start ("*" and the footer say so). A setting the environment
    sets (DHD_*) is shown but can't be changed here. Nothing here writes game state: the page
    lives in host memory and the settings in dhd.ini, never in the memory card's save.
    A host that can do only some of the rows says which in DHD_PC_SETTINGS_ROWS, a comma list of
@@ -30,7 +30,7 @@ void gs_window_apply(void);           /* port/gs/present.c */
 void gs_present_options_apply(void);
 int texpack_available(void);          /* port/gs/texpack.c */
 
-enum { ROWS = 13, MAX_CHOICES = 16 };
+enum { ROWS = 14, MAX_CHOICES = 16 };
 
 /* A row: its label and dhd.ini key; the setting's variable, built-in value and choices come from
    setting_table (dhd_settings), the list from choices_build. */
@@ -43,7 +43,7 @@ typedef struct {
     int selected, running, opened;    /* choice indexes; -1: a value not in the list */
 } Row;
 
-enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT, RATE, VSYNC, UNLOCK };
+enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, TEXTURES, FONT, RATE, VSYNC, COUNTER, UNLOCK };
 static Row rows[ROWS] = {
     {"Resolution:", "scale", 0},
     {"Display:", "window", 1},
@@ -57,6 +57,7 @@ static Row rows[ROWS] = {
     {"Font:", "font", 0},  /* port/gs/font_sharp.c */
     {"Frame Rate:", "fps", 0},
     {"V-Sync:", "vsync", 0},  /* no tearing (port/gs/gpu_rust.c) */
+    {"FPS & Ping:", "perf_counter", 1},
     {"Unlock All:", "unlock_all", 1},  /* port_unlock_all */
 };
 static char monitor_size[24];
@@ -192,7 +193,7 @@ static void commit(Row *r, int apply)
     if (!apply) return;
     r->running = r->selected;
     if (r == &rows[DISPLAY] || r == &rows[SIZE]) host_service_gs_window_apply();
-    else if (r == &rows[SHAPE] || r == &rows[SCALING]) host_service_gs_present_options_apply();
+    else if (r == &rows[SHAPE] || r == &rows[SCALING] || r == &rows[COUNTER]) host_service_gs_present_options_apply();
     else if (r == &rows[VIBRATION]) host_service_host_pad_vibrate(0, 0, 0);
 }
 

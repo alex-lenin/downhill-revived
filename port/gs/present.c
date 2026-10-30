@@ -190,7 +190,8 @@ static void monitor_size(WindowSpec *s)
 static void window_measure(void)
 {
     int w = 0, h = 0;
-    if (sdl_window && !(SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_MINIMIZED))
+    /* Tool captures need the final presenter even while the window stays minimised. */
+    if (sdl_window && (!(SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_MINIMIZED) || getenv("DHD_CAPTURE_PRESENTED")))
         SDL_GetWindowSizeInPixels(sdl_window, &w, &h);
     SDL_SetAtomicInt(&drawable, (w > 0 ? w : 0) << 16 | (h > 0 ? h : 0));
 }
@@ -386,8 +387,10 @@ void gs_window_apply(void)
 }
 
 /* The picture's filter and shape changed (DHD_PRESENT_FILTER, DHD_ASPECT): native renderer only. */
+void gs_gpu_counter_apply(void);  /* port/gs/gpu_rust.c */
 void gs_present_options_apply(void)
 {
+    gs_gpu_counter_apply();
     if (sdl_window && gs_gpu_native(&gs)) gs_native_present_options(&gs);
 }
 

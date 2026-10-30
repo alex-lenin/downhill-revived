@@ -119,6 +119,7 @@ double net_seconds(void);                          /* the clock start_at uses */
 /* The server's clock (ms since the Unix epoch), estimated from the lobby pings' round-trips: the
    same moment on every PC to a few ms, for starting the race together. */
 double net_server_ms(void);
+int net_ping_ms(void);                             /* in a room, else -1 */
 
 /* ---- the race ---- */
 
