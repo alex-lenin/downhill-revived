@@ -31,6 +31,7 @@
 #include "../runtime/sha256.h"
 #include "../include/fps.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -316,6 +317,10 @@ static struct {
     double go_server;           /* our GO on the server's clock */
     double their_go[4];         /* the others' */
     int go_sent;
+    /* the start (start_step): when this PC came to it, the last resend, whether the host named the
+       moment; the players it still waits for (start_waiting: the first) */
+    double start_entered, start_said;
+    int start_announced, start_missing, start_waiting;
     int last_sent;              /* race clock of the last snapshot sent */
     unsigned sent, received;
     /* the finish (global rider ids: humans 0..nslots-1, AI riders their slot) */
@@ -770,51 +775,97 @@ void hle_online_riders(void *game)
    moment on the server's clock and every PC holds the countdown until then, so the GOs land
    within a frame or two of each other on every PC. Both are said again every half second: after
    a TRY AGAIN or NEW LEVEL the PC that loads first is here before the other has reset for the next
-   race (rematch_reset), which would drop a single message, and the start would wait 60 s. */
-static void start_together(void)
+   race (rematch_reset), which would drop a single message, and the start would wait 60 s.
+   One step a field (pads_begin_field): the game goes on drawing while it waits, its countdown held
+   where it is (hle_online_countdown_hold) and the wait on the screen (hle_online_hud). A PC that
+   skipped the flight over the track waits so for one still watching it. The step whose field the
+   moment falls in waits for it there, as closely as the whole wait did before. 1: the countdown
+   runs from now. */
+static int start_step(void)
 {
     static const uint8_t loaded[2] = {EVENT_VERSION, EVENT_LOADED};
-    double entered = host_wall_seconds(), said = -1;
-    int host = on.local_slot == on.host_slot, announced = 0;
-    fprintf(stderr, "online: loaded at %.1f s, waiting for the others\n", entered);
-    for (;;) {
-        NetLobby lobby;
-        host_service_net_get_lobby(GADDR(&lobby));
-        if (host_wall_seconds() - said >= 0.5) {
-            said = host_wall_seconds();
-            send_event(loaded, sizeof loaded);
-            if (announced) {
-                uint8_t e[10] = {EVENT_VERSION, EVENT_START};
-                memcpy(e + 2, &on.go_at, 8);
-                send_event(e, sizeof e);
-            }
-        }
-        receive_frames();
-        int missing = 0;
-        for (int i = 0; i < lobby.nslots; i++)
-            if (i != on.local_slot && !lobby.racer[i].left && !on.loaded[i]) missing++;
-        double waited = host_wall_seconds() - entered;
-        if (!host_service_net_racing() || waited > 75) break;
-        if (host && !announced && (!missing || waited > 60)) {
+    int host = on.local_slot == on.host_slot;
+    if (!on.start_entered) {
+        on.start_entered = host_wall_seconds(), on.start_said = -1;
+        fprintf(stderr, "online: loaded at %.1f s, waiting for the others\n", on.start_entered);
+    }
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    if (host_wall_seconds() - on.start_said >= 0.5) {
+        on.start_said = host_wall_seconds();
+        send_event(loaded, sizeof loaded);
+        if (on.start_announced) {
             uint8_t e[10] = {EVENT_VERSION, EVENT_START};
-            on.go_at = host_service_net_server_ms() + START_LEAD_MS;
             memcpy(e + 2, &on.go_at, 8);
             send_event(e, sizeof e);
-            announced = 1;
-            if (missing) fprintf(stderr, "online: %d player%s never said they loaded: starting without waiting\n",
-                                 missing, missing == 1 ? "" : "s");
         }
-        if (on.go_at && host_service_net_server_ms() >= on.go_at) break;
+    }
+    receive_frames();
+    int missing = 0;
+    for (int i = 0; i < lobby.nslots && i < NET_MAX_SLOTS; i++)
+        if (i != on.local_slot && !lobby.racer[i].left && !on.loaded[i]) {
+            if (!missing++) on.start_waiting = i;
+        }
+    on.start_missing = missing;
+    double waited = host_wall_seconds() - on.start_entered;
+    int go = !host_service_net_racing() || waited > 75;
+    if (!go && host && !on.start_announced && (!missing || waited > 60)) {
+        uint8_t e[10] = {EVENT_VERSION, EVENT_START};
+        on.go_at = host_service_net_server_ms() + START_LEAD_MS;
+        memcpy(e + 2, &on.go_at, 8);
+        send_event(e, sizeof e);
+        on.start_announced = 1;
+        if (missing) fprintf(stderr, "online: %d player%s never said they loaded: starting without waiting\n",
+                             missing, missing == 1 ? "" : "s");
+    }
+    if (!go && on.go_at && on.go_at - host_service_net_server_ms() < 1000 * port_frame_period() + 5) {
+        while (host_service_net_server_ms() < on.go_at) host_sleep_ms(0);
+        go = 1;
+    }
+    if (!go) {
         if (missing) title("Downhill Revived online - room %s - waiting for %d player%s to load", on.code, missing,
                            missing == 1 ? "" : "s");
         else title("Downhill Revived online - room %s - get ready", on.code);
-        host_service_gs_pump_messages();
-        host_sleep_ms(on.go_at && on.go_at - host_service_net_server_ms() < 20 ? 0 : 2);
+        return 0;
     }
-    kernel_pace_shared(1);  /* from the agreed moment the fields keep to it, catching up after a stall */
+    on.start_missing = 0;
+    kernel_pace_shared(1);  /* from the agreed moment the fields keep to it */
     hle_puppet_rematch();  /* snapshots from before this start (of the race before, after a rematch) */
     fprintf(stderr, "online: countdown starts (waited %.3f s, %+.1f ms from the agreed moment)\n",
-            host_wall_seconds() - entered, on.go_at ? host_service_net_server_ms() - on.go_at : 0.0);
+            host_wall_seconds() - on.start_entered, on.go_at ? host_service_net_server_ms() - on.go_at : 0.0);
+    return 1;
+}
+
+/* func_0019EE98, each frame of the race's start sequence (state: the race phase): 1 keeps the
+   countdown's timer where it is, from the countdown's first frame until start_step lets it run. */
+int hle_online_countdown_hold(int state)
+{
+    return state == 1 && online_mode() && on.setup_done && !on.started && EE32(MENU) == LOAD_MENU;
+}
+
+/* func_00176ED8, each view's HUD every frame: while the countdown waits for players, who it waits
+   for, as the game writes its own prompts there (centred, x 256 of the view's 512). */
+extern char D_004F3570[];  /* the fonts: 0x20 bytes each (menu_page.c) */
+void func_0020F588(int view, int unused, int r, int g, int b, int a);
+void func_0020FB80(int font, int x, int y, int width, int height);
+void func_0020F9F0(int font, int view, int x, int y, const char *text);
+
+void hle_online_hud(int view)
+{
+    if (!online_mode() || on.started || !on.start_entered || !on.start_missing) return;
+    char text[64], name[32];
+    if (on.start_missing > 1) snprintf(text, sizeof text, "WAITING FOR THE OTHERS...");
+    else {
+        snprintf(name, sizeof name, "%s", on.name[on.start_waiting]);
+        for (char *c = name; *c; c++) *c = toupper((unsigned char)*c);
+        snprintf(text, sizeof text, "WAITING FOR %s...", name);
+    }
+    char saved[0x20];
+    memcpy(saved, D_004F3570, sizeof saved);
+    func_0020F588(view, 0, 128, 128, 128, 128);
+    func_0020FB80(0, 256, 192, -91, -32);
+    func_0020F9F0(0, view, 256, 150, text);
+    memcpy(D_004F3570, saved, sizeof saved);
 }
 
 /* ---- the finish ---- */
@@ -1111,13 +1162,15 @@ static int others_here(void)
 /* The host's TRY AGAIN or NEW LEVEL after the results: the game starts the next race on the race
    screen (race phase back to the countdown, or to the flight over a new track), on every PC. The
    race's own online state starts again; the room, the players and their rides stay. The new start
-   is agreed again (start_together), and the puppets drop what they had (hle_puppet_rematch). */
+   is agreed again (start_step), and the puppets drop what they had (hle_puppet_rematch). */
 static int rematch_trace, rematch_menu, rematch_phase;
 static void rematch_reset(int track)
 {
     fprintf(stderr, "online: the next race in room %s: track %d (at %.1f s)\n", on.code, track, host_wall_seconds());
     on.started = on.go_sent = 0;
     on.go_at = on.go_server = 0;
+    on.start_entered = on.start_said = 0;
+    on.start_announced = on.start_missing = 0;
     memset(on.their_go, 0, sizeof on.their_go);
     memset(on.loaded, 0, sizeof on.loaded);
     on.last_sent = 0;
@@ -1341,9 +1394,7 @@ void pads_begin_field(void)
                 rematch_menu, rematch_phase, host_wall_seconds());
     }
     if (!on.started && on.setup_done && EE32(MENU) == LOAD_MENU && EE32(PHASE) == 1) {
-        rematch_trace = 0;
-        start_together();
-        on.started = 1;
+        if (start_step()) rematch_trace = 0, on.started = 1;
     }
     if (on.started) state_sync();
     /* the host's new level, in the setup block once this PC is in its menus (not mid-race) */
@@ -1371,6 +1422,8 @@ void pads_read(int player, HostPad *out)
             host_service_host_pad_device(0, GADDR(out));
             menu_mouse_merge(0, out);  /* the pause menu by mouse, under the same rules */
             guest_pad(out);
+            /* no pause while the countdown waits for the others: it would hold this PC's GO */
+            if (hle_online_countdown_hold(EE32(PHASE))) out->buttons &= ~PAD_START;
         }
         else if (!on.released || !host_pad_script(player, out)) neutral(out);
         for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;

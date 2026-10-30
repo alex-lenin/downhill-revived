@@ -785,6 +785,19 @@ PATCHES['unsorted/0019EA38.c'] = PATCHES.get('unsorted/0019EA38.c', []) + [
      'func_00176E40(manager->x150,0); }\n hle_online_restart_ready();\n}'),
 ]
 
+# Online, the countdown's timer holds until every PC may start (port/hle/online.c, start_step), the
+# game drawing meanwhile, and the HUD says who it waits for.
+PATCHES['unsorted/0019EE98.c'] = PATCHES.get('unsorted/0019EE98.c', []) + [
+    ('text', 'void func_0019EE98(RaceStart *race) {',
+     'extern int hle_online_countdown_hold(int state);\nvoid func_0019EE98(RaceStart *race) {'),
+    ('text', '    race->timer = race->timer + func_00238F60();',
+     '    race->timer = race->timer + (hle_online_countdown_hold(race->state) ? 0 : func_00238F60());'),
+]
+PATCHES['unsorted/00176ED8.c'] = PATCHES.get('unsorted/00176ED8.c', []) + [
+    ('text', 'void func_00176ED8(Obj *obj)\n{',
+     'extern void hle_online_hud(int view);\nvoid func_00176ED8(Obj *obj)\n{\n    hle_online_hud(obj->player);'),
+]
+
 # WaitForRender's spin enters the kernel and sends a queued render chain the VIF1 interrupt
 # would have sent (port/hle/dma.c, hle_render_wait; issue 22).
 PATCHES['unsorted/001B4618.c'] = PATCHES.get('unsorted/001B4618.c', []) + [
