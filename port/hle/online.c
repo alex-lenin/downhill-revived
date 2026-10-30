@@ -1164,6 +1164,7 @@ static int others_here(void)
    race's own online state starts again; the room, the players and their rides stay. The new start
    is agreed again (start_step), and the puppets drop what they had (hle_puppet_rematch). */
 static int rematch_trace, rematch_menu, rematch_phase;
+static int rematches;  /* rematch_reset's so far (DHD_NET_HOST_NEXT's list) */
 static void rematch_reset(int track)
 {
     fprintf(stderr, "online: the next race in room %s: track %d (at %.1f s)\n", on.code, track, host_wall_seconds());
@@ -1185,6 +1186,7 @@ static void rematch_reset(int track)
     on.setup.track = track;
     rematch_trace = 1;
     rematch_menu = rematch_phase = -1;
+    rematches++;
     kernel_pace_shared(0);
     hle_puppet_rematch();
 }
@@ -1290,7 +1292,8 @@ static int follow_pad(HostPad *out)
 
 /* DHD_NET_HOST_NEXT (tests, online_race.py --next): the host's own choice on the results menu,
    pressed as a player would: "again" TRY AGAIN, "new" NEW LEVEL and another track on the level
-   list (DOWN, else RIGHT, until the cursor moves). One press of 0.08 s every 0.25 s of wall time,
+   list (DOWN, else RIGHT, until the cursor moves); a list ("new,new,again") one race after
+   another, its last for the rest. One press of 0.08 s every 0.25 s of wall time,
    chosen from what is on the screen then. */
 static int host_next_pad(HostPad *out)
 {
@@ -1303,7 +1306,9 @@ static int host_next_pad(HostPad *out)
         host_wall_seconds() - on.end_done_at < 8) return 0;
     neutral(out);
     double t = host_wall_seconds();
-    int row = strcmp(next, "again") ? 1 : 0;
+    const char *pick = next;
+    for (int k = 0; k < rematches && strchr(pick, ','); k++) pick = strchr(pick, ',') + 1;
+    int row = strncmp(pick, "again", 5) ? 1 : 0;
     if ((long)(t / 0.25) != period) {
         period = (long)(t / 0.25);
         if (menu_open(RESULTS_MENU))
@@ -1316,6 +1321,25 @@ static int host_next_pad(HostPad *out)
         } else press = 0;
     }
     if (t - period * 0.25 < 0.08) out->buttons = press;
+    return 1;
+}
+
+/* DHD_NET_TEST_SKIP=seconds (tests): START that long into each flight over the track (race phase
+   5) still on the screen, as a player skipping it would (the first race's is skipped by the menu
+   script at once; after a TRY AGAIN or NEW LEVEL it is the player's). One press of 0.08 s. */
+static int test_skip_pad(HostPad *out)
+{
+    static HleEnv env;
+    static double began = -1;
+    const char *v = hle_env(&env, "DHD_NET_TEST_SKIP");
+    if (!v || on.started || EE32(PHASE) != FLYBY_PHASE) { began = -1; return 0; }
+    if (began < 0) began = host_wall_seconds();
+    double t = host_wall_seconds() - began - atof(v);
+    if (t < 0 || t >= 0.08) return 0;
+    static double said;
+    if (began != said) said = began, fprintf(stderr, "online: test: START on the flight over the track at %.1f s\n", host_wall_seconds());
+    neutral(out);
+    out->buttons = PAD_START;
     return 1;
 }
 
@@ -1417,7 +1441,7 @@ void pads_read(int player, HostPad *out)
         /* Once setup has been exchanged, the flyby and its skip prompt belong to the
            player too. The boot script may already be spent after an earlier race. */
         int race = EE32(MENU) == LOAD_MENU && on.setup_done;
-        if (player == 0 && race && (rematch_pad(out) || follow_pad(out) || host_next_pad(out))) {
+        if (player == 0 && race && (rematch_pad(out) || follow_pad(out) || host_next_pad(out) || test_skip_pad(out))) {
         } else if (player == 0 && race && !hle_env(&scripted_env, "DHD_NET_SCRIPTED")) {
             host_service_host_pad_device(0, GADDR(out));
             menu_mouse_merge(0, out);  /* the pause menu by mouse, under the same rules */
