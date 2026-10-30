@@ -53,3 +53,30 @@ renderer archive. build_tests.py accepts DHD_NET_TEST_RUST_LIB to select that
 archive without rebuilding Rust; the normal path still calls rustgs.py.
 Build output, dependencies and scratch are on F: through local junctions.
 No full retail-data game build was needed. Screens remain the other lane's work.
+
+## Three fixes from the release checks (2026-10-30)
+
+Found by the in-game checks of finding 118:
+
+- **Ready across a race.** The Ready that put a member in a race stayed set while they were
+  back in the room during it: the room showed READY NEXT they never pressed, and Square then
+  took it away. The race's close cleared every racer's Ready, one pressed in the room meanwhile
+  too. Now `retire` (back, finish-and-back, time up, left) clears the member's Ready, and the
+  close clears only those still riding.
+- **A restart's ghosts.** A deploy (or Cloudflare restarting the object) drops every socket
+  with no close event, so the members stayed while each game reconnected (client.c rejoins a
+  lobby it was in) as a new member: the room filled ("The room is full", seen when Wrangler
+  reloaded under a room) and the host stayed a ghost nobody could replace. Now a hello under
+  the name of a member with no socket takes that member back (id, host, rider, Ready), and
+  members not back within the hello timeout (10 s after the instance started) leave as
+  disconnects at the next alarm. Checked in the game: Wrangler reloaded under a room, both
+  players came back as themselves, the game still the host.
+- **A race with one rider.** An AUTO room's timer (or START NOW with only the host ready)
+  starts a race with the members ready then; one still on the rider screen waits for the next.
+  When that left a single rider, the game (`online.c` barrier) still made it two slots: it
+  waited 30 s for the empty slot's rider (a freeze in the log) and put a dead puppet on the
+  grid. Seen in the PC<->Mac run: the Mac was still choosing when the timer fired. A one-slot
+  race now runs alone, with no puppets.
+
+Server tests: 51 (two new: "back in the room, the race's Ready is spent...", "after a restart,
+a player back under their name...").

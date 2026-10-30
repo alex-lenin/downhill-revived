@@ -43,13 +43,6 @@ enum { LOAD_MENU = 9, FLYBY_PHASE = 5 };  /* on the race screen: 5 the flight ov
 /* Retail func_0016B5A8: the flyby (5) is not a running race. */
 static int race_running(void) { return EE32(PHASE) >= 2 && EE32(PHASE) <= 4; }
 
-/* The race screen's menus: D_0029E290 is 1 while riding, 0 in a menu; D_003F52D0.x150 the open
-   menu (a host pointer), each menu's first word its row. The pause menu's rows: RESUME, OPTIONS,
-   TRICK LIST, NEW LEVEL, RE-START, MUSIC PLAYLIST, QUIT; RE-START and QUIT ask first ("No,
-   Return" / "Yes"), NEW LEVEL opens the level list. */
-enum { RIDING = 0x29E290, OPEN_MENU = 0x3F5420, PAUSE_MENU = 0x38BC00, RESTART_ASK = 0x388990,
-       LEVEL_LIST = 0x386680, RESULTS_MENU = 0x386B90, PAUSE_NEW_LEVEL = 3, PAUSE_RESTART = 4 };
-
 /* ---- the pads ---- */
 
 static int npads = -1, online = -1;
@@ -266,7 +259,7 @@ void hle_puppet_event(int sender, const uint8_t *in, int n);
 int hle_puppet_lag(char *out, int size);
 int hle_puppet_hits_taken(void);
 int hle_puppet_global(int slot), hle_puppet_local(int global), hle_puppet_owned(int slot);
-void hle_puppet_rematch(void);
+void hle_puppet_start(void);
 extern int func_001FA7C0(int bike);                       /* a bike's sound kind */
 extern void func_001B45F8(void *timer, int kind, int ticks);  /* the race-end countdown */
 
@@ -274,7 +267,7 @@ extern void func_001B45F8(void *timer, int kind, int ticks);  /* the race-end co
    port/hle/puppet.c's. */
 enum {
     EVENT_VERSION = 2, EVENT_HIT = 1, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_START = 4, EVENT_GO = 5,
-    EVENT_FINISH = 6, EVENT_RESULTS = 7, EVENT_REMATCH = 8
+    EVENT_FINISH = 6, EVENT_RESULTS = 7  /* 8 was 0.7.3's rematch (TRY AGAIN / NEW LEVEL in the race) */
 };
 enum { SNAPSHOT_TICKS = 3 };  /* a snapshot every 3 race ticks: 20 a second at any frame rate */
 enum { NRIDERS = 10, START_LEAD_MS = 1500 };
@@ -327,14 +320,14 @@ static struct {
     int reported[NRIDERS];
     int results[NRIDERS], nresults, have_results;
     double first_finish;        /* host_wall_seconds of the first human finish */
+    /* a room's race (from_menu): the room's last race when it started; when this PC leaves it for
+       the room, and why (shown until then) */
+    int last_race_id;
+    double leave_at;
+    const char *leave_reason;
     int end_held, end_done;     /* the race-end countdown, held for the results */
     int no_bots;                /* the room's computer riders off (its "laps" option 1) */
     int cheats;                 /* the room's cheat codes on (option 2; off: hle_cheat_code) */
-    /* the host's next race after the results (EVENT_REMATCH): 1 TRY AGAIN, 2 NEW LEVEL on
-       rematch_track; rematch_fields: 1/60 s fields (not frames) since this PC began choosing it */
-    int rematch_want, rematch_track, rematch_fields;
-    int restart_accepted;        /* a retail menu action, never inferred from a phase */
-    double rematch_at;
     double end_done_at;
     double end_held_at;
 } on;
@@ -540,7 +533,8 @@ static void barrier(void)
         host_sleep_ms(10);
     }
     kernel_pace_slip(host_wall_seconds() - entered);  /* the lobby wait isn't game time to catch up */
-    on.nslots = lobby.nslots < 2 ? 2 : lobby.nslots > 4 ? 4 : lobby.nslots;
+    /* a room's race can have one rider (START NOW with only them ready): no other player then */
+    on.nslots = lobby.nslots < 1 ? 1 : lobby.nslots > 4 ? 4 : lobby.nslots;
     on.local_slot = lobby.local_slot;
     on.host_slot = 0;
     for (int i = 0; i < lobby.nslots; i++)
@@ -639,15 +633,6 @@ static void receive_frames(void)
         case EVENT_RESULTS:
             if (sender == on.host_slot) read_results(e, n - 2);
             break;
-        case EVENT_REMATCH:
-            if (sender == on.host_slot && sender != on.local_slot && n - 2 >= 4 && e[3] < 26 &&
-                !on.rematch_want && !on.restart_accepted) {
-                on.rematch_want = e[2] ? 2 : 1, on.rematch_track = e[3], on.rematch_fields = 0;
-                on.rematch_at = host_wall_seconds();
-                fprintf(stderr, "online: the host chose %s (track %d) at %.1f s\n", e[2] ? "NEW LEVEL" : "TRY AGAIN", e[3],
-                        on.rematch_at);
-            }
-            break;
         default:  /* EVENT_HIT */
             hle_puppet_event(sender, e, n - 2);
         }
@@ -694,8 +679,8 @@ static void exchange_rides(void)
         for (int i = 0; i < on.nslots; i++)
             if (!lobby.racer[i].left && !on.ride[i].have) missing++;
         if (!missing || !host_service_net_racing() || host_wall_seconds() - entered > 30) break;
-        title("Downhill Revived online - room %s - waiting for %d player%s' riders", on.code, missing,
-              missing == 1 ? "" : "s");
+        title("Downhill Revived online - room %s - waiting for %d player%s riders", on.code, missing,
+              missing == 1 ? "'s" : "s'");
         host_service_gs_pump_messages();
         host_sleep_ms(5);
     }
@@ -769,9 +754,9 @@ void hle_online_riders(void *game)
 
 /* At the countdown: every PC says it has loaded; when all have (at most 60 s), the host names a
    moment on the server's clock and every PC holds the countdown until then, so the GOs land
-   within a frame or two of each other on every PC. Both are said again every half second: after
-   a TRY AGAIN or NEW LEVEL the PC that loads first is here before the other has reset for the next
-   race (rematch_reset), which would drop a single message, and the start would wait 60 s.
+   within a frame or two of each other on every PC. Both are said again every half second: the PC
+   that loads first can be here before another has set up its race, which would drop a single
+   message, and the start would wait 60 s.
    One step a field (pads_begin_field): the game goes on drawing while it waits, its countdown held
    where it is (hle_online_countdown_hold) and the wait on the screen (hle_online_hud). A PC that
    skipped the flight over the track waits so for one still watching it. The step whose field the
@@ -826,7 +811,7 @@ static int start_step(void)
     }
     on.start_missing = 0;
     kernel_pace_shared(1);  /* from the agreed moment the fields keep to it */
-    hle_puppet_rematch();  /* snapshots from before this start (of the race before, after a rematch) */
+    hle_puppet_start();  /* snapshots from before this start */
     fprintf(stderr, "online: countdown starts (waited %.3f s, %+.1f ms from the agreed moment)\n",
             host_wall_seconds() - on.start_entered, on.go_at ? host_service_net_server_ms() - on.go_at : 0.0);
     return 1;
@@ -845,9 +830,88 @@ extern char D_004F3570[];  /* the fonts: 0x20 bytes each (menu_page.c) */
 void func_0020F588(int view, int unused, int r, int g, int b, int a);
 void func_0020FB80(int font, int x, int y, int width, int height);
 void func_0020F9F0(int font, int view, int x, int y, const char *text);
+/* Out of the race without the player (finished, TIME UP, the host ended it): as START does
+   (func_001B4900: the race loop ends with 2 and the race screen opens its pause menu), whose
+   builder then leaves the race screen at once as QUIT's Yes does (port_online_pause_rows). While
+   the race loop runs, after a finish too, no menu opens: func_0015E0C0 alone or a pushed menu
+   does nothing there. Paused already, the menu opens again when the player resumes. */
+static int quit_on_pause;
+static void leave_race(void)
+{
+    quit_on_pause = 1;
+    EE32(0x3F52D0 + 0x130) = 0;  /* the pad that paused (D_003F52D0.x130): this PC's */
+    func_001B45F8(EE_PTR(0x4B1F40), 2, 0);
+}
+
+/* A race started outside a room (DHD_NET_CREATE / DHD_NET_JOIN, the tests' races): the host
+   publishes the order once every human has finished or left, or this long after the first. */
+enum { RESULTS_WAIT = 60 };
+
+static void hud_text(int view, int y, int size, int r, int g, int b, const char *text)
+{
+    char saved[0x20];
+    memcpy(saved, D_004F3570, sizeof saved);
+    func_0020F588(view, 0, r, g, b, 128);
+    func_0020FB80(0, 256 * size, 192 * size, -91 * size, -32 * size);
+    func_0020F9F0(0, view, 256, y, text);
+    memcpy(D_004F3570, saved, sizeof saved);
+}
+
+/* This PC's member of the room, or NULL. */
+static const NetMember *self_member(const NetLobby *l)
+{
+    for (int i = 0; i < l->nmembers; i++)
+        if (l->member[i].id == l->member_id) return &l->member[i];
+    return NULL;
+}
+
+/* A room's race over each view's HUD while this PC's rider rides (finding 118): from the first
+   human finish, who finished and the room's finish window counting down (the server's
+   finishEndsAt), its last 10 s large; then why this PC's race ends (on.leave_reason). */
+static void race_banner(int view)
+{
+    if (!on.started || !from_menu) return;
+    if (on.leave_reason) {
+        hud_text(view, 96, 2, 128, 40, 40, on.leave_reason);
+        return;
+    }
+    if (FINISHED(0)) return;
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    int finished = 0, first = -1;
+    for (int i = 0; i < lobby.nmembers; i++) {
+        const NetMember *m = &lobby.member[i];
+        if (strcmp(m->race_state, "finished")) continue;
+        finished++;
+        if (first < 0 || m->finish_ticks < lobby.member[first].finish_ticks) first = i;
+    }
+    if (!finished) return;
+    char text[64], who[32];
+    if (finished > 1) snprintf(who, sizeof who, "%d FINISHED", finished);
+    else snprintf(who, sizeof who, "%.12s FINISHED", lobby.member[first].name);
+    for (char *c = who; *c; c++) *c = toupper((unsigned char)*c);
+    if (!lobby.finish_ends_at) {
+        snprintf(text, sizeof text, "%s - NO TIME LIMIT", who);
+        hud_text(view, 40, 1, 128, 128, 128, text);
+        return;
+    }
+    double ms = lobby.finish_ends_at - host_service_net_server_ms();
+    int left = ms > 0 ? (int)((ms + 999) / 1000) : 0;
+    if (left <= 0) {
+        hud_text(view, 96, 2, 128, 40, 40, "TIME UP - DNF");
+        return;
+    }
+    snprintf(text, sizeof text, "%s - RACE ENDS IN %d:%02d", who, left / 60, left % 60);
+    hud_text(view, 40, 1, 128, 128, 128, text);
+    if (left <= 10) {
+        snprintf(text, sizeof text, "%d", left);
+        hud_text(view, 96, 3, 128, 110, 40, text);
+    }
+}
 
 void hle_online_hud(int view)
 {
+    if (online_mode()) race_banner(view);
     if (!online_mode() || on.started || !on.start_entered || !on.start_missing) return;
     char text[64], name[32];
     if (on.start_missing > 1) snprintf(text, sizeof text, "WAITING FOR THE OTHERS...");
@@ -946,6 +1010,8 @@ static void finish_step(void)
                 send_event(e, sizeof e);
                 on.reported[global] = 1;
                 read_finish(global, FINISH_TIME(slot));
+                /* this PC's own rider, in a room: its time and place for the room's results */
+                if (slot == 0 && from_menu) host_service_net_finish((uint32_t)FINISH_TIME(0), PLACE(0));
             }
         } else if (on.finish[global] >= 0) {
             if (FINISHED(slot)) FINISH_TIME(slot) = on.finish[global];
@@ -958,7 +1024,7 @@ static void finish_step(void)
     int waiting = 0;
     for (int j = 0; j < on.nslots; j++)
         if (on.finish[j] < 0 && !lobby.racer[j].left && !on.gone[j]) waiting++;
-    if (waiting && host_wall_seconds() - on.first_finish < 90) return;
+    if (waiting && host_wall_seconds() - on.first_finish < RESULTS_WAIT) return;
     /* the order: the finished by time, then the others by the game's places */
     uint8_t e[3 + 5 * NRIDERS] = {EVENT_VERSION, EVENT_RESULTS, (uint8_t)riders};
     int order[NRIDERS];
@@ -1007,7 +1073,7 @@ static void state_sync(void)
     uint8_t payload[NET_FRAME_MAX - 2];
     int n, clock = RACE_CLOCK;
     receive_frames();
-    if (EE32(MENU) != LOAD_MENU || on.restart_accepted) return;
+    if (EE32(MENU) != LOAD_MENU) return;
     if (race_running() && !on.go_sent) {  /* GO: when it was, on the server's clock */
         uint8_t e[10] = {EVENT_VERSION, EVENT_GO};
         on.go_server = host_service_net_server_ms() - port_field_seconds(clock) * 1000;
@@ -1020,7 +1086,28 @@ static void state_sync(void)
     static int checked;
     if (++checked % 15 == 0) check_left();
     finish_step();
-    if (on.end_held && !on.end_done &&
+    if (from_menu && !on.end_done) {
+        /* A room's race: this PC goes back to the room a moment after its rider finished, or 2 s
+           after the server took it out of the race with its rider still riding (the finish window
+           closed: TIME UP; or the host ended the race), as from BACK TO THE ROOM. */
+        double now = host_wall_seconds();
+        NetLobby lobby;
+        host_service_net_get_lobby(GADDR(&lobby));
+        const NetMember *me = self_member(&lobby);
+        int out = lobby.state != NET_RACING || !me || !me->in_race;
+        if (!on.leave_at && on.end_held && now - on.end_held_at > 3) {
+            fprintf(stderr, "online: finished: back to the room\n");
+            on.leave_at = now;
+        } else if (!on.leave_at && out && !FINISHED(0)) {
+            on.leave_reason = lobby.last_race_id != on.last_race_id ? "TIME UP - DNF" : "THE HOST ENDED THE RACE";
+            fprintf(stderr, "online: %s: back to the room\n", on.leave_reason);
+            on.leave_at = now + 2;
+        }
+        if (on.leave_at && now >= on.leave_at) {
+            on.end_done = 1, on.end_done_at = now;
+            leave_race();
+        }
+    } else if (on.end_held && !on.end_done &&
         (on.have_results || host_wall_seconds() - on.end_held_at > 120)) {
         func_001B45F8(EE_PTR(0x4B1F40), 1, 4 * 60);  /* the results screen in 4 s */
         on.end_done = 1;
@@ -1214,187 +1301,8 @@ static void cheats_start(void)
     *smack = 0;
 }
 
-/* ---- the next race in the same room ---- */
-
-/* Someone else still in the race, so the host's next race is theirs too. */
-static int others_here(void)
-{
-    NetLobby lobby;
-    host_service_net_get_lobby(GADDR(&lobby));
-    if (!host_service_net_racing()) return 0;
-    for (int j = 0; j < lobby.nslots && j < NET_MAX_SLOTS; j++)
-        if (j != on.local_slot && !lobby.racer[j].left && !on.gone[j]) return 1;
-    return 0;
-}
-
-/* The host's TRY AGAIN or NEW LEVEL after the results: the game starts the next race on the race
-   screen (race phase back to the countdown, or to the flight over a new track), on every PC. The
-   race's own online state starts again; the room, the players and their rides stay. The new start
-   is agreed again (start_step), and the puppets drop what they had (hle_puppet_rematch). */
-static int rematch_trace, rematch_menu, rematch_phase;
-static int rematches;  /* rematch_reset's so far (DHD_NET_HOST_NEXT's list) */
-static void rematch_reset(int track)
-{
-    fprintf(stderr, "online: the next race in room %s: track %d (at %.1f s)\n", on.code, track, host_wall_seconds());
-    on.started = on.go_sent = 0;
-    on.go_at = on.go_server = 0;
-    on.start_entered = on.start_said = 0;
-    on.start_announced = on.start_missing = 0;
-    memset(on.their_go, 0, sizeof on.their_go);
-    memset(on.loaded, 0, sizeof on.loaded);
-    on.last_sent = 0;
-    for (int i = 0; i < NRIDERS; i++) on.finish[i] = -1;
-    memset(on.reported, 0, sizeof on.reported);
-    on.nresults = on.have_results = 0;
-    on.first_finish = 0;
-    on.end_held = on.end_done = 0;
-    on.end_held_at = on.end_done_at = 0;
-    on.rematch_want = on.rematch_fields = on.restart_accepted = 0;
-    on.rematch_at = 0;
-    on.setup.track = track;
-    rematch_trace = 1;
-    rematch_menu = rematch_phase = -1;
-    rematches++;
-    kernel_pace_shared(0);
-    hle_puppet_rematch();
-}
-
-/* Called only when retail accepts TRY AGAIN / RE-START or a level selection.
-   Announce before the loader yields; phase 1 -> 1 is a valid countdown restart.
-   The initial level selection and the flyby's skip never announce a restart. */
-void hle_online_restart(void)
-{
-    if (!online_mode() || !on.started || EE32(MENU) != LOAD_MENU || on.restart_accepted) return;
-    if (on.rematch_want == 2) {
-        RaceSetup s = {on.rematch_track, {-1, -1, -1, -1}};
-        write_setup(&s);  /* the level list has just written its own cursor's track */
-    }
-    /* Test only: exercise a specific destination after the host selects NEW LEVEL. */
-    if (on.local_slot == on.host_slot && getenv("DHD_NET_TEST_NEXT_TRACK")) {
-        RaceSetup s = {atoi(getenv("DHD_NET_TEST_NEXT_TRACK")), {-1, -1, -1, -1}};
-        write_setup(&s);
-    }
-    on.restart_accepted = 1;
-    on.rematch_want = on.rematch_fields = 0;
-    on.rematch_at = 0;
-    if (on.local_slot == on.host_slot && others_here()) {
-        int track = EE32(SETUP + 0x2A0);
-        uint8_t e[4] = {EVENT_VERSION, EVENT_REMATCH, (uint8_t)(track != on.setup.track), (uint8_t)track};
-        send_event(e, sizeof e);
-        fprintf(stderr, "online: accepted %s for everyone (track %d) at %.1f s\n",
-                track != on.setup.track ? "NEW LEVEL" : "RE-START", track, host_wall_seconds());
-    }
-}
-
-/* Retail's race initialization has actually run. A phase observation can miss
-   a same-phase restart, and GO/results flags describe the previous race. */
-void hle_online_restart_ready(void)
-{
-    if (online_mode() && on.restart_accepted) rematch_reset(EE32(SETUP + 0x2A0));
-}
-
-/* Count fields once, independently of pad reads (above 60 a field has several frames, so whole
-   fields: port_whole_step). A stale request, a closed room, or an unrecognised menu must release
-   the controller instead of pressing forever. */
-static int rematch_step(void)
-{
-    if (!on.rematch_want) return 0;
-    on.rematch_fields += port_fps_high() ? port_whole_step() : 1;
-    if (!others_here() || on.rematch_fields > 1800 || host_wall_seconds() - on.rematch_at > 30) {
-        fprintf(stderr, "online: stopped following the host's stale restart request (at %.1f s, %d fields, menu %08X)\n",
-                host_wall_seconds(), on.rematch_fields, EE32(OPEN_MENU));
-        on.rematch_want = on.rematch_fields = 0;
-        on.rematch_at = 0;
-        return 1;
-    }
-    return 0;
-}
-
-static int menu_open(int menu);
-
-/* Results stay under the host's control. Read the real row and submenu instead
-   of repeating DOWN/X on a timer, which can drift into SAVE or QUIT after a fade. */
-static int rematch_pad(HostPad *out)
-{
-    static uint16_t press;
-    if (on.local_slot == on.host_slot || !on.end_done || !others_here()) return 0;
-    neutral(out);
-    if (!on.rematch_want || on.restart_accepted || host_wall_seconds() - on.end_done_at < 6) return 1;
-    /* 11: no press before the first whole field (above 60 that takes a few frames) */
-    int f = on.rematch_fields > 0 ? (on.rematch_fields - 1) % 12 : 11, row = on.rematch_want == 1 ? 0 : 1;
-    if (f == 0) {
-        if (menu_open(RESULTS_MENU))
-            press = EE32(RESULTS_MENU) < row ? PAD_DOWN : EE32(RESULTS_MENU) > row ? PAD_UP : PAD_CROSS;
-        else if (menu_open(LEVEL_LIST)) press = PAD_CROSS;
-        else press = PAD_TRIANGLE;
-    }
-    if (f < 4) out->buttons = press;
-    return 1;
-}
-
-static int menu_open(int menu)
-{
-    return EE32(RIDING) == 0 && EE32(OPEN_MENU) == (int32_t)(uintptr_t)EE_PTR(menu);
-}
-
-/* The host's RE-START or NEW LEVEL from the pause menu during the race: a guest's pause menu makes
-   the same choice (START, the row, X; "Yes" on RE-START's question; X on the level list, whose
-   track is the host's, pads_begin_field). Every 12 fields one press of 4, chosen from what is on
-   the screen then; another menu (options, the quit question) goes back. 1: out is this field's pad. */
-static int follow_pad(HostPad *out)
-{
-    static uint16_t press;
-    if (on.local_slot == on.host_slot || on.end_done || !on.rematch_want || on.restart_accepted || !others_here()) return 0;
-    neutral(out);
-    int f = on.rematch_fields > 0 ? (on.rematch_fields - 1) % 12 : 11, row = on.rematch_want == 1 ? PAUSE_RESTART : PAUSE_NEW_LEVEL;
-    if (f == 0) {
-        if (EE32(RIDING)) press = PAD_START;
-        else if (menu_open(PAUSE_MENU)) press = EE32(PAUSE_MENU) < row ? PAD_DOWN : EE32(PAUSE_MENU) > row ? PAD_UP : PAD_CROSS;
-        else if (menu_open(RESTART_ASK)) press = EE32(RESTART_ASK) ? PAD_CROSS : PAD_DOWN;
-        else if (menu_open(LEVEL_LIST)) press = PAD_CROSS;
-        else press = PAD_TRIANGLE;
-    }
-    if (f < 4) out->buttons = press;
-    return 1;
-}
-
-/* DHD_NET_HOST_NEXT (tests, online_race.py --next): the host's own choice on the results menu,
-   pressed as a player would: "again" TRY AGAIN, "new" NEW LEVEL and another track on the level
-   list (DOWN, else RIGHT, until the cursor moves); a list ("new,new,again") one race after
-   another, its last for the rest. One press of 0.08 s every 0.25 s of wall time,
-   chosen from what is on the screen then. */
-static int host_next_pad(HostPad *out)
-{
-    static HleEnv env;
-    static uint16_t press;
-    static long period = -1;
-    static int moved, first;
-    const char *next = hle_env(&env, "DHD_NET_HOST_NEXT");
-    if (!next || on.local_slot != on.host_slot || !on.end_done || on.restart_accepted ||
-        host_wall_seconds() - on.end_done_at < 8) return 0;
-    neutral(out);
-    double t = host_wall_seconds();
-    const char *pick = next;
-    for (int k = 0; k < rematches && strchr(pick, ','); k++) pick = strchr(pick, ',') + 1;
-    int row = strncmp(pick, "again", 5) ? 1 : 0;
-    if ((long)(t / 0.25) != period) {
-        period = (long)(t / 0.25);
-        if (menu_open(RESULTS_MENU))
-            press = EE32(RESULTS_MENU) < row ? PAD_DOWN : EE32(RESULTS_MENU) > row ? PAD_UP : PAD_CROSS, moved = 0;
-        else if (menu_open(LEVEL_LIST)) {
-            if (!moved) first = EE32(LEVEL_LIST);
-            press = EE32(LEVEL_LIST) != first || moved >= 8 ? PAD_CROSS : moved < 4 ? PAD_DOWN : PAD_RIGHT;
-            fprintf(stderr, "online: test: level list cursor %d, press %04X\n", EE32(LEVEL_LIST), press);
-            moved++;
-        } else press = 0;
-    }
-    if (t - period * 0.25 < 0.08) out->buttons = press;
-    return 1;
-}
-
 /* DHD_NET_TEST_SKIP=seconds (tests): START that long into each flight over the track (race phase
-   5) still on the screen, as a player skipping it would (the first race's is skipped by the menu
-   script at once; after a TRY AGAIN or NEW LEVEL it is the player's). One press of 0.08 s. */
+   5) still on the screen, as a player skipping it would. One press of 0.08 s. */
 static int test_skip_pad(HostPad *out)
 {
     static HleEnv env;
@@ -1411,23 +1319,12 @@ static int test_skip_pad(HostPad *out)
     return 1;
 }
 
-/* A guest with others in the room can't start the race again alone (the others ride on in the old
-   one): X on the pause menu's NEW LEVEL and RE-START does nothing. The host's choice is everyone's. */
-static void guest_pad(HostPad *out)
-{
-    if (on.local_slot == on.host_slot || !others_here() || !menu_open(PAUSE_MENU)) return;
-    if (EE32(PAUSE_MENU) == PAUSE_NEW_LEVEL || EE32(PAUSE_MENU) == PAUSE_RESTART) out->buttons &= ~PAD_CROSS;
-}
-
-/* Leaving the race screen (QUIT), or giving up an unreachable host restart,
-   returns this PC to offline control. Restore the previous script and seed so
-   the online boot script cannot swallow title-menu input. Accepted restarts
-   stay in the room and use rematch_reset instead. */
+/* Leaving the race screen and the room returns this PC to offline control. Restore the previous
+   script and seed so the online boot script cannot swallow title-menu input. */
 static int connected;
 static void race_over(void)
 {
     fprintf(stderr, "online: the race is over; back to offline play\n");
-    rematch_trace = 0;
     host_service_net_leave();
     hle_puppet_offline();
     port_online_relock();
@@ -1438,6 +1335,118 @@ static void race_over(void)
     online = 0, from_menu = 0, connected = 0;
     selected_ride = 0;
     host_service_gs_window_title(GADDR("Downhill Revived"));
+}
+
+/* ---- between races: the room again (finding 118) ----
+   A race started from the ONLINE menu's room ends for this PC when it leaves the race screen (its
+   finish, BACK TO THE ROOM, or END THE RACE): the race's state goes as race_over's does, but the
+   connection and the online unlocks stay, and the shell opens the room again over the rider screen
+   (online_menu.c port_online_back_to_room). LEAVE THE ROOM leaves as QUIT did (race_over). */
+void port_online_back_to_room(void);
+static int leaving_room;  /* LEAVE THE ROOM chosen: off the race screen, out of the room too */
+
+static void back_to_room(void)
+{
+    fprintf(stderr, "online: this PC's race is over; back to the room\n");
+    host_service_net_back();  /* out of the race: unless it finished, DNF (gave up) */
+    hle_puppet_offline();
+    kernel_pace_shared(0);
+    set_env("DHD_NAV", saved_nav);
+    set_env("DHD_RACE_SEED", saved_seed);
+    memset(&on, 0, sizeof on);
+    online = 0, from_menu = 0, connected = 0;
+    selected_ride = 0;
+    host_service_gs_window_title(GADDR("Downhill Revived"));
+    port_online_back_to_room();
+}
+
+static void race_left(void)
+{
+    int leave = leaving_room || !from_menu;
+    leaving_room = 0;
+    quit_on_pause = 0;  /* left by the player's own row first: not the next race's first pause */
+    if (leave) race_over();
+    else back_to_room();
+}
+
+/* The race's pause menu in a room (patched func_0015E238 / func_0015E448): RESUME, BACK TO THE
+   ROOM, END THE RACE (the host's), OPTIONS, LEAVE THE ROOM. The game's ids for RESUME (0x19) and
+   OPTIONS (0x48) keep their own accept; the room's rows are strings, accepted here by index. Each
+   of the room's rows asks first in the game's own quit question (D_00387F90: No / Yes, patched
+   func_0015DE40 / func_0015DED0), whose Yes leaves the race screen as QUIT's does. */
+enum { PAUSE_RESUME, PAUSE_ROOM, PAUSE_END, PAUSE_OPTIONS, PAUSE_LEAVE, PAUSE_KINDS };
+static unsigned char pause_kind[16];
+static int pause_count, pause_asked;  /* pause_asked: the row the question asks about */
+extern char D_0029DE68[], D_003F52D0[], D_00387F90[];
+void func_00190660(void *manager, void *screen);  /* open a popup over the others */
+void func_0018E3A8(void *menu, int id, void *table, int enabled);
+void func_0018E408(void *menu, const char *text, int enabled);
+
+static void pause_row(void *menu, int kind)
+{
+    static const char *const text[PAUSE_KINDS] = {NULL, "BACK TO THE ROOM", "END THE RACE", NULL, "LEAVE THE ROOM"};
+    if (pause_count >= (int)sizeof pause_kind) return;
+    pause_kind[pause_count++] = (unsigned char)kind;
+    if (kind == PAUSE_RESUME) func_0018E3A8(menu, 0x19, D_0029DE68, 1);
+    else if (kind == PAUSE_OPTIONS) func_0018E3A8(menu, 0x48, D_0029DE68, 1);
+    else func_0018E408(menu, text[kind], 1);
+}
+
+void func_0015E0C0(void);  /* QUIT's Yes (D_00388E90's builder): leave the race screen */
+
+int port_online_pause_rows(void *menu)
+{
+    pause_count = pause_asked = 0;
+    if (!online_mode() || !from_menu) return 0;
+    if (quit_on_pause) {  /* leave_race: no rows, out at once */
+        quit_on_pause = 0;
+        func_0015E0C0();
+        return 1;
+    }
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    pause_row(menu, PAUSE_RESUME);
+    pause_row(menu, PAUSE_ROOM);
+    if (lobby.is_host) pause_row(menu, PAUSE_END);
+    pause_row(menu, PAUSE_OPTIONS);
+    pause_row(menu, PAUSE_LEAVE);
+    return 1;
+}
+
+int port_online_pause_accept(int index)
+{
+    if (!pause_count || index < 0 || index >= pause_count) return 0;
+    int kind = pause_kind[index];
+    if (kind == PAUSE_RESUME || kind == PAUSE_OPTIONS) return 0;  /* the game's own */
+    pause_asked = kind;
+    func_00190660(D_003F52D0, D_00387F90);
+    return 1;
+}
+
+/* The quit question's title and the line under it (MenuItem, include/menu.h) for the asked row. */
+typedef struct { short x, y, id; char enabled, placed; const char *string; void *table; } MenuText;
+
+void port_online_question(void *menu)
+{
+    if (!pause_asked) return;
+    MenuText *title = (MenuText *)((char *)menu + 0x438), *line = (MenuText *)((char *)menu + 0x448);
+    const char *ask = pause_asked == PAUSE_END ? "END THE RACE FOR EVERYONE?"
+                    : pause_asked == PAUSE_LEAVE ? "LEAVE THE ROOM?" : "BACK TO THE ROOM?";
+    const char *why = pause_asked == PAUSE_END ? "NO RESULTS FROM THIS RACE WILL COUNT"
+                    : pause_asked == PAUSE_LEAVE ? "YOU LEAVE THE ROOM AND THIS RACE"
+                    : FINISHED(0) ? "THE OTHERS ARE STILL RACING" : "YOU WON'T FINISH THIS RACE (DNF)";
+    title->id = 1, title->string = ask, title->table = D_0029DE68;
+    line->id = 1, line->string = why, line->table = D_0029DE68;
+}
+
+void port_online_question_yes(void)
+{
+    if (!pause_asked) return;
+    fprintf(stderr, "online: pause menu: %s\n", pause_asked == PAUSE_ROOM ? "back to the room"
+            : pause_asked == PAUSE_END ? "the host ends the race" : "leave the room");
+    if (pause_asked == PAUSE_END) host_service_net_end_race();
+    if (pause_asked == PAUSE_LEAVE) leaving_room = 1;
+    pause_asked = 0;
 }
 
 void pads_begin_field(void)
@@ -1479,24 +1488,20 @@ void pads_begin_field(void)
         }
         exchange_rides();
         on.setup_done = 1;
-    }
-    if (rematch_trace && (rematch_menu != EE32(MENU) || rematch_phase != EE32(PHASE))) {
-        rematch_menu = EE32(MENU), rematch_phase = EE32(PHASE);
-        fprintf(stderr, "online: rematch transition menu %d phase %d at %.1f s\n",
-                rematch_menu, rematch_phase, host_wall_seconds());
+        /* the room's last race now, before loading: a race that closes later (TIME UP) changes
+           it, a voided one (the host ended it) doesn't. Not at GO: a late GO can come after. */
+        NetLobby lobby;
+        host_service_net_get_lobby(GADDR(&lobby));
+        on.last_race_id = lobby.last_race_id;
     }
     if (!on.started && on.setup_done && EE32(MENU) == LOAD_MENU && EE32(PHASE) == 1) {
-        if (start_step()) rematch_trace = 0, on.started = 1, cheats_start();
+        if (start_step()) {
+            on.started = 1;
+            cheats_start();
+        }
     }
     if (on.started) state_sync();
-    /* the host's new level, in the setup block once this PC is in its menus (not mid-race) */
-    if (on.rematch_want == 2 && EE32(SETUP + 0x2A0) != on.rematch_track &&
-        (EE32(RIDING) == 0 || EE32(PHASE) < 2 || EE32(PHASE) == FLYBY_PHASE)) {
-        RaceSetup s = {on.rematch_track, {-1, -1, -1, -1}};
-        write_setup(&s);
-    }
-    if (rematch_step()) { race_over(); return; }
-    if (on.started && EE32(MENU) != LOAD_MENU) race_over();
+    if (on.started && EE32(MENU) != LOAD_MENU) race_left();
 }
 
 /* Online: the menu script, then in the race this PC's controller (DHD_NET_SCRIPTED=1, tests:
@@ -1509,11 +1514,10 @@ void pads_read(int player, HostPad *out)
         /* Once setup has been exchanged, the flyby and its skip prompt belong to the
            player too. The boot script may already be spent after an earlier race. */
         int race = EE32(MENU) == LOAD_MENU && on.setup_done;
-        if (player == 0 && race && (rematch_pad(out) || follow_pad(out) || host_next_pad(out) || test_skip_pad(out))) {
+        if (player == 0 && race && test_skip_pad(out)) {
         } else if (player == 0 && race && !hle_env(&scripted_env, "DHD_NET_SCRIPTED")) {
             host_service_host_pad_device(0, GADDR(out));
             menu_mouse_merge(0, out);  /* the pause menu by mouse, under the same rules */
-            guest_pad(out);
             /* no pause while the countdown waits for the others: it would hold this PC's GO */
             if (hle_online_countdown_hold(EE32(PHASE))) out->buttons &= ~PAD_START;
         }

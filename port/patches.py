@@ -628,6 +628,8 @@ import patches_fps
 patches_fps.add(PATCHES)
 import patches_unlock  # PC SETTINGS Unlock All: the unlock readers (finding 095)
 patches_unlock.add(PATCHES)
+import patches_online_flow  # the race's pause menu in an online room (finding 118)
+patches_online_flow.add(PATCHES)
 
 # Online's retail preview flow (finding 065). These hooks return immediately offline.
 _ONLINE_SELECT_BEGIN = r"""
@@ -769,25 +771,6 @@ PATCHES['unsorted/001EB1D8.cpp'] += [
         ('void func_001F5398__c27(int style,int group,int color,int x,int y,void *text,int target)', 0, 'style', 'text'),
         ('void func_001F5D08__c33(int style,int group,int color,int x,int y,void *text,int target)', 1, 'style', 'text'),
         ('void func_001F5EE8__c34(int index,int row,int col,int x,int y,int z,int target)', 2, 'index', '(unsigned long)(unsigned)z'))
-]
-
-# Online restart lifecycle: hooks at accepted retail actions and actual race initialization.
-# Offline these helpers return without touching EE state.
-PATCHES['unsorted/0015C990.c'] = PATCHES.get('unsorted/0015C990.c', []) + [
-    ('text', 'void func_0015C990(void) {',
-     'extern void hle_online_restart(void);\nvoid func_0015C990(void) {\n    hle_online_restart();'),
-]
-PATCHES['unsorted/0015CC90.c'] = PATCHES.get('unsorted/0015CC90.c', []) + [
-    ('text', 'void func_0015CC90(struct Obj *obj, int wanted) {',
-     'extern void hle_online_restart(void);\nvoid func_0015CC90(struct Obj *obj, int wanted) {'),
-    ('text', '        D_004B25A0.x2a0 = selected;',
-     '        D_004B25A0.x2a0 = selected;\n        hle_online_restart();\n        selected = D_004B25A0.x2a0;'),
-]
-PATCHES['unsorted/0019EA38.c'] = PATCHES.get('unsorted/0019EA38.c', []) + [
-    ('text', 'void func_0019EA38(Obj *obj,int reset,int mode) {',
-     'extern void hle_online_restart_ready(void);\nvoid func_0019EA38(Obj *obj,int reset,int mode) {'),
-    ('text', 'func_00176E40(manager->x150,0); }\n}',
-     'func_00176E40(manager->x150,0); }\n hle_online_restart_ready();\n}'),
 ]
 
 # Online, the countdown's timer holds until every PC may start (port/hle/online.c, start_step), the

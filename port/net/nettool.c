@@ -46,7 +46,7 @@ static int racing(const NetLobby *l) { return l->state == NET_RACING; }
    without a game. It says it has loaded and what it rides, takes the race's GO from the first
    game's GO event, then sends the snapshots a game recorded (DHD_NET_RECORD) as its own rider when
    the race time reaches each one's (ms, finding 114), and its finish when they run out. */
-enum { EVENT_VERSION = 2, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_GO = 5, EVENT_FINISH = 6, EVENT_RESULTS = 7 };
+enum { EVENT_VERSION = 2, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_START = 4, EVENT_GO = 5, EVENT_FINISH = 6, EVENT_RESULTS = 7 };
 
 static void put32(uint8_t *o, int32_t v) { memcpy(o, &v, 4); }
 
@@ -166,8 +166,9 @@ int main(int argc, char **argv)
     else net_pick(-1, pick > 0 ? pick : replay_file ? rider + 1 : l.member_id % 8, 1);
     if (races > 0) {
         char phase[16] = "";
-        double phase_at = net_seconds(), race_at = 0;
-        int acted = 0, readied = 0, started_count = 0, was_racing = 0;
+        double phase_at = net_seconds(), race_at = 0, loaded_at = 0;
+        int acted = 0, readied = 0, started_count = 0, was_racing = 0, others_loaded = 0, n;
+        double go_at = 0;  /* as the room's host: the countdown's start it announced (online.c start_step) */
         until = net_seconds() + seconds;
         if (l.is_host) net_rules(60, 0, 1);
         while (net_seconds() < until) {
@@ -182,9 +183,28 @@ int main(int argc, char **argv)
             }
             if (l.state == NET_RACING && !was_racing) {
                 started_count++; race_at = l.start_at > now ? l.start_at : now; acted = 0; readied = 0;
+                others_loaded = 0, go_at = 0;
                 printf("RACE %d slot %d\n", started_count, l.local_slot);
+                /* its rider and bike, as replay() says them: the games' setup needn't wait 30 s for this one */
+                uint8_t e[30] = {EVENT_VERSION, EVENT_SETUP};
+                put32(e + 2, 0x20 * (rider + 1)), put32(e + 6, rider), put32(e + 18, 8), put32(e + 22, 3);
+                net_send_frame(NET_FRAME_EVENT, e, sizeof e);
             }
             was_racing = l.state == NET_RACING;
+            if (l.state == NET_RACING && !acted && now - loaded_at >= 0.5) {
+                /* "loaded", as a game says it until GO: the games' start needn't wait 60 s for this one */
+                uint8_t e[2] = {EVENT_VERSION, EVENT_LOADED};
+                net_send_frame(NET_FRAME_EVENT, e, 2);
+                loaded_at = now;
+                /* the host's start, as a host game's start_step says it once the others loaded: a
+                   guest game's countdown needn't wait 75 s for this one */
+                if (l.is_host && others_loaded) {
+                    uint8_t s[10] = {EVENT_VERSION, EVENT_START};
+                    if (!go_at) go_at = net_server_ms() + 1500;
+                    memcpy(s + 2, &go_at, 8);
+                    net_send_frame(NET_FRAME_EVENT, s, sizeof s);
+                }
+            }
             if (l.state == NET_RACING && !acted &&
                 ((finish_after >= 0 && now - race_at >= finish_after) ||
                  (back_after >= 0 && now - race_at >= back_after))) {
@@ -196,7 +216,10 @@ int main(int argc, char **argv)
                 (l.last_race_id > 0 || l.nmembers >= players_wanted) && now - phase_at >= ready_after) {
                 net_set_ready(1); readied = 1;
             }
-            while (net_receive_frame(frame, sizeof frame) > 0) received++;
+            while ((n = net_receive_frame(frame, sizeof frame)) > 0) {
+                received++;
+                if (frame[0] == NET_FRAME_EVENT && n >= 4 && frame[2] == EVENT_VERSION && frame[3] == EVENT_LOADED) others_loaded = 1;
+            }
             Sleep(10);
         }
         printf("RESULT {\"races\":%d,\"received\":%d}\n", started_count, received);

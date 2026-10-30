@@ -377,9 +377,9 @@ void hle_puppet_online(int local, int nslots, int host)
     fprintf(stderr, "\n");
 }
 
-/* The next online race in the same room (online.c rematch_reset), and again at its start: what the
-   puppets had is of the race before (its clock started again). */
-void hle_puppet_rematch(void)
+/* An online race's start (online.c start_step): what the puppets had is from before it (its clock
+   starts now). */
+void hle_puppet_start(void)
 {
     for (int i = 1; i < NRIDERS; i++) {
         Puppet *p = &pp.p[i];
