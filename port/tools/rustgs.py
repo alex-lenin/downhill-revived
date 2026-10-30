@@ -679,8 +679,10 @@ def common(triple, profile):
             triple, ' and '.join(TARGETS)))
     if profile not in PROFILES:
         refuse('--profile %s: one of %s' % (profile, ', '.join(PROFILES)))
-    if os.path.splitdrive(str(ROOT))[0].upper() == 'C:':
-        refuse('the worktree %s is on C:' % ROOT)
+    # A C: worktree is safe when its build folder is junctioned to the work drive.
+    # Cargo's own target/cache locations are checked separately.
+    if os.path.splitdrive(str(ROOT))[0].upper() == 'C:' and (ROOT / 'build').resolve().drive.upper() == 'C:':
+        refuse('the worktree %s needs its build folder off C: (a junction is fine)' % ROOT)
     return cargo_env(triple)
 
 
