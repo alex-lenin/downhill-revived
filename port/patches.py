@@ -332,6 +332,13 @@ PATCHES = {
         ('text', 'void func_00155E78(Obj *self,int kind) {',
          'extern "C" int hle_puppet_crash(char *);\nvoid func_00155E78(Obj *self,int kind) {'),
         ('text', ' char *rider=self->x0;\n', ' char *rider=self->x0;\n if(hle_puppet_crash(rider)) return;\n')],
+    # The bottle in hand (attack move at rider +0x5F40): its start (func_00153C70) takes a bottle
+    # only when the move's test, asked again there, picks the throw; the update then moves it to
+    # the hand. A puppet enters the attack state when its snapshot says so, after the press its
+    # pad showed is gone: no bottle, and the update wrote through NULL (guest 0x10, finding 121).
+    # A rider of this PC always has one there, so the check changes nothing for it.
+    'unsorted/00153A30.c': [
+        ('text', ' if(D_0029C658 && obj->x2c==-1) {', ' if(D_0029C658 && obj->x2c==-1 && obj->x28) {')],
     # Online (port/hle/online.c, finding 047): each PC's own rider starts where the host has that
     # player; the puppets wear their players' riders and bikes (set after the AI riders are
     # chosen); the race ends on the results of every PC, not 8 s after this PC's rider finished.
