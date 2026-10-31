@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 root = Path(__file__).resolve().parents[2]
 text = re.sub(r'/\*.*?\*/', '', (root / 'port/net/net.h').read_text(), flags=re.S)
+max_slots = int(re.search(r'NET_MAX_SLOTS\s*=\s*(\d+)', text).group(1))
 types = {'int': c.c_int32, 'unsigned': c.c_uint32, 'long long': c.c_int64,
          'uint32_t': c.c_uint32, 'double': c.c_double, 'char': c.c_char, 'unsigned char': c.c_ubyte}
 layout = {}
@@ -21,7 +22,7 @@ for body, name in re.findall(r'typedef struct\s*{(.*?)}\s*(\w+);', text, flags=r
             m = re.fullmatch(r'\s*(\w+)(?:\[(\w+)\])?\s*', field)
             key, count = m.groups()
             t = types[typ]
-            if count: t = t * (8 if count == 'NET_MAX_SLOTS' else int(count))
+            if count: t = t * (max_slots if count == 'NET_MAX_SLOTS' else int(count))
             fields.append((key,t))
     cls = type(name,(c.Structure,),{'_fields_':fields})
     types[name] = cls

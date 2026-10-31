@@ -496,11 +496,13 @@ void client_rules(NetClient *c, int finish_window, int next_race, int then)
 
 void client_rotation(NetClient *c, const unsigned char *ids, int count)
 {
-    char text[320];
+    char text[768];
     int i, n;
     if (count < 0 || count > 64 || (count && !ids)) return;
     n = snprintf(text, sizeof text, "{\"type\":\"settings\",\"rotation\":[");
-    for (i = 0; i < count; i++) n += snprintf(text + n, sizeof text - n, "%s%u", i ? "," : "", ids[i]);
+    for (i = 0; i < count; i++) n += snprintf(text + n, sizeof text - n, "%s%u", i ? "," : "", ids[i] & 31);
+    n += snprintf(text + n, sizeof text - n, "],\"trackLimits\":[");
+    for (i = 0; i < count; i++) n += snprintf(text + n, sizeof text - n, "%s%u", i ? "," : "", 10 - 2 * (ids[i] >> 5));
     snprintf(text + n, sizeof text - n, "]}");
     SDL_LockMutex(c->lock);
     say(c, "%s", text);

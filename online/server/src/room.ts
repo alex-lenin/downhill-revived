@@ -67,6 +67,7 @@ interface RoomState {
   rules?: Rules;
   nextExplicit?: boolean;
   rotation?: number[];
+  trackLimits?: number[];
   grid?: number[];
   gridRules?: Rules;
   nextRaceAt?: number | null;
@@ -366,7 +367,8 @@ export class Room extends DurableObject<Env> {
 
   /** Usage stats: one Workers Analytics Engine point (dataset dhd_online; wrangler.jsonc STATS).
       Joins carry the release, the country and a hash of the name; races the player count, track
-      and laps. No addresses or names. A server without the binding keeps none. */
+      and laps; a join refused for a full room the member count and the limit. No addresses or names.
+      A server without the binding keeps none. */
   private stat(blobs: string[], doubles: number[]): void {
     try {
       this.env.STATS?.writeDataPoint({ indexes: [blobs[0]], blobs, doubles });
@@ -467,7 +469,11 @@ export class Room extends DurableObject<Env> {
         return this.refuse(ws, "version_mismatch", `The host runs "${st.version}", you run "${version}".`);
       if (iso !== st.isoSha256)
         return this.refuse(ws, "iso_mismatch", "Your game ISO does not match the host's.");
-      if (!ghost && st.members.length >= st.maxPlayers) return this.refuse(ws, "room_full", "The room is full.");
+      if (!ghost && st.members.length >= st.maxPlayers) {
+        // counted: how often players find a room full (are bigger rooms wanted?)
+        this.stat(["full", clientVersion, info.country ?? ""], [st.members.length, st.maxPlayers]);
+        return this.refuse(ws, "room_full", "The room is full.");
+      }
     } else {
       st.session = Array.isArray(m.features) && m.features.includes("session");
       if (st.session) { st.rules = {finishWindow: 60, nextRace: "host", then: "next"}; st.rotation = []; }
@@ -537,11 +543,18 @@ export class Room extends DurableObject<Env> {
       if (m.nextRace !== undefined && !["auto","host"].includes(m.nextRace as string)) return bad("nextRace");
       if (m.then !== undefined && !["same","next","random"].includes(m.then as string)) return bad("then");
       if (m.rotation !== undefined && (!Array.isArray(m.rotation) || m.rotation.length > 64 || !m.rotation.every(isByte))) return bad("rotation");
+      if (m.rotation !== undefined && (!Array.isArray(m.trackLimits) ||
+          m.trackLimits.length !== (m.rotation as number[]).length ||
+          !m.trackLimits.every(x => x === 6 || x === 8 || x === 10) ||
+          !m.trackLimits.includes(10))) return bad("trackLimits");
       if (m.finishWindow !== undefined) st.rules!.finishWindow = m.finishWindow as number;
       if (m.then !== undefined) st.rules!.then = m.then as Rules["then"];
       if (m.nextRace !== undefined) { st.rules!.nextRace = m.nextRace as Rules["nextRace"]; st.nextExplicit = true; }
       if (m.public !== undefined && !st.nextExplicit) st.rules!.nextRace = m.public ? "auto" : "host";
-      if (m.rotation !== undefined) st.rotation = m.rotation as number[];
+      if (m.rotation !== undefined) {
+        st.rotation = m.rotation as number[];
+        st.trackLimits = m.trackLimits as number[];
+      }
       if (m.track !== undefined && m.track !== st.track && st.nextRaceAt != null)
         st.nextRaceAt = Math.max(st.nextRaceAt, Date.now() + 15_000);
     }
@@ -726,10 +739,28 @@ export class Room extends DurableObject<Env> {
     } : {})};
   }
 
+  private trackLimit(st: RoomState, track: number): number {
+    return st.trackLimits?.[(st.rotation ?? []).indexOf(track)] ?? 10;
+  }
+
+  private fittingRotation(st: RoomState, count: number): number[] {
+    const rotation = st.rotation ?? [];
+    const at = rotation.indexOf(st.track);
+    const ordered = [...rotation.slice(at + 1), ...rotation.slice(0, at + 1)];
+    return ordered.filter(track => this.trackLimit(st, track) >= count);
+  }
+
   private lockGrid(st: RoomState): void {
     st.grid = st.members.filter(x => x.ready && !x.choosing).map(x => x.id);
     st.gridRules = {...st.rules!};
     st.nextRaceAt = null; st.waitingForRider = false; st.lastEvent = null;
+    if (this.trackLimit(st, st.track) < st.grid.length) {
+      const next = this.fittingRotation(st, st.grid.length)[0];
+      if (next !== undefined) {
+        st.lastEvent = `track_switch:${st.track}:${this.trackLimit(st, st.track)}:${next}`;
+        st.track = next;
+      }
+    }
     st.countdownEndsAt = Date.now() + this.countdownMs();
   }
 
@@ -753,12 +784,19 @@ export class Room extends DurableObject<Env> {
     if (!voided) {
       const entrants = [...race.results!].sort((a,b) => (a.ticks ?? Infinity) - (b.ticks ?? Infinity));
       let place = 0;
-      for (const r of entrants) r.place = Math.max(place + 1, r.place), place = r.place;
+      const limit = this.trackLimit(st, race.track);
+      for (let i = 0; i < entrants.length; i++) {
+        const r = entrants[i];
+        // Leave a distinct place for every remaining human, including DNFs. Reported
+        // places include computer riders, but may be stale while snapshots catch up.
+        r.place = Math.max(place + 1, Math.min(r.place, limit - (entrants.length - 1 - i)));
+        place = r.place;
+      }
       st.lastRace = {id: (st.raceId ?? 0) + 1, track:race.track, entrants};
       st.raceId = st.lastRace.id;
       // The rotation picks the next track unless the host already chose one during the race.
-      const rotation = st.track === race.track ? st.rotation ?? [] : [];
-      if (race.rules!.then === "next" && rotation.length) st.track = rotation[(rotation.indexOf(race.track)+1) % rotation.length];
+      const rotation = st.track === race.track ? this.fittingRotation(st, st.members.length) : [];
+      if (race.rules!.then === "next" && rotation.length) st.track = rotation[0];
       if (race.rules!.then === "random" && rotation.length) {
         const choices = rotation.filter(x => x !== race.track);
         st.track = choices.length ? choices[randomSeed() % choices.length] : rotation[0];
@@ -836,9 +874,9 @@ export class Room extends DurableObject<Env> {
         name: x.name,
         ready: x.ready,
         rider: x.rider,
-        bike: x.bike,
+        ...(x.bike ? {bike: x.bike} : {}),
         rttMs: this.rttOf(x.id),
-        choosing: x.choosing ?? false,
+        ...(x.choosing ? {choosing: true} : {}),
       })),
     };
   }

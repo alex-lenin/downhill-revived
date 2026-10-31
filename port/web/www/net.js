@@ -15,7 +15,7 @@ export function createNet({span, str}) {
     ws = new WebSocket(base + path); ws.binaryType = 'arraybuffer';
     const socket = ws;
     ws.onopen = () => {
-      send({type:'hello', protocol:1, version, clientVersion:version.match(/\d+\.\d+\.\d+/)?.[0] || '0.7.4',
+      send({type:'hello', protocol:2, version, clientVersion:version.match(/\d+\.\d+\.\d+/)?.[0] || '0.7.4',
         isoSha256:iso, name, features:['countdown','session']});
       timer = setInterval(() => send({type:'ping',t:now()}),1000);
     };
@@ -64,10 +64,10 @@ export function createNet({span, str}) {
       server_time:room.serverTime,waiting_for_rider:!!room.waitingForRider,rules_pending:!!room.rulesPending,
       finish_window:rules.finishWindow??60,next_race:rules.nextRace==='host',then:rules.then==='same'?0:rules.then==='random'?2:1,
       rotation_count:room.rotation?.length||0,last_race_id:room.lastRace?.id||0,last_race_track:room.lastRace?.track||0,nresults:results.length});
-    members.slice(0,8).forEach((m,i)=>write('NetMember',a+layout.NetLobby.member[0]+i*layout.NetMember.size,
+    members.slice(0,10).forEach((m,i)=>write('NetMember',a+layout.NetLobby.member[0]+i*layout.NetMember.size,
       {...m,rtt_ms:m.rttMs??-1,in_race:!!m.inRace,race_state:m.raceState||'',dnf_reason:m.dnfReason||'',finish_ticks:BigInt(m.finishTicks??-1)}));
-    (start.players||[]).slice(0,8).forEach((m,i)=>write('NetRacer',a+layout.NetLobby.racer[0]+i*layout.NetRacer.size,{...m,member_id:m.memberId}));
-    results.slice(0,8).forEach((m,i)=>write('NetResult',a+layout.NetLobby.result[0]+i*layout.NetResult.size,{...m,dnf_reason:m.dnfReason||'',ticks:BigInt(m.ticks??-1)}));
+    (start.players||[]).slice(0,10).forEach((m,i)=>write('NetRacer',a+layout.NetLobby.racer[0]+i*layout.NetRacer.size,{...m,member_id:m.memberId}));
+    results.slice(0,10).forEach((m,i)=>write('NetResult',a+layout.NetLobby.result[0]+i*layout.NetResult.size,{...m,dnf_reason:m.dnfReason||'',ticks:BigInt(m.ticks??-1)}));
     span(a+layout.NetLobby.rotation[0],64).set((room.rotation||[]).slice(0,64));
   }
   function writeList(a,max) {
@@ -89,7 +89,7 @@ export function createNet({span, str}) {
     host_service_net_finish:(ticks,place)=>send({type:'finish',ticks:ticks>>>0,place}),
     host_service_net_back:()=>{send({type:'back'});state=2;frames=[];const m=me();if(m)m.inRace=false;seq++;},
     host_service_net_rules:(finishWindow,nextRace,then)=>send({type:'settings',finishWindow,nextRace:['auto','host'][nextRace],then:['same','next','random'][then]}),
-    host_service_net_rotation:(a,n)=>{if(n>=0&&n<=64)send({type:'settings',rotation:[...span(a,n)]});},
+    host_service_net_rotation:(a,n)=>{if(n>=0&&n<=64)send({type:'settings',rotation:[...span(a,n)].map(x=>x&31),trackLimits:[...span(a,n)].map(x=>10-2*(x>>5))});},
     host_service_net_set_room:a=>{
       const b=span(a,28),d=new DataView(b.buffer,b.byteOffset,b.byteLength),m={type:'settings'};
       ['track','laps','public','maxPlayers'].forEach((k,i)=>{const v=d.getInt32(i*4,true);if(v>=0)m[k]=k==='public'?!!v:v;});

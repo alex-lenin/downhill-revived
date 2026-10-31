@@ -84,7 +84,7 @@ describe("session rooms",()=>{
   });
   it("keeps a track the host chose during the race over the rotation",async()=>{
     const {h,cs,code}=await setup();
-    h.sendJson({type:"settings",rotation:[0,1,2],then:"next",track:0}); await snap(h,r=>r.rotation.length===3);
+    h.sendJson({type:"settings",rotation:[0,1,2],trackLimits:[10,10,10],then:"next",track:0}); await snap(h,r=>r.rotation.length===3);
     await start(h,cs,code);
     h.sendJson({type:"finish",ticks:600,place:1}); h.sendJson({type:"back"});
     await snap(h,r=>!r.members[0].inRace);
@@ -130,7 +130,7 @@ describe("session rooms",()=>{
   });
   it("accepts mid-race joins; finish/back/gave_up preserve waiting ready and ordered results",async()=>{
     const {h,cs,code}=await setup();
-    h.sendJson({type:"settings",rotation:[0,3,5]});
+    h.sendJson({type:"settings",rotation:[0,3,5],trackLimits:[10,10,10]});
     await snap(h,r=>r.rotation.length===3);
     await start(h,cs,code);
     const late=await Client.join(code,"Late");
@@ -187,7 +187,7 @@ describe("session rooms",()=>{
   });
   it("no-limit never starts finish clock; void retains results and does not rotate",async()=>{
     const {h,cs,code}=await setup();
-    h.sendJson({type:"settings",finishWindow:0,rotation:[0,2]});
+    h.sendJson({type:"settings",finishWindow:0,rotation:[0,2],trackLimits:[10,10]});
     await snap(h,r=>r.rules.finishWindow===0);
     await start(h,cs,code);
     h.sendJson({type:"finish",ticks:300,place:2});
@@ -198,7 +198,7 @@ describe("session rooms",()=>{
   });
   for (const then of ["same","next","random"]) it("rotates "+then+" using running rules; stages pending rules",async()=>{
     const {h,cs,code}=await setup();
-    h.sendJson({type:"settings",then,rotation:[0,2,4]});
+    h.sendJson({type:"settings",then,rotation:[0,2,4],trackLimits:[10,10,10]});
     await snap(h,r=>r.rotation.length===3); await start(h,cs,code);
     h.sendJson({type:"back"}); await snap(h,r=>!r.members[0].inRace);
     h.sendJson({type:"settings",then:then==="same"?"next":"same"});
@@ -236,23 +236,69 @@ describe("session rooms",()=>{
     cs[1].sendJson({type:"back"});
     expect((await snap(cs[1],r=>r.lastRace)).lastRace.entrants[0].dnfReason).toBe("left");
   });
-  it("lists racing and full session rooms; snapshot stays below 4KB for eight members",async()=>{
+  it("defaults to ten and accepts exactly 2 through 10",async()=>{
+    const {h}=await setup(1);
+    h.sendJson({type:"ping",t:0}); await h.json("pong");
+    h.sendJson({type:"settings",public:true});
+    expect((await snap(h,r=>r.public)).maxPlayers).toBe(10);
+    for(let n=2;n<=10;n++) {
+      h.sendJson({type:"settings",maxPlayers:n});
+      expect((await snap(h,r=>r.maxPlayers===n)).maxPlayers).toBe(n);
+    }
+    for(const n of [1,11]) {h.sendJson({type:"settings",maxPlayers:n});expect((await h.json("error")).code).toBe("bad_value");}
+  });
+  it("switches a six-rider selection at grid lock without dropping ready players",async()=>{
+    const {h,cs,code}=await setup(10);
+    const overflow = await Client.connect(`/v1/rooms/${code}`);
+    overflow.hello("Overflow");
+    expect(await overflow.closed()).toBe(4004);
+    h.sendJson({type:"settings",track:9,rotation:[9,4,12],trackLimits:[6,8,10]});
+    await snap(h,r=>r.settings.track===9);
+    await start(h,cs,code);
+    await runInDurableObject(env.ROOM.get(env.ROOM.idFromName(code)),async(room:any)=>{
+      expect(room.state.race.track).toBe(12);
+      expect(room.state.race.slots.length).toBe(10);
+      expect(room.state.lastEvent).toBe("track_switch:9:6:12");
+    });
+  });
+  it("requires matching rotation limits and a ten-rider fallback",async()=>{
+    const {h}=await setup(1);
+    for(const trackLimits of [[6], [6,8], [6,9,10]]) {
+      h.sendJson({type:"settings",rotation:[9,4,12],trackLimits});
+      expect((await h.json("error")).code).toBe("bad_value");
+    }
+  });
+  for(const then of ["next","random"]) it(then+" skips tracks smaller than room membership",async()=>{
+    const {h,cs,code}=await setup(10);
+    h.sendJson({type:"settings",track:0,then,rotation:[0,9,4,12],trackLimits:[10,6,8,10]});
+    await snap(h,r=>r.rules.then===then);
+    await start(h,cs,code);
+    for(let i=0;i<10;i++)cs[i].sendJson({type:"finish",ticks:600+i,place:i+1});
+    expect((await snap(h,r=>r.lastRace)).settings.track).toBe(12);
+  });
+  it("keeps ten results within ten places when the reported places lag",async()=>{
+    const {h,cs,code}=await setup(10); await start(h,cs,code);
+    for(let i=1;i<10;i++)cs[i].sendJson({type:"finish",ticks:600+i,place:i+1});
+    h.sendJson({type:"finish",ticks:900,place:10});
+    expect((await snap(h,r=>r.lastRace)).lastRace.entrants.map((r:any)=>r.place)).toEqual([1,2,3,4,5,6,7,8,9,10]);
+  });
+  it("lists racing and full session rooms; snapshot stays below 4KB for ten members",async()=>{
     const {h,cs,code}=await setup(1);
-    h.sendJson({type:"settings",public:true,maxPlayers:8,roomName:"\u0800".repeat(32),rotation:Array.from({length:64},(_,i)=>i)});
+    h.sendJson({type:"settings",public:true,maxPlayers:10,roomName:"\u0800".repeat(32),rotation:Array.from({length:64},(_,i)=>i),trackLimits:Array(64).fill(10)});
     await snap(h,r=>r.public);
-    for(let i=1;i<8;i++)cs.push(await Client.join(code,"\u0800".repeat(24)));
-    await snap(h,r=>r.members.length===8);
+    for(let i=1;i<10;i++)cs.push(await Client.join(code,"\u0800".repeat(24)));
+    await snap(h,r=>r.members.length===10);
     await edit(code, st=>{st.members[0].name="\u0800".repeat(24);st.version="v".repeat(64);});
     await start(h,cs,code);
     const list=async()=> (await (await exports.default.fetch(new Request("https://dhd.skuza.app/v1/lobbies"))).json<any>()).lobbies;
-    await expect.poll(list).toContainEqual(expect.objectContaining({code,phase:"racing",full:true,players:8}));
-    for (let i=0;i<8;i++){cs[i].sendJson({type:"finish",ticks:600+i,place:1});cs[i].sendJson({type:"back"});}
+    await expect.poll(list).toContainEqual(expect.objectContaining({code,phase:"racing",full:true,players:10}));
+    for (let i=0;i<10;i++){cs[i].sendJson({type:"finish",ticks:600+i,place:1});cs[i].sendJson({type:"back"});}
     await snap(h,r=>r.lastRace);
     await start(h,cs,code);
     const r=await snap(h,r=>r.phase==="racing");
     expect(new TextEncoder().encode(JSON.stringify(r)).length).toBeLessThanOrEqual(4096);
-    for(let i=0;i<7;i++) {cs[i].sendJson({type:"finish",ticks:0xffffffff,place:255}); await snap(h,r=>r.members[i].finishTicks===0xffffffff);}
-    const largest=await snap(cs[7],r=>r.members.filter((m:any)=>m.raceState==="finished").length===7);
+    for(let i=0;i<9;i++) {cs[i].sendJson({type:"finish",ticks:0xffffffff,place:255}); await snap(h,r=>r.members[i].finishTicks===0xffffffff);}
+    const largest=await snap(cs[9],r=>r.members.filter((m:any)=>m.raceState==="finished").length===9);
     expect(new TextEncoder().encode(JSON.stringify(largest)).length).toBeLessThanOrEqual(4096);
   });
 });

@@ -106,6 +106,7 @@ int main(int argc, char **argv)
     const char *server = NULL, *name = "Tester", *mode = NULL, *code = NULL, *code_file = NULL;
     const char *version = "dhd-port nettool 1", *iso = "0000000000000000000000000000000000000000000000000000000000000000";
     const char *replay_file = NULL;
+    int follow_host = 0, followed = 0; /* synthetic moving opponents for room checks */
     int rider = 4, seconds = 600, received = 0;
     int echo_ai = 0;         /* --echo-ai: session bot mirrors a host AI as a real puppet */
     int pick = -1;            /* --pick N: the lobby's rider number (1..16); 0 stays choosing */
@@ -123,6 +124,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--version") && i + 1 < argc) version = argv[++i];
         else if (!strcmp(argv[i], "--iso") && i + 1 < argc) iso = argv[++i];
         else if (!strcmp(argv[i], "--bot")) ;  /* (older scripts' flag; nothing to do) */
+        else if (!strcmp(argv[i], "--follow-host")) follow_host = 1;
         else if (!strcmp(argv[i], "--replay") && i + 1 < argc) replay_file = argv[++i];
         else if (!strcmp(argv[i], "--rider") && i + 1 < argc) rider = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
@@ -170,7 +172,7 @@ int main(int argc, char **argv)
         net_set_room(&s);
     }
     if (pick == 0) net_pick(-1, -1, 0);  /* on the rider screen, as far as the room knows */
-    else net_pick(-1, pick > 0 ? pick : replay_file ? rider + 1 : l.member_id % 8, 1);
+    else net_pick(-1, pick > 0 ? pick : replay_file ? rider + 1 : l.member_id % NET_MAX_SLOTS + 1, 1);
     if (races > 0) {
         char phase[16] = "";
         double phase_at = net_seconds(), race_at = 0, loaded_at = 0;
@@ -237,6 +239,25 @@ int main(int argc, char **argv)
             }
             while ((n = net_receive_frame(frame, sizeof frame)) > 0) {
                 received++;
+                if (follow_host && frame[0] == NET_FRAME_STATE && frame[1] == 0) {
+                    for (int at = 2; at < n;) {
+                        int size = frame[at++];
+                        if (size < 18 || at + size > n) break;
+                        if (frame[at] == 3 && frame[at+1] == 0) {
+                            uint8_t moving[256];
+                            moving[0] = (uint8_t)size;
+                            memcpy(moving + 1, frame + at, size);
+                            moving[2] = (uint8_t)l.local_slot;
+                            float x;
+                            memcpy(&x, moving + 7, 4);
+                            x += 6.0f * l.local_slot;
+                            memcpy(moving + 7, &x, 4);
+                            followed += net_send_frame(NET_FRAME_STATE, moving, size + 1) != 0;
+                            break;
+                        }
+                        at += size;
+                    }
+                }
                 if (frame[0] == NET_FRAME_EVENT && n >= 4 && frame[2] == EVENT_VERSION && frame[3] == EVENT_LOADED) others_loaded = 1;
                 if (echo_ai && !saw_go && frame[0] == NET_FRAME_EVENT && n >= 12 &&
                     frame[2] == EVENT_VERSION && frame[3] == EVENT_GO) {
@@ -270,7 +291,7 @@ int main(int argc, char **argv)
             }
             Sleep(10);
         }
-        printf("RESULT {\"races\":%d,\"received\":%d,\"echoed\":%u}\n", started_count, received, echoed);
+        printf("RESULT {\"races\":%d,\"received\":%d,\"echoed\":%u,\"snapshots\":%d}\n", started_count, received, echoed, followed);
         net_leave();
         return l.last_race_id < races;
     }

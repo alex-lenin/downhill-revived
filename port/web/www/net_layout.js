@@ -106,7 +106,7 @@ export const layout = {
     ]
   },
   "NetLobby": {
-    "size": 4088,
+    "size": 4952,
     "state": [
       0,
       4
@@ -165,127 +165,127 @@ export const layout = {
     ],
     "member": [
       168,
-      1408
+      1760
     ],
     "ping_ms": [
-      1576,
+      1928,
       4
     ],
     "local_slot": [
-      1580,
+      1932,
       4
     ],
     "nslots": [
-      1584,
+      1936,
       4
     ],
     "racer": [
-      1588,
-      960
+      1940,
+      1200
     ],
     "race_track": [
-      2548,
+      3140,
       4
     ],
     "race_laps": [
-      2552,
+      3144,
       4
     ],
     "race_seed": [
-      2556,
+      3148,
       4
     ],
     "start_at": [
-      2560,
+      3152,
       8
     ],
     "offline": [
-      2568,
+      3160,
       4
     ],
     "error_code": [
-      2572,
+      3164,
       32
     ],
     "error": [
-      2604,
+      3196,
       200
     ],
     "countdown_ms": [
-      2804,
+      3396,
       4
     ],
     "phase": [
-      2808,
+      3400,
       16
     ],
     "last_event": [
-      2824,
+      3416,
       32
     ],
     "race_started_at": [
-      2856,
+      3448,
       8
     ],
     "finish_ends_at": [
-      2864,
+      3456,
       8
     ],
     "next_race_at": [
-      2872,
+      3464,
       8
     ],
     "countdown_ends_at": [
-      2880,
+      3472,
       8
     ],
     "server_time": [
-      2888,
+      3480,
       8
     ],
     "waiting_for_rider": [
-      2896,
+      3488,
       4
     ],
     "rules_pending": [
-      2900,
+      3492,
       4
     ],
     "finish_window": [
-      2904,
+      3496,
       4
     ],
     "next_race": [
-      2908,
+      3500,
       4
     ],
     "then": [
-      2912,
+      3504,
       4
     ],
     "rotation_count": [
-      2916,
+      3508,
       4
     ],
     "rotation": [
-      2920,
+      3512,
       64
     ],
     "last_race_id": [
-      2984,
+      3576,
       4
     ],
     "last_race_track": [
-      2988,
+      3580,
       4
     ],
     "nresults": [
-      2992,
+      3584,
       4
     ],
     "result": [
-      3000,
-      1088
+      3592,
+      1360
     ]
   },
   "NetLobbyInfo": {

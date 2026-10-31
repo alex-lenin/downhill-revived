@@ -12,7 +12,7 @@ int main(void)
     NetClient c;
     NetLobby l;
     NetTransport t;
-    unsigned char rotation[] = {1,3,5};
+    unsigned char rotation[] = {1,3 | 32,5 | 64};
     const char *welcome = "{\"type\":\"welcome\",\"memberId\":7,\"code\":\"TEST22\",\"serverTime\":1000}";
     const char *room = "{\"type\":\"room\",\"hostId\":7,\"phase\":\"intermission\",\"serverTime\":1000,"
         "\"nextRaceAt\":31000,\"raceStartedAt\":900,\"finishEndsAt\":null,\"countdownEndsAt\":null,"
@@ -37,7 +37,21 @@ int main(void)
     client_back(&c); assert(!strcmp(sent,"{\"type\":\"back\"}"));
     client_rules(&c,60,1,2); assert(strstr(sent,"\"nextRace\":\"host\"") && strstr(sent,"\"then\":\"random\""));
     client_rotation(&c,rotation,3); assert(strstr(sent,"[1,3,5]"));
+    assert(strstr(sent,"\"trackLimits\":[10,8,6]"));
+    char ten[4096];
+    int at = snprintf(ten, sizeof ten, "{\"type\":\"room\",\"members\":[");
+    for (int i = 0; i < 10; i++) at += snprintf(ten + at, sizeof ten - at,
+        "%s{\"id\":%d,\"name\":\"Player%d\",\"ready\":true}", i ? "," : "", i, i);
+    snprintf(ten + at, sizeof ten - at, "]}");
+    client_on_text(&c,ten,strlen(ten)); client_lobby(&c,&l);
+    assert(l.nmembers == 10 && l.member[9].id == 9 && l.member[9].ready);
+    at = snprintf(ten, sizeof ten, "{\"type\":\"start\",\"yourSlot\":9,\"players\":[");
+    for (int i = 0; i < 10; i++) at += snprintf(ten + at, sizeof ten - at,
+        "%s{\"slot\":%d,\"memberId\":%d,\"name\":\"Player%d\"}", i ? "," : "", i, i, i);
+    snprintf(ten + at, sizeof ten - at, "]}");
+    client_on_text(&c,ten,strlen(ten)); client_lobby(&c,&l);
+    assert(l.nslots == 10 && l.local_slot == 9 && l.racer[9].member_id == 9);
     client_free(&c);
-    puts("test_session: 17 checks passed");
+    puts("test_session: session and ten-player checks passed");
     return 0;
 }

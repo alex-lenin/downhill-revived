@@ -1,4 +1,4 @@
-# Online protocol (version 1)
+# Online protocol (version 2)
 
 The wire protocol between the PC port (`port/net/`) and the online server (`online/server/`,
 Cloudflare Workers + Durable Objects). The plan behind it is `docs/ONLINE-PLAN.md`.
@@ -8,7 +8,7 @@ Cloudflare Workers + Durable Objects). The plan behind it is `docs/ONLINE-PLAN.m
 - The server runs no game logic. In a race it relays STATE and EVENT frames (state sync: every
   PC runs its own race and shows the others' riders from their snapshots, findings 041 and 044)
   and reports players who leave.
-- `PROTOCOL = 1`. It is in the URL (`/v1/`) and in `hello`. Any incompatible change raises
+- `PROTOCOL = 2`. It is in `hello`; the endpoint URL remains `/v1/`. Any incompatible change raises
   it; the server refuses clients with another number.
 
 ## Endpoints
@@ -23,7 +23,7 @@ host.
 | WebSocket | `/v1/rooms/new` | Create a room; this socket becomes its host. |
 | WebSocket | `/v1/rooms/<CODE>` | Join the room with that join code (case-insensitive). |
 | GET | `/v1/lobbies` | Public lobby list (JSON, below). |
-| GET | `/v1/health` | `{"ok":true,"protocol":1,"minVersion":"0.1.0"}` |
+| GET | `/v1/health` | `{"ok":true,"protocol":2,"minVersion":"0.1.0"}` |
 
 Join codes are 6 characters from `23456789ABCDEFGHJKMNPQRSTUVWXYZ` (no `0 O 1 I L`). Clients
 upper-case what the user types and reject characters outside that alphabet.
@@ -77,11 +77,11 @@ use the same `error` frame **without** a close; the client just shows `message`.
 
 ```jsonc
 // First message, required. name: 1-24 characters.
-{"type":"hello","protocol":1,"version":"dhd-port 0.2.0 1a2b3c4d5e6f7a8b","clientVersion":"0.2.0",
+{"type":"hello","protocol":2,"version":"dhd-port 0.2.0 1a2b3c4d5e6f7a8b","clientVersion":"0.2.0",
  "isoSha256":"<64 lowercase hex>","name":"Rider","features":["countdown"]}  // features: optional
 
 // Host only. Every field optional; omitted fields keep their value.
-{"type":"settings","track":3,"laps":2,"seed":12345,"public":true,"maxPlayers":4,"roomName":"Friday race"}
+{"type":"settings","track":3,"laps":2,"seed":12345,"public":true,"maxPlayers":10,"roomName":"Friday race"}
 
 // Rider and bike for a member. Anyone may set their own; the host may set anyone's.
 {"type":"pick","member":2,"rider":5,"bike":1}     // "member" omitted = yourself
@@ -98,7 +98,7 @@ use the same `error` frame **without** a close; the client just shows `message`.
 - `track`, `laps`, `rider`, `bike`: integers 0..255 whose meaning belongs to the game (track
   table index, rider and bike table indices). `laps` 0 = the track's default.
 - `seed`: unsigned 32-bit integer. If the host never sets one, the server draws one at `start`.
-- `maxPlayers`: 2..8, default 4. It can't go below the current member count.
+- `maxPlayers`: 2..10, default 10. It can't go below the current member count.
 - `public`: listed in `/v1/lobbies` while not started and not full. Default `false`
   (private, join code only).
 - `features`: what the client understands beyond version 1. `"countdown"`: the room may start
@@ -108,10 +108,10 @@ use the same `error` frame **without** a close; the client just shows `message`.
 
 ```jsonc
 // Answer to hello: who you are in this room.
-{"type":"welcome","protocol":1,"code":"K7QX2M","memberId":2,"host":false,"serverTime":1734000000000}
+{"type":"welcome","protocol":2,"code":"K7QX2M","memberId":2,"host":false,"serverTime":1734000000000}
 
 // Full room snapshot. Sent after every change and every ~2 s with fresh ping numbers.
-{"type":"room","code":"K7QX2M","hostId":0,"roomName":"Friday race","public":true,"maxPlayers":4,
+{"type":"room","code":"K7QX2M","hostId":0,"roomName":"Friday race","public":true,"maxPlayers":10,
  "started":false,"version":"dhd-port 0.4.0",
  "settings":{"track":3,"laps":2,"seed":null},
  "members":[{"id":0,"name":"Ann","ready":true,"rider":5,"bike":1,"rttMs":38,"choosing":false},
@@ -210,9 +210,9 @@ The server keeps what everyone has to agree on:
 `GET /v1/lobbies` → `200 application/json`:
 
 ```json
-{"protocol":1,"minVersion":"0.1.0","lobbies":[
+{"protocol":2,"minVersion":"0.1.0","lobbies":[
   {"code":"K7QX2M","roomName":"Friday race","version":"dhd-port 0.2.0 1a2b3c4d5e6f7a8b","track":3,
-   "players":2,"maxPlayers":4,"hostName":"Ann"}]}
+   "players":2,"maxPlayers":10,"hostName":"Ann"}]}
 ```
 
 Only public rooms that have not started and have a free slot are listed. Clients should
@@ -220,7 +220,7 @@ show only rooms whose `version` matches their own.
 
 ## Limits
 
-- One room holds at most 8 members.
+- One room holds at most 10 members.
 - Text frames: at most 4 KB. Binary frames: at most 3072 bytes (a STATE frame carries all of a
   player's riders).
 - A room with no members is deleted.
@@ -257,11 +257,12 @@ The host sends `settings` with any of the old fields and these optional fields:
 | finishWindow | 0, 30, 60, 120 seconds | 60 |
 | nextRace | "auto", "host" | auto if public, host if private |
 | then | "same", "next", "random" | next |
-| rotation | Array of 0�64 byte track ids | empty |
+| rotation | Array of 0–64 byte track ids | empty |
+| trackLimits | Parallel array of 6, 8 or 10; sent with rotation; includes a ten-rider entry | unset |
 
 The nextRace default follows public until nextRace is explicitly set.
-The client sends the game's track list in rotation once. An empty rotation keeps
-the track. Next walks forward, wrapping; a current track absent from the list
+The client sends the game's track list and limits once. Until then the rotation
+is empty and keeps the track. Next walks forward, wrapping; a current track absent from the list
 selects its first entry. Random excludes the current track whenever another
 track exists. Track ids may repeat; clients should send a unique list.
 
@@ -291,7 +292,7 @@ Joins are accepted in every phase up to maxPlayers, counting all members.
 
 An entrant sends `{"type":"finish","ticks":N,"place":P}` when its own human rider
 crosses the line. N is an unsigned 32-bit race clock at 60 ticks a second.
-P is 1�255, the full-field place computed locally, including computer riders.
+P is 1–255, the full-field place computed locally, including computer riders.
 Only the first finish from that entrant counts. Computer finishes send nothing.
 
 The first human finish sets finishEndsAt to now plus the running finishWindow.
@@ -366,7 +367,7 @@ An entrant may be finished while inRace is true until back or race closure.
 LastRace entrants carry id (member id), name, rider, place and either ticks or
 dnfReason. Disconnected entrants remain in lastRace.
 All deadlines are server epoch milliseconds; absent deadlines are null.
-Text frames fit 4096 UTF-8 bytes for eight members, including prior results.
+Text frames fit 4096 UTF-8 bytes for ten members, including prior results.
 Session member and room names replace C0 controls and unpaired UTF-16 surrogates with U+FFFD to
 bound JSON escaping. Old rooms retain their existing name handling.
 
@@ -418,3 +419,33 @@ while running), --ready-after S in every open/intermission (-1 never),
 Neither action means never finish. --seconds bounds the entire session.
 It logs each phase transition as PHASE followed by the phase and local race count.
 A late join waits for its first grid. Existing recording replay mode remains.
+
+
+## Ten racers (protocol 2)
+
+New public and private rooms default to ten members. The host can choose 2–10,
+but cannot shrink below current membership. A race still uses one local human.
+NetLobby member, racer and result arrays each have ten entries. Native and browser
+hosts use the regenerated shared ABI. Rider STATE format remains version 3;
+EVENT format remains version 2. The binary relay path is unchanged.
+
+Rotation settings carry `rotation` and parallel `trackLimits` arrays in the same
+message. Limits are 6, 8 or 10. At least one entry must take ten riders. Clients
+derive these from the retail track classifier, not a server track table. The
+configured rotation remains in room snapshots; limits are kept by the server.
+The native rotation import still takes up to 64 bytes: each byte stores a track
+ID in its low five bits and (10 - limit) / 2 in its high bits. Native and browser
+hosts decode this into the two JSON arrays. Snapshot rotation IDs are plain IDs.
+
+NEXT walks forward through the rotation; RANDOM draws from fitting entries other
+than the current track when possible. Both skip entries smaller than membership.
+SAME preserves the selection. At grid lock, if the ready grid exceeds the selected
+track's limit, the next fitting rotation entry is selected without dropping anyone.
+`lastEvent` is `track_switch:<old id>:<limit>:<new id>`; the game translates IDs
+into a notice such as PERU MX TAKES 6: RACING FUJI. The grid and rules still lock
+through the countdown. Computer riders fill the retail track count when enabled.
+
+Room snapshots omit `choosing` when false and `bike` when zero. Receivers use those
+defaults. This saves repeated fields while retaining all ten members and last results
+within the 4096-byte UTF-8 frame budget. The room draws two columns of five cards,
+including ping, readiness, race state and results. The fourth room rule sets capacity.

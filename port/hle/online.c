@@ -272,6 +272,7 @@ enum {
 };
 enum { SNAPSHOT_TICKS = 3 };  /* a snapshot every 3 race ticks: 20 a second at any frame rate */
 enum { NRIDERS = 10, START_LEAD_MS = 1500 };
+_Static_assert(2 + NRIDERS * 256 <= NET_FRAME_MAX, "all owned riders fit one STATE frame");
 #define RACE_CLOCK EE32(0x43EEC8)
 /* The race object D_0043EEC0 (func_0019F210): +8 the race clock, +0x1C finish times (race ticks)
    and +0x58 finished flags by rider slot, +0x62 finishes to apply on the next step. */
@@ -308,7 +309,7 @@ static struct {
     int gone[NET_MAX_SLOTS];
     double go_at;               /* EVENT_START: server ms of the countdown's start, 0 until known */
     double go_server;           /* our GO on the server's clock */
-    double their_go[4];         /* the others' */
+    double their_go[NET_MAX_SLOTS];         /* the others' */
     int go_sent;
     /* the start (start_step): when this PC came to it, the last resend, whether the host named the
        moment; the players it still waits for (start_waiting: the first) */
@@ -539,7 +540,7 @@ static void barrier(void)
     }
     kernel_pace_slip(host_wall_seconds() - entered);  /* the lobby wait isn't game time to catch up */
     /* a room's race can have one rider (START NOW with only them ready): no other player then */
-    on.nslots = lobby.nslots < 1 ? 1 : lobby.nslots > 4 ? 4 : lobby.nslots;
+    on.nslots = lobby.nslots < 1 ? 1 : lobby.nslots > NET_MAX_SLOTS ? NET_MAX_SLOTS : lobby.nslots;
     on.local_slot = lobby.local_slot;
     on.host_slot = 0;
     for (int i = 0; i < lobby.nslots; i++)
@@ -628,8 +629,8 @@ static void receive_frames(void)
             break;
         case EVENT_GO:
             if (n - 2 >= 10) {
-                memcpy(&on.their_go[sender & 3], e + 2, 8);
-                if (on.go_server) go_skew(sender & 3);
+                memcpy(&on.their_go[sender], e + 2, 8);
+                if (on.go_server) go_skew(sender);
             }
             break;
         case EVENT_FINISH:
@@ -1193,7 +1194,7 @@ static void state_sync(void)
         memcpy(e + 2, &on.go_server, 8);
         send_event(e, sizeof e);
         on.go_sent = 1;
-        for (int j = 0; j < 4; j++)
+        for (int j = 0; j < on.nslots; j++)
             if (on.their_go[j]) go_skew(j);
     }
     static double checked;

@@ -87,7 +87,7 @@ typedef struct Snapshot {
     uint32_t pad[PAD_WORDS];
 } Snapshot;
 
-enum { RING = 32, MAX_EVENTS = 16, NET_SLOTS = 8 };
+enum { RING = 32, MAX_EVENTS = 16, NET_SLOTS = 10 };
 /* Wire format version 3: rider ids are global (a human's lobby slot, an AI rider's slot), the
    snapshot carries the checkpoints passed and the attack power-ups (version 2), and its clock is
    the sender's race time in ms, not its ticks (finding 114). STATE_FIXED: the payload before the

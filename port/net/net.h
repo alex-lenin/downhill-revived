@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { NET_MAX_SLOTS = 8 };  /* a room holds 8 */
+enum { NET_MAX_SLOTS = 10 };  /* online rider slots, independent of local controllers */
 
 /* ---- connection and lobby ---- */
 
