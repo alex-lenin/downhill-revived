@@ -116,8 +116,9 @@ DISC = RENDER / 'disc'   # dhd_disc, the disc image's online check, linked into 
 MEMBERS = (NET, SETTINGS, PRESENCE, DISC)
 GS = ROOT / 'port' / 'gs'
 WGSL = ('raster.wgsl', 'present.wgsl', 'native.wgsl', 'native_dual.wgsl')
+DEVCACHES = Path(os.environ.get('DHD_DEVCACHES') or Path.home() / 'DevCaches')  # downloaded tools and caches
 CARGO_TARGETS = Path(os.environ.get('DHD_CARGO_DIR') or
-                     ('DHD_DEVCACHES/dhd-cargo' if os.name == 'nt' else Path.home() / '.cache' / 'dhd-cargo'))
+                     (DEVCACHES / 'dhd-cargo' if os.name == 'nt' else Path.home() / '.cache' / 'dhd-cargo'))
 SEED = CARGO_TARGETS / 'seed'
 WEB_OUT = ROOT / 'build' / 'web' / 'renderer'
 RENDER_CRATE = 'dhd_render'
