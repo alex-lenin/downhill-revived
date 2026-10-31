@@ -790,7 +790,7 @@ PATCHES['unsorted/0019EE98.c'] = PATCHES.get('unsorted/0019EE98.c', []) + [
 ]
 PATCHES['unsorted/00176ED8.c'] = PATCHES.get('unsorted/00176ED8.c', []) + [
     ('text', 'void func_00176ED8(Obj *obj)\n{',
-     'extern void hle_online_hud(int view);\nvoid func_00176ED8(Obj *obj)\n{\n    hle_online_hud(obj->player);'),
+     'extern void hle_online_hud(int view);\nextern int hle_online_watch_hud(void);\nextern void func_00176E40(Obj *, int);\nvoid func_00176ED8(Obj *obj)\n{\n    hle_online_hud(obj->player);\n    if (hle_online_watch_hud()) { func_00176E40(obj, 0); return; }'),
 ]
 
 # WaitForRender's spin enters the kernel and sends a queued render chain the VIF1 interrupt
@@ -802,3 +802,15 @@ PATCHES['unsorted/001B4618.c'] = PATCHES.get('unsorted/001B4618.c', []) + [
 
 # wasm32: size_t is unsigned long there and unsigned int on i686 (the same type as the game's).
 PATCHES['unsorted/00235488.cpp'] = [('text', 'operator new[](unsigned int size)', 'operator new[](__SIZE_TYPE__ size)')]
+
+# Room spectating: one camera override, shared with DHD_PUPPET_CAMERA.
+PATCHES['unsorted/00148BE8.c'] = PATCHES.get('unsorted/00148BE8.c', []) + [
+    ('text', 'void func_00148BE8(Object *s,int arg1) {',
+     'extern void hle_online_watch_camera(void *);\nvoid func_00148BE8(Object *s,int arg1) {\n hle_online_watch_camera(s);'),
+]
+
+# The pause menu runs outside the race loop; its builder marks it paused until re-entry.
+PATCHES['unsorted/001B40A0.c'] = PATCHES.get('unsorted/001B40A0.c', []) + [
+    ('text', 'int func_001B40A0(Obj *arg0)\n{',
+     'extern void hle_online_watch_resume(void);\nint func_001B40A0(Obj *arg0)\n{\n    hle_online_watch_resume();'),
+]
