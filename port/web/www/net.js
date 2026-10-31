@@ -34,6 +34,8 @@ export function createNet({span, str}) {
       seq++;
     };
     ws.onclose = () => {if(socket===ws){clearInterval(timer);state=5;seq++;}};
+    // A socket refused before it opens (e.g. by the page's CSP) may get no close event in Chrome.
+    ws.onerror = () => {if(socket===ws&&state===1){clearInterval(timer);state=5;error=error||'Could not reach the server.';seq++;}};
     return 0;
   }
   function write(type, address, values) {
