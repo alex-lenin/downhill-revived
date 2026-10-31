@@ -122,8 +122,10 @@ it unchanged (finding 088, CL3).
 - Android arm64 (finding 091): `build_host64.py --target android-arm64` makes `libmain.so` (wasm2c core, the
   POSIX host on arm64, the Rust renderer on Vulkan, SDL3 as `libSDL3.so`) and
   `port/android/build_apk.py` a debug-signed APK with Gradle (no Android Studio). On the Mi 11i:
-  title, menus and a race draw right, background/foreground works, about 25 fields/s in a race
-  (60 is the goal: speed work next). Gamepad or keyboard only (no touch). Online uses the same
+  title, menus and a race draw right, background/foreground works; the first race measurement was
+  about 25 fields/s, and findings 107/112 brought it to 115 fields/s at 1x uncapped (93 at 2x), so
+  60 is reachable there at 1x. A low-end Unisoc T612 phone (Realme, finding 126) does 36-40
+  fields/s at 1x and 14 at 2x and cannot hold 60. Gamepad or keyboard only (no touch). Online uses the same
   Rust client as Windows (`dhd_net`, below; not yet tried on the phone).
 - Retired (finding 088): the 32-bit i686 build (`link.py`, `build_clean.py`, the x87/FP-trap
   runtime), the Direct3D 11 renderer, the C wgpu-native renderer and the browser's JS renderer.
